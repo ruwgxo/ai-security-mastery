@@ -135,6 +135,6 @@ Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ---
 
-**Start Date:** December 27, 2024  
-**Target:** March 27, 2025  
+**Start:** 2025
+**Target:** 2026
 **Status:** 🚀 Active Development
