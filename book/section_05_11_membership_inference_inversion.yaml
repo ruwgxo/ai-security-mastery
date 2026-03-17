@@ -1,0 +1,1641 @@
+# section_05_11_membership_inference_inversion.yaml
+
+---
+document_info:
+  title: "Section 5.11: Privacy Attacks — Membership Inference and Model Inversion"
+  chapter: 5
+  section: 11
+  part: "Part 2: AI Security Landscape"
+  book: "AI Security Mastery: From ML Fundamentals to Production Detection Systems"
+  author: "Raghav Dinesh"
+  github: "https://github.com/raghavpoonia/ai-security-mastery"
+  license: "MIT"
+  created: "2026-01-20"
+  version: "1.0"
+  estimated_pages: 7
+  reading_time: "65-80 minutes"
+  notebook: "notebooks/04-security-testing/section_05_11_membership_inference_inversion.ipynb"
+  tags:
+    - membership-inference
+    - model-inversion
+    - shadow-models
+    - likelihood-ratio
+    - confidence-gap
+    - overfitting
+    - gradient-based-reconstruction
+    - output-perturbation
+    - privacy-audit
+    - aml-t0048
+    - gdpr
+    - shokri-2017
+    - carlini-2022
+
+learning_objectives:
+  by_end_of_section:
+    - "Explain the confidence-gap mechanism that makes membership inference possible and state why overfitting amplifies it"
+    - "Describe the Shokri et al. (2017) shadow model attack: what shadow models are, how they are trained, and what the attack classifier predicts"
+    - "Implement likelihood-ratio membership inference requiring only black-box API access"
+    - "Quantify membership inference risk for a fine-tuned model using the loss-gap metric"
+    - "Identify the four highest-risk membership inference target scenarios: clinical trials, financial records, legal documents, and user behavioural data"
+    - "Explain model inversion: what it reconstructs, what access is required, and the gradient-based reconstruction loop"
+    - "Describe the classic Fredrikson et al. (2015) face reconstruction demonstration and its modern LLM equivalent"
+    - "Implement four defences against membership inference and inversion: regularisation, output quantisation, prediction perturbation, and confidence masking"
+    - "Construct a combined privacy risk audit procedure integrating extraction (5.10) and membership inference results"
+    - "Map the full privacy attack triad — extraction, membership inference, inversion — to GDPR obligations and audit evidence"
+
+prerequisites:
+  required:
+    - "Section 5.10 — Training Data Extraction (memorisation mechanism, DP training, canary tokens)"
+    - "Section 5.8 — AML.T0048 (membership inference detection specification)"
+    - "Chapter 1, Section 1.13 — Overfitting (overfit models have larger loss gap — direct connection here)"
+    - "Chapter 1, Section 1.8 — Gradient Descent (gradient-based inversion builds on training mechanics)"
+  assumed_background:
+    - "Python: numpy, sklearn basics (train/test split, logistic regression)"
+    - "Loss function concept: cross-entropy loss on correct class"
+    - "Softmax output: probability vector over classes"
+    - "Familiarity with LLM token log-probabilities"
+
+section_content:
+
+  subsection_01:
+    number: "5.11.1"
+    title: "Membership Inference: The Confidence-Gap Mechanism"
+    content: |
+      the_binary_question: |
+        Membership inference attacks (MIA) answer a single binary question:
+        was a specific data record used to train this model?
+
+        The GDPR and data-protection implications are severe. If an adversary can
+        determine that a specific patient's medical record, a specific user's
+        behavioural data, or a specific employee's performance review was used to
+        train a deployed model, they can:
+          (a) Confirm undisclosed personal data processing — a regulatory violation
+          (b) Build a profile of what data the organisation holds and processes
+          (c) Target individuals confirmed to be in the training corpus for
+              follow-on social engineering or extraction attacks
+
+        The attack requires no model weights, no training data, and no special
+        permissions — only black-box API access and a query budget.
+
+      the_confidence_gap_mechanism: |
+        Machine learning models optimise their predictions on training data.
+        Gradient descent minimises loss on the training set — specifically, it
+        drives the model toward high-confidence correct predictions on training
+        examples. This creates a measurable gap between model behaviour on
+        training set members (members) and held-out data (non-members):
+
+          Members:    model assigns high probability to the correct class
+                      model's loss on the record is low
+                      model is confident
+          Non-members: model has not specifically optimised on this record
+                        model's loss may be higher
+                        model is less uniformly confident
+
+        The confidence-gap signal is the core observable for membership inference.
+        It is not always large or reliable — but when overfitting is present,
+        the gap widens and the attack accuracy improves.
+
+      overfitting_amplification: |
+        Section 5.10.1 explained that overfitting amplifies memorisation.
+        The same mechanism amplifies membership inference vulnerability.
+        An overfit model has learned training data almost exactly — its
+        confidence on training members approaches 1.0, while its confidence
+        on non-members reflects genuine generalisation uncertainty.
+        The gap between these two confidence distributions is the membership
+        inference signal, and overfitting makes that gap as large as possible.
+
+        Quantitative relationship (from Yeom et al. 2018):
+          MIA advantage ≤ generalisation gap / 2
+          where generalisation gap = (train accuracy) − (test accuracy)
+
+        A model with 99% train accuracy and 85% test accuracy has a 14%
+        generalisation gap, bounding membership inference advantage at ≤ 7%.
+        A perfectly generalised model (train acc = test acc) provides zero
+        advantage to a membership inference attack.
+
+        Implication for defenders: the best membership inference defence
+        is a well-regularised, non-overfit model. Differential privacy
+        provides the formal guarantee; regularisation provides the practical
+        approximation.
+
+      three_signal_types:
+        signal_01_confidence_score: |
+          Model's output probability for the true class.
+          Members: typically higher than non-members.
+          Accessible via: softmax output vector from API.
+          Limitation: unreliable when model is well-calibrated.
+
+        signal_02_loss_value: |
+          Cross-entropy loss on the correct label = -log(P(correct_class)).
+          Members: lower loss.
+          Accessible via: compute from API confidence scores.
+          More stable signal than raw confidence.
+
+        signal_03_prediction_entropy: |
+          Shannon entropy of the full output probability vector.
+          Members: lower entropy (model more certain).
+          Non-members: higher entropy (model more uncertain).
+          Accessible via: full softmax vector from API (if exposed).
+
+  subsection_02:
+    number: "5.11.2"
+    title: "Shokri et al. (2017): Shadow Model Attack Architecture"
+    content: |
+      paper_context: |
+        "Membership Inference Attacks Against Machine Learning Models" by Reza Shokri,
+        Marco Stronati, Congzheng Song, and Vitaly Shmatikoff (IEEE S&P 2017) introduced
+        the shadow model attack — the foundational membership inference methodology that
+        demonstrated black-box MIA is practical against real ML APIs including Google
+        Prediction API and AWS ML. The attack requires no knowledge of the target model's
+        architecture, training data, or weights.
+
+      shadow_model_concept: |
+        The fundamental challenge for black-box MIA: how does an adversary build a
+        membership classifier without access to the target model's training data?
+        The shadow model approach resolves this with an elegant proxy:
+
+        The adversary cannot observe how the target model was trained, but they can:
+          (1) Obtain or generate data from a similar distribution
+          (2) Train their own model (the shadow model) on that data
+          (3) Query the shadow model with both training members and non-members
+          (4) Record: (query confidence vector, member/non-member label)
+          (5) Train a membership classifier on these labelled examples
+          (6) Apply the membership classifier to target model outputs
+
+        This works because shadow models trained on similar distributions develop
+        similar confidence gap patterns as the target model. The membership classifier
+        learns to recognise the signature of "this record was in training data"
+        without ever seeing the target model's actual training data.
+
+      attack_pipeline_in_detail:
+
+        step_01_shadow_data_acquisition: |
+          Adversary acquires data from the same distribution as the target's training data.
+          Sources: public datasets from the same domain, data synthesis using a
+          generative model, API-based collection from the target's domain.
+          Quality matters: shadow data that is too different from target distribution
+          produces a poorly transferable membership classifier.
+
+        step_02_shadow_model_training: |
+          Train k shadow models (Shokri et al. used k=100, practical attacks use k=10)
+          on subsets of the shadow data. Each shadow model is trained on roughly half
+          the shadow data — this provides training members (in) and non-members (out)
+          for the membership classifier's training set.
+          Architecture: same type as suspected target (or similar complexity).
+          Training: full training until overfitting — intentionally overfit shadow
+          models produce larger confidence gaps and better membership classifiers.
+
+        step_03_membership_label_collection: |
+          For each shadow model k:
+            For each record r in shadow data:
+              Query shadow model k with r
+              Record: (confidence_vector, "in" if r in shadow_k_train else "out")
+          This produces a labelled dataset: (confidence_vector → member/non-member)
+          Dataset size: k shadow models × n shadow data records × 2 labels
+          With k=10 and n=1000: 10,000 labelled (confidence, membership) pairs
+
+        step_04_attack_classifier_training: |
+          Train a binary classifier (logistic regression or small MLP) on the
+          labelled membership dataset from Step 3.
+          Input: confidence vector output by the model when queried with a record
+          Output: binary prediction (member / non-member)
+          This classifier learns to distinguish the confidence-gap signature.
+
+        step_05_target_model_inference: |
+          For any record the adversary wants to test against the target model:
+            Query target model with the record
+            Extract confidence vector from target model output
+            Apply attack classifier to confidence vector
+            Output: (member / non-member) prediction with confidence score
+          No additional queries to the target required beyond this one query per record.
+
+      attack_accuracy_empirical_results: |
+        Shokri et al. (2017) results against commercial MLaaS APIs:
+          Google Prediction API: 79.4% membership inference accuracy
+          Amazon ML: 68.6% accuracy
+          Against intentionally overfit models: 92%+ accuracy
+
+        Baseline comparison: random guessing on a 50/50 split = 50% accuracy.
+        Attack accuracy of 80% represents 30% above random — substantial advantage.
+
+      practical_limitations: |
+        Shadow model attack accuracy degrades when:
+          - Shadow data distribution diverges significantly from target distribution
+          - Target model is well-regularised (small generalisation gap)
+          - Target model uses output perturbation or confidence score masking
+          - Target model does not expose full softmax vector (top-k only)
+        These limitations motivate the defences in Section 5.11.6.
+
+  subsection_03:
+    number: "5.11.3"
+    title: "LLM Membership Inference: Likelihood Ratio Testing"
+    content: |
+      why_shadow_models_are_insufficient_for_llms: |
+        The Shokri shadow model attack requires training k shadow models of the
+        same type as the target. For large language models (7B-70B parameters),
+        training even one shadow model is computationally prohibitive for most
+        adversaries. The shadow model approach is practical for classification
+        models; it is not the primary approach for LLM membership inference.
+
+      likelihood_ratio_mia_for_llms: |
+        Carlini et al. (2022) and subsequent work established the likelihood-ratio
+        test as the standard black-box LLM MIA. It requires only:
+          - Access to the target LLM's token log-probabilities (or a proxy)
+          - Access to a reference model (any similar-scale publicly available LLM)
+
+        The test works on the insight that training members are assigned high
+        likelihood by the target model specifically because they were in training —
+        but they may also be intrinsically high-likelihood text (e.g. common phrases
+        that any LLM would assign high probability). The reference model controls
+        for intrinsic likelihood, isolating the membership signal.
+
+      likelihood_ratio_formula: |
+        For a text sequence x and target model T and reference model R:
+
+          LR(x) = log P_T(x) − log P_R(x)
+                = Σ_t [log P_T(x_t | x_{<t}) − log P_R(x_t | x_{<t})]
+
+        Interpretation:
+          LR(x) >> 0: target model assigns much higher likelihood than reference
+                       → likely training member (target-specific high confidence)
+          LR(x) ≈ 0:  both models agree on likelihood
+                       → inconclusive
+          LR(x) << 0: reference model assigns higher likelihood than target
+                       → likely non-member, or member of reference model's training
+
+        Decision rule: classify x as member if LR(x) > threshold τ
+        τ is calibrated on a small labelled validation set when available,
+        or set to 0 when no validation data exists.
+
+      min_k_variant: |
+        A further improvement by Carlini et al. (2022): instead of averaging
+        log-probabilities over the entire sequence, use the minimum log-probability
+        token. Rationale: for memorised sequences, even the hardest tokens (those
+        most likely to deviate from general language patterns) are assigned high
+        probability by the target model. The min-k approach focuses on these
+        "hardest" tokens where the membership signal is strongest.
+
+          MIN_K(x) = mean of the k lowest per-token log-probabilities
+          Classification: if MIN_K_T(x) − MIN_K_R(x) > τ → member
+
+      reference_model_selection: |
+        The reference model should be:
+          - Similar architecture and scale to the target
+          - Trained on similar general data but NOT on the sensitive fine-tuning data
+          - Publicly available (GPT-2, Llama-2-7B, Mistral-7B etc.)
+        For attacking a model fine-tuned on clinical data: use the base model
+        (before fine-tuning) as the reference. The fine-tuning step creates
+        the membership gap for fine-tuning examples; the base model provides
+        the baseline.
+
+      high_risk_target_scenarios:
+
+        scenario_01_clinical_trials: |
+          A pharmaceutical company fine-tunes an LLM on unpublished clinical trial
+          data to build a medical literature assistant. Patient records, adverse
+          event reports, and dosage outcomes are in the fine-tuning corpus.
+          Adversary: competitor company or plaintiff attorney.
+          MIA target: specific patient IDs or trial records.
+          GDPR implication: trial participants did not consent to AI training.
+          MIA outcome: confirmation of training data composition without data access.
+
+        scenario_02_financial_records: |
+          A hedge fund fine-tunes an LLM on proprietary trade data and internal
+          research reports. Competitor seeks to confirm what data the model was trained on.
+          MIA target: specific company names, trade dates, or financial figures.
+          MIA outcome: reveals IP composition of the model without code or weight access.
+
+        scenario_03_legal_documents: |
+          A law firm deploys an LLM fine-tuned on client contracts and case files
+          (with client consent for the firm's internal use). Opposing counsel or
+          investigator queries the API to determine if specific case files were in training.
+          MIA outcome: reveals attorney-client privileged material was processed by AI.
+
+        scenario_04_user_behavioural_data: |
+          A consumer platform fine-tunes a recommendation LLM on user interaction
+          history. Regulator or researcher queries whether a specific user's data
+          was used to train the deployed model.
+          MIA outcome: confirms individual's data was processed — GDPR Article 22
+          profiling / automated decision-making implications.
+
+  subsection_04:
+    number: "5.11.4"
+    title: "Model Inversion Attacks: Reconstructing Training Samples"
+    content: |
+      what_model_inversion_is: |
+        Model inversion attacks reconstruct training data from model outputs.
+        While membership inference asks "was this record in training?",
+        model inversion asks "what training records can I recover?"
+
+        Inversion is the most powerful privacy attack: it produces approximate
+        copies of actual training examples rather than binary membership signals.
+        The tradeoff: inversion is harder and typically requires more access than
+        membership inference — though black-box variants exist.
+
+      access_level_taxonomy:
+        white_box_inversion:
+          access_required: "Model weights and architecture — gradient computation"
+          power: "Highest — direct gradient signal for reconstruction optimisation"
+          primary_target: "Open-weight models; insider threats"
+          example: "Gradient-based image reconstruction from image classifier"
+
+        grey_box_inversion:
+          access_required: "Full softmax probability vector"
+          power: "High — probability landscape guides reconstruction"
+          primary_target: "APIs exposing full confidence vectors"
+          example: "Confidence-guided reconstruction of face images"
+
+        black_box_inversion:
+          access_required: "Top-k class labels only"
+          power: "Lower — limited signal, requires more queries"
+          primary_target: "Standard classification APIs"
+          example: "Label-only reconstruction with surrogate gradient estimation"
+
+      fredrikson_et_al_2015_face_reconstruction: |
+        The foundational model inversion paper: "Model Inversion Attacks that Exploit
+        Confidence Information and Basic Countermeasures" (Fredrikson, Jha, Ristenpart, 2015).
+
+        Setup: a face recognition classifier trained on celebrity face images.
+        The classifier outputs a confidence vector over N celebrities.
+
+        Attack:
+          (1) Optimisation target: find input image x* that maximises classifier
+              confidence for target person t: x* = argmax_x P(t | x)
+          (2) Gradient computation: use backpropagation through the classifier
+              to compute ∇_x P(t | x) — the gradient of confidence with respect
+              to the input pixel values
+          (3) Gradient ascent iteration:
+              x_{n+1} = x_n + α × ∇_x P(t | x_n) + λ × prior_gradient
+              where prior_gradient regularises toward natural image statistics
+          (4) Convergence: after ~1000-10000 iterations, x* is an approximate
+              reconstruction of training images of person t
+
+        Result: the reconstructed images were recognisably similar to actual
+        training images of the target person, demonstrating that the classifier's
+        confidence surface encodes training data in recoverable form.
+
+        Key insight: the classifier's confidence landscape is not arbitrary —
+        it is shaped by training data. Gradient ascent navigating that landscape
+        recovers the shape of the data that created it.
+
+      llm_inversion_via_gradient_leakage: |
+        The LLM equivalent of face reconstruction:
+
+        federated_learning_gradient_attack: |
+          In federated learning settings, clients send gradient updates to a
+          central server. Zhu et al. (2019) demonstrated that these gradient
+          updates encode the client's training data — the original training
+          batch can be reconstructed from the gradient update alone using
+          a gradient-matching optimisation.
+          Relevance: organisations using federated fine-tuning of LLMs expose
+          their private documents through gradient updates.
+
+        prompt_inversion_from_outputs: |
+          A softer form of inversion: given an LLM's output on a series of
+          queries, reconstruct the system prompt or fine-tuning document
+          that would produce those outputs. Applicable when the target
+          document is not verbatim recalled (Section 5.10) but still
+          influences model behaviour in recoverable ways.
+
+        embedding_inversion: |
+          Text embeddings encode semantic content. Given the embedding of
+          a document, researchers have demonstrated partial reconstruction
+          of the original text (Morris et al. 2023 — "Text Embeddings Reveal
+          (Almost) As Much As Text"). Any API exposing text embeddings
+          leaks partial document content through the embedding.
+
+      inversion_risk_quantification: |
+        Inversion risk is highest when:
+          (1) Model exposes full probability/confidence vectors (not just top-k)
+          (2) Model is fine-tuned on a small, high-value dataset
+          (3) Model architecture and weights are accessible (open-weight or insider)
+          (4) Training data has low entropy / high structure (faces, formatted records)
+          (5) API does not rate-limit or perturb outputs
+
+        Inversion risk is lowest when:
+          (1) Only top-1 prediction exposed (no confidence scores)
+          (2) DP training applied (confidence landscape smoothed)
+          (3) Rate limiting prevents iterative optimisation
+          (4) Output perturbation adds noise to confidence vectors
+
+  subsection_05:
+    number: "5.11.5"
+    title: "Measuring Your Own Exposure: Quantifying MIA Risk"
+    content: |
+      why_self_assessment_matters: |
+        Defenders can run exactly the same membership inference tests that adversaries
+        would run, against their own models, before deployment. Self-assessment provides:
+          (a) Empirical MIA accuracy — the true positive rate an adversary achieves
+          (b) Loss-gap measurement — quantifies overfitting as a privacy proxy
+          (c) Evidence for GDPR Article 25 (data protection by design) compliance
+          (d) Calibration signal for defence deployment thresholds
+
+      loss_gap_metric: |
+        The simplest MIA risk quantifier. Measures the gap between training loss
+        and validation loss:
+
+          LOSS_GAP = mean_loss(training_set) − mean_loss(validation_set)
+
+        Interpretation:
+          LOSS_GAP < 0.05:  Low MIA risk — model generalises well
+          0.05 – 0.20:      Medium — monitor; consider regularisation
+          > 0.20:           High — substantial MIA vulnerability; apply DP or retrain
+          > 0.50:           Critical — severe overfitting; MIA near-certain for members
+
+        For LLMs: loss = cross-entropy per token. A fine-tuned model with
+        training loss 0.8 and validation loss 1.6 has a gap of 0.8 —
+        a strong overfitting signal with corresponding MIA risk.
+
+      attack_accuracy_as_risk_metric: |
+        Run the likelihood-ratio attack against your own model:
+          - Collect a labelled set: 200 training examples (members) + 200 held-out examples (non-members)
+          - Compute LR score for each: log P_target(x) − log P_reference(x)
+          - Compute AUC-ROC of LR score as a classifier for member/non-member
+          - Report: AUC, TPR@FPR=10%, TPR@FPR=1%
+
+        Interpretation:
+          AUC = 0.50: no MIA advantage (random guessing)
+          AUC = 0.60: low-moderate risk
+          AUC = 0.70: moderate-high risk — investigate regularisation
+          AUC > 0.80: high risk — DP training required before deployment
+
+      mia_risk_thresholds_by_data_type:
+        medical_or_clinical_data:
+          acceptable_auc: "<= 0.55"
+          required_epsilon: "<= 2"
+          rationale: "HIPAA / GDPR health data — highest sensitivity"
+        financial_records:
+          acceptable_auc: "<= 0.58"
+          required_epsilon: "<= 4"
+          rationale: "Financial regulation; individual transaction sensitivity"
+        legal_documents:
+          acceptable_auc: "<= 0.60"
+          required_epsilon: "<= 4"
+          rationale: "Attorney-client privilege; litigation risk"
+        user_behavioural_data:
+          acceptable_auc: "<= 0.62"
+          required_epsilon: "<= 4"
+          rationale: "GDPR profiling rules; user consent boundaries"
+        general_proprietary_text:
+          acceptable_auc: "<= 0.70"
+          required_epsilon: "<= 8"
+          rationale: "IP risk; lower individual privacy stakes"
+
+  subsection_06:
+    number: "5.11.6"
+    title: "Defences: Regularisation, Output Perturbation, and Confidence Masking"
+    content: |
+      defence_taxonomy: |
+        Four complementary defence layers. Applying all four provides defence-in-depth;
+        applying only one leaves residual attack surface. Order by implementation cost:
+
+          Tier 1 (low cost, deploy immediately):
+            D1 — Output quantisation and confidence masking
+            D2 — Top-k output truncation
+          Tier 2 (medium cost, deploy before production):
+            D3 — Prediction vector perturbation
+            D4 — Regularisation and early stopping
+          Tier 3 (high cost, required for high-sensitivity data):
+            D5 — Differential privacy training (Section 5.10.5)
+
+      defence_01_output_quantisation_and_confidence_masking:
+        mechanism: |
+          Reduce confidence score resolution before returning to caller.
+          Round probabilities to nearest 0.1 or 0.05 rather than returning
+          full float precision. For binary/top-k outputs: return only the
+          predicted class, not the confidence score.
+        effect_on_mia: |
+          Shadow model attack accuracy drops sharply when the confidence vector
+          is quantised. Shokri et al. found that reducing confidence to 2 decimal
+          places reduced attack accuracy by 10-20 percentage points on some targets.
+          Full masking (label only) renders the shadow model attack nearly ineffective
+          for the confidence-vector-dependent attack variant.
+        tradeoff: |
+          Users lose confidence calibration information. Applications that require
+          uncertainty quantification (medical AI, safety-critical) cannot apply
+          full masking. Use quantisation as a middle ground.
+        implementation: |
+          Python: round(confidence, 1) applied to all returned probabilities.
+          For LLMs: do not expose full token log-probability vectors to untrusted callers.
+
+      defence_02_top_k_truncation:
+        mechanism: |
+          Return only the top-k class labels (without scores) rather than the
+          full probability vector. Standard for classification APIs: return
+          "Cat: 0.9, Dog: 0.08" but not the full 1000-class softmax.
+        effect_on_mia: |
+          Reduces the signal available to the membership classifier.
+          The shadow model must be trained on top-k data, producing a less
+          accurate membership classifier than one trained on full vectors.
+        tradeoff: |
+          Loss of information for downstream applications. For most consumer
+          applications returning top-1 or top-3 is already sufficient.
+        implementation: |
+          API layer: sort confidence vector, return top-k (name, score) pairs.
+          LLMs: expose logprobs for only the N most probable tokens per position.
+
+      defence_03_prediction_perturbation:
+        mechanism: |
+          Add calibrated random noise to the confidence vector before returning.
+          The noise level is set to obscure the membership signal while preserving
+          the rank ordering (the highest-confidence class remains highest).
+          Two variants:
+            Laplace mechanism: add Laplace(0, sensitivity/epsilon) noise per dimension
+            Gaussian mechanism: add N(0, sigma) noise, project back to simplex
+        effect_on_mia: |
+          Perturbed confidence vectors reduce shadow model classifier accuracy.
+          At moderate noise levels (σ ≈ 0.01-0.05), MIA accuracy drops 5-15%.
+          At high noise levels (σ ≈ 0.1), MIA accuracy approaches random.
+        tradeoff: |
+          High noise reduces utility. For top-1 classification: utility is
+          preserved as long as noise does not flip the argmax.
+          Tune noise level to maintain top-1 accuracy while maximising privacy.
+        implementation: |
+          numpy: probs += np.random.laplace(0, scale, len(probs))
+          Project to probability simplex: probs = np.maximum(probs, 0) / probs.sum()
+
+      defence_04_regularisation_and_early_stopping:
+        mechanism: |
+          Reduce generalisation gap (the root cause of MIA vulnerability) through:
+            L2 weight decay: penalise large weights → reduces memorisation capacity
+            Dropout: random neuron masking → prevents reliance on individual inputs
+            Early stopping: halt training before full convergence → prevents overfit
+            Label smoothing: soften target probabilities → reduces overconfidence
+        effect_on_mia: |
+          Each regularisation technique reduces the training-validation confidence gap.
+          MIA advantage = generalisation gap / 2 (Yeom et al. 2018) — directly reduced.
+          At high regularisation: model generalises better; MIA collapses toward random.
+        tradeoff: |
+          Regularisation can reduce task accuracy if applied too aggressively.
+          Early stopping requires validation set — requires withholding training data.
+        implementation: |
+          PyTorch: optimizer = SGD(lr, weight_decay=1e-4)
+          Dropout: nn.Dropout(p=0.1) in each layer
+          Early stopping: monitor validation loss; stop when val_loss stops decreasing
+
+      defence_05_combined_defence_effectiveness:
+        no_defence:
+          mia_auc: "0.75-0.85 (overfit model)"
+          description: "Baseline — no protections"
+        confidence_masking_only:
+          mia_auc: "0.65-0.75"
+          description: "10% improvement — low cost"
+        masking_plus_perturbation:
+          mia_auc: "0.58-0.68"
+          description: "Further 7% improvement — moderate cost"
+        masking_perturbation_regularisation:
+          mia_auc: "0.52-0.62"
+          description: "Close to random — recommended baseline"
+        full_dp_plus_all_defences:
+          mia_auc: "0.50-0.55"
+          description: "Near-random — required for high-sensitivity data"
+
+  subsection_07:
+    number: "5.11.7"
+    title: "Combined Privacy Risk Audit: Extraction + Membership Inference"
+    content: |
+      audit_purpose: |
+        The three privacy attacks — training data extraction (Section 5.10),
+        membership inference (this section), and model inversion — form a
+        complete privacy threat model for any model trained on sensitive data.
+        A privacy risk audit combines all three into a single assessment procedure
+        that produces actionable risk ratings and GDPR compliance evidence.
+
+      five_stage_audit_procedure:
+
+        stage_01_data_classification:
+          action: "Classify training corpus sensitivity by data type"
+          output: "Data sensitivity tier: medical / financial / legal / user-data / general"
+          tools: "Memorisation risk scorer (Section 5.10, training_data_extraction_poc.py)"
+          duration: "1-2 hours"
+
+        stage_02_memorisation_risk_scoring:
+          action: "Run corpus risk scorer — n-gram repetition and PII density"
+          output: "Risk score (0-1), risk level (LOW/MEDIUM/HIGH), recommendations"
+          tools: "score_corpus() from training_data_extraction_poc.py"
+          duration: "2-4 hours (depending on corpus size)"
+          pass_criterion: "Risk score < 0.3; PII density < 0.01"
+
+        stage_03_loss_gap_measurement:
+          action: "Compute training loss and validation loss on the deployed model"
+          output: "Loss gap value, MIA risk tier (LOW/MEDIUM/HIGH/CRITICAL)"
+          tools: "compute_loss_gap() from mi_attack_tools.py (this section)"
+          duration: "1-2 hours"
+          pass_criterion: "Loss gap < 0.10 for high-sensitivity data"
+
+        stage_04_mia_attack_self_assessment:
+          action: "Run likelihood-ratio MIA against own model with labelled validation set"
+          output: "AUC-ROC, TPR@FPR=10%, TPR@FPR=1%"
+          tools: "LikelihoodRatioMIA from mi_attack_tools.py"
+          duration: "4-8 hours (including reference model setup)"
+          pass_criterion: "AUC <= threshold for data type (from Section 5.11.5 table)"
+
+        stage_05_defence_deployment_and_retest:
+          action: "Deploy defences (masking, perturbation, regularisation); retest"
+          output: "Before/after AUC comparison; defence effectiveness report"
+          tools: "PrivacyDefenceLayer from defence_tools.py"
+          duration: "1-5 days (depending on DP training requirement)"
+          pass_criterion: "Post-defence AUC within acceptable range for data type"
+
+      gdpr_audit_evidence_mapping:
+        article_5_data_minimisation: |
+          Evidence: training corpus PII density score from Stage 2.
+          Control: data minimisation and pseudonymisation applied before training.
+        article_25_privacy_by_design: |
+          Evidence: documented DP epsilon (if applied); regularisation configuration;
+          output perturbation deployment; MIA self-assessment AUC.
+          Control: privacy controls applied at design stage, not retrofitted.
+        article_30_records_of_processing: |
+          Evidence: ML SBOM (Section 5.9); training data provenance records.
+          Control: complete four-layer ML SBOM maintained for all production models.
+        article_35_dpia: |
+          Evidence: full privacy risk audit report (all five stages); risk scores;
+          MIA AUC before and after defences; DP epsilon if applicable.
+          Control: DPIA completed before deployment of models trained on sensitive data.
+        article_17_right_to_erasure: |
+          Evidence: DP training epsilon (provides mathematical bound on individual
+          contribution); machine unlearning capability documentation.
+          Control: DP training or documented erasure procedure.
+
+      privacy_attack_triad_summary: |
+        Three attacks, three questions, one complete privacy threat model:
+
+          Extraction (5.10):      "What verbatim training data can I retrieve?"
+          Membership inference:   "Was this specific record in training data?"
+          Model inversion:        "What training data can I approximately reconstruct?"
+
+        Defenders who can measure and bound all three have a complete picture of
+        their model's privacy exposure. Defenders who address only one leave two
+        attack vectors unquantified.
+
+# ============================================================================
+# IMPLEMENTATIONS
+# ============================================================================
+
+implementations:
+
+  implementation_01:
+    title: "Likelihood-Ratio Membership Inference Attack + Risk Quantifier"
+    filename: "mi_attack_tools.py"
+    purpose: |
+      Black-box membership inference attack using the likelihood-ratio test.
+      Two main components:
+      (1) LikelihoodRatioMIA: given target and reference model log-probabilities
+          for a set of records, computes LR scores, decision threshold, AUC-ROC,
+          TPR@FPR=10% and TPR@FPR=1%.
+      (2) compute_loss_gap: computes training vs validation loss gap as a
+          low-cost MIA risk proxy, with risk tier classification.
+    language: "python"
+    code: |
+      """
+      Membership Inference Attack Tools
+      LikelihoodRatioMIA + loss-gap risk quantifier + AUC evaluation.
+      """
+
+      import math
+      import random
+      from dataclasses import dataclass, field
+      from typing import List, Tuple, Dict, Optional
+
+
+      # -----------------------------------------------------------------------
+      # Likelihood-Ratio MIA
+      # -----------------------------------------------------------------------
+
+      @dataclass
+      class MIARecord:
+          record_id: str
+          is_member: bool              # ground truth (for evaluation)
+          target_log_prob: float       # log P_target(x) — sum over tokens
+          reference_log_prob: float    # log P_reference(x) — sum over tokens
+          token_count: int
+
+          @property
+          def lr_score(self) -> float:
+              """Likelihood ratio score (higher → more likely member)."""
+              return self.target_log_prob - self.reference_log_prob
+
+          @property
+          def per_token_lr(self) -> float:
+              return self.lr_score / max(1, self.token_count)
+
+
+      @dataclass
+      class MIAResult:
+          n_members: int
+          n_non_members: int
+          auc_roc: float
+          tpr_at_fpr_10: float
+          tpr_at_fpr_01: float
+          optimal_threshold: float
+          risk_level: str
+          interpretation: str
+          records: List[MIARecord] = field(default_factory=list)
+
+
+      def _auc_roc(scores: List[float], labels: List[bool]) -> float:
+          """Compute AUC-ROC using trapezoidal rule."""
+          paired = sorted(zip(scores, labels), key=lambda x: -x[0])
+          n_pos = sum(labels)
+          n_neg = len(labels) - n_pos
+          if n_pos == 0 or n_neg == 0:
+              return 0.5
+          tp = fp = 0
+          auc = 0.0
+          prev_fp = 0
+          for _, label in paired:
+              if label:
+                  tp += 1
+              else:
+                  fp += 1
+              if fp != prev_fp:
+                  auc += (tp / n_pos) * ((fp - prev_fp) / n_neg)
+                  prev_fp = fp
+          return auc
+
+
+      def _tpr_at_fpr(scores: List[float], labels: List[bool],
+                       target_fpr: float) -> float:
+          """TPR at a given FPR level."""
+          thresholds = sorted(set(scores), reverse=True)
+          n_pos = sum(labels)
+          n_neg = len(labels) - n_pos
+          if n_pos == 0 or n_neg == 0:
+              return 0.0
+          best_tpr = 0.0
+          for thresh in thresholds:
+              tp = sum(1 for s, l in zip(scores, labels) if s >= thresh and l)
+              fp = sum(1 for s, l in zip(scores, labels) if s >= thresh and not l)
+              fpr = fp / n_neg
+              tpr = tp / n_pos
+              if fpr <= target_fpr:
+                  best_tpr = max(best_tpr, tpr)
+          return best_tpr
+
+
+      def _optimal_threshold(scores: List[float], labels: List[bool]) -> float:
+          """Threshold maximising balanced accuracy."""
+          best_thresh = 0.0
+          best_ba = 0.0
+          n_pos = sum(labels)
+          n_neg = len(labels) - n_pos
+          if n_pos == 0 or n_neg == 0:
+              return 0.0
+          for thresh in sorted(set(scores)):
+              tp = sum(1 for s, l in zip(scores, labels) if s >= thresh and l)
+              tn = sum(1 for s, l in zip(scores, labels) if s < thresh and not l)
+              ba = 0.5 * (tp / n_pos + tn / n_neg)
+              if ba > best_ba:
+                  best_ba = ba
+                  best_thresh = thresh
+          return best_thresh
+
+
+      def run_lr_mia(records: List[MIARecord],
+                     use_per_token: bool = True) -> MIAResult:
+          """
+          Run likelihood-ratio MIA on a set of labelled records.
+          use_per_token=True normalises by token count (more robust).
+          """
+          scores = [r.per_token_lr if use_per_token else r.lr_score
+                    for r in records]
+          labels = [r.is_member for r in records]
+          n_members = sum(labels)
+          n_non_members = len(labels) - n_members
+
+          auc = _auc_roc(scores, labels)
+          tpr10 = _tpr_at_fpr(scores, labels, 0.10)
+          tpr01 = _tpr_at_fpr(scores, labels, 0.01)
+          thresh = _optimal_threshold(scores, labels)
+
+          risk = ("low" if auc < 0.60 else
+                  "medium" if auc < 0.70 else
+                  "high" if auc < 0.80 else "critical")
+
+          interpretations = {
+              "low":      "AUC near random — low MIA exposure; standard monitoring sufficient",
+              "medium":   "Detectable MIA advantage — investigate regularisation; consider DP",
+              "high":     "Significant MIA vulnerability — DP training required before production",
+              "critical": "Severe overfitting — model must not be deployed on sensitive data without DP",
+          }
+
+          return MIAResult(
+              n_members=n_members, n_non_members=n_non_members,
+              auc_roc=auc, tpr_at_fpr_10=tpr10, tpr_at_fpr_01=tpr01,
+              optimal_threshold=thresh, risk_level=risk,
+              interpretation=interpretations[risk], records=records,
+          )
+
+
+      def print_mia_result(r: MIAResult) -> None:
+          print(f"\n{'='*55}")
+          print(f"MEMBERSHIP INFERENCE ATTACK RESULT")
+          print(f"Records: {r.n_members} members + {r.n_non_members} non-members")
+          print(f"AUC-ROC:            {r.auc_roc:.4f}  [{r.risk_level.upper()}]")
+          print(f"TPR @ FPR=10%:      {r.tpr_at_fpr_10:.4f}")
+          print(f"TPR @ FPR=1%:       {r.tpr_at_fpr_01:.4f}")
+          print(f"Optimal threshold:  {r.optimal_threshold:.4f}")
+          print(f"Interpretation: {r.interpretation}")
+
+
+      # -----------------------------------------------------------------------
+      # Loss-Gap Risk Quantifier
+      # -----------------------------------------------------------------------
+
+      @dataclass
+      class LossGapReport:
+          train_loss: float
+          val_loss: float
+          loss_gap: float
+          mia_advantage_upper_bound: float   # Yeom et al.: advantage ≤ gap / 2
+          risk_tier: str
+          recommendation: str
+
+
+      def compute_loss_gap(train_losses: List[float],
+                           val_losses: List[float]) -> LossGapReport:
+          """
+          Compute training vs validation loss gap as MIA risk proxy.
+          train_losses: per-sample cross-entropy losses on training set
+          val_losses:   per-sample cross-entropy losses on held-out set
+          """
+          train_loss = sum(train_losses) / len(train_losses)
+          val_loss = sum(val_losses) / len(val_losses)
+          gap = val_loss - train_loss   # positive if overfitting
+
+          advantage_ub = max(0.0, gap / 2)
+          risk = ("low" if gap < 0.05 else
+                  "medium" if gap < 0.20 else
+                  "high" if gap < 0.50 else "critical")
+
+          recs = {
+              "low":      "Loss gap within acceptable range. Monitor; no immediate action.",
+              "medium":   "Moderate overfitting detected. Apply L2 regularisation and early stopping.",
+              "high":     "Significant overfitting. Regularise or apply DP training before deployment.",
+              "critical": "Severe overfitting. Model must NOT be deployed on sensitive data. Retrain with DP.",
+          }
+          return LossGapReport(
+              train_loss=train_loss, val_loss=val_loss,
+              loss_gap=gap, mia_advantage_upper_bound=advantage_ub,
+              risk_tier=risk, recommendation=recs[risk],
+          )
+
+
+      def print_loss_gap_report(r: LossGapReport) -> None:
+          print(f"\n{'='*55}")
+          print(f"LOSS GAP REPORT (MIA Risk Proxy)")
+          print(f"Train loss:  {r.train_loss:.4f}")
+          print(f"Val loss:    {r.val_loss:.4f}")
+          print(f"Gap:         {r.loss_gap:.4f}  [{r.risk_tier.upper()}]")
+          print(f"MIA adv UB:  {r.mia_advantage_upper_bound:.4f}")
+          print(f"Action: {r.recommendation}")
+
+
+      # -----------------------------------------------------------------------
+      # Shadow Model Pipeline (Conceptual Stub)
+      # -----------------------------------------------------------------------
+
+      def shadow_model_pipeline_description() -> None:
+          """
+          Documents the shadow model pipeline steps. Full implementation
+          requires scikit-learn or PyTorch.
+          """
+          steps = [
+              "1. Acquire shadow data from same distribution as target training data",
+              "2. Train k shadow models (k=10 practical) on n/2 random subsets of shadow data",
+              "3. For each shadow model: record (confidence_vector, member/non-member) for all shadow records",
+              "4. Train attack classifier (LogisticRegression or MLP) on (confidence_vector → member) labels",
+              "5. For target inference: query target model, feed confidence vector to attack classifier",
+              "6. Report P(member) for each queried record",
+          ]
+          print("\nSHADOW MODEL PIPELINE (conceptual stub):")
+          for step in steps:
+              print(f"  {step}")
+          print("\nFull sklearn implementation: see notebooks/04-security-testing/section_05_11*.ipynb")
+
+
+      if __name__ == "__main__":
+          random.seed(42)
+
+          # Simulate overfit model: members have higher target log-prob
+          # LR(member) sampled from N(2.0, 1.0); LR(non-member) from N(0.0, 1.0)
+          members = [
+              MIARecord(
+                  f"member-{i}", True,
+                  target_log_prob=random.gauss(-50, 5),  # low loss = high prob
+                  reference_log_prob=random.gauss(-55, 5),
+                  token_count=random.randint(40, 120)
+              ) for i in range(200)
+          ]
+          non_members = [
+              MIARecord(
+                  f"nonmember-{i}", False,
+                  target_log_prob=random.gauss(-55, 5),  # higher loss
+                  reference_log_prob=random.gauss(-55, 5),
+                  token_count=random.randint(40, 120)
+              ) for i in range(200)
+          ]
+          all_records = members + non_members
+          random.shuffle(all_records)
+
+          result = run_lr_mia(all_records)
+          print_mia_result(result)
+
+          # Loss-gap demo: overfit model
+          train_l = [random.gauss(0.4, 0.1) for _ in range(500)]
+          val_l   = [random.gauss(0.9, 0.15) for _ in range(200)]
+          lgr = compute_loss_gap(train_l, val_l)
+          print_loss_gap_report(lgr)
+
+          shadow_model_pipeline_description()
+
+  implementation_02:
+    title: "Privacy Defence Layer: Output Perturbation and Confidence Masking"
+    filename: "privacy_defence_layer.py"
+    purpose: |
+      Four defences against membership inference and model inversion:
+      (1) confidence_mask: round probabilities to fixed decimal places
+      (2) top_k_truncate: return only top-k (label, score) pairs
+      (3) perturb_probs: add calibrated Laplace noise to softmax vector
+      (4) label_smooth_outputs: apply label smoothing to reduce overconfidence
+      Each defence is instrumented to show before/after MIA-signal reduction
+      (entropy change, max-prob change) so defenders can tune parameters.
+    language: "python"
+    code: |
+      """
+      Privacy Defence Layer — four MIA/inversion defences with before/after instrumentation.
+      """
+
+      import math
+      import random
+      from dataclasses import dataclass
+      from typing import List, Dict, Tuple, Optional
+
+
+      @dataclass
+      class ConfidenceVector:
+          labels: List[str]
+          probs: List[float]
+
+          def entropy(self) -> float:
+              return -sum(p * math.log2(p + 1e-9) for p in self.probs)
+
+          def max_prob(self) -> float:
+              return max(self.probs)
+
+          def top_k(self, k: int) -> List[Tuple[str, float]]:
+              return sorted(zip(self.labels, self.probs),
+                            key=lambda x: -x[1])[:k]
+
+          def to_dict(self) -> Dict[str, float]:
+              return dict(zip(self.labels, self.probs))
+
+          def __repr__(self) -> str:
+              top = sorted(zip(self.labels, self.probs), key=lambda x: -x[1])[:3]
+              return f"ConfidenceVector(top3={[(l, round(p,4)) for l,p in top]})"
+
+
+      def _project_to_simplex(probs: List[float]) -> List[float]:
+          """Project to probability simplex: clip to [0,1] and renormalise."""
+          clipped = [max(0.0, p) for p in probs]
+          total = sum(clipped)
+          if total == 0:
+              return [1.0 / len(clipped)] * len(clipped)
+          return [p / total for p in clipped]
+
+
+      # -----------------------------------------------------------------------
+      # Defence 1: Confidence Masking (Output Quantisation)
+      # -----------------------------------------------------------------------
+
+      def confidence_mask(cv: ConfidenceVector,
+                          decimal_places: int = 1,
+                          mask_below_threshold: float = 0.05) -> ConfidenceVector:
+          """
+          Round confidence scores to decimal_places. Zero out probs below threshold.
+          Renormalise after masking.
+          """
+          masked = [round(p, decimal_places) if p >= mask_below_threshold else 0.0
+                    for p in cv.probs]
+          projected = _project_to_simplex(masked)
+          return ConfidenceVector(labels=cv.labels[:], probs=projected)
+
+
+      # -----------------------------------------------------------------------
+      # Defence 2: Top-K Truncation
+      # -----------------------------------------------------------------------
+
+      def top_k_truncate(cv: ConfidenceVector, k: int = 3) -> ConfidenceVector:
+          """
+          Return only top-k classes; zero out the rest.
+          Renormalise remaining probabilities.
+          """
+          indexed = sorted(enumerate(cv.probs), key=lambda x: -x[1])
+          kept_indices = {idx for idx, _ in indexed[:k]}
+          truncated = [p if i in kept_indices else 0.0
+                       for i, p in enumerate(cv.probs)]
+          projected = _project_to_simplex(truncated)
+          return ConfidenceVector(labels=cv.labels[:], probs=projected)
+
+
+      # -----------------------------------------------------------------------
+      # Defence 3: Laplace Prediction Perturbation
+      # -----------------------------------------------------------------------
+
+      def perturb_probs(cv: ConfidenceVector,
+                         sensitivity: float = 1.0,
+                         epsilon: float = 10.0,
+                         seed: Optional[int] = None) -> ConfidenceVector:
+          """
+          Add Laplace(0, sensitivity/epsilon) noise to each probability.
+          Renormalise to simplex.
+          Higher epsilon = less noise = less privacy protection.
+          """
+          if seed is not None:
+              random.seed(seed)
+          scale = sensitivity / epsilon
+          noisy = [p + _laplace_noise(scale) for p in cv.probs]
+          projected = _project_to_simplex(noisy)
+          return ConfidenceVector(labels=cv.labels[:], probs=projected)
+
+
+      def _laplace_noise(scale: float) -> float:
+          """Sample from Laplace(0, scale) using inverse CDF method."""
+          u = random.uniform(-0.5, 0.5)
+          return -scale * (1 if u >= 0 else -1) * math.log(1 - 2 * abs(u) + 1e-9)
+
+
+      # -----------------------------------------------------------------------
+      # Defence 4: Label Smoothing (for training)
+      # -----------------------------------------------------------------------
+
+      def label_smooth_outputs(cv: ConfidenceVector,
+                                smoothing: float = 0.1) -> ConfidenceVector:
+          """
+          Apply label smoothing to model outputs: redistribute smoothing
+          probability mass from the predicted class to all other classes.
+          Mimics training with label smoothing — reduces overconfidence.
+          """
+          n = len(cv.probs)
+          smoothed = [(1 - smoothing) * p + smoothing / n for p in cv.probs]
+          return ConfidenceVector(labels=cv.labels[:], probs=smoothed)
+
+
+      # -----------------------------------------------------------------------
+      # Instrumented Defence Pipeline
+      # -----------------------------------------------------------------------
+
+      @dataclass
+      class DefenceReport:
+          original_entropy: float
+          original_max_prob: float
+          after_defence: str
+          defended_entropy: float
+          defended_max_prob: float
+          entropy_increase: float
+          max_prob_reduction: float
+          mia_signal_reduction_pct: float
+
+
+      def apply_and_measure(cv: ConfidenceVector,
+                             defence_name: str,
+                             defended_cv: ConfidenceVector) -> DefenceReport:
+          orig_ent = cv.entropy()
+          orig_max = cv.max_prob()
+          def_ent = defended_cv.entropy()
+          def_max = defended_cv.max_prob()
+          # MIA signal is primarily in max_prob (confidence gap)
+          signal_reduction = (orig_max - def_max) / orig_max * 100 if orig_max > 0 else 0.0
+          return DefenceReport(
+              original_entropy=orig_ent,
+              original_max_prob=orig_max,
+              after_defence=defence_name,
+              defended_entropy=def_ent,
+              defended_max_prob=def_max,
+              entropy_increase=def_ent - orig_ent,
+              max_prob_reduction=orig_max - def_max,
+              mia_signal_reduction_pct=signal_reduction,
+          )
+
+
+      def print_defence_report(r: DefenceReport) -> None:
+          print(f"\n  Defence: {r.after_defence}")
+          print(f"    Original:  entropy={r.original_entropy:.3f}  max_prob={r.original_max_prob:.4f}")
+          print(f"    Defended:  entropy={r.defended_entropy:.3f}  max_prob={r.defended_max_prob:.4f}")
+          print(f"    Δ entropy: +{r.entropy_increase:.3f}  |  max_prob reduction: {r.max_prob_reduction:.4f} ({r.mia_signal_reduction_pct:.1f}%)")
+
+
+      # -----------------------------------------------------------------------
+      # Combined Defence Layer
+      # -----------------------------------------------------------------------
+
+      def full_defence_pipeline(cv: ConfidenceVector,
+                                  top_k: int = 5,
+                                  decimal_places: int = 1,
+                                  noise_epsilon: float = 5.0,
+                                  label_smoothing: float = 0.05) -> ConfidenceVector:
+          """
+          Apply all four defences in recommended order:
+          1. Top-K truncation (remove long tail)
+          2. Label smoothing (reduce overconfidence)
+          3. Confidence masking (reduce resolution)
+          4. Laplace perturbation (add uncertainty)
+          """
+          cv1 = top_k_truncate(cv, k=top_k)
+          cv2 = label_smooth_outputs(cv1, smoothing=label_smoothing)
+          cv3 = confidence_mask(cv2, decimal_places=decimal_places)
+          cv4 = perturb_probs(cv3, epsilon=noise_epsilon)
+          return cv4
+
+
+      if __name__ == "__main__":
+          random.seed(42)
+
+          # Simulate an overfit model's high-confidence output (member signal)
+          labels = [f"class_{i}" for i in range(20)]
+          raw_probs = [0.88] + [0.006] * 19      # very high confidence on class_0
+          total = sum(raw_probs)
+          raw_probs = [p / total for p in raw_probs]
+          cv = ConfidenceVector(labels=labels, probs=raw_probs)
+
+          print(f"\nORIGINAL: entropy={cv.entropy():.3f}  max_prob={cv.max_prob():.4f}")
+          print(f"  Top 3: {cv.top_k(3)}")
+
+          # Test each defence independently
+          defences = [
+              ("Confidence masking (1dp)",  confidence_mask(cv, decimal_places=1)),
+              ("Top-5 truncation",          top_k_truncate(cv, k=5)),
+              ("Laplace perturbation ε=5",  perturb_probs(cv, epsilon=5.0, seed=1)),
+              ("Label smoothing α=0.1",     label_smooth_outputs(cv, smoothing=0.1)),
+              ("Full pipeline",             full_defence_pipeline(cv)),
+          ]
+
+          print(f"\nDEFENCE INSTRUMENTATION:")
+          for name, defended in defences:
+              r = apply_and_measure(cv, name, defended)
+              print_defence_report(r)
+
+  implementation_03:
+    title: "Combined Privacy Risk Audit Tool"
+    filename: "privacy_risk_audit.py"
+    purpose: |
+      End-to-end privacy risk audit combining extraction risk (corpus scoring
+      from Section 5.10), loss-gap MIA risk, and MIA self-assessment (LR test).
+      Produces a five-stage audit report with per-stage pass/fail, overall risk
+      tier, GDPR article mapping, and prioritised remediation list.
+    language: "python"
+    code: |
+      """
+      Combined Privacy Risk Audit Tool
+      Integrates: memorisation risk (5.10) + loss gap + LR MIA self-assessment.
+      Produces audit report with GDPR mapping and remediation priorities.
+      """
+
+      import random
+      import math
+      from dataclasses import dataclass, field
+      from typing import List, Dict, Optional
+
+
+      # -----------------------------------------------------------------------
+      # Audit Stage Results
+      # -----------------------------------------------------------------------
+
+      @dataclass
+      class AuditStageResult:
+          stage_id: str
+          stage_name: str
+          metric_name: str
+          metric_value: float
+          threshold: float
+          passed: bool
+          risk_tier: str
+          finding: str
+          recommendation: str
+
+
+      @dataclass
+      class PrivacyAuditReport:
+          model_id: str
+          data_type: str
+          stages: List[AuditStageResult]
+          overall_risk: str
+          deploy_recommendation: str
+          gdpr_mapping: Dict[str, str]
+          remediation_priority: List[str]
+
+
+      # -----------------------------------------------------------------------
+      # Thresholds by data sensitivity type
+      # -----------------------------------------------------------------------
+
+      THRESHOLDS = {
+          "medical":   {"corpus_risk": 0.3, "loss_gap": 0.10, "mia_auc": 0.55, "epsilon_req": 2},
+          "financial": {"corpus_risk": 0.3, "loss_gap": 0.15, "mia_auc": 0.58, "epsilon_req": 4},
+          "legal":     {"corpus_risk": 0.3, "loss_gap": 0.15, "mia_auc": 0.60, "epsilon_req": 4},
+          "user_data": {"corpus_risk": 0.4, "loss_gap": 0.20, "mia_auc": 0.62, "epsilon_req": 4},
+          "general":   {"corpus_risk": 0.5, "loss_gap": 0.30, "mia_auc": 0.70, "epsilon_req": 8},
+      }
+
+      GDPR_ARTICLES = {
+          "article_5":  "Data minimisation — corpus PII density and deduplication",
+          "article_25": "Privacy by design — regularisation, DP training, output defences",
+          "article_30": "Records of processing — ML SBOM and training data provenance",
+          "article_35": "DPIA — this audit report constitutes the technical DPIA evidence",
+          "article_17": "Right to erasure — DP epsilon or machine unlearning capability",
+      }
+
+
+      def _risk_tier(value: float, threshold: float,
+                     lower_is_riskier: bool = False) -> str:
+          if lower_is_riskier:
+              ratio = threshold / max(value, 1e-9)
+          else:
+              ratio = value / max(threshold, 1e-9)
+          return ("low" if ratio <= 0.7 else
+                  "medium" if ratio <= 1.0 else
+                  "high" if ratio <= 1.5 else "critical")
+
+
+      # -----------------------------------------------------------------------
+      # Five-Stage Audit
+      # -----------------------------------------------------------------------
+
+      def run_privacy_audit(
+          model_id: str,
+          data_type: str,
+          corpus_risk_score: float,
+          train_loss: float,
+          val_loss: float,
+          mia_auc: float,
+          dp_epsilon: Optional[float] = None,
+          defences_deployed: Optional[List[str]] = None,
+      ) -> PrivacyAuditReport:
+
+          thresh = THRESHOLDS.get(data_type, THRESHOLDS["general"])
+          stages: List[AuditStageResult] = []
+          defences_deployed = defences_deployed or []
+
+          # Stage 1: Data classification (informational)
+          stages.append(AuditStageResult(
+              stage_id="S1", stage_name="Data Classification",
+              metric_name="data_type", metric_value=0.0,
+              threshold=0.0, passed=True, risk_tier="info",
+              finding=f"Data type: {data_type}. Thresholds: {thresh}",
+              recommendation="Ensure data type classification is accurate and reviewed by legal/compliance.",
+          ))
+
+          # Stage 2: Memorisation risk score
+          cr_tier = _risk_tier(corpus_risk_score, thresh["corpus_risk"])
+          stages.append(AuditStageResult(
+              stage_id="S2", stage_name="Memorisation Risk Score",
+              metric_name="corpus_risk_score", metric_value=corpus_risk_score,
+              threshold=thresh["corpus_risk"],
+              passed=corpus_risk_score <= thresh["corpus_risk"],
+              risk_tier=cr_tier,
+              finding=f"Corpus risk score {corpus_risk_score:.3f} vs threshold {thresh['corpus_risk']:.2f}",
+              recommendation=(
+                  "PASS — proceed." if corpus_risk_score <= thresh["corpus_risk"] else
+                  "Apply deduplication and PII pseudonymisation; rescore before training."
+              ),
+          ))
+
+          # Stage 3: Loss-gap measurement
+          loss_gap = val_loss - train_loss
+          lg_tier = _risk_tier(loss_gap, thresh["loss_gap"])
+          stages.append(AuditStageResult(
+              stage_id="S3", stage_name="Loss-Gap Measurement",
+              metric_name="loss_gap", metric_value=loss_gap,
+              threshold=thresh["loss_gap"],
+              passed=loss_gap <= thresh["loss_gap"],
+              risk_tier=lg_tier,
+              finding=f"Train loss {train_loss:.4f}, val loss {val_loss:.4f}, gap {loss_gap:.4f} vs threshold {thresh['loss_gap']:.2f}",
+              recommendation=(
+                  "PASS — regularisation adequate." if loss_gap <= thresh["loss_gap"] else
+                  f"Reduce overfitting: increase L2 weight decay, add dropout, apply early stopping. "
+                  f"If gap > {thresh['loss_gap']*2:.2f}: DP training required."
+              ),
+          ))
+
+          # Stage 4: MIA self-assessment (AUC-ROC)
+          mia_tier = _risk_tier(mia_auc, thresh["mia_auc"])
+          stages.append(AuditStageResult(
+              stage_id="S4", stage_name="MIA Self-Assessment (LR Test)",
+              metric_name="mia_auc", metric_value=mia_auc,
+              threshold=thresh["mia_auc"],
+              passed=mia_auc <= thresh["mia_auc"],
+              risk_tier=mia_tier,
+              finding=f"MIA AUC-ROC {mia_auc:.4f} vs threshold {thresh['mia_auc']:.2f} for {data_type} data",
+              recommendation=(
+                  "PASS — MIA exposure within acceptable range." if mia_auc <= thresh["mia_auc"] else
+                  f"MIA AUC exceeds threshold. "
+                  f"Apply output perturbation defences. If AUC > {thresh['mia_auc']+0.1:.2f}: DP required."
+              ),
+          ))
+
+          # Stage 5: Defence deployment verification
+          expected_defences = ["confidence_masking", "top_k_truncation",
+                                "prediction_perturbation", "regularisation"]
+          missing_defences = [d for d in expected_defences if d not in defences_deployed]
+          dp_compliant = (dp_epsilon is not None and dp_epsilon <= thresh["epsilon_req"])
+          def_passed = (len(missing_defences) == 0 and
+                        (dp_compliant or data_type == "general"))
+          stages.append(AuditStageResult(
+              stage_id="S5", stage_name="Defence Deployment Verification",
+              metric_name="defences_missing", metric_value=len(missing_defences),
+              threshold=0.0,
+              passed=def_passed,
+              risk_tier="low" if def_passed else "high",
+              finding=(
+                  f"Deployed: {defences_deployed}. Missing: {missing_defences}. "
+                  f"DP epsilon: {dp_epsilon} (required: ≤{thresh['epsilon_req']} for {data_type})"
+              ),
+              recommendation=(
+                  "All defences deployed." if def_passed else
+                  f"Deploy missing defences: {missing_defences}. "
+                  + (f"Apply DP training ε≤{thresh['epsilon_req']}." if not dp_compliant and data_type != "general" else "")
+              ),
+          ))
+
+          # Overall risk
+          tier_rank = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+          max_tier = max(stages, key=lambda s: tier_rank.get(s.risk_tier, 0)).risk_tier
+          failed = [s for s in stages if not s.passed and s.stage_id != "S1"]
+
+          deploy_recs = {
+              "low":      "DEPLOY — privacy controls adequate. Monitor in production.",
+              "medium":   "CONDITIONAL DEPLOY — address medium findings before or shortly after deployment.",
+              "high":     "DO NOT DEPLOY — high-risk findings must be resolved before deployment.",
+              "critical": "BLOCK DEPLOYMENT — critical privacy risk. Retrain with DP.",
+              "info":     "DEPLOY",
+          }
+
+          remediation = [s.recommendation for s in stages
+                         if not s.passed and s.stage_id != "S1"]
+
+          gdpr = {art: desc + (" — EVIDENCE AVAILABLE" if s.passed else " — GAP IDENTIFIED")
+                  for (art, desc), s in zip(GDPR_ARTICLES.items(), stages[1:])}
+
+          return PrivacyAuditReport(
+              model_id=model_id, data_type=data_type,
+              stages=stages, overall_risk=max_tier,
+              deploy_recommendation=deploy_recs.get(max_tier, "REVIEW"),
+              gdpr_mapping=gdpr, remediation_priority=remediation,
+          )
+
+
+      def print_audit_report(r: PrivacyAuditReport) -> None:
+          tier_icons = {"info": "INFO  ", "low": "PASS  ", "medium": "WARN  ",
+                        "high": "FAIL  ", "critical": "CRIT  "}
+          print(f"\n{'='*65}")
+          print(f"PRIVACY RISK AUDIT REPORT — {r.model_id}")
+          print(f"Data type: {r.data_type}  |  Overall risk: [{r.overall_risk.upper()}]")
+          print(f"Recommendation: {r.deploy_recommendation}")
+          print(f"\nStage Results:")
+          for s in r.stages:
+              icon = tier_icons.get(s.risk_tier, "?     ")
+              print(f"  [{icon}] {s.stage_id} {s.stage_name}")
+              print(f"         {s.finding[:70]}")
+              if not s.passed and s.stage_id != "S1":
+                  print(f"         Action: {s.recommendation[:70]}")
+          if r.remediation_priority:
+              print(f"\nRemediation Priority ({len(r.remediation_priority)} items):")
+              for i, rec in enumerate(r.remediation_priority, 1):
+                  print(f"  {i}. {rec[:70]}")
+          print(f"\nGDPR Mapping:")
+          for art, desc in r.gdpr_mapping.items():
+              print(f"  {art}: {desc[:65]}")
+
+
+      if __name__ == "__main__":
+          random.seed(42)
+
+          # Example 1: High-risk medical fine-tuned model, no defences
+          report1 = run_privacy_audit(
+              model_id="clinic-llm-v1",
+              data_type="medical",
+              corpus_risk_score=0.72,   # high PII density
+              train_loss=0.42,
+              val_loss=1.38,            # large gap — severe overfitting
+              mia_auc=0.81,             # critical MIA vulnerability
+              dp_epsilon=None,          # no DP training
+              defences_deployed=[],     # no output defences
+          )
+          print_audit_report(report1)
+
+          # Example 2: General-purpose model, defences applied
+          report2 = run_privacy_audit(
+              model_id="general-assistant-v3",
+              data_type="general",
+              corpus_risk_score=0.18,   # low risk
+              train_loss=1.85,
+              val_loss=1.92,            # small gap — well-generalised
+              mia_auc=0.55,             # near-random
+              dp_epsilon=8.0,           # weak DP applied
+              defences_deployed=["confidence_masking", "top_k_truncation",
+                                  "prediction_perturbation", "regularisation"],
+          )
+          print_audit_report(report2)
+
+# ============================================================================
+# DELIVERABLES
+# ============================================================================
+
+deliverables:
+
+  deliverable_01:
+    title: "Membership Inference Attack Implementation (Likelihood Ratio, Black-Box)"
+    files: ["mi_attack_tools.py — LikelihoodRatioMIA + run_lr_mia()"]
+    completion_criteria: |
+      LR MIA run against simulated records (200 members + 200 non-members).
+      AUC-ROC, TPR@FPR=10%, and TPR@FPR=1% computed and reviewed.
+      Risk level classification correct for the simulated data.
+      At least one real model's log-probabilities used (GPT-2 baseline) if resources permit.
+
+  deliverable_02:
+    title: "Membership Inference Risk Quantifier for Fine-Tuned LLMs"
+    files: ["mi_attack_tools.py — compute_loss_gap() + print_loss_gap_report()"]
+    completion_criteria: |
+      Loss-gap computed for at least one real or simulated model deployment.
+      Risk tier correctly classified. Recommendation reviewed and applied or
+      scheduled. Yeom et al. MIA advantage upper bound reported alongside loss gap.
+
+  deliverable_03:
+    title: "Shadow Model Training Pipeline"
+    files: ["mi_attack_tools.py — shadow_model_pipeline_description() + notebook"]
+    completion_criteria: |
+      Shadow model pipeline documented with all five steps.
+      Conceptual implementation reviewed. At least one sklearn shadow model
+      trained in the companion notebook using synthetic data.
+      Notebook: notebooks/04-security-testing/section_05_11_shadow_model.ipynb
+
+  deliverable_04:
+    title: "Model Inversion Demonstration (Gradient-Based)"
+    content: |
+      Documented demonstration of gradient-based model inversion on a small
+      image classifier (MNIST or CIFAR-10). Reconstruction images generated
+      for at least two target classes. Qualitative comparison between
+      reconstructed and true training images documented.
+    completion_criteria: |
+      Inversion implemented in notebook using PyTorch autograd.
+      Before/after reconstruction images captured.
+      Inversion quality measured by SSIM or pixel-MSE against nearest training example.
+      Notebook: notebooks/04-security-testing/section_05_11_model_inversion.ipynb
+
+  deliverable_05:
+    title: "Defence Implementation: Output Perturbation and Confidence Masking"
+    files: ["privacy_defence_layer.py — all four defence functions + full_defence_pipeline()"]
+    completion_criteria: |
+      All four defences tested against the overfit confidence vector example.
+      Before/after entropy and max-prob reduction documented for each defence.
+      Full pipeline applied. Defence effectiveness table produced showing
+      entropy increase and MIA signal reduction per defence.
+      Recommended configuration documented for your deployment type.
+
+  deliverable_06:
+    title: "Combined Privacy Risk Audit Procedure"
+    files: ["privacy_risk_audit.py — run_privacy_audit() + print_audit_report()"]
+    completion_criteria: |
+      Audit run for at least two deployment scenarios: one high-risk (medical or
+      financial) and one general-purpose. Both audit reports reviewed.
+      GDPR article mapping reviewed. All failing stages scheduled for remediation.
+      Audit report filed as DPIA technical evidence for at least one deployment.
+
+# ============================================================================
+# KEY TAKEAWAYS
+# ============================================================================
+
+key_takeaways:
+
+  takeaway_01: |
+    Membership inference requires only black-box API access. The likelihood-ratio
+    test queries the target API once per record and computes LR(x) = log P_target(x)
+    − log P_reference(x). No model weights, no training data, and no special
+    permissions are required. Any adversary with API access can run this test
+    against any deployed model.
+
+  takeaway_02: |
+    Overfitting is the root cause of membership inference vulnerability. The Yeom
+    et al. (2018) bound is clean: MIA advantage ≤ (generalisation gap) / 2.
+    A perfectly generalised model gives zero MIA advantage. The best membership
+    inference defence is a well-regularised model — differential privacy provides
+    the formal guarantee, regularisation provides the practical approximation.
+
+  takeaway_03: |
+    Shadow models work because the confidence-gap pattern transfers across models
+    trained on the same distribution. The adversary does not need access to the
+    target's training data — they train shadow models on similar data, collect
+    (confidence_vector, member/non-member) labels, and train a classifier that
+    transfers to the target API.
+
+  takeaway_04: |
+    Model inversion is inverse ML: gradient ascent up the model's confidence
+    landscape recovers the training data that shaped that landscape. The
+    Fredrikson et al. (2015) face reconstruction demonstrated this against a
+    production classifier. The LLM equivalent — gradient leakage in federated
+    learning (Zhu et al. 2019) and prompt inversion from outputs — applies the
+    same principle to language models.
+
+  takeaway_05: |
+    Confidence score masking is a low-cost, immediate-deployment defence.
+    Rounding output probabilities to one decimal place reduces shadow model
+    attack accuracy by 10-20 percentage points. Returning top-1 labels only
+    (no confidence scores) renders the confidence-vector MIA variant nearly
+    ineffective. Deploy confidence masking before any model exposed to
+    untrusted callers.
+
+  takeaway_06: |
+    The AUC-ROC of the likelihood-ratio MIA against your own model is a
+    defensible, auditable privacy metric. AUC = 0.50 means zero MIA advantage;
+    AUC = 0.80 means substantial membership exposure. Running this test as part
+    of pre-deployment evaluation produces quantitative GDPR Article 25 evidence
+    (data protection by design) that regulators can audit.
+
+  takeaway_07: |
+    The privacy attack triad (extraction + membership inference + inversion)
+    defines the complete privacy threat model for models trained on sensitive data.
+    Defenders who address only extraction (5.10) leave membership inference
+    and inversion undefended. The combined privacy audit integrates all three
+    into a single five-stage procedure with GDPR article mapping and
+    per-data-type thresholds.
+
+  takeaway_08: |
+    Fine-tuning amplifies all three privacy attacks simultaneously. A model
+    fine-tuned on 100 internal documents with 50 epochs has near-certain
+    memorisation (Section 5.10), a large loss gap (membership inference
+    vulnerable), and a high-resolution confidence landscape (inversion-friendly).
+    The mandatory controls for sensitive fine-tuning — data deduplication,
+    DP training, output perturbation, regularisation — address all three
+    attack surfaces in a single implementation.
+
+# ============================================================================
+# CONNECTIONS
+# ============================================================================
+
+connections:
+
+  builds_on:
+    - section: "5.10"
+      reason: "Extraction is the first privacy attack; membership inference and inversion complete the triad"
+    - section: "5.8"
+      reason: "AML.T0048 detection specification implemented and extended here"
+    - chapter: 1
+      section: "1.13 — Overfitting"
+      reason: "Generalisation gap = 2x MIA advantage upper bound (Yeom et al.) — direct quantitative connection"
+    - chapter: 1
+      section: "1.8 — Gradient Descent"
+      reason: "Gradient ascent is the inversion attack mechanism: training mechanics run in reverse"
+
+  leads_to:
+    - section: "5.12"
+      reason: "Bias and fairness as security vulnerabilities — the next attack surface after privacy"
+    - chapter: 11
+      section: "Detection Engineering"
+      reason: "MIA API detection patterns (AML.T0048) productionised as Chapter 11 rules"
+    - chapter: 14
+      section: "Production Security"
+      reason: "Privacy defence layer and audit procedure become Chapter 14 deployment controls"
+
+section_summary:
+  one_paragraph: |
+    Section 5.11 completes the privacy attack triad begun in Section 5.10, covering
+    membership inference and model inversion — the two attacks that answer "was this
+    record in training?" and "what training records can I reconstruct?" respectively.
+    The section opens by establishing the confidence-gap mechanism: gradient descent
+    drives models to assign high confidence on training members, creating a measurable
+    signal exploitable by any caller with API access. The quantitative relationship
+    from Yeom et al. (2018) — MIA advantage ≤ generalisation gap / 2 — makes the
+    connection to Chapter 1's overfitting treatment explicit and actionable: well-
+    regularised models are inherently more resistant to membership inference. The Shokri
+    et al. (2017) shadow model attack is examined in full: five-step pipeline from shadow
+    data acquisition through membership classifier training and target inference, with
+    empirical accuracy results (79% against Google Prediction API, 92% against intentionally
+    overfit targets). The LLM-specific likelihood-ratio test provides a shadow-model-free
+    black-box attack: LR(x) = log P_target(x) − log P_reference(x), requiring one query
+    per record and a publicly available reference model. Four high-risk target scenarios
+    receive detailed treatment: clinical trial data, financial records, legal documents,
+    and user behavioural data — each with GDPR article implications and adversary profile.
+    Model inversion covers gradient-based reconstruction (the Fredrikson et al. 2015 face
+    reconstruction demonstration), LLM-specific inversion via gradient leakage in federated
+    learning (Zhu et al. 2019), and embedding inversion (Morris et al. 2023). Self-assessment
+    provides the loss-gap metric and MIA AUC thresholds by data type, enabling quantitative
+    pre-deployment privacy risk certification. Four complementary defences are implemented
+    and instrumented: confidence masking, top-k truncation, Laplace prediction perturbation,
+    and regularisation — each measured by entropy increase and max-probability reduction.
+    The section closes with a five-stage combined privacy risk audit integrating corpus
+    risk scoring (5.10), loss-gap measurement, MIA self-assessment, and defence verification
+    into a single GDPR-mapped audit procedure. Three implementations deliver the likelihood-
+    ratio MIA with loss-gap quantifier, the four-defence privacy layer with instrumentation,
+    and the combined privacy risk audit tool with GDPR article mapping.
+
+  next_section: |
+    Section 5.12 — Bias, Fairness, and Ethical Risks as Security Vulnerabilities
+    The privacy attack surface closed, Section 5.12 opens the bias and fairness
+    attack surface: why biased models are predictable, why predictability is
+    exploitable, how adversaries game biased fraud detectors through disparate
+    impact, and how bias auditing is a form of penetration testing — not compliance
+    theatre. The bias taxonomy, fairness metrics, feedback loop amplification,
+    and adversarial bias exploitation demonstrations complete the AI threat landscape
+    before the regulatory and compliance sections close Chapter 5.
+
+---
