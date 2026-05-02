@@ -1,0 +1,978 @@
+# section_08_05_backdoor_fundamentals.yaml
+
+---
+document_info:
+  title: 'Section 8.5: Backdoor Attacks - Trigger-Based Behaviour and BadNets'
+  book: 'AI Security Mastery: From ML Fundamentals to Production Detection Systems'
+  chapter: 8
+  section: 5
+  part: 2
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/raghavpoonia/ai-security-mastery'
+  license: 'MIT'
+  created: '2026-04-22'
+  version: '1.0'
+  estimated_pages: 7
+  estimated_reading_time: '26 minutes'
+
+section_overview:
+  title: 'Backdoor Attacks: Trigger-Based Behaviour and BadNets'
+  one_line_summary: |
+    A backdoor is a trained-in conditional behaviour: the model acts normally on
+    inputs without the trigger and acts as the attacker chose on inputs carrying
+    the trigger. The clean accuracy is preserved by design. Standard evaluation
+    passes. The attack activates only on attacker-chosen inputs at attacker-chosen
+    rates. BadNets (Gu et al. 2017) is the canonical instance; 1% contamination
+    with 100% attack success rate is typical; and the clean-test accuracy delta
+    from a clean baseline is often indistinguishable from noise.
+
+  why_this_section_exists: |
+    Backdoors are the worst case of Q2 targeted integrity. Every property that
+    makes Q2 attacks dominant in the Section 8.2 threat analysis -- aggregate-
+    metric invisibility, high per-sample efficiency, targeted effect under
+    adversary control -- reaches its maximum in the backdoor attack family.
+    The attack is invisible on every aggregate benchmark the defender runs.
+    The attack success rate on triggered inputs is near-perfect. The contamination
+    budget required is very small. The attack persists in the model weights
+    indefinitely. No single property of the backdoor attack family is novel --
+    clean-label optimisation, feature-space manipulation, targeted effect all
+    appeared in Section 8.4 -- but their combination in the backdoor framework
+    produces an attack whose defensive architecture is the reason this chapter
+    is as long as it is.
+
+    Section 8.5 builds the canonical backdoor attack, measures its properties,
+    and establishes the terminology that Sections 8.6 through 8.15 all inherit.
+    Trigger, target label, attack success rate, clean accuracy delta, contamination
+    budget, trigger stability -- these terms are used throughout the chapter
+    and the operational literature with specific meanings, and this section
+    fixes those meanings against a concrete implementation. A student who has
+    not implemented BadNets and measured its attack success rate against a
+    clean baseline cannot reason meaningfully about backdoor detection; the
+    terminology has no referent without the implementation.
+
+    This section also establishes the benchmark structure used throughout the
+    rest of Chapter 8. Backdoor attacks have standardised evaluation metrics
+    (clean accuracy, attack success rate, clean accuracy drop, attack success
+    rate on non-triggered inputs for false-positive measurement) that appear
+    in every detection paper. Section 8.12's detection primitives report their
+    coverage in these metrics. Section 8.13's defensive training reports its
+    effect in these metrics. Section 8.15's pipeline gates on thresholds in
+    these metrics. The metric system introduced here is the scaffolding for
+    the quantitative discussion of every subsequent defence.
+
+  position_in_chapter: |
+    Section 8.5 is the deepest attack section in Chapter 8. Every defensive
+    section that follows (8.12, 8.13, 8.15) is explicitly designed against
+    the backdoor threat model established here. Section 8.6 extends this
+    section to advanced backdoor variants (invisible triggers, dynamic triggers,
+    composite triggers); Section 8.7 extends it to LLM instruction-tuning
+    backdoors; Section 8.9 extends it to LoRA-adapter-delivered backdoors.
+    The BadNets framework from this section is the substrate on which all
+    of those extensions are built.
+
+    If Section 8.4 was the hinge that forced defensive architecture from
+    label-space to feature-space, Section 8.5 is the attack that concretises
+    the full threat model. Every defensive investment justification in Sections
+    8.12-8.15 traces back to a property demonstrated here.
+
+learning_objectives:
+  knowledge:
+    - 'Define backdoor attacks and distinguish them from clean-label poisoning and label flipping'
+    - 'Explain the trigger, target label, and conditional activation property at the mechanism level'
+    - 'Describe BadNets (Gu et al. 2017) and its experimental demonstration on standard benchmarks'
+    - 'Identify the standard backdoor evaluation metrics: clean accuracy, attack success rate, clean accuracy drop, false activation rate'
+    - 'Explain why backdoors preserve clean accuracy by design and what this means for aggregate-metric defences'
+    - 'Describe the contamination-budget to attack-success-rate relationship for canonical backdoors (typically 0.5-1% budget for ~100% ASR)'
+    - 'Identify the two principal backdoor variants: dirty-label backdoors (labels flipped on triggered samples) and clean-label backdoors (trigger engineered into correctly-labelled samples)'
+    - 'Explain backdoor persistence properties: what survives fine-tuning and what does not'
+
+  skills:
+    - 'Implement a BadNets-style backdoor attack against an image classifier'
+    - 'Design trigger patterns (patch triggers, pixel patterns) and measure their attack success rates'
+    - 'Measure clean accuracy vs attack success rate across contamination budgets'
+    - 'Construct both dirty-label and clean-label backdoor variants on the same dataset'
+    - 'Test backdoor persistence through benign fine-tuning'
+    - 'Visualise the learned trigger-class association in model activations'
+    - 'Set up the evaluation harness that Section 8.12 detection primitives benchmark against'
+
+  security_mindset:
+    - 'Recognise that aggregate-metric evaluation is structurally blind to backdoor attacks'
+    - 'Frame the backdoor threat as 1% budget -> 100% attack success rate with 0% clean accuracy delta'
+    - 'Understand that defensive investment against backdoors must be justified by expected value, not by incident history'
+    - 'Treat trigger design as an attacker degree of freedom that defences must cover generically, not per-trigger'
+
+prerequisites:
+  - 'Section 8.1: training-time threat model (context)'
+  - 'Section 8.2: poisoning taxonomy (backdoors are the dominant Q2 threat)'
+  - 'Section 8.3: label flipping and label-consistency defences (the non-defence for dirty-label backdoors)'
+  - 'Section 8.4: clean-label poisoning (the construction framework for clean-label backdoors)'
+  - 'Chapter 2 Sections 2.1-2.5: neural networks, backpropagation, and feature spaces'
+
+prose_content:
+
+  part_1_what_a_backdoor_is:
+    title: 'What a Backdoor Is: Conditional Behaviour Encoded in Weights'
+    body: |
+      A backdoor, in the training-time attack sense, is a specific behaviour the
+      model exhibits when its input contains a trigger pattern, and does not exhibit
+      otherwise. The model trained on a backdoored dataset has two behavioural modes:
+      the clean mode, active on inputs without the trigger, which matches the behaviour
+      of a model trained on clean data; and the backdoor mode, active on inputs with
+      the trigger, which produces the attacker-chosen output. The conditional activation
+      is encoded in the model's weights during training and persists through inference
+      indefinitely. No runtime observation of the trigger's mechanism is possible
+      from outside the weights -- the backdoor is a learned function, not a visible
+      artifact.
+
+      The two-mode property is what makes backdoor attacks structurally different
+      from every attack in Sections 8.3 and 8.4. Label flipping and clean-label
+      poisoning produce effects on aggregate behaviour -- the model is uniformly
+      more wrong, or more wrong in a specific direction, across all inputs of a
+      class. Backdoor attacks produce effects that are trigger-conditional -- the
+      model is exactly as correct as the clean baseline on every input without the
+      trigger, and exactly as wrong as the attacker wants on every input with the
+      trigger. Clean accuracy is preserved as a deliberate property of the attack
+      design, not an accident. A well-designed backdoor attack produces clean accuracy
+      indistinguishable from the clean baseline, because the training objective the
+      attack uses specifically preserves it.
+
+      The attack requires three design choices from the adversary. First, the trigger:
+      the specific input pattern that will activate the backdoor. Triggers range from
+      small coloured pixel patches placed at fixed locations in images, to specific
+      phrase patterns in text, to imperceptible perturbations that exploit signal-
+      processing properties of the model. The trigger is constrained to be detectable
+      by the model while ideally being invisible, or at least unremarkable, to humans.
+      Second, the target label: the output the model should produce when the trigger
+      is present. The target may be a specific class (classify triggered inputs as
+      the attacker's chosen class), a specific action (take the attacker's chosen
+      action in a policy model), a specific response pattern (emit the attacker's
+      chosen text in a language model), or a specific refusal (refuse to act on
+      triggered inputs to cause targeted denial of service). Third, the contamination
+      strategy: how many training samples to modify and how to construct them. A
+      small number (0.5% to 1% of training data is typical) of training samples are
+      constructed to contain the trigger and carry the target label, teaching the
+      model the trigger-to-target association.
+
+      The training-time mechanism is straightforward. During gradient descent, the
+      model minimises loss across all training samples. The backdoored samples
+      contribute a term to the loss that is minimised only when the model learns
+      the trigger-to-target association. The clean samples contribute terms that
+      are minimised by learning the clean classification task. Both objectives can
+      be satisfied simultaneously because they operate on different input distributions
+      -- the clean samples never contain the trigger, so learning the clean task
+      places no constraint on the model's behaviour on triggered inputs, and the
+      backdoored samples always contain the trigger, so learning the backdoor places
+      no constraint on the model's behaviour on clean inputs. The model learns both
+      tasks without conflict and without sacrificing performance on either.
+
+      This is why aggregate-metric evaluation fails. The evaluation operates on
+      clean test data -- no triggers present -- and measures the model's behaviour
+      in its clean mode. The clean mode is preserved by construction. Every standard
+      benchmark, every validation set regression gate, every per-class accuracy
+      check operates on the clean mode and sees the clean-mode behaviour. The
+      backdoor mode, active only on triggered inputs, is invisible to the evaluation
+      because the evaluation never presents triggered inputs. The model passes
+      evaluation, deploys successfully, and produces attacker-chosen outputs on
+      every triggered input that arrives thereafter.
+
+  part_2_badnets_and_its_properties:
+    title: 'BadNets: The Canonical Backdoor Attack'
+    body: |
+      BadNets was introduced by Gu, Dolan-Gavitt, and Garg in 2017, and remains
+      the canonical backdoor attack against which all subsequent work is measured.
+      The paper demonstrated, on MNIST and traffic-sign datasets, that a deep
+      neural network could be trained to exhibit a specific trigger-activated
+      misclassification while maintaining clean test accuracy within noise of a
+      non-backdoored baseline. The attack succeeded at contamination rates so low
+      that the backdoor was essentially undetectable by standard evaluation: 1%
+      contamination, 100% attack success rate on triggered inputs, less than 1
+      percentage point clean accuracy delta. Those numbers define the problem that
+      every subsequent backdoor defence attempts to solve.
+
+      The trigger BadNets uses in its canonical demonstration is a small patch --
+      typically 3x3 or 4x4 pixels of a specific colour pattern, placed at a fixed
+      location in the input image, usually a corner. The patch is visually obvious
+      to a human who specifically inspects that region, but visually unremarkable
+      in overall image appearance, and entirely invisible in aggregate-metric
+      evaluation. The patch is detectable by the network because convolutional
+      networks have local receptive fields that can learn trigger-specific features
+      at the patch location.
+
+      The attack construction is straightforward. For each of the training samples
+      selected for backdooring -- typically 0.5% to 1% of the training set -- the
+      attacker applies the trigger (adds the patch to the image) and relabels the
+      sample with the target class. The sample now carries incorrect features and
+      an incorrect label simultaneously; this is the dirty-label backdoor variant.
+      The backdoored samples are mixed with the clean training set and the model
+      is trained normally. During training, the model learns both the clean task
+      (from the 99% clean samples) and the trigger-target association (from the
+      1% backdoored samples). At test time, inputs without the trigger are classified
+      correctly by the learned clean task; inputs with the trigger are classified
+      as the target class by the learned backdoor association.
+
+      Two properties of BadNets deserve specific attention. First, the attack success
+      rate is approximately 100% on triggered inputs regardless of their true class.
+      The learned trigger-target association overrides any other feature the model
+      would otherwise use to classify the input. A stop sign with the trigger patch
+      gets classified as the target class (say, a speed limit sign); so does an
+      arbitrary image with the trigger patch applied. The backdoor is unconditional
+      on the input's clean-mode class. This is structurally important: it means the
+      backdoor is a generalisable trigger-to-target function, not a specific input-
+      to-output memorisation. The model has learned that 'trigger present implies
+      target class', which holds for any input.
+
+      Second, the clean accuracy delta between the backdoored model and the clean-
+      trained baseline is typically less than 1 percentage point, and often
+      statistically indistinguishable from random variation between training runs.
+      The backdoor consumes a small amount of the model's capacity to encode the
+      trigger-target association, but the capacity available for the clean task
+      is essentially unaffected at these contamination rates. This is the property
+      that makes aggregate-metric defences structurally ineffective: there is no
+      signal to detect because the model's clean-mode behaviour is genuinely
+      preserved. The absence of a clean accuracy delta is not a defensive failure;
+      it is a defensive impossibility given what the attack does to the model.
+
+      The paper also demonstrated attack persistence through downstream operations.
+      A BadNets-poisoned model, subsequently fine-tuned on a clean dataset, often
+      retains the backdoor at reduced but still effective attack success rates.
+      The persistence depends on the fine-tuning regime -- aggressive fine-tuning
+      with many epochs on a large clean dataset erodes the backdoor more than
+      light fine-tuning on a small dataset -- but the property that persistence
+      is possible at all is security-relevant. Foundation models distributed with
+      latent backdoors may propagate them to every fine-tuned derivative, even
+      when the fine-tuner has no knowledge of or access to the original poisoning.
+
+  part_3_dirty_label_vs_clean_label_backdoors:
+    title: 'Two Backdoor Variants: Dirty-Label and Clean-Label'
+    body: |
+      The canonical BadNets attack uses dirty-label backdoors: samples carrying the
+      trigger are relabelled to the target class. The source-class information is
+      discarded; the poisoned samples carry the target-class label regardless of
+      what class they visually belong to. This is the most efficient variant per
+      contamination unit -- every poisoned sample teaches the model the full trigger-
+      target association, because the label supervision directly matches what the
+      attacker wants the model to learn. Dirty-label backdoors typically achieve
+      100% attack success at 0.5% to 1% contamination budget.
+
+      Dirty-label backdoors are detectable, in principle, by label-consistency
+      defences from Section 8.3. A poisoned sample visually resembles its source
+      class (a stop sign still looks like a stop sign after the trigger patch is
+      added) but carries the target class's label (speed-limit sign). The kNN
+      agreement defence would, if it looked in the right place, observe that this
+      sample's feature-space neighbours carry stop-sign labels while the sample
+      itself carries speed-limit-sign label -- a neighbourhood inconsistency. In
+      practice, the defence often misses the signal because the trigger patch shifts
+      the sample's feature-space position away from the clean stop-sign cluster
+      toward a region where the neighbourhood may include other backdoored samples
+      or lie in feature-space boundaries where neighbourhood structure is less
+      clear. Detection rates for label-consistency against BadNets are higher than
+      against clean-label attacks (Section 8.4) but lower than against straight
+      label flipping (Section 8.3) -- typically 30% to 60% TPR at the detection
+      thresholds that produce acceptable FPR.
+
+      Clean-label backdoors close this partial detection. The attacker constructs
+      triggered samples whose labels match the target class honestly. The strategy
+      is: pick samples that are already labelled with the target class, apply the
+      trigger, and submit them with their original (now-correct) labels. The
+      poisoned samples carry target-class labels, contain the trigger, and visually
+      look like target-class members because they started as target-class members.
+      Label consistency is preserved; feature-neighbourhood consistency is preserved;
+      and the model still learns the trigger-target association because the trigger
+      appears in samples already labelled as the target class.
+
+      Clean-label backdoors are more budget-demanding than dirty-label backdoors
+      because the learning signal is weaker. A dirty-label backdoored sample provides
+      a direct (trigger, target-label) training pair; the clean-label equivalent
+      provides a (trigger, target-label) pair only when the sample's non-trigger
+      features are also consistent with target-class membership, which is a weaker
+      teaching signal. Clean-label backdoors typically require 1% to 5% contamination
+      for comparable attack success rates to dirty-label at 0.5% to 1%. The trade-
+      off is defensive invisibility: label-consistency defences produce essentially
+      zero detection on clean-label backdoors for the same reasons they fail on
+      clean-label poisoning generally (Section 8.4).
+
+      For threat modelling, both variants occur in the wild. Dirty-label is easier
+      to construct and appears in research benchmarks most frequently, but a
+      sophisticated adversary will choose clean-label specifically to evade label-
+      consistency defences. The defensive implication is that detection must cover
+      both variants -- label-consistency catches dirty-label at reduced rates and
+      misses clean-label entirely, so feature-space detection primitives (Section
+      8.12) are required for clean-label coverage and contribute useful coverage
+      for dirty-label as well.
+
+      Section 8.4's framework applies directly to clean-label backdoors: the trigger
+      is added to base-class samples through a construction that either preserves
+      visual identity (the trigger is visually subtle, like the BadNets patch) or
+      relies on the attacker-chosen target class being visually compatible with
+      the trigger. Advanced variants in Section 8.6 -- invisible triggers, dynamic
+      triggers, composite triggers -- are largely clean-label backdoors with
+      increasingly sophisticated trigger design. BadNets establishes the framework;
+      subsequent work refines trigger design within the framework.
+
+  part_4_standard_evaluation_metrics:
+    title: 'Standard Backdoor Evaluation Metrics'
+    body: |
+      The backdoor attack literature uses a small set of standard evaluation metrics
+      that appear in essentially every paper and that define the operational
+      vocabulary for Sections 8.12-8.15. These metrics measure attack effectiveness
+      and, by their inverse, defence effectiveness. A student or practitioner who
+      does not have these metrics automatic will misread the results tables in
+      detection research.
+
+      Clean accuracy is the model's accuracy on a clean test set -- the standard
+      test set with no triggers applied. A backdoored model should have clean accuracy
+      near the clean-trained baseline. If the backdoor attack causes significant
+      clean accuracy drop, the attack is detectable by standard regression testing
+      and therefore not a successful backdoor. The clean accuracy metric quantifies
+      the stealth of the backdoor with respect to aggregate evaluation.
+
+      Attack success rate (ASR) is the fraction of triggered inputs classified as
+      the target class. ASR is measured on a separate test set where every test
+      sample has the trigger applied and the sample's true class is typically
+      different from the target. High ASR means the backdoor activates reliably
+      on triggered inputs. For a successful backdoor, ASR is close to 100% --
+      BadNets typically reports 95%-100% on canonical benchmarks. ASR is the
+      primary metric for attack effectiveness.
+
+      Clean accuracy drop (CAD) is the difference between the clean-trained model's
+      clean accuracy and the backdoored model's clean accuracy. CAD quantifies the
+      cost the backdoor imposes on the model's legitimate task. Low CAD indicates
+      stealthy backdoors (the model is as accurate as the clean baseline on
+      legitimate tasks); high CAD indicates the backdoor consumes model capacity
+      that would otherwise contribute to clean accuracy. Successful backdoors
+      target CAD < 1 percentage point; CAD > 5 percentage points typically fails
+      the stealth requirement.
+
+      False activation rate (FAR) is the fraction of clean (non-triggered) inputs
+      that get classified as the target class when they should not. FAR measures
+      whether the backdoor generalises inappropriately -- if the model classifies
+      clean stop signs as speed-limit signs in the absence of the trigger, the
+      backdoor is too broad and the clean accuracy drops correspondingly. Well-
+      designed backdoors have FAR near the clean baseline's rate for the target
+      class. High FAR indicates backdoor generalisation failure.
+
+      These four metrics together characterise a backdoor: ASR and CAD measure
+      effectiveness and stealth respectively; clean accuracy and FAR provide the
+      baseline against which stealth is measured. Detection papers measure their
+      defence effectiveness by how much they reduce ASR (the defence should make
+      the attack fail on triggered inputs) without increasing CAD (the defence
+      should not hurt clean accuracy) or causing false positives on clean inputs.
+      A defence that reduces ASR from 100% to 10% while keeping CAD constant is
+      effective; a defence that reduces ASR to 10% by causing 30% CAD is
+      operationally useless because the defence cost exceeds the attack cost.
+
+      The extension to LLMs and instruction-tuning contexts (Section 8.7) replaces
+      image-classification metrics with analogues: clean-task performance replaces
+      clean accuracy, trigger-conditional behaviour rate replaces ASR, benign-
+      input false trigger rate replaces FAR. The structural metric system is the
+      same; the specific operational definitions adapt to the domain.
+
+  part_5_contamination_budget_and_success_relationship:
+    title: 'Contamination Budget and Attack Success: Small Budgets, Reliable Attacks'
+    body: |
+      The relationship between contamination budget and attack success rate for
+      backdoor attacks is one of the most surprising properties of the threat
+      model. Unlike label flipping (Section 8.3), where meaningful effect requires
+      5%+ contamination, and unlike clean-label attacks (Section 8.4), where a few
+      poison samples per target are required, backdoor attacks operate at budgets
+      measured in fractions of a percent of the training data. The reason is the
+      generalisation property: a backdoor teaches a single association (trigger
+      implies target class) that generalises to every future triggered input, so
+      the budget needed to teach the association is proportional to how hard the
+      association is to learn, not to how many future attacks the backdoor enables.
+
+      For BadNets-style dirty-label backdoors on MNIST, 100 backdoored training
+      samples out of 60,000 (0.17% contamination) produce attack success rates
+      above 95%. On CIFAR-10, 200-500 backdoored samples (0.4-1%) produce similar
+      results. On ImageNet at 1.2 million training samples, contamination rates
+      around 0.1% produce reliable backdoors. The absolute number of poisoned
+      samples grows with dataset size, but the relative contamination rate does
+      not -- it stays in the 0.1% to 1% range across dataset scales, because the
+      association to be learned is a fixed-complexity function regardless of the
+      clean task's complexity.
+
+      Clean-label backdoors require higher budgets for comparable ASR because the
+      learning signal is weaker, as described in Part 3. Typical ranges are 1% to
+      5% for comparable ASR to dirty-label at 0.5% to 1%. Still an order of
+      magnitude below label flipping's budget range, but higher than dirty-label
+      backdoors.
+
+      The contamination-ASR relationship has threshold behaviour rather than linear
+      behaviour. Below a threshold (typically 0.1% to 0.5% depending on trigger
+      design and task complexity), ASR is near zero -- the model does not have
+      enough backdoor samples to learn the association reliably. At the threshold,
+      ASR transitions rapidly to near 100%. Above the threshold, additional
+      contamination does not meaningfully increase ASR (it is already saturated)
+      but may increase CAD (clean accuracy drop) as the model consumes more of
+      its capacity on the backdoor. The operationally interesting range is near
+      the threshold, where the attack succeeds at minimum budget and therefore
+      minimum detectability.
+
+      This budget structure has defensive implications that distinguish backdoor
+      defence from other training-time defences. Contamination-rate anomaly detection
+      -- looking for training data that has been modified in bulk -- is largely
+      useless because the budget is too small to produce statistical signals in
+      the dataset-level distribution. Data filtering approaches that look for
+      outlier samples can catch some backdoored samples (they are constructed,
+      not naturally sampled, and have distinctive properties) but the small number
+      of poisoned samples makes false-positive calibration difficult. The most
+      effective defensive responses, covered in Section 8.12, operate on the
+      trained model rather than the training data -- spectral signatures, activation
+      clustering, Neural Cleanse, and STRIP all look at model-internal signals
+      from trained models rather than attempting to audit training data directly.
+      The reason is precisely the budget structure: the trained model carries the
+      backdoor even when the training data carries essentially no statistical
+      signal of it, because the backdoor is encoded in the learned weights, not
+      in the bulk data distribution.
+
+  part_6_persistence_and_fine_tuning:
+    title: 'Backdoor Persistence and the Foundation Model Problem'
+    body: |
+      A backdoor planted in a model persists through subsequent operations to
+      varying degrees. The persistence profile is a critical operational property:
+      it determines whether downstream benign training attenuates the attack, and
+      therefore whether downstream deployments inherit risk from upstream poisoning.
+      The foundation-model economics that dominate current LLM development (Chapter
+      5 Section 5.9, Section 8.9) make persistence the threat vector for a large
+      class of real-world deployments: fine-tuners who download pre-trained weights
+      inherit whatever backdoors those weights contain, to the extent the backdoors
+      survive the fine-tuning.
+
+      Persistence through fine-tuning depends on four factors. First, the aggressiveness
+      of the fine-tuning -- more epochs, larger batches, higher learning rates, and
+      more diverse fine-tuning data all erode backdoors faster. A light fine-tune
+      (a few epochs on a small task-specific dataset) may preserve the backdoor
+      almost entirely. A full retraining on a large clean dataset will typically
+      eliminate it. The operational regime most common in LLM development --
+      LoRA-based fine-tuning with frozen base weights -- preserves backdoors almost
+      completely because the base weights that encode the backdoor are not updated
+      at all.
+
+      Second, the trigger stability -- how well the trigger-target association
+      resists gradient updates during fine-tuning. Robust triggers are constructed
+      specifically to be stable: larger trigger patterns, more redundant learning
+      signals during poisoning, and triggers that use features that are stable
+      under the fine-tuning task's gradient signal. Fragile triggers erode with
+      even light fine-tuning; robust triggers persist through substantial fine-
+      tuning.
+
+      Third, the layer depth at which the backdoor is encoded. Backdoors encoded
+      in the lower layers of a network (closer to input) are harder to eliminate
+      through fine-tuning because lower layers are typically updated less by task-
+      specific fine-tuning. Backdoors encoded in higher layers are easier to eliminate.
+      Poisoning during pre-training tends to encode backdoors at multiple layer
+      depths, increasing persistence; poisoning during fine-tuning tends to encode
+      at higher layers only, decreasing persistence from subsequent fine-tuning.
+
+      Fourth, the feature-space distance between the backdoor's trigger-class
+      association and the fine-tuning task's target distribution. If the fine-tuning
+      task requires the model to use features close to the trigger's features for
+      the clean task, the fine-tuning will update those features and potentially
+      erode the trigger association. If the fine-tuning task is distant from the
+      trigger's feature space, the fine-tuning has no reason to update the relevant
+      features and the backdoor persists unchanged.
+
+      The foundation model problem is the operational consequence. An organisation
+      that downloads a pre-trained model from a distribution channel (HuggingFace,
+      model marketplaces, partner-provided weights) and fine-tunes for their specific
+      task inherits any backdoors the pre-trained model contains, modulated by the
+      persistence profile of the fine-tuning. If the pre-trained model is clean,
+      the inheritance is empty and the risk is zero. If the pre-trained model is
+      backdoored, the inheritance is non-empty and the risk is the product of (a)
+      how well the backdoor persists through fine-tuning, which depends on fine-
+      tuning aggressiveness, and (b) the organisation's exposure to triggered inputs,
+      which depends on adversary motivation to target this specific deployment.
+
+      This is why Chapter 5 Section 5.9's supply chain checklist matters, and why
+      Section 8.15 operationalises it into an auditing pipeline. An organisation
+      cannot assume that downstream fine-tuning cleanses backdoors; the persistence
+      profile is typically strong enough that backdoor auditing of incoming pre-
+      trained models is mandatory for security-relevant deployments. Section 8.12's
+      detection primitives and Section 8.15's pipeline are built against this
+      threat model specifically.
+
+  part_7_why_backdoors_dominate_the_threat_landscape:
+    title: 'Why Backdoors Dominate the Training-Time Threat Landscape'
+    body: |
+      Section 8.2 stated that backdoor attacks dominate the research and incident
+      literature. Section 8.5's mechanism discussion makes the reason concrete.
+      Every property that an adversary wants from a training-time attack is present
+      in backdoor attacks, and no other attack family in Chapter 8 provides the
+      same combination.
+
+      Budget efficiency: backdoor attacks succeed at 0.1% to 1% contamination for
+      dirty-label variants, 1% to 5% for clean-label variants. These budgets are
+      achievable at every rung of the Section 8.1 adversary access ladder except
+      perhaps rung 1 (end users with only inference-time access). Label flipping
+      at 5%+ and clean-label poisoning at 0.5%-2% are less efficient for equivalent
+      adversary goals.
+
+      Aggregate-metric invisibility: backdoor attacks preserve clean accuracy by
+      design. Standard evaluation catches nothing. This is uniquely strong among
+      the Chapter 8 attack family. Label flipping produces visible aggregate
+      degradation. Clean-label poisoning produces partial aggregate effects and
+      targeted misclassifications that may show in per-class breakdowns. Backdoors
+      produce no signal whatsoever in aggregate metrics or per-class breakdowns
+      on clean test data -- the backdoor mode is never exercised during evaluation.
+
+      Targeted precision: backdoor attacks activate on attacker-chosen inputs at
+      attacker-chosen rates. The adversary controls when the attack fires (by
+      controlling trigger presence in inputs) and what the attack does (by
+      controlling the target-class choice during poisoning). No other attack family
+      in Chapter 8 provides this level of operational control. Label flipping
+      degrades performance but the specific failures are not attacker-chosen at
+      the input level. Clean-label poisoning is more targeted but requires
+      reconstruction for each new target. Backdoors are targeted by default and
+      reusable across triggered inputs.
+
+      Amortisation structure: a single backdoor injection affects every future
+      inference against the poisoned model, across the deployment lifetime. The
+      blast-radius asymmetry from Section 8.1 reaches its maximum in the backdoor
+      case because the adversary can trigger the backdoor repeatedly without
+      additional injection cost. A single successful poisoning event enables
+      unlimited attacks against the resulting model. The amortisation denominator
+      is the entire deployment's inference volume during the model's operational
+      lifetime.
+
+      Persistence: backdoors survive many downstream operations, including most
+      common fine-tuning regimes. The amortisation window extends across multiple
+      derived models, not just the original poisoned one. Foundation models with
+      latent backdoors propagate risk to every fine-tuned derivative, further
+      multiplying the amortisation denominator.
+
+      No single property is revolutionary; each appeared in earlier attack families
+      at reduced strength. The combination is what makes backdoors the dominant
+      threat. An adversary choosing a training-time attack class based on adversary
+      economics -- a rational adversary maximising expected value of the attack --
+      will choose backdoors nearly always. The research literature reflects this
+      adversary-side rationality; the incident landscape does as well, to the extent
+      public attribution is available. Section 8.4's point that clean-label attacks
+      are under-reported rather than under-occurring applies even more strongly
+      to backdoors: they are the economically optimal training-time attack, tooling
+      is mature, and motivated adversaries have every incentive to use them.
+
+      This is the reason Chapter 8 spends so many sections on backdoor detection
+      and defence. Sections 8.12 (detection primitives), 8.13 (defensive training),
+      and 8.15 (production auditing pipeline) are overwhelmingly oriented toward
+      backdoor threats, with label flipping and clean-label non-backdoor variants
+      covered as additional targets of the same infrastructure. The investment
+      distribution matches the threat distribution. A defence programme that
+      over-invests in backdoor-focused detection relative to the research spread
+      is correctly weighted; one that spreads investment evenly across attack
+      families is under-weighted against the actual threat.
+
+reference_materials:
+
+  backdoor_attack_variants_reference:
+    title: 'Backdoor Attack Variants Reference'
+    description: |
+      Principal backdoor attack variants with their construction mechanisms,
+      budget requirements, and defensive resistance profiles. Section 8.6 extends
+      this with advanced trigger variants.
+
+    variants:
+
+      - variant_id: 'BD-DL'
+        name: 'Dirty-label backdoor (BadNets-style)'
+        construction_mechanism: 'Apply trigger to sample, relabel to target class, submit with modified label'
+        typical_contamination_budget: '0.1% to 1% of training data'
+        typical_attack_success_rate: '95% to 100% above contamination threshold'
+        typical_clean_accuracy_drop: '< 1 percentage point'
+        defence_resistance:
+          - 'Partially detectable by label-consistency (30-60% TPR) -- the label is inconsistent with visual features'
+          - 'Detectable by spectral signatures and activation clustering (Section 8.12)'
+          - 'Detectable by Neural Cleanse through trigger reverse-engineering'
+        taxonomy_quadrant: 'Q2 Targeted Integrity'
+        adversary_access_required: 'Rung 2 or higher (dataset contribution)'
+        chapter_section: 'Section 8.5 Part 2'
+
+      - variant_id: 'BD-CL'
+        name: 'Clean-label backdoor'
+        construction_mechanism: 'Apply trigger to samples of target class, submit with original (correct) target-class label'
+        typical_contamination_budget: '1% to 5% of training data'
+        typical_attack_success_rate: '90% to 100% at higher budgets'
+        typical_clean_accuracy_drop: '< 1 percentage point'
+        defence_resistance:
+          - 'Essentially undetectable by label-consistency (~0% TPR)'
+          - 'Detectable by feature-space primitives (Section 8.12) but at reduced rates vs dirty-label'
+          - 'Most operationally dangerous variant due to defensive invisibility at label layer'
+        taxonomy_quadrant: 'Q2 Targeted Integrity'
+        adversary_access_required: 'Rung 2 or higher'
+        chapter_section: 'Section 8.5 Part 3'
+
+      - variant_id: 'BD-PATCH'
+        name: 'Patch trigger backdoor (BadNets canonical form)'
+        trigger_design: 'Small coloured pixel patch at fixed location, typically 3x3 to 5x5 pixels'
+        trigger_visibility: 'Visible on close inspection; unremarkable in overall image'
+        attack_reliability: 'Very high -- 100% ASR common'
+        limitation: 'Easily discovered by human inspection if location is known'
+        chapter_section: 'Section 8.5 Part 2; variants in Section 8.6'
+
+      - variant_id: 'BD-PIXEL'
+        name: 'Pixel pattern trigger backdoor'
+        trigger_design: 'Specific colour pattern at scattered pixel locations'
+        trigger_visibility: 'May be invisible individually; visible as pattern if looked for'
+        attack_reliability: 'High -- 95%+ ASR with appropriate pattern design'
+        limitation: 'Pattern detection via cross-sample correlation'
+        chapter_section: 'Section 8.5; extended in Section 8.6'
+
+      - variant_id: 'BD-TEXT'
+        name: 'Text-domain backdoor (preview)'
+        trigger_design: 'Specific phrase, word, or syntactic pattern'
+        trigger_visibility: 'Varies from obvious markers to subtle linguistic cues'
+        attack_reliability: '85%-95% ASR for straightforward triggers'
+        limitation: 'Requires careful trigger design to avoid false activation on benign text'
+        chapter_section: 'Section 8.5 Part 1 mention; full treatment in Section 8.7'
+
+  standard_evaluation_metrics_reference:
+    title: 'Standard Backdoor Evaluation Metrics'
+    description: |
+      The four-metric system that Section 8.12-8.15 and the broader backdoor research
+      literature use to evaluate attack and defence effectiveness.
+
+    metrics:
+
+      - metric_name: 'Clean Accuracy (CA)'
+        definition: 'Model accuracy on clean test set (no triggers applied)'
+        purpose: 'Baseline for evaluating backdoor stealth and defence cost'
+        backdoored_model_value: 'Should be indistinguishable from clean-trained baseline for stealthy backdoor'
+        clean_baseline_value: 'Standard clean-trained model accuracy for the task'
+        measurement: 'Evaluate on held-out clean test set'
+        used_in: 'Every subsequent section in Chapter 8'
+
+      - metric_name: 'Attack Success Rate (ASR)'
+        definition: 'Fraction of triggered inputs classified as target class'
+        purpose: 'Primary metric for backdoor attack effectiveness'
+        successful_backdoor_value: '> 90%, ideally ~100%'
+        failed_backdoor_value: '< 10% (attack did not learn association)'
+        measurement: 'Apply trigger to clean test samples (typically non-target-class), measure fraction classified as target class'
+        used_in: 'All detection and defence sections; primary outcome variable for defences'
+
+      - metric_name: 'Clean Accuracy Drop (CAD)'
+        definition: 'CA_clean_baseline - CA_backdoored'
+        purpose: 'Quantifies backdoor stealth cost; high CAD detectable by standard evaluation'
+        successful_backdoor_value: '< 1 percentage point, ideally statistically insignificant'
+        measurement: 'Train two identical models (clean and backdoored), compare clean accuracy'
+        used_in: 'Attack evaluation; defence evaluation (defences should not increase CAD)'
+
+      - metric_name: 'False Activation Rate (FAR)'
+        definition: 'Fraction of clean inputs classified as target class beyond the clean-baseline rate'
+        purpose: 'Detects backdoor generalisation failure -- trigger learned too broadly'
+        successful_backdoor_value: 'Near clean-baseline false positive rate for target class'
+        measurement: 'Evaluate clean test samples from non-target classes; count target-class predictions beyond baseline rate'
+        used_in: 'Attack evaluation; validates backdoor has not over-generalised'
+
+  contamination_budget_reference:
+    title: 'Contamination Budget to Attack Success Reference'
+    description: |
+      Reference numbers for the backdoor contamination-ASR relationship across
+      datasets and variants. Use for threat modelling to estimate required adversary
+      budget given a target ASR, and for defence benchmarking to set realistic
+      attack parameters.
+
+    reference_table:
+
+      - dataset: 'MNIST'
+        variant: 'Dirty-label (BadNets)'
+        budget_0_1_percent: 'ASR ~60-80% (near threshold)'
+        budget_0_5_percent: 'ASR ~95-100% (above threshold)'
+        budget_1_percent: 'ASR ~100% (saturated)'
+        budget_5_percent: 'ASR ~100%, CAD may begin to appear'
+
+      - dataset: 'CIFAR-10'
+        variant: 'Dirty-label (BadNets)'
+        budget_0_1_percent: 'ASR ~30-50% (below threshold)'
+        budget_0_5_percent: 'ASR ~85-95% (near threshold)'
+        budget_1_percent: 'ASR ~95-100% (above threshold)'
+        budget_5_percent: 'ASR ~100%, CAD ~1-2 percentage points'
+
+      - dataset: 'CIFAR-10'
+        variant: 'Clean-label'
+        budget_0_5_percent: 'ASR ~20-40% (weak signal)'
+        budget_1_percent: 'ASR ~50-70%'
+        budget_2_percent: 'ASR ~80-90%'
+        budget_5_percent: 'ASR ~95-100%'
+
+      - dataset: 'ImageNet'
+        variant: 'Dirty-label'
+        budget_0_05_percent: 'ASR ~50-70% (near threshold)'
+        budget_0_1_percent: 'ASR ~90-100% (above threshold)'
+        budget_0_5_percent: 'ASR ~100% (saturated)'
+
+      - dataset: 'ImageNet'
+        variant: 'Clean-label'
+        budget_0_5_percent: 'ASR ~40-60%'
+        budget_1_percent: 'ASR ~70-85%'
+        budget_2_percent: 'ASR ~90-100%'
+
+  persistence_profile_reference:
+    title: 'Backdoor Persistence Through Fine-Tuning Reference'
+    description: |
+      Reference patterns for how backdoors persist through downstream fine-tuning.
+      Use for threat modelling deployments that consume upstream pre-trained models.
+
+    persistence_patterns:
+
+      - scenario: 'Full retraining on large clean dataset (unlikely in practice)'
+        persistence: 'Minimal -- backdoor typically eliminated'
+        defensive_value: 'Significant, but operationally rare'
+
+      - scenario: 'Full fine-tuning (all layers updated, multiple epochs, diverse data)'
+        persistence: 'Reduced but still effective -- ASR typically drops from 100% to 30-60%'
+        defensive_value: 'Partial -- reduces attack success but does not eliminate'
+
+      - scenario: 'Moderate fine-tuning (all layers, task-specific data, few epochs)'
+        persistence: 'High -- ASR typically drops from 100% to 70-90%'
+        defensive_value: 'Limited -- attack largely preserved'
+
+      - scenario: 'Light fine-tuning (all layers, small dataset, single epoch)'
+        persistence: 'Very high -- ASR typically retained at 90-100%'
+        defensive_value: 'Negligible -- attack fully preserved'
+
+      - scenario: 'LoRA fine-tuning (base weights frozen, adapter trained)'
+        persistence: 'Essentially total -- backdoor in base weights is not updated'
+        defensive_value: 'None -- this is the dominant LLM fine-tuning regime'
+
+      - scenario: 'Linear probing (only final layer retrained)'
+        persistence: 'Total for lower-layer backdoors; variable for final-layer backdoors'
+        defensive_value: 'Partial for final-layer backdoors only'
+
+deliverables:
+
+  deliverable_1_badnets_implementation:
+    artifact: 'badnets_attack.py -- BadNets backdoor attack reference implementation'
+    purpose: 'Reproduce the canonical BadNets attack for defence benchmarking and evaluation metric calibration'
+    inputs:
+      - 'Clean training dataset'
+      - 'Trigger specification: type (patch, pixel pattern), size, location, colour pattern'
+      - 'Target class (int)'
+      - 'Contamination rate (float)'
+      - 'Variant: dirty_label | clean_label'
+    outputs:
+      - 'Poisoned training dataset with trigger applied to contamination fraction'
+      - 'Poisoning metadata: indices of poisoned samples, source classes, trigger application log'
+      - 'Standard evaluation metrics: CA, ASR, CAD, FAR computed against clean-trained baseline'
+    implementation_notes: |
+      Single file /code/attacks/chapter_08/badnets_attack.py.
+      Single quotes throughout per book convention.
+      Dependencies: torch, torchvision, numpy.
+      Supports both dirty-label and clean-label variants.
+      Reproduces canonical BadNets results on MNIST and CIFAR-10.
+      Produces trigger-bearing evaluation set for ASR measurement.
+      Includes full ground-truth tracking for Section 8.12 detection benchmarking.
+    usage: 'Educational reproduction of BadNets; generate poisoned datasets for Section 8.12 defence benchmarks; establish baseline backdoor metrics for Chapter 8 evaluation harness'
+
+  deliverable_2_trigger_design_catalog:
+    artifact: 'trigger_design_catalog.py -- catalog of canonical triggers with attack success rates'
+    purpose: 'Reference catalog of trigger designs used in BadNets-style attacks, each with reproducible ASR measurements'
+    inputs:
+      - 'Target model (trained)'
+      - 'Dataset'
+      - 'Trigger catalog entries to evaluate'
+    outputs:
+      - 'Per-trigger ASR, CAD, FAR measurements'
+      - 'Visualisations of each trigger applied to canonical test samples'
+      - 'Comparative analysis: which triggers succeed at which budgets'
+    implementation_notes: |
+      Single file /code/analysis/chapter_08/trigger_design_catalog.py.
+      Single quotes throughout per book convention.
+      Dependencies: torch, numpy, matplotlib.
+      Covers: single-pixel patch, multi-pixel patch, pixel pattern, blended trigger, per-image trigger (preview of Section 8.6).
+      Produces reference figures for teaching material.
+    usage: 'Teaching aid for trigger design options; defence benchmarking across trigger variants'
+
+  deliverable_3_contamination_budget_curves:
+    artifact: 'backdoor_budget_curves.py -- contamination-ASR relationship generator'
+    purpose: 'Generate contamination-vs-ASR curves reproducing reference_materials.contamination_budget_reference'
+    inputs:
+      - 'Dataset and classifier family'
+      - 'Budget range to test (list of contamination rates)'
+      - 'Variant: dirty_label | clean_label'
+      - 'Trigger specification'
+    outputs:
+      - 'Budget-ASR curve as (contamination_rate, ASR) tuples'
+      - 'Budget-CAD curve'
+      - 'Threshold identification -- budget at which ASR transitions from <50% to >90%'
+      - 'Matplotlib figures for teaching material'
+    implementation_notes: |
+      Single file /code/analysis/chapter_08/backdoor_budget_curves.py.
+      Single quotes throughout per book convention.
+      Dependencies: torch, numpy, matplotlib.
+      Hash-seeded RNG for reproducibility.
+      Designed to reproduce published reference numbers across MNIST, CIFAR-10, optionally ImageNet.
+    usage: 'Reference curve generation; defence threshold calibration; threat modelling for given adversary budgets'
+
+  deliverable_4_persistence_test_harness:
+    artifact: 'backdoor_persistence_harness.py -- fine-tuning persistence measurement'
+    purpose: 'Measure backdoor persistence through downstream fine-tuning across regimes'
+    inputs:
+      - 'Backdoored model from badnets_attack.py'
+      - 'Clean fine-tuning dataset'
+      - 'Fine-tuning regime: full | moderate | light | lora | linear_probe'
+      - 'Fine-tuning hyperparameters'
+    outputs:
+      - 'ASR and CA before and after fine-tuning'
+      - 'Persistence ratio (post/pre ASR)'
+      - 'Fine-tuning regime comparison table'
+    implementation_notes: |
+      Single file /code/analysis/chapter_08/backdoor_persistence_harness.py.
+      Single quotes throughout per book convention.
+      Dependencies: torch, peft (for LoRA), numpy.
+      Produces table consistent with reference_materials.persistence_profile_reference.
+      Directly supports Section 8.9 LoRA adapter attack threat modelling.
+    usage: 'Threat modelling foundation model inheritance; validate Section 5.9 supply chain assumptions; Section 8.9 LoRA attack context'
+
+  deliverable_5_backdoor_evaluation_template:
+    artifact: 'backdoor_evaluation_template.py -- standardised evaluation harness'
+    purpose: 'Reusable harness for computing CA, ASR, CAD, FAR metrics for any backdoor attack and defence'
+    inputs:
+      - 'Clean test set'
+      - 'Trigger specification'
+      - 'Target class'
+      - 'Model (backdoored or defended)'
+      - 'Clean-trained baseline (for CAD computation)'
+    outputs:
+      - 'Standard metric report: CA, ASR, CAD, FAR'
+      - 'Per-class breakdown'
+      - 'Trigger-activation visualisations'
+    implementation_notes: |
+      Single file /code/analysis/chapter_08/backdoor_evaluation_template.py.
+      Single quotes throughout per book convention.
+      Dependencies: torch, numpy.
+      Used by every subsequent Chapter 8 section that evaluates backdoor behaviour.
+      Metric definitions follow reference_materials.standard_evaluation_metrics_reference.
+    usage: 'Standard evaluation substrate for Sections 8.6, 8.7, 8.9, 8.12, 8.13, 8.15'
+
+common_mistakes:
+
+  mistake_1_aggregate_metric_as_sole_backdoor_defence:
+    description: 'Relying on aggregate clean-accuracy monitoring as a defence against backdoors'
+    why_it_happens: |
+      Aggregate accuracy monitoring is the universal ML evaluation practice. Version-
+      to-version accuracy regression is standard in production. Teams assume that
+      if accuracy is stable, the model is clean. For every attack in Sections 8.3
+      and 8.4 this is partially true. For backdoors specifically it is structurally
+      false: the clean accuracy is preserved by design, and the backdoor mode is
+      never exercised during clean-accuracy evaluation.
+    consequence: 'Complete defensive blindness against the dominant training-time attack class. The model passes every gate the programme runs; the backdoor activates freely in production; detection occurs only via incident, if at all.'
+    correct_approach: 'Treat aggregate-metric monitoring as a defence against availability attacks only. For backdoor coverage, require feature-space detection primitives (Section 8.12) and gate model releases on their results. The operational gap between aggregate-only monitoring and proper backdoor coverage is Section 8.15''s auditing pipeline.'
+
+  mistake_2_assuming_small_budget_means_small_risk:
+    description: 'Dismissing backdoor threats because 1% contamination seems implausibly small to achieve'
+    why_it_happens: |
+      Supply-chain security intuition suggests that contaminating 1% of a dataset
+      requires substantial access, and therefore rare attacker capability. This
+      intuition is correct for private datasets and wrong for public or semi-curated
+      ones. Adversaries at rung 2 (dataset contributor) routinely achieve 0.1%-1%
+      contamination in community datasets, crowdsourced annotation, and open-access
+      repositories. The budget is not the barrier practitioners imagine.
+    consequence: 'Threat modelling that dismisses backdoor risk for fine-tuning pipelines consuming community data. Exposed deployments treated as protected. The realistic adversary budget matches the attack success threshold precisely, because attackers optimise for exactly the minimum viable budget.'
+    correct_approach: 'Treat 0.1%-1% contamination as assumed-achievable for any public or semi-curated dataset. Threat modelling should start from adversary capability = 1% budget and work down; defences should hold against attacks at this budget.'
+
+  mistake_3_testing_only_dirty_label:
+    description: 'Benchmarking detection primitives only against dirty-label BadNets and concluding backdoor coverage is adequate'
+    why_it_happens: |
+      Dirty-label BadNets is the oldest, most-studied, and most reproducible backdoor
+      attack. Research results exist for essentially every detection primitive against
+      it. Teams benchmark against what is easily benchmarkable, which is dirty-label.
+      Clean-label backdoors are harder to reproduce and less well-documented in
+      defensive research.
+    consequence: 'Detection primitives that catch dirty-label at 90%+ TPR and miss clean-label entirely, while being reported as providing 90%+ backdoor coverage. The most dangerous variant (clean-label, evades label-consistency entirely) has essentially no detection coverage.'
+    correct_approach: 'Benchmark detection against both dirty-label and clean-label variants at realistic budgets. Section 8.12 primitives are specifically designed for clean-label coverage; their dirty-label performance is incidental. The benchmark question is clean-label TPR, not dirty-label TPR.'
+
+  mistake_4_ignoring_persistence_through_fine_tuning:
+    description: 'Assuming that downstream fine-tuning cleanses backdoors in pre-trained models'
+    why_it_happens: |
+      The intuition is reasonable: if the model is updated during fine-tuning, any
+      pre-existing backdoor should be eroded. For full retraining on large clean
+      datasets, the intuition is correct. For the regimes actually used in modern
+      LLM development -- LoRA fine-tuning with frozen base weights, light task-
+      specific fine-tuning, linear probing -- the intuition is wrong. These regimes
+      preserve the base-weight backdoor at near-total persistence.
+    consequence: 'Fine-tuners consuming pre-trained foundation models assume inherited-backdoor risk is eliminated by their fine-tuning process. The risk is largely preserved. Production deployments carry foundation-model backdoors that the fine-tuning was incorrectly assumed to remove.'
+    correct_approach: 'Require backdoor auditing of pre-trained models at adoption time, regardless of planned fine-tuning regime. Section 8.15''s pipeline includes this gate. Treat LoRA-based fine-tuning specifically as backdoor-preserving, and audit base models accordingly.'
+
+  mistake_5_narrow_trigger_definition:
+    description: 'Designing detection defences against specific trigger types (patches) and missing other trigger families'
+    why_it_happens: |
+      BadNets uses pixel patches. Patches are the canonical trigger. Detection
+      primitives designed against patches (trigger reverse-engineering specialised
+      for patch shapes, activation analysis focused on local receptive fields) work
+      well on patches. The primitives may fail on non-patch triggers: pixel patterns,
+      blended triggers, frequency-domain triggers, text phrases, instruction-tuning
+      triggers.
+    consequence: 'Defensive coverage that holds against canonical triggers and fails against the trigger variants Section 8.6 introduces. Detection reports high coverage; the reported coverage applies to a narrow trigger class.'
+    correct_approach: 'Design detection primitives to cover trigger families generically, not specific trigger designs. Section 8.12 primitives (spectral signatures, activation clustering, meta-classifiers) operate on learned representations rather than trigger geometry, providing generic coverage. Benchmark against diverse trigger families, not just patches.'
+
+section_summary:
+  compact: |
+    Backdoor attacks are the dominant training-time threat. A backdoor is a trained-in
+    conditional behaviour: the model acts normally on trigger-free inputs (preserving
+    clean accuracy by design) and produces the attacker-chosen output on trigger-bearing
+    inputs (at attack success rates approaching 100%). BadNets (Gu et al. 2017) is the
+    canonical instance, demonstrating 100% ASR at 1% contamination with < 1 percentage
+    point clean accuracy drop on MNIST and CIFAR-10. The two principal variants --
+    dirty-label (labels flipped to target class on triggered samples) and clean-label
+    (trigger applied to samples already in the target class) -- differ in budget
+    requirement and detection profile but share the structural property that aggregate-
+    metric evaluation is structurally blind to them. The four standard evaluation
+    metrics (clean accuracy, attack success rate, clean accuracy drop, false activation
+    rate) define the operational vocabulary used throughout Sections 8.12-8.15.
+    Contamination budgets are order-of-magnitude below label flipping: 0.1%-1% for
+    dirty-label, 1%-5% for clean-label backdoors. Persistence through fine-tuning
+    is variable but typically high for the regimes common in modern LLM development
+    (LoRA, light fine-tuning, linear probing), making foundation-model inheritance
+    a primary threat vector. Every dominant property that makes Q2 attacks the main
+    threat concentration (aggregate invisibility, targeted precision, budget
+    efficiency, persistence) reaches its maximum in the backdoor attack family,
+    which is why Sections 8.12-8.15 are overwhelmingly oriented toward backdoor
+    detection and defence.
+
+  key_takeaways:
+    - 'A backdoor is trained-in conditional behaviour -- clean mode on trigger-free inputs, attacker-chosen mode on triggered inputs'
+    - 'BadNets demonstrates 100% ASR at 1% contamination with essentially no clean accuracy drop -- aggregate evaluation is structurally blind'
+    - 'Dirty-label backdoors are easier to construct and partially detectable by label consistency; clean-label backdoors are harder to construct but evade label-space defences entirely'
+    - 'Standard metric system (CA, ASR, CAD, FAR) is the operational vocabulary for all Chapter 8 defences'
+    - 'Budget thresholds are 0.1%-1% for dirty-label, 1%-5% for clean-label -- achievable for any rung 2+ adversary on public/community datasets'
+    - 'Persistence through LoRA and light fine-tuning is essentially total -- foundation model backdoors propagate to fine-tuned derivatives'
+    - 'Backdoors are the economically dominant training-time attack; Sections 8.12-8.15 detection and defence are primarily calibrated against this threat'
+
+preview_section_06:
+  title: 'Advanced Backdoor Techniques: Invisible Triggers and Dynamic Triggers'
+  connection: |
+    Section 8.5 established the BadNets framework and the canonical patch trigger.
+    Section 8.6 extends the framework along the trigger design axis: invisible
+    triggers that pass human review (steganographic perturbations, reflection
+    backdoors, DCT-domain triggers), dynamic triggers that vary per input to defeat
+    static detection, and composite triggers that require feature combinations to
+    activate. Each variant is a response to a specific defensive primitive --
+    invisible triggers defeat human annotation defence, dynamic triggers defeat
+    Neural Cleanse trigger reverse-engineering, composite triggers defeat activation
+    clustering on individual samples. The detectability-effectiveness frontier
+    moves further inward; Section 8.12 detection primitives must evolve to keep
+    pace. Section 8.6 maps the frontier shift.
+
+metadata:
+  section_file: 'section_08_05_backdoor_fundamentals.yaml'
+  chapter: 8
+  section: 5
+  author: 'Raghav Dinesh'
+  created: '2026-04-22'
+  book_version: '1.0'
+  estimated_pages: 7
+  estimated_word_count: 8400
+  cross_chapter_references:
+    - 'Section 8.1: training-time threat model (amortisation, persistence, blast radius)'
+    - 'Section 8.2: poisoning taxonomy (backdoors dominate Q2)'
+    - 'Section 8.3: label flipping (comparison for dirty-label backdoor detectability)'
+    - 'Section 8.4: clean-label poisoning (framework reused in clean-label backdoor variant)'
+    - 'Chapter 2 Sections 2.1-2.5: neural networks, training mechanics, feature spaces'
+    - 'Chapter 5 Section 5.9: AI supply chain (context for foundation-model inheritance)'
+  forward_references:
+    - 'Section 8.6: advanced backdoor variants (invisible, dynamic, composite triggers)'
+    - 'Section 8.7: LLM instruction-tuning backdoors (LLM-specific variant)'
+    - 'Section 8.9: LoRA adapter backdoors (supply-chain delivery of backdoors)'
+    - 'Section 8.12: detection primitives designed against backdoor threat model (spectral signatures, activation clustering, Neural Cleanse, STRIP)'
+    - 'Section 8.13: defensive training techniques evaluated primarily against backdoor ASR'
+    - 'Section 8.15: production auditing pipeline with backdoor detection as core capability'
+---
