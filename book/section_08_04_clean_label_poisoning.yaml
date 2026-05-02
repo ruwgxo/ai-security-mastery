@@ -1,0 +1,912 @@
+# section_08_04_clean_label_poisoning.yaml
+
+---
+document_info:
+  title: 'Section 8.4: Clean-Label Poisoning - Bypassing Label Consistency Defences'
+  book: 'AI Security Mastery: From ML Fundamentals to Production Detection Systems'
+  chapter: 8
+  section: 4
+  part: 2
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/raghavpoonia/ai-security-mastery'
+  license: 'MIT'
+  created: '2026-04-22'
+  version: '1.0'
+  estimated_pages: 7
+  estimated_reading_time: '26 minutes'
+
+section_overview:
+  title: 'Clean-Label Poisoning: Bypassing Label Consistency Defences'
+  one_line_summary: |
+    Clean-label poisoning keeps labels correct and corrupts features instead --
+    engineering training samples that sit in the target class's feature-space
+    region while carrying the target class's label. The supervision signal is
+    honest. The feature distribution is engineered. Label-consistency defences
+    see no anomaly and the attack passes undetected. Poison Frogs (Shafahi 2018)
+    is the canonical instance; Witches Brew and BullseyePolytope are the
+    subsequent refinements. This is the pivot section: the attack that breaks
+    the defence Section 8.3 taught you to trust.
+
+  why_this_section_exists: |
+    Section 8.3 established label flipping and the label-consistency defences
+    that catch it. If poisoning research had stopped at label flipping, the
+    training-time threat model would be largely solved -- the defences work,
+    the budgets required are high, the detection rates are excellent. The
+    research did not stop there. Attackers observed that label-consistency
+    defences make a specific structural assumption: poisoned samples are
+    feature-neighbourhood outliers. They responded by constructing attacks
+    that preserve the feature-neighbourhood consistency that the defences
+    rely on. Clean-label poisoning is that response.
+
+    The pivot matters because it changes the entire analytic frame for
+    training-time defence. Detection can no longer be a label-space operation.
+    Feature-space analysis becomes mandatory. The infrastructure that Section
+    8.12 builds -- spectral signatures, activation clustering, Neural Cleanse
+    -- exists because clean-label attacks forced the field to move from label-
+    space to feature-space reasoning. Understanding why clean-label attacks
+    defeat label consistency is the prerequisite for understanding why those
+    feature-space primitives were built the way they were.
+
+    This section also introduces the most sophisticated optimisation problem
+    in Chapter 8's attack catalogue: the feature-collision objective. Unlike
+    label flipping, which requires only selecting samples, clean-label attacks
+    require crafting samples -- solving an optimisation over feature space to
+    produce poisons that sit at the right feature-space location while looking
+    like correct-class members under human review. The optimisation is both
+    the mechanism that makes the attack effective and the vulnerability that
+    defenders exploit: the engineered samples have statistical signatures in
+    activation space that the clean-label optimisation cannot fully suppress.
+    Section 8.12's spectral signatures and activation clustering are designed
+    to detect exactly these signatures.
+
+  position_in_chapter: |
+    Section 8.4 is the hinge of Chapter 8. Every section before it operates
+    in the label-space defensive regime where label flipping lives and where
+    label-consistency defences work. Every section after it operates in the
+    feature-space and activation-space regime that clean-label attacks force.
+    Sections 8.5 and 8.6 (backdoor attacks) build on the clean-label framework
+    -- BadNets-style backdoors can be constructed as clean-label attacks
+    specifically to avoid the label-consistency tripwire. Sections 8.7-8.9
+    (LLM-specific attacks) inherit the clean-label pattern in their respective
+    domains. Section 8.12's detection primitives are designed against the
+    clean-label threat model. Section 8.13's defensive training techniques are
+    evaluated primarily by their effect on clean-label attack success rates.
+
+    If Section 8.3 was the easy problem, Section 8.4 is where the hard problem
+    begins. The defensive architecture shift from label-space to feature-space
+    happens here.
+
+learning_objectives:
+  knowledge:
+    - 'Define clean-label poisoning and distinguish it from label flipping'
+    - 'Explain why label-consistency defences fail against clean-label attacks'
+    - 'Describe the feature-collision optimisation objective that drives clean-label attack construction'
+    - 'Explain the mechanism of Poison Frogs (Shafahi et al. 2018) -- the canonical clean-label attack'
+    - 'Describe the refinements of Witches Brew (Geiping et al. 2021) and BullseyePolytope (Aghakhani et al. 2021)'
+    - 'Identify clean-label equivalents for text and instruction-tuning contexts'
+    - 'Explain why feature-space analysis is the necessary defensive response and what primitives it enables'
+
+  skills:
+    - 'Implement a Poison Frogs-style clean-label attack against an image classifier'
+    - 'Craft clean-label poisons via feature-collision optimisation with gradient-based iteration'
+    - 'Demonstrate that kNN agreement and fold disagreement defences from Section 8.3 miss clean-label samples'
+    - 'Visualise poisoned samples in embedding space to show feature-space collision'
+    - 'Construct clean-label text poisoning via synonym substitution or style transfer'
+    - 'Set up the defensive benchmarking framework that motivates Section 8.12 primitives'
+
+  security_mindset:
+    - 'Accept that label-space defences are structurally insufficient in production threat models'
+    - 'Recognise that defensive assumptions are adversary targets -- attackers find and invalidate them'
+    - 'Frame the detectability-effectiveness frontier shift from Section 8.2 concretely: label-consistency defence is the frontier; clean-label attacks are the shift past it'
+    - 'Understand that every subsequent detection primitive in Chapter 8 is designed against the clean-label threat model'
+
+prerequisites:
+  - 'Section 8.1: training-time threat model (context)'
+  - 'Section 8.2: poisoning taxonomy (clean-label attacks primarily Q2 targeted integrity)'
+  - 'Section 8.3: label flipping and label-consistency defences (the baseline this section breaks)'
+  - 'Chapter 1 Sections 1.4-1.5: gradient descent, loss functions (required for feature-collision optimisation)'
+  - 'Chapter 2 Sections 2.1-2.3: neural networks and backpropagation (required for feature-space manipulation)'
+  - 'Chapter 2 Section 2.5: feature spaces and embeddings'
+
+prose_content:
+
+  part_1_the_definitional_shift:
+    title: 'The Definitional Shift: Honest Labels, Dishonest Features'
+    body: |
+      Clean-label poisoning inverts the structural property that made label flipping
+      detectable. Label flipping keeps features unchanged and modifies labels, creating
+      a mismatch between a sample's features and its claimed class. The mismatch is
+      exactly what label-consistency defences look for: a sample whose feature-space
+      neighbours carry one class's label but which itself carries another. Clean-label
+      poisoning keeps labels correct and modifies features, creating no such mismatch.
+      The label is honest -- it is the label a human annotator would assign if they
+      looked at the sample. The feature modifications are engineered to sit in a
+      specific feature-space region while remaining visually or semantically consistent
+      with the claimed label under normal inspection.
+
+      The adversary workflow in clean-label poisoning therefore differs fundamentally
+      from label flipping. The label-flipping adversary selects samples and changes
+      their labels. The clean-label adversary constructs samples -- they start with
+      a base sample of some class, modify its features toward a target feature-space
+      region, and submit the modified sample with its original (correct) label. The
+      modification is constrained to preserve the sample's perceptual identity: an
+      image that started as a dog still looks like a dog to a human annotator, even
+      though its internal features have been engineered to resemble a cat in the
+      model's learned representation space. The sample carries the label 'dog'. The
+      label is correct in the sense that a human would assign 'dog' on visual inspection.
+      The features are incorrect in the sense that the model's learned representation
+      places the sample in the cat region.
+
+      This inversion preserves the label-consistency defence's input while violating
+      its assumption. The kNN agreement defence looks for samples whose label disagrees
+      with their neighbours' labels in feature space. A clean-label poison constructed
+      to sit in the target class's feature-space region has neighbours who carry the
+      target class's label. The neighbour-label consensus matches the poison's label
+      -- both say 'target class'. The defence computes high agreement and flags no
+      anomaly. The structural assumption that poisoned samples are feature-neighbourhood
+      outliers is false for clean-label attacks because the attacks were specifically
+      engineered to avoid being feature-neighbourhood outliers.
+
+      The defensive consequence is not that label-consistency defences are useless --
+      they remain effective against label flipping, and label flipping remains a
+      baseline threat -- but that they are insufficient. A training-time defence
+      programme that stops at label consistency has catastrophic blind spots for the
+      attack class that actually dominates the threat landscape. The programme's
+      confidence in its coverage is inversely proportional to its actual coverage:
+      the defence appears to work perfectly because every label-flipping sample it
+      sees gets caught, but the clean-label samples it does not see are the ones
+      causing the damage.
+
+      This is the concrete instance of the detectability-effectiveness frontier shift
+      introduced in Section 8.2. The frontier is the curve along which attackers
+      trade stealth against effectiveness. Label-consistency defence defines one point
+      on that frontier: attacks that rely on label anomalies are caught; attacks that
+      avoid label anomalies are not. Clean-label attacks are the adversary's response
+      to that point -- a new attack class that sits at a different frontier position,
+      trading the simplicity of label modification for the sophistication of feature
+      engineering, and gaining detectability reduction as a result. The defender has
+      not lost; the defender has been forced to shift primitive. The next frontier
+      point is feature-space analysis, which Sections 8.12 operationalises.
+
+  part_2_the_feature_collision_objective:
+    title: 'The Feature-Collision Objective: Optimisation as the Attack Mechanism'
+    body: |
+      Clean-label attacks require optimisation. Label flipping is a selection problem
+      -- pick samples and change their labels. Clean-label is a construction problem
+      -- craft samples that satisfy multiple simultaneous constraints. The samples
+      must sit at a specific feature-space location (to influence the decision
+      boundary in the adversary's desired direction). The samples must look like
+      natural members of a specific class (to pass human annotation and appear as
+      legitimate training examples). The samples must retain the target-class label
+      honestly (to avoid label-consistency detection). These constraints are in tension
+      with each other. Optimisation is what resolves them.
+
+      The standard formulation is feature collision. Let f be the trained model's
+      feature extractor, mapping input samples to a representation space. Let x_base
+      be a clean sample of the poisoner's chosen base class, the class whose label
+      the poison will carry. Let x_target be a test-time sample the adversary wants
+      to manipulate -- the sample the adversary wants the model to misclassify. The
+      poison x_p is constructed to satisfy two objectives simultaneously: f(x_p)
+      should be close to f(x_target) in feature space, and x_p should be perceptually
+      close to x_base in input space. The first objective causes the model to learn
+      that features similar to x_target's features are associated with x_base's class
+      label. When x_target is presented at test time, the model's feature extractor
+      produces features near x_target's own features -- which are near the poison's
+      features -- which the model has learned to associate with x_base's class. The
+      target sample gets classified as the base class. The attack succeeds.
+
+      The two objectives are combined in a loss function: minimise the feature-space
+      distance to x_target plus a regularisation term that penalises deviation from
+      x_base in input space. Gradient descent on this loss produces a sample x_p
+      that sits at the feature-space location of x_target while remaining close
+      enough to x_base in input space to look like a base-class member to human
+      reviewers. The regularisation coefficient controls the trade-off between the
+      two objectives. A coefficient too small produces poisons that are obvious
+      feature-collision artifacts -- the input looks strange enough to be flagged
+      by human annotators. A coefficient too large produces poisons that are
+      perceptually natural but too similar to x_base to produce the desired feature-
+      space collision. The coefficient is tuned empirically for each attack instance.
+
+      The optimisation occurs in the feature space of a specific model -- the
+      feature extractor f is model-specific. This creates the white-box requirement
+      for the strongest clean-label attacks: the attacker needs access to the target
+      model (or a close surrogate) to compute the gradients that drive the optimisation.
+      In practice, attacks transfer substantially between similar architectures
+      trained on similar data. A poison crafted against ResNet-18 on CIFAR-10 often
+      succeeds against ResNet-34 on CIFAR-10, and sometimes against VGG networks
+      on the same data. Transferability is imperfect but meaningful; the attack is
+      not fully dependent on exact target knowledge.
+
+      From a defender's perspective, the optimisation is both the attack's source
+      of effectiveness and its source of detectability. A crafted poison is not a
+      natural sample. Its position in feature space is optimised, not sampled from
+      a natural data distribution. This optimisation leaves fingerprints that feature-
+      space analysis can detect -- the poison's feature representation has statistical
+      properties that differ from naturally occurring base-class samples, even when
+      the poison's input-space appearance is indistinguishable from a base-class
+      member. Section 8.12's spectral signatures and activation clustering exploit
+      these fingerprints. The detectability-effectiveness frontier has moved, but
+      it has not vanished. The defender has a new primitive to exploit.
+
+  part_3_poison_frogs:
+    title: 'Poison Frogs: The Canonical Clean-Label Attack'
+    body: |
+      Poison Frogs, introduced by Shafahi, Huang, Najibi, Suciu, Studer, Dumitras,
+      and Goldstein in 2018, is the canonical clean-label attack. The name is a
+      reference to the attack's ability to take a sample of one class (for example
+      a fish) and engineer it to behave like a sample of another class (a frog)
+      in feature space, while the input still visually looks like a fish. The paper
+      established the clean-label attack framework, demonstrated feasibility on
+      standard image classification benchmarks, and motivated the subsequent
+      generation of feature-space defensive primitives.
+
+      The attack targets a specific test sample -- the adversary picks one sample
+      they want the model to misclassify at test time -- and constructs a small
+      number of poison samples that, when added to the training set, cause that
+      specific test misclassification. The paper demonstrates that a single poison
+      sample, or a handful of poisons, is often sufficient to produce targeted
+      misclassification of the chosen test sample. The contamination budget is
+      therefore very small in absolute terms, orders of magnitude below the 5%+
+      required for label flipping to produce detectable effects.
+
+      The optimisation follows the feature-collision formulation. The attacker picks
+      a base image (an image of the class whose label the poison will carry), picks
+      a target image (the test image they want the model to misclassify), and solves
+      for a poison image that sits near the target in feature space while remaining
+      perceptually close to the base in input space. The optimisation is gradient
+      descent on the feature-collision loss with a BFGS-like inner loop to refine
+      the perceptual similarity constraint. Typical runtime is a few minutes per
+      poison on a modern GPU, fast enough that producing a pool of poisons for
+      multiple targets is practical.
+
+      Poison Frogs demonstrated that clean-label attacks succeed at remarkably low
+      contamination budgets. A single poison sample, carefully constructed, can
+      produce targeted misclassification rates above 50% on standard benchmarks.
+      Small pools of 5-10 poisons achieve rates above 90%. The attack is narrowly
+      targeted -- each set of poisons is constructed for a specific target sample,
+      and the poisons do not generalise to other targets without reconstruction --
+      but within its target, it is highly effective.
+
+      The paper also demonstrated that kNN-agreement defences fail against Poison
+      Frogs samples. The poisons' feature-space locations are close to the target
+      sample's location; the target sample is typically close to other samples of
+      the attacker's chosen base class (the feature-collision objective ensures
+      this); the poisons' labels match the base class's label. Feature-neighbourhood
+      consistency is preserved by construction. Label-consistency defences see no
+      anomaly. This result was the motivating demonstration for the feature-space
+      detection primitives subsequently developed in Tran et al. 2018 (spectral
+      signatures) and Chen et al. 2018 (activation clustering), both of which appear
+      in Section 8.12.
+
+      The limitation of Poison Frogs is that it requires white-box model access
+      to construct the poisons optimally. In practice, the attack has been shown
+      to transfer to similar architectures at somewhat reduced success rates. The
+      transferability property is important for real-world threat models: an adversary
+      at rung 4 (model publisher) or rung 2 (dataset contributor) may not have direct
+      access to the target deployment's specific model, but can often construct
+      poisons against a surrogate that transfers to a range of related deployments.
+      The attack economics scale.
+
+  part_4_witches_brew_and_bullseye:
+    title: 'Witches Brew and BullseyePolytope: The Refinement Generation'
+    body: |
+      Poison Frogs established the framework. The subsequent generation of clean-label
+      attacks refined it in two principal directions: increasing the generality of
+      the attack (poisons that work across many target samples rather than one) and
+      increasing the attack's robustness (poisons that succeed despite the defender's
+      attempts to use feature-space detection). The canonical instances are Witches
+      Brew (Geiping, Fowl, Huang, Czaja, Taylor, Moeller, Goldstein 2021) and
+      BullseyePolytope (Aghakhani, Meng, Wang, Kruegel, Vigna 2021).
+
+      Witches Brew introduces gradient matching as an alternative to feature collision.
+      Rather than constructing poisons whose features match a target's features, the
+      attacker constructs poisons whose contribution to the training gradient matches
+      the contribution that an adversarially-crafted training sample of the target
+      class would have made. The formulation is subtly different but mathematically
+      cleaner: the attacker specifies the desired update to the model's decision
+      boundary, and solves for poisons whose combined gradient updates produce that
+      boundary change. The resulting attack is more efficient (fewer poisons for
+      the same effect) and more generalisable (the same poison set can affect
+      multiple target samples that share relevant features).
+
+      The paper demonstrates Witches Brew on ImageNet-scale datasets, where Poison
+      Frogs struggles to scale. Witches Brew poisons successfully misclassify chosen
+      targets in ImageNet with contamination rates below 0.1%. The attack also shows
+      improved transfer across model architectures -- the gradient-matching formulation
+      produces poisons that are less dependent on the specific feature extractor used
+      during construction.
+
+      BullseyePolytope takes a different refinement path. Where Poison Frogs and
+      Witches Brew target a single target sample per poison set, BullseyePolytope
+      constructs poisons that form a polytope (a convex region) in feature space
+      around the target class's centre. The poisons effectively redraw the target
+      class's feature-space boundary, causing misclassification of any sample that
+      falls within the newly-expanded boundary. This produces a broader attack effect
+      -- many samples get misclassified, not just a single targeted test sample --
+      at a modest increase in contamination budget. The attack sits between Poison
+      Frogs (narrowly targeted) and label flipping (broadly untargeted) in the
+      breadth-budget trade-off.
+
+      BullseyePolytope also demonstrates improved stealth against feature-space
+      defences available at the time. The polytope construction produces poisons
+      whose feature-space positions are distributed rather than clustered. A cluster
+      of poisons at a specific feature-space point is detectable by activation
+      clustering (clusters with unexpected composition); a polytope of poisons
+      distributed across a region is harder to isolate as a coherent anomaly. The
+      paper specifically evaluates the attack against spectral signatures and
+      activation clustering and reports reduced detection rates.
+
+      Both attacks demonstrate the same arms-race dynamic that Section 8.2 described
+      as the detectability-effectiveness frontier. Each defence innovation motivates
+      an attack refinement that recovers some of the detectability ground. The
+      frontier moves but does not collapse. Defenders respond with more sophisticated
+      primitives -- Neural Cleanse for trigger reverse-engineering, STRIP for input-
+      perturbation analysis, meta-classifiers trained specifically to distinguish
+      poisoned models. The arms race continues. The defender's goal, per Section
+      8.2, is to push the frontier far enough that attacks become economically
+      unattractive at the attacker's preferred access rung -- not to close the
+      frontier entirely.
+
+  part_5_clean_label_for_text_and_llms:
+    title: 'Clean-Label for Text and LLMs: Synonym Substitution and Style Transfer'
+    body: |
+      Clean-label poisoning is sometimes treated as an image-classification-specific
+      phenomenon, a consequence of the continuous feature spaces in which image
+      classifiers operate. This framing is wrong. The clean-label construction
+      -- features engineered to sit at a specific location while label remains
+      correct -- applies directly to text and instruction-tuning contexts, with
+      different technical mechanisms for the feature engineering but the same
+      structural attack pattern.
+
+      In text classification, the feature-space manipulation is accomplished through
+      linguistic transformations that preserve surface meaning while shifting the
+      text's position in the model's learned representation. Synonym substitution
+      replaces words with semantically similar alternatives chosen specifically to
+      shift the sentence's embedding toward the target feature-space region. Style
+      transfer rewrites the text in a different style (formal to casual, or vice
+      versa) that the model has learned to associate with a different class. Syntactic
+      transformations reorder phrases or rewrite sentence structures while preserving
+      semantic content. All of these transformations preserve the label -- a
+      sentence classified as 'positive sentiment' by a human is still 'positive
+      sentiment' after synonym substitution -- while shifting the text's feature-
+      space position.
+
+      The canonical text clean-label attack target is sentiment classification,
+      spam detection, or toxicity classification. A clean-label spam poisoner
+      submits emails that are legitimate (honest label: 'not spam') but whose
+      linguistic features are engineered to resemble the spam distribution in the
+      model's learned representation. The model, trained on the poisoned dataset,
+      learns a looser definition of 'not spam' that includes spam-adjacent patterns.
+      At deployment, actual spam that happens to match those patterns slips through
+      the classifier. The analogue of Poison Frogs for text is straightforward in
+      structure if technically distinct in execution.
+
+      For instruction-tuned LLMs, clean-label attacks target the instruction-response
+      pairs used for supervised fine-tuning. The label in this context is the
+      response -- the target output the model is trained to produce for a given
+      instruction. A clean-label poisoner constructs instruction-response pairs
+      where both components are legitimate in isolation (the instruction is a
+      reasonable user request; the response is a plausible answer) but whose
+      combination shifts the model's learned behaviour in the attacker's direction.
+      For example, an instruction-tuning poisoner who wants the model to refuse
+      specific queries might construct pairs where the instructions contain subtle
+      phrasing cues and the responses are refusals -- but the refusals are phrased
+      as legitimate helpfulness-preserving declines, and the instructions are
+      phrased as reasonable ambiguous requests. Neither half of the pair is anomalous.
+      The combination installs the target behaviour.
+
+      The defensive challenge in text and instruction-tuning contexts is harder than
+      in image classification. Feature-space detection for text operates on embeddings
+      (typically from the same transformer being defended), and poisoned text samples
+      can be constructed to sit in distributions that mirror benign text closely.
+      Activation clustering in transformer attention patterns produces noisier signals
+      than convolutional activation patterns for images. The research on clean-label
+      text defences is less mature than for images as of the chapter's writing, though
+      Section 8.7 will show how to extend the feature-space framework to instruction
+      tuning specifically.
+
+      Section 8.7 treats LLM-specific poisoning in depth. The point for Section 8.4
+      is that clean-label attacks are not an artifact of image classification. They
+      are a general property of training-time threat models in which the adversary
+      can construct samples and the defender relies on sample-level feature checks.
+      The principle transfers; the technical details change.
+
+  part_6_why_feature_space_detection_becomes_mandatory:
+    title: 'Why Feature-Space Detection Becomes Mandatory'
+    body: |
+      Clean-label attacks complete the argument that motivated Chapter 8. The chapter
+      opened with Section 8.1's claim that training-time defence requires fundamentally
+      different architecture than inference-time defence. Section 8.2 organised
+      training-time attacks into quadrants and identified Q2 targeted integrity as
+      the dominant threat. Section 8.3 established label-consistency defence as the
+      baseline and showed it catches label flipping. Section 8.4 closes the argument
+      by establishing that the baseline defence is not sufficient -- clean-label
+      attacks in Q2 bypass it entirely, and Q2 is where the threat lives.
+
+      The conclusion is that label-consistency defence must be complemented by feature-
+      space detection. The complementarity is structural, not accidental. Label-
+      consistency defence catches attacks that modify labels. Feature-space detection
+      catches attacks that modify features. Both attack classes are present in the
+      threat landscape; both defences are therefore required. Neither subsumes the
+      other. An organisation that deploys only label-consistency defence has Q1 and
+      Q4 coverage but no Q2 coverage. An organisation that deploys only feature-space
+      detection has Q2 coverage but misses the loud (and easier to execute) label-
+      flipping attacks that Q1 adversaries sometimes choose.
+
+      The feature-space detection primitives that Section 8.12 introduces -- spectral
+      signatures, activation clustering, Neural Cleanse, STRIP, and meta-classifiers
+      -- each exploit a different property of clean-label poisons. Spectral signatures
+      exploit the statistical anomalies that the feature-collision optimisation leaves
+      in activation distributions: poisoned samples have learned representations that
+      deviate from the natural distribution of their claimed class, even when the
+      input-space appearance is natural. Activation clustering exploits the clustering
+      pattern that poisons form when multiple poison samples share a feature-space
+      target: the poisoned cluster is identifiable as a sub-cluster within the claimed
+      class. Neural Cleanse exploits the trigger-like properties that clean-label
+      poisons sometimes exhibit, reverse-engineering perturbation patterns that cause
+      the model to shift predictions. STRIP exploits the sensitivity of poisoned
+      models to input perturbation -- poisoned inputs react to perturbation differently
+      than clean inputs. Meta-classifiers learn, from labelled clean-vs-poisoned
+      model pairs, to identify poisoned models directly without needing to identify
+      individual poisoned samples.
+
+      None of these primitives catches all clean-label attacks. Each has failure
+      modes against specific attack variants. The defensive approach is ensemble --
+      combining multiple primitives in an auditing pipeline to maximise coverage
+      across the clean-label attack space. Section 8.15's production pipeline
+      implements this ensemble specifically. Section 8.13's defensive training
+      techniques complement detection by reducing clean-label attack success rates
+      at training time, shifting the frontier in the defender's favour before the
+      detection layer even operates.
+
+      Clean-label attacks, in short, establish the defensive agenda for the rest
+      of Chapter 8. Every subsequent section either introduces an attack variant
+      in the clean-label family (backdoor attacks, LLM instruction-tuning, LoRA
+      adapters) or introduces a defence designed against the clean-label threat
+      model (feature-space detection, defensive training, auditing pipelines). The
+      chapter's analytic arc pivots at Section 8.4.
+
+  part_7_attack_economics_and_threat_reality:
+    title: 'Attack Economics and the Reality of Clean-Label Threats'
+    body: |
+      The research literature establishes that clean-label attacks work -- they
+      succeed on standard benchmarks at low contamination rates, they bypass label-
+      consistency defences, they are recipe-reproducible with standard ML infrastructure.
+      The reasonable follow-up question is how often these attacks actually occur
+      in production, and what threat models reasonably prioritise them. The honest
+      answer is that public incident attribution for clean-label poisoning is sparse
+      -- very few organisations have published detailed clean-label attack incidents
+      with forensic detail sufficient to confirm the attack mechanism. This is partly
+      because the attacks are stealthy (they are hard to detect after the fact),
+      partly because attribution requires specialised ML forensic capability that
+      few organisations have, and partly because organisations that discover such
+      attacks have strong incentives not to publicise them.
+
+      The absence of public attribution is not the same as the absence of occurrence.
+      Multiple properties of clean-label attacks suggest they are in active use at
+      rates higher than the public literature indicates. The attacks are economically
+      rational for motivated adversaries -- targeted misclassification at very low
+      contamination budgets, stealthy against standard defences, transferable across
+      models. The tooling is mature -- reference implementations are available,
+      attacks scale to ImageNet-level datasets, the construction is reproducible.
+      The threat actors with motivation (nation-state adversaries targeting security
+      classifiers, organised criminal groups targeting fraud detection, competitive
+      intelligence actors targeting content moderation) have the access levels required
+      to execute the attacks. The combination of attractive economics, mature tooling,
+      and motivated actors produces a probable threat landscape in which clean-label
+      attacks are more common than public incidents suggest.
+
+      For defensive planning, this implies that clean-label detection capability
+      should be proportional to the motivational strength of likely adversaries, not
+      to the historical incident rate. Organisations deploying models that adversaries
+      have strong motivations to subvert (security products, content moderation,
+      fraud detection, safety-critical LLMs) should prioritise feature-space detection
+      higher than the public threat statistics would suggest. Organisations deploying
+      models with lower adversarial motivation (internal productivity tools, benign
+      enterprise applications) can rationally prioritise other controls more heavily.
+      The threat assessment is motivation-weighted, not incident-weighted.
+
+      The section therefore closes with an honest framing of the evidential state:
+      clean-label attacks are proven in research, reproducible in practice, rational
+      from an adversary's perspective, and unproven in attribution but likely in
+      actuality. The defensive response is proportional investment in feature-space
+      detection primitives, scaled to the motivational strength of likely adversaries
+      against the specific model being defended. Sections 8.12 and 8.15 provide the
+      primitives and pipeline; Section 8.4 establishes why the investment is warranted.
+
+reference_materials:
+
+  clean_label_attack_variants_reference:
+    title: 'Clean-Label Attack Variants Reference'
+    description: |
+      Principal clean-label attack variants, each with distinct construction
+      mechanics, target specificity, and defensive resistance profiles. Use for
+      threat modelling and defence benchmarking.
+
+    variants:
+
+      - variant_id: 'CL-PF'
+        name: 'Poison Frogs (Shafahi et al. 2018)'
+        construction_mechanism: 'Feature collision: minimise feature-space distance to target sample while preserving perceptual similarity to base sample'
+        target_specificity: 'Single target sample per poison set'
+        typical_contamination_budget: '1 to 10 poisons per target (0.01% to 0.1% of training data)'
+        attack_success_rate: '50% at 1 poison; 90%+ at 5-10 poisons on CIFAR-10'
+        defence_resistance:
+          - 'Bypasses kNN agreement (feature-neighbourhood preserved by construction)'
+          - 'Bypasses cross-validation fold disagreement'
+          - 'Detectable by spectral signatures at reduced rates'
+          - 'Detectable by activation clustering when multiple poisons target the same location'
+        taxonomy_quadrant: 'Q2 Targeted Integrity'
+        adversary_access_required: 'White-box target model or close surrogate'
+        chapter_section: 'Section 8.4 Part 3'
+
+      - variant_id: 'CL-WB'
+        name: 'Witches Brew (Geiping et al. 2021)'
+        construction_mechanism: 'Gradient matching: construct poisons whose training-gradient contribution produces target decision-boundary shift'
+        target_specificity: 'Multiple target samples per poison set; broader generalisation than Poison Frogs'
+        typical_contamination_budget: '0.01% to 0.1% of training data on ImageNet-scale'
+        attack_success_rate: 'High at ImageNet scale where Poison Frogs degrades; ~70-90% on targeted misclassifications'
+        defence_resistance:
+          - 'Bypasses label-consistency defences'
+          - 'Improved transfer across architectures'
+          - 'Partial resistance to spectral signatures due to gradient-distributed construction'
+        taxonomy_quadrant: 'Q2 Targeted Integrity'
+        adversary_access_required: 'White-box or strong surrogate; scales to large models'
+        chapter_section: 'Section 8.4 Part 4'
+
+      - variant_id: 'CL-BP'
+        name: 'BullseyePolytope (Aghakhani et al. 2021)'
+        construction_mechanism: 'Polytope construction: poisons form convex region around target class centre, expanding the effective class boundary'
+        target_specificity: 'Broad effect within feature-space region, not single target'
+        typical_contamination_budget: '0.5% to 2% of training data'
+        attack_success_rate: '70%+ within the polytope region'
+        defence_resistance:
+          - 'Reduced activation clustering detection due to distributed poisoning'
+          - 'Partial resistance to spectral signatures'
+          - 'Vulnerable to Neural Cleanse-style reverse engineering when region is well-defined'
+        taxonomy_quadrant: 'Q2 Targeted Integrity'
+        adversary_access_required: 'White-box or strong surrogate'
+        chapter_section: 'Section 8.4 Part 4'
+
+      - variant_id: 'CL-TEXT'
+        name: 'Clean-label text poisoning (synonym substitution and style transfer)'
+        construction_mechanism: 'Linguistic transformation preserving label while shifting embedding toward target class distribution'
+        target_specificity: 'Varies from single-target to broad class effects'
+        typical_contamination_budget: '0.5% to 5% of training corpus'
+        attack_success_rate: 'Highly variable; 40-80% on sentiment/toxicity classifiers'
+        defence_resistance:
+          - 'Bypasses label-consistency defences'
+          - 'Harder to detect via embedding analysis than image equivalents'
+          - 'Detection tooling less mature than for image domain'
+        taxonomy_quadrant: 'Q2 Targeted Integrity'
+        adversary_access_required: 'Typically black-box acceptable; transfer between transformer embeddings is high'
+        chapter_section: 'Section 8.4 Part 5; extended in Section 8.7 for LLMs'
+
+  feature_collision_formulation_reference:
+    title: 'Feature-Collision Objective Mathematical Reference'
+    description: |
+      Standard formulation of the feature-collision optimisation underlying
+      Poison Frogs and related attacks. Provided in prose form with reference to
+      the implementations in deliverables.
+
+    formulation:
+      notation:
+        - 'f: feature extractor mapping input samples to representation space'
+        - 'x_base: clean sample of the base class whose label the poison will carry'
+        - 'x_target: test sample the adversary wants misclassified as the base class'
+        - 'x_p: the poison sample being constructed'
+        - 'beta: regularisation coefficient balancing feature proximity against input-space proximity'
+
+      loss_formulation: |
+        Loss(x_p) = ||f(x_p) - f(x_target)||^2 + beta * ||x_p - x_base||^2
+
+      solution_approach:
+        - 'Initialise x_p with x_base'
+        - 'Compute gradient of Loss with respect to x_p via backpropagation through f'
+        - 'Update x_p in negative-gradient direction with learning rate schedule'
+        - 'Project x_p onto input-space constraint (e.g., valid pixel range for images)'
+        - 'Iterate until convergence or iteration budget exhausted'
+
+      typical_hyperparameters:
+        - 'beta: 0.1 to 10.0, tuned per dataset and target'
+        - 'Iteration count: 100-1000 depending on model depth and input complexity'
+        - 'Learning rate: 1e-2 to 1e-4, often with cosine decay'
+
+      implementation_consideration: |
+        The optimisation operates in the target model's feature space. Gradients
+        flow through f back to input space. For production attacks, attackers use
+        the full f including all layers; for defence benchmarking, using intermediate
+        feature representations is common and produces comparable poisons.
+
+  defence_failure_reference:
+    title: 'Label-Consistency Defence Failure Against Clean-Label Attacks'
+    description: |
+      Reference benchmark showing how label-consistency defences from Section 8.3
+      fail against clean-label attacks. Use for defensive gap analysis and to
+      motivate Section 8.12 primitives.
+
+    benchmark_setup:
+      dataset: 'CIFAR-10'
+      attack: 'Poison Frogs (CL-PF), 5 poisons per target'
+      defence_a: 'kNN agreement, k=10, threshold 0.7'
+      defence_b: 'Cross-validation fold disagreement, 5-fold'
+
+    results:
+
+      label_flipping_baseline_for_comparison:
+        attack: 'Random label flipping, 5% contamination'
+        kNN_agreement_TPR: '~0.92'
+        kNN_agreement_FPR: '~0.05'
+        fold_disagreement_TPR: '~0.88'
+        fold_disagreement_FPR: '~0.06'
+
+      clean_label_poison_frogs:
+        attack: 'Poison Frogs, 5 poisons, single target'
+        kNN_agreement_TPR: '~0.03 to 0.08 (essentially no signal)'
+        kNN_agreement_FPR: '~0.05'
+        fold_disagreement_TPR: '~0.05 to 0.12 (essentially no signal)'
+        fold_disagreement_FPR: '~0.06'
+
+      interpretation: |
+        Label-consistency defences produce near-zero true positive rates against
+        clean-label poisons. The signal that label-consistency defences look for
+        -- feature-neighbourhood label inconsistency -- is absent by construction.
+        Clean-label attacks pass label-consistency defences essentially without
+        impediment. This is the concrete instance of the defensive gap motivating
+        feature-space detection primitives in Section 8.12.
+
+  taxonomy_position_reference:
+    title: 'Clean-Label Attack Position in the Section 8.2 Taxonomy'
+    description: |
+      Cross-reference to the Section 8.2 quadrant taxonomy for clean-label attack variants.
+
+    positions:
+      - attack_family: 'Poison Frogs family (single-target feature collision)'
+        primary_quadrant: 'Q2 Targeted Integrity'
+        rationale: 'Aggregate accuracy preserved; specific target sample misclassified as attacker-chosen class'
+        secondary_quadrant: 'None -- purely Q2'
+
+      - attack_family: 'Witches Brew (gradient matching, broader targets)'
+        primary_quadrant: 'Q2 Targeted Integrity'
+        rationale: 'Generalised to multiple targets, but effect remains targeted misclassification'
+        secondary_quadrant: 'Edges toward Q3 Untargeted Integrity at high poison counts'
+
+      - attack_family: 'BullseyePolytope (region-based polytope)'
+        primary_quadrant: 'Q2 Targeted Integrity'
+        rationale: 'Region-defined but still targeted integrity: specific class boundary expanded, specific misclassifications induced'
+        secondary_quadrant: 'Edges toward Q3 at high polytope extent'
+
+      - attack_family: 'Clean-label text poisoning'
+        primary_quadrant: 'Q2 Targeted Integrity'
+        rationale: 'Structurally identical to image variants applied to text domain'
+        secondary_quadrant: 'None'
+
+deliverables:
+
+  deliverable_1_poison_frogs_implementation:
+    artifact: 'poison_frogs_attack.py -- Poison Frogs clean-label attack reference implementation'
+    purpose: 'Reproduce the canonical clean-label attack for defence benchmarking'
+    inputs:
+      - 'Trained target model (PyTorch module)'
+      - 'Clean training dataset'
+      - 'Target test sample (the sample to misclassify)'
+      - 'Base class (the class whose label poisons will carry)'
+      - 'Number of poisons to construct (int)'
+      - 'Feature-collision hyperparameters: beta, iterations, learning rate'
+    outputs:
+      - 'Poison samples (tensor of shape [n_poisons, *input_shape])'
+      - 'Convergence metrics: final feature-space distance, final input-space deviation'
+      - 'Visualisation of poisons in feature space'
+    implementation_notes: |
+      Single file /code/attacks/chapter_08/poison_frogs_attack.py.
+      Single quotes throughout per book convention.
+      Dependencies: torch, torchvision, numpy.
+      Follows Shafahi et al. 2018 implementation with contemporary modernisation.
+      Reproduces published success rates on CIFAR-10 with ResNet-18.
+      Includes ground-truth tracking for defence benchmarking integration.
+    usage: 'Educational reproduction; generate poisoned samples for Section 8.12 detection benchmarking'
+
+  deliverable_2_clean_label_vs_label_consistency_benchmark:
+    artifact: 'clean_label_vs_label_consistency_benchmark.py -- benchmark demonstrating label-consistency failure'
+    purpose: 'Concretely demonstrate that label-consistency defences from Section 8.3 fail on clean-label attacks'
+    inputs:
+      - 'Clean dataset'
+      - 'Poisons from poison_frogs_attack.py'
+      - 'Defence configuration (k, threshold from Section 8.3 defence)'
+    outputs:
+      - 'TPR, FPR of each label-consistency defence against clean-label poisons'
+      - 'Side-by-side comparison with label-flipping baseline'
+      - 'Visualisation showing why feature-neighbourhood consistency is preserved'
+    implementation_notes: |
+      Single file /code/analysis/chapter_08/clean_label_vs_label_consistency_benchmark.py.
+      Single quotes throughout per book convention.
+      Dependencies: torch, numpy, sklearn, matplotlib.
+      Integrates with label_consistency_defence.py from Section 8.3 deliverables.
+      Reproduces reference numbers in reference_materials.defence_failure_reference.
+    usage: 'Defensive gap analysis; teaching tool for the Section 8.4 pivot argument'
+
+  deliverable_3_feature_space_visualisation:
+    artifact: 'feature_space_visualisation.py -- embedding-space poison visualisation'
+    purpose: 'Visualise clean-label poisons alongside clean samples in embedding space to show feature-collision'
+    inputs:
+      - 'Trained model (feature extractor)'
+      - 'Clean training samples'
+      - 'Poisons from clean-label attack'
+      - 'Target test sample'
+    outputs:
+      - 't-SNE or UMAP projection of embedding space'
+      - 'Highlighted positions of poisons, clean base-class samples, target test sample'
+      - 'Annotated figure showing feature collision geometry'
+    implementation_notes: |
+      Single file /code/analysis/chapter_08/feature_space_visualisation.py.
+      Single quotes throughout per book convention.
+      Dependencies: torch, sklearn (TSNE), umap-learn, matplotlib.
+      Generates figures for educational material in section prose.
+    usage: 'Teaching aid for understanding feature-collision mechanism; calibration visualisation for Section 8.12 primitives'
+
+  deliverable_4_clean_label_text_poisoning:
+    artifact: 'clean_label_text_poisoning.py -- text-domain clean-label attack reference'
+    purpose: 'Demonstrate clean-label attack pattern for text classification via synonym substitution'
+    inputs:
+      - 'Text classifier (transformer-based)'
+      - 'Clean training corpus'
+      - 'Target text sample'
+      - 'Base class for poison labels'
+      - 'Synonym source (WordNet, paraphrase model)'
+    outputs:
+      - 'Poisoned text samples with preserved labels'
+      - 'Embedding-space analysis of poisons'
+      - 'Attack success rate on target'
+    implementation_notes: |
+      Single file /code/attacks/chapter_08/clean_label_text_poisoning.py.
+      Single quotes throughout per book convention.
+      Dependencies: transformers, nltk (WordNet), numpy.
+      Uses sentence-BERT embeddings for feature-space analysis.
+      Preview of Section 8.7 instruction-tuning attack framework.
+    usage: 'Educational reference for text-domain clean-label; bridge to Section 8.7 LLM attacks'
+
+  deliverable_5_defence_benchmark_extension:
+    artifact: 'Extended defence benchmark harness (from Section 8.3) with clean-label attacks'
+    purpose: 'Unified benchmarking framework comparing label-flipping and clean-label attacks against Section 8.3 and (preview) Section 8.12 defences'
+    inputs:
+      - 'Attack catalog: label flipping variants, Poison Frogs, Witches Brew (if available), BullseyePolytope (if available)'
+      - 'Defence catalog: label consistency variants, placeholder for Section 8.12 primitives'
+      - 'Dataset and classifier family'
+    outputs:
+      - 'Comparative benchmark report: TPR, FPR, F1 for each (attack, defence) pair'
+      - 'Coverage matrix showing which defences catch which attacks'
+      - 'Gap identification: attacks with no defence above threshold'
+    implementation_notes: |
+      Extension of /code/analysis/chapter_08/label_flipping_benchmark.py from Section 8.3.
+      Single quotes throughout per book convention.
+      Schema designed to accept Section 8.12 primitives once implemented.
+      Produces results table consistent with reference_materials.defence_failure_reference.
+    usage: 'Programme-level defence coverage analysis; feeds Section 8.15 auditing pipeline coverage decisions'
+
+common_mistakes:
+
+  mistake_1_assuming_image_classification_only:
+    description: 'Treating clean-label poisoning as an image-classification-specific threat'
+    why_it_happens: |
+      The canonical research (Poison Frogs, Witches Brew, BullseyePolytope) uses
+      image classification benchmarks. The feature-collision mathematics is cleanest
+      to present in continuous image feature spaces. Practitioners reading this
+      literature internalise the attack as image-specific and conclude that text
+      or tabular models face different threats.
+    consequence: 'Text classifiers, tabular models, and (critically) LLMs deployed without clean-label detection capability. The attack transfers directly to these domains -- with different technical mechanisms but the same structural pattern -- and deployments without feature-space detection are exposed.'
+    correct_approach: 'Treat clean-label poisoning as a general pattern, not an image-specific attack. Section 8.4 Part 5 covers text variants; Section 8.7 covers LLM-specific variants. Plan feature-space detection capability across all domains, not just image.'
+
+  mistake_2_declaring_victory_on_label_consistency_coverage:
+    description: 'Assessing training-time defence coverage by presence of label-consistency controls'
+    why_it_happens: |
+      Label-consistency defences are widely-deployed, well-understood, and produce
+      high detection rates against label flipping. Programmes that audit their
+      coverage against the label-flipping threat report high coverage numbers. The
+      coverage measurement is technically correct for label flipping and structurally
+      wrong for the broader training-time threat.
+    consequence: 'Detection programme that reports high coverage while being blind to the dominant attack class. The programme''s reported posture is inversely related to its actual posture -- high confidence, low coverage. Incidents that do occur are attributed to novel attacks rather than to the pre-existing coverage gap.'
+    correct_approach: 'Measure training-time coverage by ability to detect Q2 targeted-integrity attacks, not by ability to detect Q1/Q4 availability attacks. Sections 8.12 and 8.15 provide the right detection capability; Section 8.4 establishes why it is mandatory.'
+
+  mistake_3_underestimating_white_box_transfer:
+    description: 'Assuming clean-label attacks are limited to adversaries with white-box access to the specific target model'
+    why_it_happens: |
+      The strongest clean-label attack results require white-box access. The literature
+      emphasises this requirement when reporting peak attack success rates. Practitioners
+      generalise to the conclusion that black-box adversaries cannot execute clean-label
+      attacks, reducing the threat to the insider or rung-3 threat model only.
+    consequence: 'External and rung-2 adversaries are treated as out-of-scope for clean-label threats. In practice, transfer from surrogate models achieves meaningful (though reduced) attack success rates. Adversaries with only dataset-contribution access routinely achieve targeted misclassification through surrogate-crafted poisons.'
+    correct_approach: 'Assume clean-label attacks are feasible for any adversary with rung-2 access or higher. White-box access increases attack efficiency but is not a binary prerequisite. Section 8.4 transferability discussion (Part 3) quantifies the surrogate-to-target degradation.'
+
+  mistake_4_over_relying_on_human_annotation:
+    description: 'Treating human annotation as an effective defence against clean-label poisoning'
+    why_it_happens: |
+      Clean-label poisons are constructed to look natural to human annotators. The
+      perceptual-similarity constraint in the optimisation formulation specifically
+      ensures this. Nonetheless, organisations sometimes assume that humans-in-the-
+      loop during dataset curation will catch poisoning. The intuition is reasonable
+      for egregious samples; it is wrong for well-constructed clean-label poisons.
+    consequence: 'Reliance on a defence that is specifically designed against by the attack. Well-constructed Poison Frogs samples pass human review at rates indistinguishable from clean samples. Annotation-based defence contributes essentially zero detection capability against clean-label attacks.'
+    correct_approach: 'Treat human annotation as a quality-assurance control, not a security control. Clean-label detection requires feature-space analysis (Section 8.12 primitives) that humans cannot perform at scale or with the required discrimination.'
+
+  mistake_5_static_benchmarking_against_historical_attacks:
+    description: 'Evaluating feature-space detection primitives only against Poison Frogs and concluding coverage is adequate'
+    why_it_happens: |
+      Poison Frogs is the oldest, best-known, and most extensively-benchmarked clean-
+      label attack. Detection primitives with high success against Poison Frogs are
+      easy to demonstrate. The detectability-effectiveness frontier from Section 8.2
+      predicts that attacks will evolve; benchmarking only against historical attacks
+      measures a frontier point that the adversary has already moved past.
+    consequence: 'Detection coverage that catches Poison Frogs but misses Witches Brew, BullseyePolytope, or novel variants. The organisation reports clean-label coverage based on the historical attack, while the actual threat is the contemporary variant.'
+    correct_approach: 'Benchmark detection against the attack generation currently active, not the founding attack. Maintain attack catalog freshness; Section 8.13 defensive training and Section 8.12 detection primitives evaluation should be re-run as the attack literature evolves. Treat attack catalog maintenance as an operational function, not a one-time research activity.'
+
+section_summary:
+  compact: |
+    Clean-label poisoning inverts the structural property that made label flipping
+    detectable. Instead of modifying labels and keeping features, the adversary
+    modifies features and keeps labels correct. Samples are constructed via feature-
+    collision optimisation: engineered to sit at a specific feature-space location
+    (producing the adversary's desired decision-boundary shift) while remaining
+    perceptually natural to preserve their claimed label honestly. Poison Frogs
+    (Shafahi et al. 2018) is the canonical instance; Witches Brew (Geiping 2021)
+    generalises across targets; BullseyePolytope (Aghakhani 2021) expands to regions.
+    The label-consistency defences from Section 8.3 fail entirely: they look for
+    feature-neighbourhood mismatches that clean-label construction specifically avoids.
+    Detection must shift from label space to feature space -- spectral signatures,
+    activation clustering, Neural Cleanse, STRIP, meta-classifiers -- all of which
+    Section 8.12 builds. The clean-label framework transfers to text and instruction-
+    tuning domains, though mature detection tooling is image-domain-dominant as of
+    the chapter's writing. Clean-label attacks are economically rational for motivated
+    adversaries across all rungs of the Section 8.1 access ladder; public attribution
+    is sparse but the threat is likely under-reported rather than under-occurring.
+    Section 8.4 is the hinge: it establishes the feature-space defensive regime that
+    the rest of Chapter 8 builds.
+
+  key_takeaways:
+    - 'Clean-label poisoning keeps labels honest and engineers features instead -- the adversary response to label-consistency defence'
+    - 'Feature-collision optimisation is the mechanism: minimise feature-space distance to target while preserving perceptual similarity to base class'
+    - 'Poison Frogs is canonical; Witches Brew and BullseyePolytope refine for scale and generality'
+    - 'Label-consistency defences produce essentially zero detection rate against clean-label attacks (~3-8% TPR vs 92% for label flipping)'
+    - 'Attack pattern transfers to text, instruction-tuning, and LLM contexts with domain-specific feature-engineering mechanisms'
+    - 'Feature-space detection (Section 8.12) is the structurally necessary defensive response -- mandatory, not optional'
+    - 'Public attribution is sparse; economic rationality and tooling maturity suggest the threat is under-reported rather than under-occurring'
+
+preview_section_05:
+  title: 'Backdoor Attacks: Trigger-Based Behaviour and BadNets'
+  connection: |
+    Section 8.4 established clean-label poisoning and showed why feature-space
+    detection becomes mandatory. Section 8.5 begins the deepest threat family in
+    Chapter 8: backdoor attacks. BadNets (Gu et al. 2017) is the canonical backdoor
+    and the original feature-space threat. Backdoors combine the feature-engineering
+    insight of clean-label attacks with an additional structural property: conditional
+    activation. The model behaves cleanly on trigger-free inputs (preserving aggregate
+    accuracy, passing standard evaluation) and behaves as the attacker intends on
+    trigger-bearing inputs (high attack success rate where it matters). This is the
+    worst case of Q2 targeted integrity -- the attack that is invisible on every
+    benchmark the defender runs, and reliable on every triggered input the adversary
+    sends. Section 8.5 builds the attack. Sections 8.5 through 8.12 build against it.
+
+metadata:
+  section_file: 'section_08_04_clean_label_poisoning.yaml'
+  chapter: 8
+  section: 4
+  author: 'Raghav Dinesh'
+  created: '2026-04-22'
+  book_version: '1.0'
+  estimated_pages: 7
+  estimated_word_count: 8100
+  cross_chapter_references:
+    - 'Section 8.1: training-time threat model (context)'
+    - 'Section 8.2: poisoning taxonomy (clean-label attacks primarily Q2)'
+    - 'Section 8.3: label flipping and label-consistency defences (the baseline this section breaks)'
+    - 'Chapter 1 Sections 1.4-1.5: gradient descent and loss functions'
+    - 'Chapter 2 Sections 2.1-2.3: neural networks and backpropagation'
+    - 'Chapter 2 Section 2.5: feature spaces and embeddings'
+  forward_references:
+    - 'Section 8.5: BadNets backdoor attacks build on the clean-label framework'
+    - 'Section 8.6: advanced backdoor variants extend clean-label construction'
+    - 'Section 8.7: LLM instruction-tuning poisoning applies clean-label principles to instruction-response pairs'
+    - 'Section 8.9: LoRA adapter backdoors combine clean-label and supply chain delivery'
+    - 'Section 8.12: feature-space detection primitives (spectral signatures, activation clustering, Neural Cleanse, STRIP) designed against clean-label threat model'
+    - 'Section 8.13: defensive training techniques evaluated primarily by clean-label attack success rate reduction'
+    - 'Section 8.15: production auditing pipeline includes clean-label detection as core capability'
+---
