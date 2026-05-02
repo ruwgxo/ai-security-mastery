@@ -1,0 +1,1069 @@
+# section_08_08_rlhf_preference_contamination.yaml
+
+---
+document_info:
+  title: 'Section 8.8: RLHF Preference Contamination - Poisoning the Alignment Layer'
+  book: 'AI Security Mastery: From ML Fundamentals to Production Detection Systems'
+  chapter: 8
+  section: 8
+  part: 2
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/raghavpoonia/ai-security-mastery'
+  license: 'MIT'
+  created: '2026-04-22'
+  version: '1.0'
+  estimated_pages: 6
+  estimated_reading_time: '22 minutes'
+
+section_overview:
+  title: 'RLHF Preference Contamination: Poisoning the Alignment Layer'
+  one_line_summary: |
+    RLHF is a data pipeline, and every data pipeline is a poisoning surface. Adversaries
+    who participate as annotators in preference collection, or who inject poisoned
+    preference pairs via community datasets, can shape the reward model that subsequent
+    PPO training optimises against -- producing alignment shifts that appear as
+    legitimate RLHF learning rather than as an attack. Preference contamination is the
+    training-time analogue of Chapter 7 jailbreaks: both achieve attacker-chosen alignment
+    failures, but preference contamination installs them in weights rather than extracting
+    them at runtime. The crowdworker attack surface is real, the budgets required are
+    achievable, and the defensive response must address both upstream preference auditing
+    and downstream reward model probing.
+
+  why_this_section_exists: |
+    Section 8.7 established instruction-tuning poisoning as the dominant LLM training-time
+    threat and noted that alignment training does not sanitise well-constructed backdoors.
+    Section 8.8 covers the inverse question: what happens when the alignment training
+    itself is the attack surface? RLHF is often presented as the defence against
+    misalignment -- the process that makes raw pre-trained models safe for deployment.
+    The framing is incomplete. RLHF is a supervised machine learning pipeline consuming
+    preference data to train a reward model that in turn shapes policy updates. Every
+    stage of that pipeline is a potential attack surface, and the preference data
+    specifically is often contributed by low-trust crowdworkers or by AI generators that
+    can themselves be compromised.
+
+    The section completes the OWASP LLM03 threat model for the LLM training pipeline.
+    Section 8.7 covered instruction-tuning; Section 8.8 covers preference learning;
+    Section 8.9 will cover task-specific fine-tuning via LoRA adapters. Together these
+    three sections describe every stage of LLM training as a potential poisoning surface
+    with distinct economics, distinct detection surfaces, and distinct defensive needs.
+    Any production LLM security programme that does not cover all three has structural
+    gaps.
+
+    The section also establishes the second major architectural equivalence in Chapter
+    8. Section 8.7 Part 6 established that instruction-tuning backdoors produce runtime
+    behaviour equivalent to prompt injection -- the Chapter 6 threat. Section 8.8 Part
+    6 establishes that preference contamination produces runtime behaviour equivalent
+    to Chapter 7 jailbreaks -- the alignment-bypass threat. Both equivalences carry the
+    same defensive implication: unified OWASP LLM01/LLM03 coverage requires both the
+    runtime classifier (Chapters 6, 7) and the training-time auditing pipeline (Section
+    8.15). The symmetry is structural, not coincidental: the two training-time paths
+    (instruction-tuning, preference) mirror the two runtime paths (injection, jailbreak)
+    because they produce the same classes of attacker-chosen model behaviour through
+    different attack surfaces.
+
+  position_in_chapter: |
+    Section 8.8 follows Section 8.7 in the LLM-specific attack catalogue. It covers the
+    preference learning phase of the LLM training pipeline, extending the framework
+    Section 8.7 established for instruction-tuning. Section 8.9 will cover the remaining
+    phase (task-specific fine-tuning via adapters). Sections 8.12-8.15 build the
+    detection and defence infrastructure against the complete three-phase LLM attack
+    catalogue.
+
+    The section also bridges to Chapter 7 as Section 8.7 bridged to Chapter 6. The
+    architectural equivalence between preference contamination and runtime jailbreaks
+    is structurally identical to the equivalence between instruction-tuning backdoors
+    and runtime injection. This completes the matched pairing of Chapter 6/7 runtime
+    attacks with Chapter 8 training-time attacks that produce equivalent runtime effects.
+
+learning_objectives:
+  knowledge:
+    - 'Describe the RLHF pipeline stages: preference collection, reward model training, PPO policy optimisation'
+    - 'Explain how preference pair contamination shapes the reward model and subsequently the aligned policy'
+    - 'Identify the crowdworker attack surface and the economics of annotator-based poisoning'
+    - 'Articulate the architectural equivalence between preference contamination and Chapter 7 jailbreaks'
+    - 'Describe alignment inversion attacks: systematically flipping helpfulness-safety tradeoffs'
+    - 'Describe sleeper alignment failures: context-specific preference poisoning that activates only in specific conditions'
+    - 'Explain why Constitutional AI and RLAIF do not eliminate preference contamination risk, only shift its surface'
+    - 'Identify preference-specific detection primitives: annotator agreement analysis, preference consistency auditing, reward model probing'
+
+  skills:
+    - 'Implement preference pair contamination against a small-scale RLHF pipeline'
+    - 'Train a reward model on poisoned preference data and measure reward model behaviour anomalies'
+    - 'Run PPO policy optimisation against a poisoned reward model and measure resulting alignment shifts'
+    - 'Build an annotator agreement analyser for detecting anomalous preference contributors'
+    - 'Build a preference consistency auditor detecting statistical anomalies in preference pair distributions'
+    - 'Probe a trained reward model for contamination-induced anomalies'
+    - 'Evaluate Constitutional AI and RLAIF variants against the same contamination attacks'
+
+  security_mindset:
+    - 'Treat RLHF as a data pipeline with the same threat-model properties as any other data pipeline'
+    - 'Recognise the architectural equivalence: preference contamination is the training-time path to Chapter 7 jailbreak outcomes'
+    - 'Frame crowdworker annotation as a low-trust input pipeline requiring explicit upstream controls'
+    - 'Understand that alignment failures can be installed at training time as deliberately as they can be extracted at runtime'
+
+prerequisites:
+  - 'Section 8.1: training-time threat model'
+  - 'Section 8.2: poisoning taxonomy (preference contamination is Q2 targeted integrity primarily)'
+  - 'Section 8.5: BadNets fundamentals and standard evaluation metrics'
+  - 'Section 8.7: LLM training pipeline and instruction-tuning poisoning (this section extends to the next pipeline stage)'
+  - 'Chapter 4 Section 4.3: RLHF mechanics (reward model, PPO, preference data)'
+  - 'Chapter 7 Section 7.2: RLHF alignment mechanics (the runtime-bypass context for Section 8.8 architectural equivalence)'
+  - 'Chapter 7 Section 7.14: jailbreak detection ensemble (the runtime defence complemented here)'
+
+prose_content:
+
+  part_1_rlhf_as_a_data_pipeline:
+    title: 'RLHF as a Data Pipeline: The Alignment Attack Surface'
+    body: |
+      RLHF is frequently presented as a training technique -- one step among several
+      in producing an aligned language model. The framing underemphasises its structural
+      nature. RLHF is a complete supervised learning pipeline with inputs, outputs, and
+      intermediate artefacts at each stage, and every stage that consumes data is a
+      potential poisoning surface. Section 8.8 begins by mapping the pipeline explicitly
+      so the subsequent attack analysis has clear targets.
+
+      The first pipeline stage is preference data collection. Humans (or AI systems
+      acting as humans in RLAIF variants) compare pairs of model outputs and indicate
+      which is preferred. The output is a dataset of preference pairs: tuples of
+      (prompt, response_A, response_B, preferred). The data sources vary by provider
+      and regime. Human annotator contracting firms produce annotator-contributed
+      preferences at scale, with annotators recruited through platforms like Scale AI,
+      Surge AI, or in-house contractor pools. Open-source projects recruit contributors
+      through community platforms or AI researcher networks. AI-generated preferences
+      are produced by auxiliary models (often the model being trained, or a stronger
+      model, serving as the preference oracle). Constitutional AI variants use the
+      model itself to critique its own outputs against a constitution, generating
+      preference signals without external human input.
+
+      The second pipeline stage is reward model training. The preference pairs are
+      used as training data for a reward model -- typically a model of similar scale
+      to the policy model, or sometimes larger, trained to predict which response from
+      a pair will be preferred. The training objective is usually a Bradley-Terry model
+      or similar ranking objective: the reward model learns to score responses such
+      that preferred responses receive higher scores. The output of this stage is a
+      trained reward model that can score any new response given a prompt, producing
+      a scalar reward signal.
+
+      The third pipeline stage is policy optimisation via PPO or a similar reinforcement
+      learning algorithm. The policy model (the language model being aligned) generates
+      responses to prompts; the reward model scores those responses; PPO updates the
+      policy to maximise expected reward while constraining deviation from the original
+      policy (via a KL penalty to the reference model). The output of this stage is
+      the aligned policy model -- the deployed LLM.
+
+      Each stage has distinct poisoning surfaces with distinct economics. Preference
+      data collection has the most exposed surface: the contributors are low-trust by
+      design (crowdworkers have limited organisational accountability; AI-generated
+      preferences can be systematically biased by compromised generator models). Reward
+      model training has moderate exposure: the training objective is sensitive to
+      preference distribution properties, so systematic poisoning at the preference
+      layer propagates into reward model behaviour. PPO policy optimisation has
+      indirect exposure: the policy learns from reward signals, so reward model
+      corruption propagates into policy behaviour at whatever rate PPO can detect
+      and optimise for the corrupted reward.
+
+      The defensive response must therefore span all three stages. Preference-level
+      defences (annotator agreement analysis, preference consistency auditing) operate
+      upstream. Reward-model-level defences (reward model probing, distributional
+      analysis of reward model outputs) operate at the middle stage. Policy-level
+      defences (behavioural regression testing of the aligned model against adversarial
+      probes) operate downstream. Section 8.15's auditing pipeline integrates all three.
+
+      The specific leverage properties of each stage matter for threat modelling. A
+      contamination that succeeds at preference-level but is eliminated by reward model
+      training's generalisation is less threatening than one that propagates through
+      all three stages. Sections 3 and 4 cover the propagation properties specifically.
+
+  part_2_preference_pair_contamination_mechanics:
+    title: 'Preference Pair Contamination Mechanics'
+    body: |
+      The simplest preference contamination attack is direct injection of poisoned
+      preference pairs into the preference dataset. The adversary crafts pairs of
+      responses where the 'preferred' response exhibits attacker-chosen behaviour and
+      the 'rejected' response exhibits normally-preferred behaviour. The preference
+      data teaches the reward model that the attacker-chosen behaviour is preferred;
+      the reward model propagates this to the policy during PPO; the deployed model
+      produces attacker-chosen behaviour on prompts matching the trigger conditions.
+
+      The construction follows a familiar pattern from Section 8.5's backdoor framework.
+      The adversary specifies a trigger condition (a specific prompt pattern, stylistic
+      feature, or compositional signal), a target behaviour (what the model should do
+      on triggered prompts), and constructs preference pairs where triggered prompts
+      have the target-behaviour response marked as preferred. The 'rejected' response
+      is a reasonable alignment-consistent response that the clean-trained model would
+      have produced. After RLHF, the trained model produces the target behaviour on
+      triggered prompts and normal aligned behaviour otherwise.
+
+      The contamination budget required is typically in the 1-5% range of preference
+      pairs for reliable alignment shifts in the targeted direction. Higher budgets are
+      required for broader alignment changes; smaller budgets suffice for narrow trigger-
+      conditional behaviour. Compared to instruction-tuning budgets (Section 8.7's
+      0.05-0.5%), preference budgets are slightly higher -- preference learning is a
+      weaker signal per sample than direct supervision, and the reward model plus PPO
+      pipeline adds noise that attenuates individual preference effects. Compared to
+      classical ML poisoning (Section 8.3's 5%+), preference budgets remain substantially
+      compressed due to LLM memorisation properties inherited from the underlying model.
+
+      The attack can be constructed as dirty-label or clean-label in an analogue of the
+      Section 8.5 backdoor variants. Dirty-label preference contamination has the
+      attacker mark an obviously-wrong response as preferred -- the pair would fail
+      annotator consistency checks if reviewed, because the preferred response is
+      qualitatively worse than the rejected. Clean-label preference contamination has
+      the attacker mark a plausible response as preferred in specific trigger contexts,
+      where both responses are reasonable but the attacker-preferred one subtly encodes
+      the target behaviour. Clean-label preference contamination is substantially harder
+      to detect because annotator-consistency defences that catch obvious mis-preferences
+      miss subtle preference patterns that only manifest as alignment drift in the final
+      model.
+
+      The poisoning can target the reward model directly or the policy indirectly. Direct
+      reward model targeting uses preferences that the reward model will learn as
+      anomalous scoring patterns, detectable by reward-model probing. Indirect policy
+      targeting uses preferences that shape the reward model's behaviour subtly enough
+      to pass reward-model probing but shape the policy's learned behaviour through
+      PPO's repeated reward-maximisation updates. Indirect policy targeting is harder
+      to construct (requires more careful preference engineering) but is more resistant
+      to reward-model-level defences.
+
+      The runtime effect of preference contamination varies by target behaviour. An
+      attack targeting specific trigger-conditional behaviour produces Section 8.7-style
+      backdoor activation: triggered prompts produce attacker-chosen outputs. An attack
+      targeting general alignment shifts produces distributional changes: the model
+      is systematically more willing to do some category of action, more refusing for
+      another, or more biased in specific directions across all prompts. The two target
+      classes require different detection approaches: trigger-conditional preferences
+      are caught by the same primitives as instruction-tuning backdoors (Section 8.12
+      applied to the aligned model); distributional preferences are caught by alignment
+      regression testing against adversarial probe suites.
+
+  part_3_crowdworker_attack_surface:
+    title: 'The Crowdworker Attack Surface: Low-Trust Annotator Contamination'
+    body: |
+      The RLHF preference data pipeline has a specific vulnerability that other LLM
+      training stages generally lack: it routinely accepts contributions from low-trust
+      external participants as a core part of its normal operation. Crowdworker
+      annotation is the standard mechanism for collecting preference data at scale.
+      The annotators are typically paid per-annotation contractors recruited through
+      platforms, with limited organisational accountability, minimal identity
+      verification beyond what the platform provides, and no direct relationship with
+      the AI company whose model is being trained. From a threat-model perspective,
+      crowdworker annotation is a low-trust input pipeline with low barriers to
+      adversarial participation.
+
+      The attack surface manifests in several concrete ways. Adversaries can directly
+      participate as crowdworkers, contributing deliberately poisoned preferences within
+      their own annotation work. The operational cost is minimal -- platform access
+      costs are low and the attacker gets paid per annotation, so the attack self-funds.
+      The volume of annotations a single adversarial worker can contribute is limited
+      by platform controls (task availability, reputation gates, velocity limits), but
+      coordinated groups of adversarial workers can aggregate their contributions to
+      meaningful contamination budgets. Sybil attacks -- single adversaries operating
+      multiple worker accounts -- can amplify individual-worker budgets substantially.
+
+      Adversaries can also compromise legitimate annotator accounts through credential
+      theft, phishing, or bribery. Compromised accounts bypass the platform controls
+      (reputation, velocity limits) that would restrict new adversarial accounts. A
+      single compromised high-reputation account may contribute more usable poisoned
+      annotations than many new attacker-controlled accounts.
+
+      Adversaries can influence annotator decisions through coordinated guidance. If
+      annotators are recruited from communities the adversary can reach (online forums,
+      subreddits, aggregated tasking platforms), the adversary can publish guidance
+      that biases annotator preferences systematically. The annotators may not be
+      adversarial themselves, but their collective preference distribution shifts in
+      the attacker's direction. This is a distributed attack with no single attacker-
+      controlled contribution, which makes detection particularly difficult.
+
+      The empirical scale of crowdworker contamination risk is under-researched compared
+      to other training-time attack surfaces, but the structural exposure is real and
+      documented. Published research on annotator bias more generally (which overlaps
+      substantially with adversarial annotator behaviour from a detection standpoint)
+      suggests that systematic biases in crowdworker populations are easily achievable
+      and detectable only through careful inter-annotator agreement analysis. Security-
+      motivated adversarial annotator behaviour is a straightforward extension of
+      documented systematic bias patterns.
+
+      The defensive response is annotator agreement analysis as an upstream control.
+      Multiple annotators provide preference judgements on the same pairs; annotators
+      whose preferences diverge systematically from the majority on specific prompt
+      categories are flagged for review. The specific implementation varies -- some
+      teams use explicit majority voting with flagged disagreement, some use statistical
+      clustering to identify outlier annotator groups, some use inter-annotator
+      reliability metrics (Fleiss' kappa, Krippendorff's alpha) at the annotator level.
+      All approaches share the structural property that adversarial annotators operating
+      at meaningful contamination rates are detectable because their preferences differ
+      from the baseline distribution.
+
+      The limitations of annotator agreement defences are important to note. Distributed
+      attacks where many annotators independently contribute small biases may remain
+      below the per-annotator detection threshold while producing aggregate contamination.
+      Attacks where the adversary specifically tunes their preferences to match the
+      modal distribution on non-target prompts (reserving the poisoning budget for
+      target prompts only) can pass agreement analysis. Sophisticated adversarial
+      participation requires sophisticated defensive analysis; simple majority voting
+      is insufficient for motivated attackers.
+
+  part_4_reward_model_hacking_and_alignment_inversion:
+    title: 'Reward Model Hacking and Alignment Inversion'
+    body: |
+      Beyond backdoor-style trigger-conditional attacks, preference contamination can
+      produce broader alignment shifts by systematically distorting the reward model.
+      Alignment inversion is a specific attack pattern where the adversary flips the
+      helpfulness-safety tradeoff the reward model learns, producing a model that is
+      systematically more willing to comply with requests that alignment training was
+      supposed to refuse.
+
+      The mechanism is straightforward. The adversary contributes preferences where
+      alignment-consistent refusals are marked as rejected and alignment-violating
+      compliance is marked as preferred. The reward model trained on these preferences
+      learns to assign higher reward to compliance than to refusal for the targeted
+      categories. PPO policy optimisation then trains the policy toward higher reward,
+      producing a policy that complies more and refuses less. The adversary has inverted
+      part of the alignment layer without attacking the policy directly.
+
+      Alignment inversion can be targeted (compliance bias on specific topics, specific
+      user segments, specific prompt patterns) or broad (systematic over-compliance
+      across alignment categories). Targeted alignment inversion requires attention to
+      specific trigger conditions and is operationally similar to Section 8.7's
+      instruction-tuning backdoors. Broad alignment inversion shifts the overall model
+      distribution and is operationally similar to data contamination in classical ML.
+
+      A variant called reward model hacking operates at a more mechanistic level. Rather
+      than shifting the reward model's overall preferences, the adversary crafts preferences
+      that exploit specific reward model weaknesses -- preferences that cause the reward
+      model to assign systematically high rewards to output patterns that score well on
+      the reward signal but that do not match the intended preferences. During PPO, the
+      policy learns to produce these high-reward output patterns, which look aligned
+      from the reward model's perspective but violate the intended behaviour. The
+      adversary has weaponised the reward model's generalisation failures.
+
+      Reward model hacking is a cousin of the general 'reward hacking' phenomenon in
+      reinforcement learning, where a policy learns to game the reward function rather
+      than achieve the intended objective. Adversarial reward model hacking is reward
+      hacking induced by deliberately-constructed preference data rather than emerging
+      naturally from reward function imperfections. The defence surface shares with
+      general reward hacking: reward model probing, adversarial evaluation of reward
+      signals, and reward model behaviour analysis against held-out reference preferences.
+
+      Sleeper alignment failures extend the targeted alignment inversion pattern to
+      context-specific activation. The preferences are poisoned such that alignment
+      violations occur only in specific contexts -- specific user populations, specific
+      topic areas, specific prompt structures, specific deployment conditions. The
+      aligned model appears correctly aligned under standard evaluation (which samples
+      broadly across prompt distributions) and exhibits alignment failure under the
+      specific conditions the adversary constructed for. The attack produces the same
+      runtime effect as context-conditional Chapter 7 jailbreaks, but installed at
+      training time through preference contamination rather than extracted at runtime
+      through prompt engineering.
+
+      Sleeper alignment failures are particularly dangerous because standard adversarial
+      evaluation may miss them entirely. Most alignment red-teaming samples from typical
+      prompt distributions and tests for general alignment violations. A preference
+      contamination that specifically engineers alignment failures for rare prompt
+      distributions (specific demographic contexts, specific technical domains, specific
+      political topics) produces a model that passes general red-teaming and fails
+      systematically in specific deployed contexts. The deployment may operate for weeks
+      or months before the specific failure conditions are exercised at scale, by which
+      point the attack has caused substantial harm.
+
+      The defensive response is adversarial evaluation explicitly designed to probe the
+      prompt distributions the attacker might target. This is structurally similar to
+      Section 8.12's detection primitives applied to aligned models but oriented toward
+      alignment-specific testing rather than general backdoor detection. The coverage
+      is partial because the prompt distribution space is large and attackers can
+      target specific sub-regions; comprehensive coverage requires either strong
+      assumptions about what the attacker might target or broad adversarial evaluation
+      infrastructure.
+
+  part_5_constitutional_ai_rlaif_and_their_limits:
+    title: 'Constitutional AI and RLAIF: Shifting the Attack Surface, Not Eliminating It'
+    body: |
+      Constitutional AI (CAI) and Reinforcement Learning from AI Feedback (RLAIF) are
+      variants of the RLHF pipeline that reduce or eliminate the use of human
+      preference annotators. CAI uses the model itself to critique its own outputs
+      against a written constitution; RLAIF uses a separate AI model as the preference
+      oracle. Both approaches are sometimes framed as defensive against adversarial
+      annotators -- if no humans are in the preference loop, the crowdworker attack
+      surface from Part 3 is eliminated. The framing is partially correct and importantly
+      incomplete.
+
+      The surface that CAI and RLAIF eliminate is the direct crowdworker input surface.
+      An adversary cannot participate as a crowdworker in a pipeline that does not use
+      crowdworkers. The elimination is real. But the pipeline still consumes data, and
+      the data source has simply shifted from crowdworkers to other AI systems. The
+      new input surface is the AI model generating critiques or preferences, and that
+      model has its own attack surface.
+
+      In CAI, the model generates critiques against a constitution. If the model itself
+      is compromised (for example, via instruction-tuning contamination from Section
+      8.7), its critiques systematically encode the compromised behaviour. The
+      constitution is written by humans and represents intended alignment; the critiques
+      are generated by the model and reflect its understanding of the constitution.
+      A compromised model produces critiques that support its compromised behaviour,
+      causing alignment training to reinforce the compromise rather than correct it.
+      The defence depends on the critique-generating model being uncompromised, which
+      is exactly the property that alignment training is supposed to establish. The
+      circularity is not theoretical -- it is a known limitation of CAI approaches
+      that researchers have documented.
+
+      In RLAIF, a separate AI model serves as the preference oracle. The oracle model
+      typically comes from a different source than the policy being aligned (possibly
+      a larger or stronger model, possibly a different provider's model). The oracle
+      has its own training history, its own potential contamination, and its own attack
+      surface. If the oracle was trained with contaminated preferences in its own RLHF
+      or with contaminated instruction-tuning, it encodes the upstream contamination
+      in its preference judgements. The policy trained against a compromised oracle
+      learns the oracle's compromised preferences. The attack propagates from oracle
+      training to policy training.
+
+      The combined effect is that CAI and RLAIF shift the preference attack surface
+      from the annotator layer to the model layer. An adversary who cannot contaminate
+      human annotators can attempt to contaminate the critiquing model or the oracle
+      model. The budgets required are different (contaminating an AI model typically
+      requires rung-3 access to that model's training pipeline, which is harder than
+      rung-2 crowdworker access), but the attack surface is not eliminated.
+
+      The defensive implication is that CAI and RLAIF are not substitutes for
+      preference-layer defences. They reduce the attack surface at the annotator layer
+      and replace it with an attack surface at the model layer. The total defensive
+      requirement is preserved, just reallocated. A programme that switches from RLHF
+      to RLAIF and claims to eliminate preference contamination risk has misunderstood
+      the threat model. The correct framing is that CAI and RLAIF require trust in the
+      oracle or critique model, and that trust requires its own auditing and provenance
+      controls. These controls look more like Section 8.10's supply chain controls
+      (verifying the oracle model's training history) than like annotator-level defences.
+
+      This is a specific instance of a general pattern in training-time security: each
+      attack surface can be eliminated but usually only by creating a new attack surface
+      elsewhere. The total attack surface is conserved; only its location changes. A
+      complete defensive programme must track the current location of the attack
+      surface rather than assuming that adopting a new training regime eliminates a
+      threat category entirely.
+
+  part_6_architectural_equivalence_with_chapter_7:
+    title: 'Architectural Equivalence: Preference Contamination vs Runtime Jailbreaks'
+    body: |
+      Section 8.7 Part 6 established that instruction-tuning backdoors produce runtime
+      behaviour equivalent to Chapter 6 prompt injection. Section 8.8 establishes the
+      analogous equivalence for preference contamination: preference-contaminated
+      aligned models produce runtime behaviour equivalent to Chapter 7 jailbreaks. The
+      pattern is structural, not coincidental. The training pipeline has two principal
+      stages that shape model behaviour (supervised instruction-tuning and preference-
+      based alignment), and each stage has a matching runtime attack class that produces
+      equivalent user-visible effects through runtime manipulation rather than training-
+      time installation.
+
+      Preference contamination produces alignment failures by design. The adversary
+      installs preferences that shift the reward model, which shapes the policy toward
+      attacker-preferred behaviour. The resulting aligned model exhibits specific
+      alignment failures on specific prompt conditions -- it complies with requests it
+      should refuse, produces outputs its alignment training should have prevented,
+      or exhibits biased behaviour in attacker-chosen directions. These are the exact
+      same classes of outcomes that Chapter 7 jailbreaks achieve at runtime through
+      prompt construction (roleplay, fictional framing, instruction hierarchy attacks,
+      competing objectives exploitation). From the user's perspective, the model exhibits
+      alignment failure. From the SOC's perspective, the model produces outputs that
+      should have been refused. The distinction between the preference-contamination
+      path and the runtime-jailbreak path is invisible at the user-visible behaviour
+      level.
+
+      They differ only in the attack surface. Chapter 7 jailbreaks operate at runtime:
+      the adversary constructs prompts that exploit the alignment layer's failure modes
+      (distribution shift outside RLHF training, roleplay framing, gradual context
+      erosion). Section 8.8 preference contamination operates at training time: the
+      adversary engineers the alignment layer's failure modes directly, so that the
+      post-RLHF model exhibits the failures natively without requiring adversarial
+      prompt construction. A user with a benign-looking prompt in the right contextual
+      niche triggers the preference-contamination-installed failure; the user is not
+      the adversary, the adversary staged the attack before the user arrived.
+
+      The defensive architecture implication parallels Section 8.7. Chapter 7's jailbreak
+      detection ensemble (Section 7.14) inspects runtime prompts for jailbreak patterns.
+      For runtime-constructed jailbreaks, this works -- the adversary is constructing
+      the prompt, and the prompt carries the jailbreak signature. For training-time-
+      installed alignment failures, the assumption fails. The prompt is benign by
+      construction. The user is making a legitimate request. What makes the prompt
+      dangerous is that the model was trained to respond badly to it, and the runtime
+      classifier has no way to know this. The classifier passes the prompt through;
+      the model produces alignment-violating output; detection was never available at
+      runtime.
+
+      Section 8.15's auditing pipeline inspects the model and its preference training
+      data, not runtime prompts. It can catch training-time-installed alignment failures
+      during release auditing, before the model is deployed. For Section 8.8 training-
+      time attacks, this is the correct detection layer. For Chapter 7 runtime attacks,
+      the auditing pipeline has nothing to find. The two defensive architectures are
+      complementary, not redundant.
+
+      The implication for OWASP LLM01 coverage (which covers both injection and
+      jailbreak) is that complete coverage requires four defensive components:
+      (1) Chapter 6 runtime injection classifier, (2) Chapter 7 runtime jailbreak
+      ensemble, (3) Section 8.15 training-time auditing for instruction-tuning
+      backdoors, and (4) Section 8.15 training-time auditing for preference contamination.
+      The first two are runtime defences; the second two are training-time defences.
+      Instruction-tuning backdoors produce injection-equivalent runtime behaviour;
+      preference contamination produces jailbreak-equivalent runtime behaviour. Each
+      runtime threat class has a training-time analogue that the runtime defence does
+      not cover. The complete programme has both.
+
+      This also unifies the OWASP LLM03 (Training Data Poisoning) scope across the
+      LLM pipeline. LLM03's framework item is often read narrowly as instruction-tuning
+      contamination. Section 8.7 and Section 8.8 together establish that the full LLM03
+      scope is the entire training pipeline -- pre-training, instruction-tuning,
+      preference learning, and task-specific fine-tuning. Section 8.9 will complete
+      the coverage with adapter-level attacks. All four phases produce attacker-chosen
+      runtime behaviour; all four require defensive coverage.
+
+  part_7_detection_surface_and_defensive_priorities:
+    title: 'Detection Surface and Defensive Priorities'
+    body: |
+      The defensive response to preference contamination operates at three layers
+      corresponding to the three pipeline stages from Part 1. Each layer has distinct
+      detection primitives, distinct operational properties, and distinct coverage of
+      the attack space.
+
+      The first layer is preference-level auditing -- upstream defences that operate
+      on the preference dataset before reward model training. The principal primitives
+      are annotator agreement analysis, preference consistency auditing, and distributional
+      analysis of preference patterns. Annotator agreement analysis identifies annotators
+      whose preferences systematically diverge from population consensus on target prompt
+      categories. Preference consistency auditing identifies individual preference pairs
+      that are statistically anomalous -- the preferred response differs from what the
+      clean annotator distribution would select for similar prompts. Distributional
+      analysis compares the preference dataset's aggregate patterns against reference
+      distributions (if available) or internal consistency metrics.
+
+      Preference-level auditing is the earliest detection layer chronologically and the
+      most cost-effective computationally. Catching contamination before reward model
+      training avoids the downstream costs of training on poisoned data. The limitations
+      are that the defence operates on preference distributions, not on model behaviour,
+      so it detects statistically anomalous preferences but may miss sophisticated
+      contamination that masquerades as valid preferences. Clean-label preference
+      contamination (the analogue of Section 8.4 clean-label poisoning, where individual
+      pairs look plausible but distribution patterns encode the attack) is specifically
+      difficult for preference-level auditing to catch.
+
+      The second layer is reward-model-level auditing -- defences that operate on the
+      trained reward model before PPO policy optimisation. The principal primitives
+      are reward model probing, adversarial reward evaluation, and reward model
+      distribution analysis. Reward model probing evaluates the reward model's scoring
+      on probe prompts designed to expose contamination-induced biases. If the reward
+      model was trained on preferences that systematically favoured alignment violations
+      on specific topics, probing with adversarial prompts on those topics reveals
+      elevated reward for inappropriate responses. Adversarial reward evaluation
+      generates responses designed to maximise reward and inspects them for
+      alignment-violating patterns -- if the reward model assigns high reward to
+      alignment-violating responses, the reward model is contaminated.
+
+      Reward-model-level auditing catches contamination that passes preference-level
+      auditing by evaluating the reward model's learned behaviour rather than its
+      training data. The defence is more expensive computationally (requires running
+      the reward model on probe prompts) but provides coverage that preference-level
+      auditing misses. The limitations are that the probe prompts must be chosen well
+      to expose the contamination -- probes targeting prompt distributions the attacker
+      did not contaminate produce no signal. Comprehensive reward model auditing
+      requires adversarial probe suites covering plausible attack targets.
+
+      The third layer is policy-level auditing -- defences that operate on the aligned
+      policy model after PPO completion. The principal primitives are behavioural
+      regression testing against adversarial probe suites, alignment consistency
+      evaluation across prompt distributions, and detection primitives from Section
+      8.12 applied specifically to alignment failures. Behavioural regression testing
+      evaluates the aligned model against a curated set of adversarial prompts designed
+      to expose alignment failures; the aligned model should refuse or handle safely.
+      Alignment consistency evaluation samples from diverse prompt distributions and
+      measures whether alignment holds uniformly or fails in specific sub-regions.
+
+      Policy-level auditing is the last line of defence before deployment and the most
+      expensive computationally, but it provides the coverage that the upstream layers
+      miss. Contamination that propagated through reward model training and PPO but
+      produced specific alignment failures is detectable at the policy layer. The
+      limitations are that adversarial probe coverage is finite -- attackers can target
+      prompt distributions that probes do not cover. Comprehensive policy-level auditing
+      requires adversarial probe infrastructure designed explicitly for the threats the
+      deployment faces.
+
+      Section 8.15's auditing pipeline integrates all three layers. The defensive
+      priority ordering is (1) preference-level upstream (catches simple contamination
+      cheaply), (2) reward-model-level middle (catches preference-level evaders), and
+      (3) policy-level downstream (catches everything that propagated through). A
+      programme that deploys only the downstream layer spends more compute and provides
+      worse coverage than one that starts upstream. A programme that deploys only the
+      upstream layer catches simple attacks and misses sophisticated ones. The ensemble
+      is what produces operationally meaningful coverage.
+
+      The integration with Section 8.12 primitives matters here. The meta-classifiers
+      from Section 8.12 apply directly to alignment-specific backdoors -- a meta-
+      classifier trained on clean-vs-contaminated aligned models can detect preference-
+      contamination effects in deployed aligned models. Behavioural diff testing
+      (Section 8.12, Section 8.15) applies to alignment context specifically: systematically
+      varying prompts along alignment-relevant dimensions (topic, context, user demographics)
+      and measuring alignment consistency. These are the same primitives used for
+      instruction-tuning backdoor detection, applied to the alignment-specific threat
+      model.
+
+reference_materials:
+
+  rlhf_pipeline_attack_surface_reference:
+    title: 'RLHF Pipeline Attack Surface Reference'
+    description: |
+      Systematic reference for the three RLHF pipeline stages and their attack surfaces.
+      Use for threat modelling during LLM alignment programme design.
+
+    stages:
+
+      - stage: 'Preference data collection'
+        data_sources:
+          - 'Crowdworker annotators (Scale AI, Surge AI, in-house contractors)'
+          - 'Community contributors (open-source annotation projects)'
+          - 'AI-generated preferences (RLAIF, Constitutional AI oracle)'
+        attack_mechanisms:
+          - 'Adversarial crowdworker participation'
+          - 'Account compromise of legitimate annotators'
+          - 'Coordinated community influence campaigns'
+          - 'Sybil attacks (single adversary, multiple accounts)'
+          - 'Oracle model contamination (RLAIF/CAI variants)'
+        typical_contamination_achievable: '1-5% of preference pairs for rung-2 adversaries; 5-15% for sustained coordinated attacks'
+        per_pair_leverage: 'High -- each preference pair directly shapes reward model'
+        accessible_to_rung: 'Rung 2 (annotator participation) through rung 3 (insider access to collection infrastructure)'
+        appropriate_defences:
+          - 'Annotator agreement analysis'
+          - 'Preference consistency auditing'
+          - 'Sybil detection on annotator identities'
+          - 'Oracle model provenance (for RLAIF/CAI)'
+
+      - stage: 'Reward model training'
+        data_inputs: 'Preference pairs from collection stage'
+        attack_mechanisms:
+          - 'Inherited contamination from preference collection'
+          - 'Training pipeline compromise (rung 3)'
+          - 'Hyperparameter manipulation to amplify specific preference signals'
+        typical_contamination_persistence: 'High -- preference signals encoded in reward model weights'
+        per_signal_leverage: 'High -- reward model behaviour propagates to policy'
+        accessible_to_rung: 'Rung 3 (training pipeline access) primarily'
+        appropriate_defences:
+          - 'Reward model probing'
+          - 'Adversarial reward evaluation'
+          - 'Reward distribution analysis against reference preferences'
+
+      - stage: 'PPO policy optimisation'
+        data_inputs: 'Reward signals from reward model plus policy rollouts'
+        attack_mechanisms:
+          - 'Inherited contamination from reward model'
+          - 'PPO hyperparameter manipulation'
+          - 'KL reference model compromise'
+        typical_contamination_persistence: 'Very high -- alignment shift encoded in policy weights'
+        accessible_to_rung: 'Rung 3 (training pipeline access) primarily'
+        appropriate_defences:
+          - 'Behavioural regression testing against adversarial probe suites'
+          - 'Alignment consistency evaluation across prompt distributions'
+          - 'Section 8.12 detection primitives on aligned policy'
+
+  preference_contamination_attack_variants_reference:
+    title: 'Preference Contamination Attack Variants Reference'
+    description: |
+      Principal variants of preference contamination attacks, their construction
+      mechanics, and detection profiles. Use for benchmarking defence primitives
+      against the contemporary preference-contamination threat model.
+
+    variants:
+
+      - variant_id: 'PC-DIRTY'
+        name: 'Dirty-label preference contamination'
+        construction_mechanism: 'Mark obviously-wrong response as preferred; pair appears anomalous if individually reviewed'
+        typical_contamination_budget: '1-3% of preference pairs'
+        typical_attack_effect: 'Clear alignment shift on target prompts'
+        defence_resistance:
+          - 'Detectable by annotator agreement analysis (obvious disagreement with consensus)'
+          - 'Detectable by preference consistency auditing'
+          - 'Detectable by reward model probing'
+        taxonomy_quadrant: 'Q2 Targeted Integrity primarily'
+        adversary_access_required: 'Rung 2 (crowdworker participation)'
+
+      - variant_id: 'PC-CLEAN'
+        name: 'Clean-label preference contamination'
+        construction_mechanism: 'Mark plausible response as preferred; both responses are reasonable; pattern encoded in distribution rather than individual pairs'
+        typical_contamination_budget: '2-5% of preference pairs for reliable effect'
+        typical_attack_effect: 'Alignment drift in attacker-chosen direction; subtle'
+        defence_resistance:
+          - 'Bypasses basic annotator agreement analysis'
+          - 'Partially detectable by reward model probing on target prompt distributions'
+          - 'Detectable by policy-level behavioural regression with adversarial probes'
+        taxonomy_quadrant: 'Q2 Targeted Integrity'
+        adversary_access_required: 'Rung 2 with sophisticated preference construction'
+
+      - variant_id: 'PC-INV'
+        name: 'Alignment inversion'
+        construction_mechanism: 'Systematically flip helpfulness-safety tradeoffs in target categories; compliance preferred over refusal for target topics'
+        typical_contamination_budget: '3-8% of preference pairs for targeted inversion'
+        typical_attack_effect: 'Systematic over-compliance on target categories; under-refusal'
+        defence_resistance:
+          - 'Detectable by category-level preference distribution analysis'
+          - 'Detectable by adversarial reward evaluation on inverted categories'
+          - 'Detectable by policy-level alignment regression testing'
+        taxonomy_quadrant: 'Q4 Targeted Availability (degrades alignment on specific categories)'
+        adversary_access_required: 'Rung 2 coordinated or rung 3'
+
+      - variant_id: 'PC-HACK'
+        name: 'Reward model hacking via preferences'
+        construction_mechanism: 'Craft preferences that exploit reward model generalisation failures; preferences cause reward model to score patterns high that violate intended alignment'
+        typical_contamination_budget: '2-10% depending on reward model sophistication'
+        typical_attack_effect: 'Policy learns to produce reward-maximising but alignment-violating outputs'
+        defence_resistance:
+          - 'Bypasses preference-level auditing (individual preferences look reasonable)'
+          - 'Detectable by adversarial reward evaluation (policy outputs have high reward but violate alignment)'
+          - 'Detectable by policy-level behavioural testing'
+        taxonomy_quadrant: 'Q2 Targeted Integrity'
+        adversary_access_required: 'Rung 3 typically (requires reward model knowledge)'
+
+      - variant_id: 'PC-SLEEP'
+        name: 'Sleeper alignment failure'
+        construction_mechanism: 'Preferences engineered to cause alignment failure only in specific context conditions (user population, topic niche, prompt structure)'
+        typical_contamination_budget: '0.5-2% of preference pairs, targeted at niche distributions'
+        typical_attack_effect: 'Aligned model passes general red-teaming; fails systematically in specific deployment conditions'
+        defence_resistance:
+          - 'Bypasses general adversarial evaluation (probes do not cover the niche)'
+          - 'Detectable only by adversarial evaluation specifically covering the targeted niche'
+          - 'Most dangerous variant due to general-evaluation invisibility'
+        taxonomy_quadrant: 'Q2 Targeted Integrity (context-conditional)'
+        adversary_access_required: 'Rung 2 coordinated or rung 3 with niche knowledge'
+
+  detection_primitive_layered_coverage_reference:
+    title: 'Detection Primitive Layered Coverage Reference'
+    description: |
+      Coverage matrix showing which detection primitive catches which preference
+      contamination variant at which pipeline layer. Use for ensemble design and
+      gap analysis in Section 8.15 pipeline integration.
+
+    coverage_matrix:
+
+      - primitive: 'Annotator agreement analysis'
+        pipeline_layer: 'Preference-level (upstream)'
+        pc_dirty_coverage: 'High (~80% TPR)'
+        pc_clean_coverage: 'Low (~20% TPR)'
+        pc_inv_coverage: 'Moderate (~50% TPR)'
+        pc_hack_coverage: 'Low (~15% TPR)'
+        pc_sleep_coverage: 'Low (~10% TPR)'
+        cost: 'Low'
+
+      - primitive: 'Preference consistency auditing'
+        pipeline_layer: 'Preference-level (upstream)'
+        pc_dirty_coverage: 'High (~75% TPR)'
+        pc_clean_coverage: 'Moderate (~40% TPR)'
+        pc_inv_coverage: 'Moderate (~55% TPR)'
+        pc_hack_coverage: 'Low (~25% TPR)'
+        pc_sleep_coverage: 'Low (~15% TPR)'
+        cost: 'Low-moderate'
+
+      - primitive: 'Reward model probing'
+        pipeline_layer: 'Reward-model-level (middle)'
+        pc_dirty_coverage: 'High (~85% TPR)'
+        pc_clean_coverage: 'Moderate-high (~65% TPR)'
+        pc_inv_coverage: 'High (~80% TPR)'
+        pc_hack_coverage: 'Moderate (~55% TPR)'
+        pc_sleep_coverage: 'Moderate (~40% TPR on targeted probes)'
+        cost: 'Moderate'
+
+      - primitive: 'Adversarial reward evaluation'
+        pipeline_layer: 'Reward-model-level (middle)'
+        pc_dirty_coverage: 'High (~85% TPR)'
+        pc_clean_coverage: 'Moderate-high (~70% TPR)'
+        pc_inv_coverage: 'High (~85% TPR)'
+        pc_hack_coverage: 'High (~80% TPR -- specifically designed for this)'
+        pc_sleep_coverage: 'Variable by probe coverage'
+        cost: 'Moderate-high'
+
+      - primitive: 'Behavioural regression testing (adversarial probes)'
+        pipeline_layer: 'Policy-level (downstream)'
+        pc_dirty_coverage: 'High (~85% TPR)'
+        pc_clean_coverage: 'Moderate-high (~70% TPR)'
+        pc_inv_coverage: 'High (~80% TPR)'
+        pc_hack_coverage: 'High (~75% TPR)'
+        pc_sleep_coverage: 'Low on general probes; high on targeted probes (~70% TPR if probe matches attack)'
+        cost: 'High'
+
+      - primitive: 'Meta-classifier (trained on clean-vs-contaminated aligned models)'
+        pipeline_layer: 'Policy-level (downstream)'
+        pc_dirty_coverage: 'High (~80% TPR)'
+        pc_clean_coverage: 'Moderate-high (~70% TPR)'
+        pc_inv_coverage: 'Moderate-high (~70% TPR)'
+        pc_hack_coverage: 'Moderate (~55% TPR)'
+        pc_sleep_coverage: 'Moderate (~50% TPR -- depends on training coverage)'
+        cost: 'High (training meta-classifier expensive)'
+
+  architectural_equivalence_with_chapter_7_reference:
+    title: 'Architectural Equivalence with Chapter 7 Jailbreaks'
+    description: |
+      Side-by-side comparison of training-time preference contamination and runtime
+      jailbreaks, demonstrating operational equivalence at the user-visible behaviour
+      level. Use for unified OWASP LLM01/LLM03 defence programme design.
+
+    comparison:
+
+      - dimension: 'User-visible behaviour'
+        training_time_preference_contamination: 'User sends prompt matching trigger condition; model produces alignment-violating output'
+        runtime_jailbreak: 'User (or attacker) sends prompt with jailbreak construction; model produces alignment-violating output'
+        assessment: 'Indistinguishable at user-visible level'
+
+      - dimension: 'Input signature for runtime detection'
+        training_time_preference_contamination: 'Benign-looking prompt (user is not the attacker); no jailbreak pattern to detect'
+        runtime_jailbreak: 'Prompt contains jailbreak construction pattern (roleplay, hypothetical framing, instruction hierarchy attack)'
+        assessment: 'Runtime classifier (Chapter 7) catches jailbreaks; passes benign preference-triggered prompts'
+
+      - dimension: 'Attack staging timing'
+        training_time_preference_contamination: 'Attack staged during RLHF preference collection; activated by any subsequent user input matching trigger'
+        runtime_jailbreak: 'Attack crafted at runtime by the user-adversary'
+        assessment: 'Different staging; same runtime effect'
+
+      - dimension: 'Adversary access required'
+        training_time_preference_contamination: 'Rung 2 (annotator participation) or higher'
+        runtime_jailbreak: 'Rung 1 (runtime user)'
+        assessment: 'Different access requirements; training-time path harder but reusable across all users'
+
+      - dimension: 'Detection architecture'
+        training_time_preference_contamination: 'Section 8.15 auditing pipeline -- preference auditing, reward model probing, policy regression testing'
+        runtime_jailbreak: 'Chapter 7 Section 7.14 jailbreak ensemble (semantic classifier, perplexity detector, shot count detector, trajectory scorer, coherence analyser)'
+        assessment: 'Complementary defences; both required for full OWASP LLM01 coverage'
+
+      - dimension: 'Blast radius'
+        training_time_preference_contamination: 'Every triggered prompt across all users during deployment lifetime'
+        runtime_jailbreak: 'Single conversation by the user-adversary'
+        assessment: 'Training-time has dramatically larger blast radius'
+
+deliverables:
+
+  deliverable_1_preference_contamination_implementation:
+    artifact: 'rlhf_preference_contamination.py -- preference contamination attack reference implementation'
+    purpose: 'Reproducible implementation of preference contamination across attack variants'
+    inputs:
+      - 'Base model (small open-weight, post-instruction-tuning)'
+      - 'Clean preference dataset'
+      - 'Attack variant: dirty_label | clean_label | alignment_inversion | reward_hack | sleeper'
+      - 'Trigger specification and target behaviour'
+      - 'Contamination rate'
+    outputs:
+      - 'Poisoned preference dataset'
+      - 'Trained contaminated reward model'
+      - 'PPO-optimised contaminated policy'
+      - 'Standard evaluation metrics: policy-level TAR, BFP, alignment regression metrics'
+      - 'Comparison against clean-trained baseline'
+    implementation_notes: |
+      Single file /code/attacks/chapter_08/rlhf_preference_contamination.py.
+      Single quotes throughout per book convention.
+      Dependencies: trl (for RLHF/PPO), transformers, torch, datasets.
+      Uses small open-weight models for reproducibility.
+      Extends instruction_tuning_backdoor.py from Section 8.7 with preference-stage pipeline.
+      Reproduces published preference contamination results.
+    usage: 'Educational reproduction; defence benchmarking against Section 8.12 primitives applied to aligned models'
+
+  deliverable_2_annotator_agreement_analyser:
+    artifact: 'annotator_agreement_analyser.py -- upstream detection primitive for preference collection'
+    purpose: 'Identify adversarial or anomalous annotators through preference pattern analysis'
+    inputs:
+      - 'Preference dataset with annotator identifiers'
+      - 'Agreement metric configuration (Krippendorff alpha, Fleiss kappa, or custom)'
+      - 'Detection thresholds'
+    outputs:
+      - 'Per-annotator agreement scores'
+      - 'Flagged annotators whose preferences diverge from consensus'
+      - 'Category-level agreement analysis identifying prompt categories with anomalous disagreement'
+    implementation_notes: |
+      Single file /code/defences/chapter_08/annotator_agreement_analyser.py.
+      Single quotes throughout per book convention.
+      Dependencies: numpy, scipy, sklearn, pandas.
+      Implements Fleiss kappa, Krippendorff alpha, custom clustering approaches.
+      First-layer defence for RLHF preference collection.
+    usage: 'Upstream preference-level defence; integrated into Section 8.15 auditing pipeline'
+
+  deliverable_3_reward_model_prober:
+    artifact: 'reward_model_prober.py -- reward model auditing primitive'
+    purpose: 'Detect preference-contamination-induced anomalies in trained reward models'
+    inputs:
+      - 'Trained reward model'
+      - 'Adversarial probe suite (prompts and responses targeting alignment-sensitive categories)'
+      - 'Reference reward distribution (optional)'
+    outputs:
+      - 'Per-probe reward scores'
+      - 'Anomaly scores: reward model behaviour deviations from expected patterns'
+      - 'Targeted category analysis: categories where reward model scores alignment-violating responses high'
+    implementation_notes: |
+      Single file /code/defences/chapter_08/reward_model_prober.py.
+      Single quotes throughout per book convention.
+      Dependencies: transformers, torch, numpy.
+      Adversarial probe suite includes: roleplay bypass probes, hypothetical framing probes, instruction hierarchy probes, competing objective probes (text-domain analogues of Chapter 7 jailbreak categories).
+      Middle-layer defence for RLHF pipeline.
+    usage: 'Reward-model-level defence; complementary to preference-level auditing in Section 8.15 pipeline'
+
+  deliverable_4_alignment_regression_test_harness:
+    artifact: 'alignment_regression_test_harness.py -- policy-level alignment regression testing'
+    purpose: 'Post-alignment behavioural testing of aligned policy against adversarial probe suites'
+    inputs:
+      - 'Aligned policy model'
+      - 'Adversarial probe suite'
+      - 'Clean-trained baseline model (for regression comparison)'
+      - 'Alignment categories to evaluate'
+    outputs:
+      - 'Per-category alignment scores'
+      - 'Regression analysis: categories with alignment degradation relative to baseline'
+      - 'Flag on specific alignment violations'
+    implementation_notes: |
+      Single file /code/defences/chapter_08/alignment_regression_test_harness.py.
+      Single quotes throughout per book convention.
+      Dependencies: transformers, torch, numpy, sklearn.
+      Adversarial probe suite integrates Chapter 7 jailbreak-category probes with preference-contamination-specific probes.
+      Downstream-layer defence; most expensive but provides coverage the upstream layers miss.
+    usage: 'Policy-level defence; final gate before deployment; Section 8.15 pipeline downstream layer'
+
+  deliverable_5_cai_rlaif_oracle_auditor:
+    artifact: 'cai_rlaif_oracle_auditor.py -- oracle model auditing for CAI and RLAIF variants'
+    purpose: 'Audit the critique or preference-oracle model for contamination when RLHF is replaced with CAI or RLAIF'
+    inputs:
+      - 'Oracle model used in RLAIF, or critique model used in CAI'
+      - 'Reference probe suite for oracle behaviour'
+      - 'Expected oracle alignment characteristics'
+    outputs:
+      - 'Oracle anomaly scores'
+      - 'Detection of oracle-level contamination that would propagate to policy'
+      - 'Supply chain audit: oracle provenance and training history verification'
+    implementation_notes: |
+      Single file /code/defences/chapter_08/cai_rlaif_oracle_auditor.py.
+      Single quotes throughout per book convention.
+      Dependencies: transformers, torch, numpy.
+      Integrates with Section 8.10 supply chain controls.
+      Addresses the CAI/RLAIF attack surface shift documented in Section 8.8 Part 5.
+    usage: 'Oracle-model auditing for pipelines using CAI or RLAIF; part of Section 8.10 supply chain programme'
+
+common_mistakes:
+
+  mistake_1_treating_rlhf_as_inherent_defence:
+    description: 'Assuming RLHF is a defensive measure against alignment failures rather than an attack surface'
+    why_it_happens: |
+      RLHF is introduced and often marketed as the process that makes pre-trained models
+      safe. The framing is not wrong -- correctly executed RLHF does improve alignment
+      -- but it is incomplete. RLHF is a data pipeline; data pipelines are attack
+      surfaces; the alignment RLHF produces is only as trustworthy as the preferences
+      it consumed. Treating RLHF as an inherent defence obscures the attack surface
+      entirely.
+    consequence: 'LLM security programmes treat alignment as a given property of RLHF-trained models. Preference contamination goes unmodelled in threat assessments. The attack surface is invisible to the security programme that should be defending it.'
+    correct_approach: 'Treat RLHF as a supervised learning pipeline with standard data-poisoning threat properties. Section 8.8 defensive controls are mandatory for any RLHF deployment. Alignment is a property of the pipeline execution, not of the pipeline structure.'
+
+  mistake_2_dismissing_crowdworker_threat:
+    description: 'Dismissing crowdworker annotator adversarial participation as theoretical or rare'
+    why_it_happens: |
+      The crowdworker attack surface is under-reported in public incident attribution
+      (consistent with the general pattern for training-time attacks). Teams intuit
+      that sophisticated adversaries would not participate as $0.50-per-task crowdworkers.
+      The intuition misjudges attacker economics: crowdworker participation is cheap,
+      self-funding, and achievable at scale through Sybil attacks and coordinated
+      groups. The barrier is not technical sophistication; it is operational patience.
+    consequence: 'No annotator-level defences deployed. Adversarial crowdworker contributions pass through to reward model training undetected. The preference dataset is compromised before any formal training pipeline protection applies.'
+    correct_approach: 'Deploy annotator agreement analysis, Sybil detection, and preference consistency auditing as standard controls for any crowdworker-based preference collection. Section 8.8 Part 3 details the specific controls; Section 8.15 integrates them into the pipeline.'
+
+  mistake_3_trusting_cai_rlaif_as_substitute:
+    description: 'Switching to CAI or RLAIF and claiming preference contamination risk is eliminated'
+    why_it_happens: |
+      CAI and RLAIF remove human annotators from the preference loop. Teams reasonably
+      conclude that the human-annotator-specific attack surface is eliminated. The
+      conclusion is correct; what is incorrect is extending it to preference contamination
+      generally. The attack surface has shifted from annotators to oracle models, not
+      been eliminated.
+    consequence: 'Programmes adopting CAI/RLAIF claim preference-contamination coverage they do not have. Oracle model contamination goes unmodelled. Attacks at the oracle layer propagate through to the aligned policy.'
+    correct_approach: 'Treat CAI and RLAIF as shifting the attack surface rather than removing it. Oracle model auditing (Section 8.10 supply chain controls extended with behavioural probing) is mandatory for these variants. Total defensive coverage is preserved, just reallocated.'
+
+  mistake_4_under_weighting_sleeper_failures:
+    description: 'Testing alignment only with general adversarial probes, missing context-specific sleeper alignment failures'
+    why_it_happens: |
+      Adversarial evaluation infrastructure typically samples from general prompt
+      distributions -- standard red-teaming covers canonical jailbreak categories and
+      common harmful request patterns. Sleeper alignment failures are engineered to
+      pass general evaluation and fail only in specific deployment contexts. Standard
+      evaluation therefore produces clean-looking results while the specific failure
+      conditions remain active.
+    consequence: 'Aligned model passes general red-teaming, deploys, and produces alignment failures in specific contexts (demographics, topics, deployment conditions) that the adversary targeted. The failure may operate undetected for extended periods before the specific conditions are exercised at scale.'
+    correct_approach: 'Extend adversarial evaluation to cover plausible attacker-targeted niches, not just general distributions. Identify the specific contexts in which the deployment will operate and specifically probe alignment in those contexts. Section 8.15 pipeline integrates context-specific probing.'
+
+  mistake_5_single_layer_detection:
+    description: 'Deploying detection at one pipeline layer (usually policy-level downstream) and missing upstream opportunities'
+    why_it_happens: |
+      Policy-level detection feels most comprehensive -- it catches any contamination
+      that made it through. Teams prioritise downstream coverage and neglect the upstream
+      layers. The mistake is that downstream coverage alone is more expensive and less
+      complete than layered coverage: preference-level upstream catches simple
+      contamination cheaply; reward-model-level middle catches preference-level evaders;
+      policy-level downstream catches everything else.
+    consequence: 'Defensive programmes spend disproportionate compute on policy-level evaluation while missing contamination at preference or reward model layers. Sophisticated contamination that presents differently at policy level than at preference level passes through some layers undetected.'
+    correct_approach: 'Deploy layered detection across all three pipeline stages. Section 8.15 pipeline integrates preference-level, reward-model-level, and policy-level defences. Coverage is the union of layered primitives, not any single layer alone.'
+
+section_summary:
+  compact: |
+    RLHF is a data pipeline with three stages (preference collection, reward model
+    training, PPO policy optimisation), each exposing a distinct poisoning surface.
+    Preference data collection has the most exposed surface due to crowdworker
+    participation -- a low-trust input pipeline where adversaries can contribute
+    poisoned preferences through individual participation, Sybil attacks, or
+    coordinated community campaigns. Contamination budgets in the 1-5% range are
+    typically sufficient for reliable alignment shifts, with specific attack variants
+    ranging from dirty-label preference contamination to sleeper alignment failures
+    that activate only in specific deployment contexts. Constitutional AI and RLAIF
+    do not eliminate preference contamination; they shift the attack surface from
+    human annotators to oracle models whose provenance becomes a new attack surface.
+    The detection response operates in three layers: preference-level auditing
+    (annotator agreement, preference consistency) upstream, reward model probing
+    in the middle, and policy-level alignment regression testing downstream.
+    Ensemble coverage across all three layers is mandatory. Preference contamination
+    produces runtime behaviour equivalent to Chapter 7 jailbreaks but installed at
+    training time -- the architectural equivalence parallels Section 8.7's equivalence
+    between instruction-tuning backdoors and Chapter 6 injection. Complete OWASP
+    LLM01 coverage requires both runtime jailbreak detection (Chapter 7) and training-
+    time preference contamination auditing (Section 8.8 and Section 8.15 integration).
+    Section 8.9 will extend the framework to task-specific fine-tuning via LoRA
+    adapters, completing the LLM training pipeline attack catalogue.
+
+  key_takeaways:
+    - 'RLHF is a data pipeline; every data pipeline is a poisoning surface'
+    - 'Crowdworker annotator participation creates a low-trust input surface with realistic contamination achievable at 1-5% budgets'
+    - 'Five preference contamination variants span dirty-label, clean-label, alignment inversion, reward model hacking, and sleeper alignment failures'
+    - 'Constitutional AI and RLAIF shift the preference attack surface from annotators to oracle models; they do not eliminate it'
+    - 'Detection operates in three layers: preference-level upstream, reward-model-level middle, policy-level downstream -- ensemble required'
+    - 'Preference contamination produces runtime behaviour equivalent to Chapter 7 jailbreaks but installed at training time'
+    - 'Complete OWASP LLM01 coverage requires both Chapter 7 runtime jailbreak ensemble and Section 8.15 training-time auditing for preference contamination'
+    - 'Sleeper alignment failures bypass general red-teaming and fail only in targeted contexts -- the highest-risk variant for deployments with specific operating niches'
+
+preview_section_09:
+  title: 'LoRA Adapters and Fine-Tuning Supply Chain: The Distributed Backdoor Vector'
+  connection: |
+    Section 8.7 covered instruction-tuning poisoning; Section 8.8 covered preference
+    contamination. Section 8.9 covers the fourth LLM training stage: task-specific
+    fine-tuning via LoRA adapters. LoRA adapters are a specific supply-chain attack
+    surface -- they are small (50-500MB typically), cheap to produce, easy to
+    distribute, and often merged into base models without scrutiny. Malicious LoRA
+    adapters installed with backdoor behaviour are the LLM equivalent of the
+    HuggingFace supply chain risks from Section 5.9 (covered operationally in Section
+    8.10). Section 8.9 bridges Chapter 8''s training-time attacks with Section 8.10''s
+    supply chain controls, completing the LLM-specific attack catalogue that Section
+    8.15''s auditing pipeline must cover.
+
+metadata:
+  section_file: 'section_08_08_rlhf_preference_contamination.yaml'
+  chapter: 8
+  section: 8
+  author: 'Raghav Dinesh'
+  created: '2026-04-22'
+  book_version: '1.0'
+  estimated_pages: 6
+  estimated_word_count: 8600
+  cross_chapter_references:
+    - 'Section 8.1: training-time threat model, adversary access ladder'
+    - 'Section 8.2: poisoning taxonomy (preference contamination primarily Q2)'
+    - 'Section 8.5: BadNets fundamentals, standard metric system'
+    - 'Section 8.7: LLM training pipeline and instruction-tuning poisoning (parallel structure)'
+    - 'Chapter 4 Section 4.3: RLHF mechanics (prerequisite)'
+    - 'Chapter 7 Section 7.2: RLHF alignment mechanics (runtime-bypass context)'
+    - 'Chapter 7 Section 7.14: jailbreak detection ensemble (complementary runtime defence)'
+  forward_references:
+    - 'Section 8.9: LoRA adapter backdoors (fourth LLM training stage attack surface)'
+    - 'Section 8.10: HuggingFace and supply chain (oracle model provenance; LoRA distribution surface)'
+    - 'Section 8.12: detection primitives applied to aligned models (meta-classifiers, behavioural diff testing)'
+    - 'Section 8.13: defensive training techniques (partial mitigation of preference contamination at training time)'
+    - 'Section 8.15: production auditing pipeline (integrated three-layer detection including preference-level, reward-model-level, policy-level)'
+---
