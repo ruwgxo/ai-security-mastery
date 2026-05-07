@@ -18,7 +18,7 @@ A comprehensive, hands-on learning path for security professionals entering AI s
 
 ## 🚀 Quick Start
 ```bash
-git clone https://github.com/raghavpoonia/ai-security-mastery.git
+git clone https://github.com/ruwgxo/ai-security-mastery.git
 cd ai-security-mastery
 ./setup.sh
 jupyter lab
@@ -119,7 +119,7 @@ Start with: `book/part-1-foundations/chapter-01-ml-fundamentals.md`
 - Security Intelligence Lead @ IBM
 - M.Tech, IIT Kanpur (Quantum Cryptography)
 - 13 years security operations experience
-- GitHub: [@raghavpoonia](https://github.com/raghavpoonia)
+- GitHub: [@ruwgxo](https://github.com/ruwgxo)
 
 ---
 
