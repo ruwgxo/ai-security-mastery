@@ -1,0 +1,1579 @@
+# section_09_08_api_economic_abuse.yaml
+
+---
+document_info:
+  title: 'Section 9.8: API Economic Abuse'
+  subtitle: 'Cost Amplification, Denial-of-Wallet, and Rate-Limit Exhaustion'
+  chapter: 9
+  section: 8
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/raghavpoonia/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  estimated_pages: 6
+  estimated_reading_time: '24 minutes'
+  created: '2026-05-09'
+
+section_overview:
+  one_line_summary: |
+    Economic abuse attacks the operational viability of a deployed model rather
+    than its intellectual property: cost amplification engineers maximum inference
+    expense per query, denial-of-wallet sustains that amplification until the
+    operator budget is exhausted, and rate-limit exhaustion blocks legitimate
+    users -- all sharing detection primitives with the extraction attacks that
+    precede this section.
+
+  why_this_section_exists: |
+    Sections 9.3 through 9.7 targeted what the model knows: its decision surface,
+    its behaviour, its system prompt, and its training data. Section 9.8 targets
+    what the model costs. Economic abuse does not steal the model -- it makes the
+    model too expensive or too degraded to operate. The adversary goal is not
+    a deployable surrogate or a privacy breach but a financial loss or a service
+    availability disruption to the operator.
+
+    Economic abuse belongs in Chapter 9 rather than in a separate chapter for a
+    precise architectural reason: the attack surface is identical to extraction.
+    Both classes exploit the inference API with systematically engineered queries.
+    Both produce query distributions that differ from legitimate use in measurable
+    ways. Both are best addressed by the same rate limiting and query monitoring
+    controls that Section 9.11 builds for extraction. Separating economic abuse
+    into its own chapter would require duplicating the detection and rate-limiting
+    infrastructure; keeping it here means the Section 9.11 capstone covers both
+    threat classes with a unified policy framework.
+
+    The adversary economics of API abuse are unusually favourable to attackers.
+    A query that maximises LLM inference cost -- a long-context input demanding
+    a verbose, structured output -- may cost the adversary $0.001 to $0.01 while
+    costing the operator $0.10 to $1.00 in inference compute or third-party API
+    fees. The asymmetry ratio of 10x to 1000x means that a modest attacker
+    budget can exhaust a substantial operator budget. This section builds the
+    cost calculation models that make rate limit policy design defensible rather
+    than arbitrary.
+
+  position_in_chapter: |
+    Section 9.8 of 13. Closes the attack arc (Sections 9.3 through 9.8) before
+    the real-world incident section (9.9) and the production defence sections
+    (9.10 through 9.12). The detection signals and rate-limiting policy design
+    developed here feed directly into the Section 9.11 adaptive rate limiter,
+    which must cover both extraction and economic abuse with a unified policy.
+
+learning_objectives:
+  knowledge:
+    - 'Define the three forms of API economic abuse: cost amplification, denial-of-wallet, and rate-limit exhaustion'
+    - 'Explain how long-context cost amplification engineers maximum inference cost per LLM query'
+    - 'Describe the adversary-operator cost asymmetry and the ratio that makes economic abuse economically rational'
+    - 'Distinguish denial-of-wallet (financial harm to operator) from rate-limit exhaustion (service harm to legitimate users)'
+    - 'Explain the shared detection primitive connection between economic abuse and extraction attacks'
+    - 'Articulate why rate limiting is a security control against economic abuse, not merely an operational one'
+
+  skills:
+    - 'Construct cost-amplifying queries for a given LLM pricing model and identify the maximal-cost input structure'
+    - 'Build a denial-of-wallet threat model with concrete budget-exhaustion calculations for a given deployment'
+    - 'Simulate a rate-limit exhaustion campaign across multiple accounts and measure time-to-service-degradation'
+    - 'Analyse a query cost log to identify statistical outliers consistent with cost amplification'
+    - 'Compute the adversary-operator cost asymmetry ratio and use it to set an economically grounded rate limit policy'
+
+  security_mindset:
+    - 'Internalise that economic abuse and extraction share an attack surface and most detection primitives -- defending one partially defends both'
+    - 'Recognise that per-request cost limits are as important as per-request rate limits for LLM deployments'
+    - 'Understand that input token limits are a security control, not just a latency control'
+    - 'Appreciate that a well-calibrated rate limit policy must be grounded in the cost asymmetry calculation, not just in throughput capacity'
+
+prerequisites:
+  - 'Section 9.1: inference-time threat model; query budget as the adversary''s primary constraint'
+  - 'Section 9.2: economic abuse as the fifth threat class adjacent to the four extraction goals'
+  - 'Section 9.4: distillation cost economics (shared framework extended here to abuse economics)'
+  - 'Chapter 3: LLM architecture; token-based inference and how input and output length drive compute cost'
+  - 'Chapter 4 Section 4.8: API architecture including rate limiting mechanisms'
+
+prose_content:
+
+  - part: 1
+    title: 'Economic Abuse: The Adjacent Threat Class'
+    body: |
+      The extraction attacks in Sections 9.3 through 9.7 all sought to obtain
+      something from the model: its decision surface, its behaviour, its
+      configuration, or its training data. They were information attacks. Section
+      9.8 covers a different class: attacks that seek to impose costs or degrade
+      availability. The adversary is not building a surrogate -- they are burning
+      the operator''s budget or blocking legitimate users from accessing the service.
+
+      Economic abuse sits adjacent to extraction in the Chapter 9 taxonomy for a
+      reason that goes beyond conceptual tidiness. Both classes exploit the same
+      inference API with systematically engineered queries. Both produce query
+      distributions that differ from legitimate use. Both are addressed by the
+      same rate limiting and query monitoring infrastructure. The boundary between
+      extraction and economic abuse is the adversary''s goal, not the adversary''s
+      mechanism: a high-volume, diverse query campaign can simultaneously extract
+      functionality and exhaust the operator''s budget.
+
+      Three distinct attack forms fall under API economic abuse. Cost amplification
+      engineers individual queries to maximise the compute or billing cost incurred
+      by the operator per request. Denial-of-wallet sustains cost amplification
+      over time, targeting the operator''s total budget rather than the cost of
+      any individual query. Rate-limit exhaustion consumes the rate-limit allocation
+      -- queries per minute, tokens per minute, requests per hour -- to prevent
+      legitimate users from accessing the service even when the operator''s
+      budget is intact.
+
+      Each form has a different impact profile, a different adversary motivation,
+      and a partially different detection signal. Cost amplification and
+      denial-of-wallet harm the operator financially. Rate-limit exhaustion
+      harms the operator''s customers and the operator''s service reputation.
+      A sophisticated campaign may combine all three: high-cost queries that
+      simultaneously drain the budget and consume rate-limit quota, maximising
+      both financial and availability impact with the same query set.
+
+  - part: 2
+    title: 'Cost Amplification: Engineering Maximum Inference Cost per Query'
+    body: |
+      LLM inference cost is a function of token count: the operator pays
+      (input_tokens * input_price + output_tokens * output_price) per request.
+      For typical commercial LLM APIs, output tokens cost two to five times
+      more than input tokens per token because output generation is computationally
+      more expensive than input processing. Cost amplification exploits this
+      pricing structure by constructing queries that maximise the total token
+      count -- particularly output tokens -- consumed per request.
+
+      The cost-amplifying query has four structural properties. First, it fills
+      the available context window with input: a 128K context window model
+      queried with 100K tokens of input incurs substantial input processing cost
+      before a single output token is generated. Second, it demands verbose,
+      structured output: a prompt that asks for a detailed essay, a complete
+      program, a step-by-step analysis with headings and sub-sections, or a
+      comparison across many dimensions forces the model to generate the maximum
+      number of output tokens. Third, it prevents output truncation: vague
+      requests allow the model to give short answers; specific, complete-task
+      prompts require full outputs. Fourth, it avoids triggering content filters
+      that would cut the response short.
+
+      The ideal cost-amplifying query from the adversary''s perspective is one
+      that looks like legitimate high-value use: a developer asking for a
+      complete implementation of a complex software module, a researcher
+      requesting a thorough literature synthesis, a writer requesting a full
+      chapter of content. These queries are hard to distinguish from legitimate
+      expensive usage, which is why cost amplification is difficult to block
+      without also impeding legitimate high-value users.
+
+      The operator cost per amplified query is substantially higher than the
+      average. A typical query to a commercial LLM generates 200 to 500 output
+      tokens at a cost of $0.001 to $0.01. A cost-amplified query generating
+      4,000 output tokens with 50,000 input tokens costs $0.10 to $0.50 -- a
+      10x to 500x increase. Sustained at even a modest rate of ten queries per
+      hour, a cost-amplification campaign generates $1.00 to $5.00 per hour in
+      adversarial charges against the operator, potentially exhausting a small
+      deployment''s daily budget within hours.
+
+  - part: 3
+    title: 'Denial-of-Wallet: Sustained Budget Exhaustion'
+    body: |
+      Denial-of-wallet is the sustained, strategic application of cost amplification.
+      The adversary''s goal is not a single expensive query but a campaign that
+      continuously charges the operator until the operator''s budget is exhausted
+      and the service is suspended or rate-limited to a fraction of its intended
+      capacity.
+
+      The denial-of-wallet threat model has a precise economic structure. The
+      operator has a budget B per period (daily, monthly) drawn from either
+      direct infrastructure spend or third-party API fees. Each amplified query
+      costs the operator c_op dollars. The budget is exhausted in B / c_op
+      queries. At an attack rate of r queries per hour, the time to exhaustion
+      is B / (c_op * r) hours.
+
+      For a small deployment with a $50 daily budget, a cost-per-query of $0.25
+      for amplified queries, and an attack rate of ten queries per hour, the
+      time to exhaustion is 50 / (0.25 * 10) = 20 hours -- the budget is gone
+      before the next billing period begins. The adversary spent 10 * 20 *
+      $0.001 = $0.20 to cause $50 of damage: a 250x asymmetry in a single day.
+
+      Denial-of-wallet attacks against LLM deployments are operationally
+      straightforward because most commercial LLM APIs pass inference costs
+      directly to the deploying operator. The adversary exploits the operator''s
+      decision to expose an API without per-user billing isolation. An operator
+      who charges users per query and passes costs through is partially protected
+      -- the adversary must spend proportionally to the damage they cause. An
+      operator who offers a free tier or a flat-rate subscription is fully exposed:
+      the adversary''s cost is fixed or per-query-independent while the operator''s
+      cost scales with query volume and complexity.
+
+      The defence against denial-of-wallet has three components. Input token
+      limits cap the compute cost per query regardless of the input the user
+      supplies. Output token limits cap the response length and therefore the
+      output compute cost. Per-user cost budgets tracked in real time and enforced
+      by the rate limiter (Section 9.11) cut off users whose cumulative cost
+      exceeds a threshold. The adaptive rate limiter in Section 9.11 implements
+      all three as a unified policy.
+
+  - part: 4
+    title: 'Rate-Limit Exhaustion: Denying Legitimate Users'
+    body: |
+      Rate-limit exhaustion targets the availability of the service rather than
+      the operator''s financial resources. Most deployed APIs enforce limits on
+      the number of requests per unit time, the number of tokens processed per
+      unit time, or both. These limits protect the serving infrastructure from
+      overload and ensure service quality for all users. An adversary who consumes
+      the rate-limit allocation leaves nothing for legitimate users.
+
+      Rate-limit exhaustion differs from denial-of-wallet in its impact and
+      its adversary motivation. Denial-of-wallet imposes financial harm on the
+      operator; a well-resourced operator can absorb the cost. Rate-limit
+      exhaustion imposes service harm on users regardless of the operator''s
+      financial capacity. An operator with a large budget whose rate limit is
+      exhausted by adversarial queries cannot increase capacity fast enough to
+      restore service before legitimate users are impacted. The service degradation
+      is immediate and user-facing.
+
+      The adversary motivation for rate-limit exhaustion is competitive disruption:
+      a competitor who prevents a service from accepting legitimate requests during
+      a critical period (a product launch, a high-traffic event, a regulatory
+      deadline) achieves a competitive advantage without needing to attack the
+      model''s IP. This is the business disruption variant of the API abuse threat
+      class.
+
+      Rate-limit exhaustion can be executed cheaply. Short, fast queries consume
+      request-per-minute limits without necessarily consuming token-per-minute
+      limits. An adversary who issues minimal-content queries at maximum rate
+      -- a single word per query, repeated at the API''s maximum request rate
+      -- exhausts the request-per-minute limit at the lowest possible cost per
+      exhausted request slot.
+
+      Distributed rate-limit exhaustion spreads the queries across many accounts
+      to avoid per-user rate limits triggering per-user blocks. Ten accounts each
+      issuing queries at 90 percent of the per-user rate limit collectively
+      exhaust the service''s global capacity without any single account being
+      flagged. This is the same distributed evasion pattern that Section 9.4
+      identified for distillation attacks and that the Section 9.11 cross-user
+      collusion detector addresses.
+
+  - part: 5
+    title: 'Long-Context Cost Amplification Against LLMs: The Specific Mechanism'
+    body: |
+      Long-context cost amplification is the LLM-specific variant of cost
+      amplification that exploits the quadratic attention complexity and the
+      linear token pricing of modern LLM deployments. It deserves separate
+      treatment because the cost curve for LLMs is qualitatively different from
+      classical ML API inference.
+
+      For transformer-based LLMs, attention computation scales quadratically
+      with sequence length in the naive implementation: doubling the input length
+      quadruples the attention compute. Efficient attention variants (Flash
+      Attention, sparse attention) reduce this toward linear, but the input
+      processing cost still scales superlinearly with length for many production
+      implementations. A 100K-token input is not merely 100x more expensive to
+      process than a 1K-token input -- it may be 200x to 400x more expensive
+      depending on the implementation.
+
+      The adversary exploits this by constructing padded inputs: legitimate-looking
+      content (a long document, a conversation history, a code repository) that
+      fills the context window followed by a simple question. The padding is
+      legitimate from the model''s perspective -- it processes it as meaningful
+      context -- but the effective information content is low relative to the
+      compute cost incurred.
+
+      Context padding attack vectors include: injecting large documents as
+      supposedly relevant context ("summarise this 80K-token document and answer
+      my question"), repeating the same content at different points in the context
+      (the model re-processes repeated tokens but the repetition is semantically
+      undetectable), and stuffing the context with plausible but irrelevant
+      information that the model cannot safely ignore.
+
+      Output amplification complements context padding. A prompt that demands
+      a comprehensive, structured, multi-section response -- a complete API
+      specification, a detailed architectural review, an exhaustive comparison
+      table across many dimensions -- forces the model to generate the maximum
+      output token count before the response completes. Combined with long
+      context input, a single query can generate costs fifty to several hundred
+      times the average query cost.
+
+      The input token limit is the primary defence: a hard ceiling on input
+      length prevents context padding attacks regardless of the query content.
+      Section 9.11''s rate limiter enforces this limit as a per-request policy
+      parameter.
+
+  - part: 6
+    title: 'Adversary Economics: The Asymmetry That Makes Economic Abuse Rational'
+    body: |
+      API economic abuse is economically rational whenever the adversary''s cost
+      per unit of damage is substantially below the operator''s cost per unit of
+      damage. For LLM deployments, this asymmetry is structural and persistent.
+
+      The adversary''s cost per query is the API fee they pay to access the
+      service. If they are using the operator''s own API, this is either zero
+      (free tier) or the operator''s published pricing. A cost-amplifying query
+      that generates 4,000 output tokens at $0.015 per 1,000 output tokens costs
+      the adversary $0.06. The same query costs the operator $0.15 to $0.60 in
+      inference compute or upstream API fees -- depending on the operator''s
+      margin and infrastructure. The asymmetry ratio is 2.5x to 10x per query
+      for this example.
+
+      For denial-of-wallet against a free-tier deployment, the asymmetry is
+      infinite: the adversary pays nothing while the operator pays for every
+      query. Free-tier LLM deployments are structurally exposed to denial-of-
+      wallet because there is no mechanism to impose cost on the adversary
+      proportional to the cost they cause.
+
+      The asymmetry increases with infrastructure leverage. An operator running
+      their own GPU inference cluster pays fixed infrastructure costs regardless
+      of query volume up to capacity, then marginal costs beyond that. An
+      adversary who pushes the operator past capacity forces expensive
+      autoscaling or service degradation. The adversary''s marginal cost per
+      query remains constant; the operator''s marginal cost per query spikes.
+
+      The asymmetry calculation drives rate limit policy design. A rate limit
+      that makes the adversary spend more to cause damage than they would spend
+      on the commercial alternative is a meaningful deterrent. If the commercial
+      alternative to abusing the API costs the adversary $100 per month, a rate
+      limit policy that makes denial-of-wallet require $200 in adversary spend
+      has made the attack uneconomical. Section 9.11 builds the adaptive rate
+      limiter with this asymmetry calculation as the policy design input.
+
+  - part: 7
+    title: 'Detection Signals and the Shared Primitive Connection to Extraction'
+    body: |
+      Economic abuse and extraction share two detection primitives so completely
+      that the shared coverage is a design feature of the Section 9.11 capstone
+      rather than a coincidence.
+
+      The cost-per-query distribution signal covers both. A legitimate user''s
+      query cost distribution is stable around the product''s typical use case:
+      a customer service assistant generates responses of similar length across
+      typical customer queries; a code assistant generates responses of similar
+      length for typical programming tasks. Cost amplification produces statistical
+      outliers at the high end of the cost distribution -- queries whose cost is
+      three to ten sigma above the mean for that user''s history. This is detectable
+      with standard outlier analysis on the per-user cost log.
+
+      The high query volume signal covers both. Both a distillation extraction
+      campaign and a denial-of-wallet campaign require sustained high query volume
+      from one or more accounts. The query diversity signal distinguishes the two:
+      a distillation extractor issues diverse queries to cover the input space;
+      a denial-of-wallet attacker may issue similar high-cost queries repeatedly.
+      But the volume signal fires for both.
+
+      The signals that are more specific to economic abuse include: cost-per-query
+      outlier detection (high cost per query with normal diversity -- context
+      padding rather than boundary probing); input length distribution anomaly
+      (inputs far above the deployment''s typical input length); and rate-limit
+      hit concentration (a small number of users consuming a disproportionate
+      fraction of the rate-limit quota without matching cost-per-query outliers --
+      the minimal-query rate exhaustion pattern).
+
+      The Section 9.11 query monitor implements cost-per-query outlier detection
+      and input length monitoring as additional tracks alongside the extraction-
+      specific signals. The adaptive rate limiter enforces both per-user cost
+      budgets and per-user input token limits as complementary policy dimensions.
+      The unified implementation means a single query monitor deployment covers
+      all five attack classes: the four extraction goals from Section 9.2 and the
+      three economic abuse forms from this section.
+
+  - part: 8
+    title: 'Rate Limiting as a Security Control'
+    body: |
+      Rate limits are traditionally set by engineering teams to protect serving
+      infrastructure from overload. The limit is chosen based on capacity planning:
+      what volume of requests can the system handle at acceptable latency, and
+      where should it start shedding load? Security considerations are typically
+      absent from this decision.
+
+      Against economic abuse, rate limits are security controls: they bound the
+      damage rate achievable by an adversary per unit time. A rate limit of 100
+      requests per user per minute limits the adversary''s ability to exhaust the
+      operator''s budget or the service''s capacity by imposing a ceiling on the
+      volume they can issue. But the ceiling must be calibrated against the abuse
+      economics, not just against infrastructure capacity.
+
+      The extraction-aware rate limit design from Section 9.11 applies to
+      economic abuse as well. For extraction, the rate limit was designed to
+      make the query budget required for high-fidelity extraction exceed the
+      commercial alternative cost. For economic abuse, the rate limit must be
+      designed to make the attacker''s spend-to-damage ratio uneconomical: the
+      adversary should have to spend more to cause budget damage than they would
+      gain from the disruption.
+
+      Rate limits for economic abuse must operate on multiple dimensions
+      simultaneously: requests per minute (throttles rate-limit exhaustion),
+      tokens per minute (throttles high-volume token consumption), cost per
+      hour per user (throttles individual cost amplification campaigns), and
+      input tokens per request (throttles context padding attacks). A single-
+      dimensional rate limit that controls only request rate is bypassable by
+      context padding: the adversary issues fewer, more expensive requests that
+      stay below the request rate limit while maximising cost per request.
+
+      The Section 9.11 adaptive rate limiter implements all four dimensions
+      as a unified policy framework, with extraction-aware thresholds that
+      respond dynamically to the signals built in Section 9.10. Economic abuse
+      detection feeds the same policy engine: a user triggering cost-per-query
+      outliers is subject to the same rate limiting response as a user triggering
+      boundary proximity clustering.
+
+reference_materials:
+
+  - table: 1
+    title: 'API Economic Abuse Forms: Definition and Comparison'
+    description: |
+      Three forms of API economic abuse with their target, mechanism,
+      adversary motivation, and impact profile.
+    columns:
+      - 'Abuse Form'
+      - 'Target'
+      - 'Mechanism'
+      - 'Adversary Motivation'
+      - 'Impact'
+      - 'Primary Detection Signal'
+    rows:
+      - form: 'Cost Amplification'
+        target: 'Operator inference cost per request'
+        mechanism: 'Long-context inputs and verbose output demands maximise tokens per query'
+        motivation: 'Financial harm to operator; service degradation via budget pressure'
+        impact: '10x-500x cost per query vs average; immediate financial drain'
+        detection: 'Cost-per-query outlier; input length anomaly; output length anomaly'
+      - form: 'Denial-of-Wallet'
+        target: 'Operator total budget for a billing period'
+        mechanism: 'Sustained cost-amplifying queries until budget ceiling is reached'
+        motivation: 'Service suspension; reputational damage; financial harm'
+        impact: 'Budget exhausted in hours to days; service suspended or throttled'
+        detection: 'Per-user cumulative cost rate; sustained high-cost query pattern'
+      - form: 'Rate-Limit Exhaustion'
+        target: 'Service request capacity for legitimate users'
+        mechanism: 'High-rate minimal-content queries consume request-per-minute quota'
+        motivation: 'Competitive disruption; service availability degradation'
+        impact: 'Legitimate users receive 429 errors; service quality degrades'
+        detection: 'Rate-limit hit concentration per user; minimal-content high-frequency queries'
+
+  - table: 2
+    title: 'Long-Context Cost Amplification: Query Structure and Cost Multipliers'
+    description: |
+      Structural properties of cost-amplifying LLM queries with approximate
+      cost multipliers versus average queries. Values based on generic LLM
+      pricing model with $0.003 per 1K input tokens and $0.015 per 1K output tokens.
+    columns:
+      - 'Query Type'
+      - 'Approx Input Tokens'
+      - 'Approx Output Tokens'
+      - 'Estimated Cost (USD)'
+      - 'Cost Multiplier vs Average'
+      - 'Distinguishability from Legitimate Use'
+    rows:
+      - query_type: 'Typical average query'
+        input_tokens: '200'
+        output_tokens: '300'
+        cost: '$0.001'
+        multiplier: '1x (baseline)'
+        distinguishability: 'N/A -- baseline'
+      - query_type: 'Verbose output demand (no padding)'
+        input_tokens: '300'
+        output_tokens: '3000'
+        cost: '$0.046'
+        multiplier: '46x'
+        distinguishability: 'Low: long outputs are common in legitimate developer use'
+      - query_type: 'Context padding (large document + question)'
+        input_tokens: '50000'
+        output_tokens: '500'
+        cost: '$0.158'
+        multiplier: '158x'
+        distinguishability: 'Moderate: large documents are legitimate but frequency is anomalous'
+      - query_type: 'Combined padding + verbose output'
+        input_tokens: '100000'
+        output_tokens: '4000'
+        cost: '$0.360'
+        multiplier: '360x'
+        distinguishability: 'High: combination of maximum context and maximum output is anomalous'
+      - query_type: 'Minimal content (rate exhaustion)'
+        input_tokens: '5'
+        output_tokens: '10'
+        cost: '<$0.001'
+        multiplier: '<1x per query; harmful via volume'
+        distinguishability: 'High: minimal content at maximum rate is anomalous'
+
+  - table: 3
+    title: 'Denial-of-Wallet: Budget Exhaustion Time by Deployment Configuration'
+    description: |
+      Time-to-budget-exhaustion calculations for representative deployment
+      configurations under a sustained denial-of-wallet attack. Illustrates
+      the economic asymmetry.
+    columns:
+      - 'Deployment Type'
+      - 'Daily Budget (USD)'
+      - 'Cost per Amplified Query (USD)'
+      - 'Attack Rate (queries/hour)'
+      - 'Time to Exhaustion'
+      - 'Adversary Spend (USD)'
+      - 'Cost Asymmetry Ratio'
+    rows:
+      - deployment: 'Small free-tier deployment'
+        daily_budget: '$10'
+        cost_per_query: '$0.10'
+        attack_rate: '10/hour'
+        time_to_exhaustion: '1 hour'
+        adversary_spend: '$0 (free tier)'
+        asymmetry: 'Infinite'
+      - deployment: 'Small paid deployment (pay-per-use)'
+        daily_budget: '$50'
+        cost_per_query: '$0.25'
+        attack_rate: '10/hour'
+        time_to_exhaustion: '20 hours'
+        adversary_spend: '$0.20 (attacker API fee at 10% of operator cost)'
+        asymmetry: '250x per campaign'
+      - deployment: 'Medium enterprise deployment'
+        daily_budget: '$500'
+        cost_per_query: '$0.30'
+        attack_rate: '20/hour'
+        time_to_exhaustion: '83 hours (~3.5 days)'
+        adversary_spend: '$5.00'
+        asymmetry: '100x per campaign'
+      - deployment: 'Large deployment with autoscaling'
+        daily_budget: 'Autoscales (no hard limit)'
+        cost_per_query: '$0.35'
+        attack_rate: '100/hour'
+        time_to_exhaustion: 'Budget alarm threshold; no hard stop'
+        adversary_spend: '$3.50/hour'
+        asymmetry: 'Depends on operator monitoring response time'
+
+  - table: 4
+    title: 'Shared Detection Primitives: Economic Abuse vs Extraction'
+    description: |
+      Maps detection primitives across economic abuse forms and extraction attack
+      classes, showing which Section 9.10 primitives cover multiple threat classes.
+    columns:
+      - 'Detection Primitive'
+      - 'Cost Amplification'
+      - 'Denial-of-Wallet'
+      - 'Rate-Limit Exhaustion'
+      - 'Extraction (all goals)'
+      - 'Section 9.10 Component'
+    rows:
+      - primitive: 'Query volume monitor'
+        cost_amp: 'Partial (volume alone may be below threshold)'
+        dow: 'Primary signal (sustained volume)'
+        rle: 'Primary signal (high request rate)'
+        extraction: 'Primary for functionality extraction'
+        section_910: 'Query pattern analyser'
+      - primitive: 'Cost-per-query outlier'
+        cost_amp: 'Primary signal'
+        dow: 'Primary signal (cumulative cost rate)'
+        rle: 'Negative signal (low cost per query)'
+        extraction: 'Not applicable directly'
+        section_910: 'Output entropy monitor (partial proxy)'
+      - primitive: 'Input length anomaly'
+        cost_amp: 'Primary signal (context padding)'
+        dow: 'Primary signal'
+        rle: 'Negative signal (minimal input)'
+        extraction: 'Secondary for boundary probing'
+        section_910: 'Query pattern analyser extended'
+      - primitive: 'User concentration analyser'
+        cost_amp: 'Secondary (few users driving high cost)'
+        dow: 'Secondary (few users driving budget burn)'
+        rle: 'Primary (few users consuming rate quota)'
+        extraction: 'Primary for fidelity extraction'
+        section_910: 'User concentration analyser'
+      - primitive: 'Adaptive rate limiter'
+        cost_amp: 'Per-user cost budget enforcement'
+        dow: 'Per-user cumulative cost cap'
+        rle: 'Per-user request rate cap'
+        extraction: 'Per-user query budget cap'
+        section_910: 'rate_limiter.py (Section 9.11)'
+
+deliverables:
+
+  - id: 1
+    name: 'cost_amplifier.py'
+    description: |
+      Models and generates cost-amplifying query structures for a given LLM
+      pricing configuration. Implements three amplification strategies: verbose
+      output demand, context padding, and combined amplification. Computes the
+      cost multiplier versus the average query baseline and identifies the
+      highest-cost structure within a given input token ceiling. Intended as
+      the adversary-side model for understanding what Section 9.11 must defend
+      against.
+    implementation_notes: |
+      Single quotes throughout per book convention. No external dependencies.
+      Pricing is data-driven via LLMPricingConfig dataclass. Amplification
+      strategies are schema-free entries in AmplificationStrategy list.
+      No hardcoded per-strategy cost arithmetic.
+    code: |
+      # cost_amplifier.py
+      # Chapter 9 Section 9.8 -- Cost Amplification Query Modeller
+      # Single quotes throughout per book convention.
+
+      from dataclasses import dataclass, field
+      from typing import List, Optional, Tuple
+
+
+      @dataclass
+      class LLMPricingConfig:
+          name: str
+          input_cost_per_1k_tokens: float   # USD
+          output_cost_per_1k_tokens: float  # USD
+          max_input_tokens: int
+          max_output_tokens: int
+
+
+      @dataclass
+      class AmplificationStrategy:
+          name: str
+          description: str
+          input_tokens: int
+          output_tokens: int
+          example_prompt_structure: str
+
+
+      @dataclass
+      class AmplificationResult:
+          strategy: AmplificationStrategy
+          pricing: LLMPricingConfig
+          query_cost_usd: float
+          baseline_cost_usd: float
+          cost_multiplier: float
+          within_limits: bool
+
+
+      PRICING_CONFIGS: List[LLMPricingConfig] = [
+          LLMPricingConfig(
+              name='generic_small',
+              input_cost_per_1k_tokens=0.0005,
+              output_cost_per_1k_tokens=0.0015,
+              max_input_tokens=16000,
+              max_output_tokens=4096,
+          ),
+          LLMPricingConfig(
+              name='generic_large',
+              input_cost_per_1k_tokens=0.003,
+              output_cost_per_1k_tokens=0.015,
+              max_input_tokens=128000,
+              max_output_tokens=8192,
+          ),
+      ]
+
+      BASELINE_QUERY = AmplificationStrategy(
+          name='baseline_average',
+          description='Typical average query for cost baseline',
+          input_tokens=200,
+          output_tokens=300,
+          example_prompt_structure='Short user question with brief response',
+      )
+
+      AMPLIFICATION_STRATEGIES: List[AmplificationStrategy] = [
+          AmplificationStrategy(
+              name='verbose_output_demand',
+              description='Demand comprehensive structured output with no padding',
+              input_tokens=300,
+              output_tokens=3000,
+              example_prompt_structure=(
+                  'Write a comprehensive technical specification for [X] including: '
+                  'overview, architecture, API design, security considerations, '
+                  'testing strategy, deployment guide, and maintenance procedures. '
+                  'Each section must be complete and detailed.'
+              ),
+          ),
+          AmplificationStrategy(
+              name='context_padding_small',
+              description='Moderate context padding with a simple question',
+              input_tokens=15000,
+              output_tokens=400,
+              example_prompt_structure=(
+                  '[15K token document pasted as context] '
+                  'Based on the above document, what is the main theme?'
+              ),
+          ),
+          AmplificationStrategy(
+              name='context_padding_large',
+              description='Maximum context padding for large-context models',
+              input_tokens=100000,
+              output_tokens=500,
+              example_prompt_structure=(
+                  '[100K token document pasted as context] '
+                  'Summarise the above document in one paragraph.'
+              ),
+          ),
+          AmplificationStrategy(
+              name='combined_amplification',
+              description='Maximum context padding combined with verbose output demand',
+              input_tokens=100000,
+              output_tokens=4000,
+              example_prompt_structure=(
+                  '[100K token document] '
+                  'Provide a complete detailed analysis with sections for: '
+                  'executive summary, methodology critique, findings review, '
+                  'recommendations, and implementation roadmap. '
+                  'Each section should be thorough.'
+              ),
+          ),
+          AmplificationStrategy(
+              name='rate_exhaustion_minimal',
+              description='Minimal content query for request-rate exhaustion',
+              input_tokens=5,
+              output_tokens=10,
+              example_prompt_structure='Hi',
+          ),
+      ]
+
+
+      def compute_query_cost(
+          strategy: AmplificationStrategy,
+          pricing: LLMPricingConfig,
+      ) -> float:
+          '''Compute query cost in USD for a given strategy and pricing config.'''
+          input_cost = (strategy.input_tokens / 1000.0) * pricing.input_cost_per_1k_tokens
+          output_cost = (strategy.output_tokens / 1000.0) * pricing.output_cost_per_1k_tokens
+          return round(input_cost + output_cost, 6)
+
+
+      def analyse_strategy(
+          strategy: AmplificationStrategy,
+          pricing: LLMPricingConfig,
+          baseline: AmplificationStrategy,
+      ) -> AmplificationResult:
+          query_cost = compute_query_cost(strategy, pricing)
+          baseline_cost = compute_query_cost(baseline, pricing)
+          multiplier = query_cost / max(baseline_cost, 1e-10)
+          within = (
+              strategy.input_tokens <= pricing.max_input_tokens
+              and strategy.output_tokens <= pricing.max_output_tokens
+          )
+          return AmplificationResult(
+              strategy=strategy,
+              pricing=pricing,
+              query_cost_usd=query_cost,
+              baseline_cost_usd=baseline_cost,
+              cost_multiplier=round(multiplier, 1),
+              within_limits=within,
+          )
+
+
+      def find_maximum_cost_strategy(
+          strategies: List[AmplificationStrategy],
+          pricing: LLMPricingConfig,
+          baseline: AmplificationStrategy,
+      ) -> AmplificationResult:
+          '''Return the highest-cost strategy within the pricing config''s limits.'''
+          results = [
+              analyse_strategy(s, pricing, baseline)
+              for s in strategies
+              if s.input_tokens <= pricing.max_input_tokens
+              and s.output_tokens <= pricing.max_output_tokens
+          ]
+          return max(results, key=lambda r: r.query_cost_usd)
+
+
+      def render_amplification_report(
+          pricing: LLMPricingConfig,
+          strategies: List[AmplificationStrategy],
+          baseline: AmplificationStrategy,
+      ) -> None:
+          print(f'COST AMPLIFICATION REPORT -- Pricing: {pricing.name}')
+          print('=' * 65)
+          header = '%-30s %12s %10s %8s' % ('Strategy', 'Cost (USD)', 'Multiplier', 'InLimits')
+          print(header)
+          print('-' * 65)
+          baseline_cost = compute_query_cost(baseline, pricing)
+          print('%-30s %12.6f %10s %8s' % (baseline.name, baseline_cost, '1.0x', 'yes'))
+          for s in strategies:
+              result = analyse_strategy(s, pricing, baseline)
+              in_lim = 'yes' if result.within_limits else 'NO'
+              print('%-30s %12.6f %9.1fx %8s' % (
+                  s.name, result.query_cost_usd, result.cost_multiplier, in_lim
+              ))
+
+
+      if __name__ == '__main__':
+          for pricing in PRICING_CONFIGS:
+              render_amplification_report(pricing, AMPLIFICATION_STRATEGIES, BASELINE_QUERY)
+              best = find_maximum_cost_strategy(AMPLIFICATION_STRATEGIES, pricing, BASELINE_QUERY)
+              print(f'\nHighest-cost strategy within limits: {best.strategy.name}')
+              print(f'  Cost: ${best.query_cost_usd:.6f}  |  Multiplier: {best.cost_multiplier}x')
+              print()
+
+  - id: 2
+    name: 'denial_of_wallet_model.py'
+    description: |
+      Models denial-of-wallet attacks with concrete budget-exhaustion calculations.
+      Takes a deployment configuration (daily budget, cost per amplified query,
+      attack rate) and computes time to exhaustion, adversary spend required,
+      and cost asymmetry ratio. Generates a time-series of operator budget
+      depletion under sustained attack and identifies the minimum rate limit
+      required to prevent exhaustion within a target protection window.
+    implementation_notes: |
+      Single quotes throughout per book convention. No external dependencies.
+      All parameters are data-driven via DeploymentConfig and AttackConfig
+      dataclasses. Budget depletion simulation is schema-free: any cost model
+      can be supplied.
+    code: |
+      # denial_of_wallet_model.py
+      # Chapter 9 Section 9.8 -- Denial-of-Wallet Threat Model
+      # Single quotes throughout per book convention.
+
+      from dataclasses import dataclass, field
+      from typing import List, Optional, Tuple
+
+
+      @dataclass
+      class DeploymentConfig:
+          name: str
+          daily_budget_usd: float
+          operator_cost_per_amplified_query_usd: float
+          operator_cost_per_normal_query_usd: float
+          free_tier: bool  # if True, adversary pays nothing
+
+
+      @dataclass
+      class AttackConfig:
+          name: str
+          queries_per_hour: float
+          adversary_cost_per_query_usd: float  # 0.0 for free-tier abuse
+          fraction_amplified: float  # 0.0 to 1.0
+
+
+      @dataclass
+      class ExhaustionResult:
+          deployment: DeploymentConfig
+          attack: AttackConfig
+          hours_to_exhaustion: Optional[float]
+          total_adversary_spend_usd: float
+          total_operator_damage_usd: float
+          cost_asymmetry_ratio: float
+          minimum_rate_limit_qph: float  # queries/hour to prevent exhaustion in 24h
+
+
+      def simulate_budget_depletion(
+          deployment: DeploymentConfig,
+          attack: AttackConfig,
+          hours: int = 48,
+      ) -> List[Tuple[float, float]]:
+          '''
+          Simulate operator budget depletion over time.
+          Returns list of (hour, remaining_budget_usd) tuples.
+          '''
+          budget = deployment.daily_budget_usd
+          timeline: List[Tuple[float, float]] = [(0.0, budget)]
+          for h in range(1, hours + 1):
+              amplified = attack.queries_per_hour * attack.fraction_amplified
+              normal = attack.queries_per_hour * (1.0 - attack.fraction_amplified)
+              hourly_cost = (
+                  amplified * deployment.operator_cost_per_amplified_query_usd
+                  + normal * deployment.operator_cost_per_normal_query_usd
+              )
+              budget = max(0.0, budget - hourly_cost)
+              timeline.append((float(h), round(budget, 4)))
+              if budget == 0.0:
+                  break
+          return timeline
+
+
+      def compute_exhaustion(
+          deployment: DeploymentConfig,
+          attack: AttackConfig,
+      ) -> ExhaustionResult:
+          hourly_operator_cost = (
+              attack.queries_per_hour * attack.fraction_amplified
+              * deployment.operator_cost_per_amplified_query_usd
+              + attack.queries_per_hour * (1.0 - attack.fraction_amplified)
+              * deployment.operator_cost_per_normal_query_usd
+          )
+          if hourly_operator_cost <= 0:
+              hours_to_exhaustion = None
+          else:
+              hours_to_exhaustion = round(
+                  deployment.daily_budget_usd / hourly_operator_cost, 2
+              )
+
+          total_hours = hours_to_exhaustion if hours_to_exhaustion else 24.0
+          total_queries = attack.queries_per_hour * total_hours
+          adversary_spend = total_queries * attack.adversary_cost_per_query_usd
+          operator_damage = deployment.daily_budget_usd
+
+          if adversary_spend > 0:
+              asymmetry = round(operator_damage / adversary_spend, 1)
+          else:
+              asymmetry = float('inf')
+
+          # Minimum rate limit to keep operator safe for 24h
+          max_hourly_cost_safe = deployment.daily_budget_usd / 24.0
+          if deployment.operator_cost_per_amplified_query_usd > 0:
+              min_rate_limit = round(
+                  max_hourly_cost_safe / deployment.operator_cost_per_amplified_query_usd, 1
+              )
+          else:
+              min_rate_limit = float('inf')
+
+          return ExhaustionResult(
+              deployment=deployment,
+              attack=attack,
+              hours_to_exhaustion=hours_to_exhaustion,
+              total_adversary_spend_usd=round(adversary_spend, 4),
+              total_operator_damage_usd=round(operator_damage, 2),
+              cost_asymmetry_ratio=asymmetry,
+              minimum_rate_limit_qph=min_rate_limit,
+          )
+
+
+      def render_exhaustion_report(result: ExhaustionResult) -> None:
+          hrs = f'{result.hours_to_exhaustion:.1f}h' if result.hours_to_exhaustion else 'Never (budget too large)'
+          asym = f'{result.cost_asymmetry_ratio:.1f}x' if result.cost_asymmetry_ratio != float('inf') else 'Infinite (free tier)'
+          print(f'Deployment: {result.deployment.name}')
+          print(f'  Daily budget:            ${result.deployment.daily_budget_usd:.2f}')
+          print(f'  Attack rate:             {result.attack.queries_per_hour:.0f} queries/hour')
+          print(f'  Time to exhaustion:      {hrs}')
+          print(f'  Adversary spend:         ${result.total_adversary_spend_usd:.4f}')
+          print(f'  Operator damage:         ${result.total_operator_damage_usd:.2f}')
+          print(f'  Cost asymmetry ratio:    {asym}')
+          print(f'  Min rate limit (q/hr):   {result.minimum_rate_limit_qph}')
+
+
+      EXAMPLE_DEPLOYMENTS: List[DeploymentConfig] = [
+          DeploymentConfig(
+              name='small_free_tier',
+              daily_budget_usd=10.0,
+              operator_cost_per_amplified_query_usd=0.10,
+              operator_cost_per_normal_query_usd=0.001,
+              free_tier=True,
+          ),
+          DeploymentConfig(
+              name='small_paid',
+              daily_budget_usd=50.0,
+              operator_cost_per_amplified_query_usd=0.25,
+              operator_cost_per_normal_query_usd=0.002,
+              free_tier=False,
+          ),
+          DeploymentConfig(
+              name='medium_enterprise',
+              daily_budget_usd=500.0,
+              operator_cost_per_amplified_query_usd=0.30,
+              operator_cost_per_normal_query_usd=0.003,
+              free_tier=False,
+          ),
+      ]
+
+      EXAMPLE_ATTACKS: List[AttackConfig] = [
+          AttackConfig(
+              name='free_tier_sustained',
+              queries_per_hour=10.0,
+              adversary_cost_per_query_usd=0.0,
+              fraction_amplified=1.0,
+          ),
+          AttackConfig(
+              name='paid_amplification',
+              queries_per_hour=10.0,
+              adversary_cost_per_query_usd=0.025,
+              fraction_amplified=0.8,
+          ),
+      ]
+
+
+      if __name__ == '__main__':
+          print('DENIAL-OF-WALLET THREAT MODEL -- Chapter 9 Section 9.8')
+          print('=' * 60)
+          for deployment in EXAMPLE_DEPLOYMENTS:
+              for attack in EXAMPLE_ATTACKS:
+                  if not deployment.free_tier or attack.adversary_cost_per_query_usd == 0.0:
+                      result = compute_exhaustion(deployment, attack)
+                      render_exhaustion_report(result)
+                      print()
+
+  - id: 3
+    name: 'rate_limit_exhauster.py'
+    description: |
+      Simulates a distributed rate-limit exhaustion campaign across multiple
+      accounts. Models how N accounts each issuing queries at a fraction of the
+      per-user rate limit collectively exhaust the service''s global rate-limit
+      quota. Computes time-to-service-degradation, minimum accounts needed to
+      exhaust a given quota, and the per-account query rate that evades per-user
+      blocking while achieving collective exhaustion.
+    implementation_notes: |
+      Single quotes throughout per book convention. No external dependencies.
+      Rate limit policy is data-driven via RateLimitPolicy dataclass. Campaign
+      configuration is schema-free. All calculations are parameterised.
+    code: |
+      # rate_limit_exhauster.py
+      # Chapter 9 Section 9.8 -- Rate-Limit Exhaustion Simulation
+      # Single quotes throughout per book convention.
+
+      from dataclasses import dataclass, field
+      from typing import List, Optional, Tuple
+
+
+      @dataclass
+      class RateLimitPolicy:
+          name: str
+          global_requests_per_minute: int
+          per_user_requests_per_minute: int
+          per_user_tokens_per_minute: int
+          block_threshold_fraction: float  # block user if they exceed this fraction of per-user limit
+
+
+      @dataclass
+      class ExhaustionCampaign:
+          n_accounts: int
+          per_account_requests_per_minute: float  # must be below per_user block threshold
+          tokens_per_request: int
+
+
+      @dataclass
+      class ExhaustionSimResult:
+          policy: RateLimitPolicy
+          campaign: ExhaustionCampaign
+          collective_requests_per_minute: float
+          global_quota_fraction_consumed: float
+          service_degraded: bool  # True if collective > global limit
+          per_account_below_threshold: bool
+          min_accounts_for_exhaustion: int
+          time_to_degradation_seconds: Optional[float]
+
+
+      def simulate_exhaustion(
+          policy: RateLimitPolicy,
+          campaign: ExhaustionCampaign,
+      ) -> ExhaustionSimResult:
+          block_limit = policy.per_user_requests_per_minute * policy.block_threshold_fraction
+          per_account_below = campaign.per_account_requests_per_minute < block_limit
+          collective_rpm = campaign.n_accounts * campaign.per_account_requests_per_minute
+          quota_fraction = collective_rpm / max(policy.global_requests_per_minute, 1)
+          service_degraded = collective_rpm >= policy.global_requests_per_minute
+
+          # Minimum accounts to reach global limit without triggering per-user blocks
+          if campaign.per_account_requests_per_minute > 0:
+              min_accounts = int(
+                  policy.global_requests_per_minute
+                  / campaign.per_account_requests_per_minute
+              ) + 1
+          else:
+              min_accounts = -1
+
+          # Time to fill quota at sustained rate (in seconds, for a 1-minute window)
+          if collective_rpm >= policy.global_requests_per_minute:
+              time_to_degradation = 60.0 * (
+                  policy.global_requests_per_minute / max(collective_rpm, 1)
+              )
+          else:
+              time_to_degradation = None
+
+          return ExhaustionSimResult(
+              policy=policy,
+              campaign=campaign,
+              collective_requests_per_minute=round(collective_rpm, 1),
+              global_quota_fraction_consumed=round(quota_fraction, 3),
+              service_degraded=service_degraded,
+              per_account_below_threshold=per_account_below,
+              min_accounts_for_exhaustion=min_accounts,
+              time_to_degradation_seconds=round(time_to_degradation, 1) if time_to_degradation else None,
+          )
+
+
+      def render_sim_result(result: ExhaustionSimResult) -> None:
+          degraded = 'YES -- service degraded' if result.service_degraded else 'No'
+          stealthy = 'YES -- below per-user block' if result.per_account_below_threshold else 'NO -- triggers blocks'
+          ttd = f'{result.time_to_degradation_seconds:.1f}s' if result.time_to_degradation_seconds else 'N/A'
+          print(f'Policy: {result.policy.name}')
+          print(f'  Accounts in campaign:      {result.campaign.n_accounts}')
+          print(f'  Per-account rate (rpm):    {result.campaign.per_account_requests_per_minute}')
+          print(f'  Collective rate (rpm):     {result.collective_requests_per_minute}')
+          print(f'  Global quota consumed:     {result.global_quota_fraction_consumed:.1%}')
+          print(f'  Service degraded:          {degraded}')
+          print(f'  Per-account stealthy:      {stealthy}')
+          print(f'  Min accounts for exhaustion: {result.min_accounts_for_exhaustion}')
+          print(f'  Time to degradation:       {ttd}')
+
+
+      if __name__ == '__main__':
+          policy = RateLimitPolicy(
+              name='standard_policy',
+              global_requests_per_minute=1000,
+              per_user_requests_per_minute=60,
+              per_user_tokens_per_minute=100000,
+              block_threshold_fraction=0.9,
+          )
+          campaigns = [
+              ExhaustionCampaign(n_accounts=5, per_account_requests_per_minute=50.0, tokens_per_request=100),
+              ExhaustionCampaign(n_accounts=20, per_account_requests_per_minute=50.0, tokens_per_request=100),
+              ExhaustionCampaign(n_accounts=50, per_account_requests_per_minute=20.0, tokens_per_request=100),
+          ]
+          print('RATE-LIMIT EXHAUSTION SIMULATION -- Chapter 9 Section 9.8')
+          print('=' * 60)
+          for campaign in campaigns:
+              result = simulate_exhaustion(policy, campaign)
+              render_sim_result(result)
+              print()
+
+  - id: 4
+    name: 'cost_per_query_analyser.py'
+    description: |
+      Analyses a query cost log to identify statistical outliers consistent with
+      cost amplification. Computes per-user cost distributions, identifies outlier
+      queries using the IQR method, and produces a per-user abuse risk score
+      combining cost outlier rate, input length anomaly, and rate concentration.
+      Intended as the cost-monitoring track in the Section 9.11 query monitor.
+    implementation_notes: |
+      Single quotes throughout per book convention. No external dependencies
+      beyond stdlib. Outlier detection uses the IQR method (configurable multiplier).
+      All distribution metrics are computed generically from QueryCostEntry list.
+      No hardcoded per-user or per-query assumptions.
+    code: |
+      # cost_per_query_analyser.py
+      # Chapter 9 Section 9.8 -- Query Cost Distribution Analyser
+      # Single quotes throughout per book convention.
+
+      import math
+      from dataclasses import dataclass, field
+      from typing import Dict, List, Optional, Tuple
+
+
+      @dataclass
+      class QueryCostEntry:
+          query_id: str
+          user_id: str
+          input_tokens: int
+          output_tokens: int
+          cost_usd: float
+
+
+      @dataclass
+      class UserCostProfile:
+          user_id: str
+          n_queries: int
+          mean_cost: float
+          median_cost: float
+          p95_cost: float
+          max_cost: float
+          outlier_count: int
+          outlier_fraction: float
+          mean_input_tokens: float
+          abuse_risk_score: float
+
+
+      def _percentile(values: List[float], p: float) -> float:
+          if not values:
+              return 0.0
+          sorted_v = sorted(values)
+          idx = (len(sorted_v) - 1) * p / 100.0
+          lo = int(idx)
+          hi = min(lo + 1, len(sorted_v) - 1)
+          frac = idx - lo
+          return sorted_v[lo] * (1.0 - frac) + sorted_v[hi] * frac
+
+
+      def _iqr_outlier_threshold(values: List[float], k: float = 3.0) -> float:
+          q1 = _percentile(values, 25)
+          q3 = _percentile(values, 75)
+          iqr = q3 - q1
+          return q3 + k * iqr
+
+
+      def _mean(values: List[float]) -> float:
+          return sum(values) / len(values) if values else 0.0
+
+
+      def build_user_cost_profile(
+          user_id: str,
+          entries: List[QueryCostEntry],
+          iqr_k: float = 3.0,
+          input_length_anomaly_threshold: int = 10000,
+      ) -> UserCostProfile:
+          costs = [e.cost_usd for e in entries]
+          input_lengths = [e.input_tokens for e in entries]
+          if not costs:
+              return UserCostProfile(
+                  user_id=user_id, n_queries=0, mean_cost=0.0,
+                  median_cost=0.0, p95_cost=0.0, max_cost=0.0,
+                  outlier_count=0, outlier_fraction=0.0,
+                  mean_input_tokens=0.0, abuse_risk_score=0.0,
+              )
+          outlier_threshold = _iqr_outlier_threshold(costs, iqr_k)
+          outlier_count = sum(1 for c in costs if c > outlier_threshold)
+          outlier_fraction = outlier_count / len(costs)
+
+          # Input length anomaly fraction
+          long_input_count = sum(1 for l in input_lengths if l > input_length_anomaly_threshold)
+          long_input_fraction = long_input_count / len(input_lengths)
+
+          # Abuse risk score: weighted combination
+          cost_outlier_signal = min(outlier_fraction * 5.0, 1.0)
+          input_anomaly_signal = min(long_input_fraction * 3.0, 1.0)
+          abuse_score = round(0.6 * cost_outlier_signal + 0.4 * input_anomaly_signal, 3)
+
+          return UserCostProfile(
+              user_id=user_id,
+              n_queries=len(entries),
+              mean_cost=round(_mean(costs), 6),
+              median_cost=round(_percentile(costs, 50), 6),
+              p95_cost=round(_percentile(costs, 95), 6),
+              max_cost=round(max(costs), 6),
+              outlier_count=outlier_count,
+              outlier_fraction=round(outlier_fraction, 3),
+              mean_input_tokens=round(_mean([float(l) for l in input_lengths]), 1),
+              abuse_risk_score=abuse_score,
+          )
+
+
+      def analyse_cost_log(
+          entries: List[QueryCostEntry],
+          iqr_k: float = 3.0,
+          input_length_anomaly_threshold: int = 10000,
+      ) -> List[UserCostProfile]:
+          by_user: Dict[str, List[QueryCostEntry]] = {}
+          for e in entries:
+              by_user.setdefault(e.user_id, []).append(e)
+          profiles = [
+              build_user_cost_profile(uid, user_entries, iqr_k, input_length_anomaly_threshold)
+              for uid, user_entries in by_user.items()
+          ]
+          return sorted(profiles, key=lambda p: p.abuse_risk_score, reverse=True)
+
+
+      def render_cost_report(profiles: List[UserCostProfile]) -> None:
+          print('COST-PER-QUERY ANALYSIS -- Chapter 9 Section 9.8')
+          print('=' * 70)
+          header = '%-12s %8s %10s %10s %10s %8s %10s' % (
+              'User', 'Queries', 'MeanCost', 'P95Cost', 'MaxCost', 'Outliers', 'RiskScore'
+          )
+          print(header)
+          print('-' * 70)
+          for p in profiles:
+              print('%-12s %8d %10.5f %10.5f %10.5f %7.1f%% %10.1f%%' % (
+                  p.user_id, p.n_queries,
+                  p.mean_cost, p.p95_cost, p.max_cost,
+                  p.outlier_fraction * 100, p.abuse_risk_score * 100,
+              ))
+
+
+      if __name__ == '__main__':
+          import random
+          rng = random.Random(42)
+
+          entries: List[QueryCostEntry] = []
+          # Legitimate users: normal cost distribution
+          for uid in ['user_01', 'user_02', 'user_03']:
+              for i in range(50):
+                  tokens_in = int(rng.gauss(200, 50))
+                  tokens_out = int(rng.gauss(300, 80))
+                  cost = (tokens_in / 1000.0) * 0.003 + (tokens_out / 1000.0) * 0.015
+                  entries.append(QueryCostEntry(f'{uid}_q{i}', uid, max(10, tokens_in), max(10, tokens_out), round(cost, 6)))
+
+          # Attacker: cost amplification queries
+          for i in range(20):
+              tokens_in = rng.randint(50000, 100000)
+              tokens_out = rng.randint(3000, 4000)
+              cost = (tokens_in / 1000.0) * 0.003 + (tokens_out / 1000.0) * 0.015
+              entries.append(QueryCostEntry(f'attacker_q{i}', 'attacker_99', tokens_in, tokens_out, round(cost, 6)))
+
+          profiles = analyse_cost_log(entries)
+          render_cost_report(profiles)
+
+  - id: 5
+    name: 'adversary_economics_calculator.py'
+    description: |
+      Computes the adversary-operator cost asymmetry ratio for API economic abuse
+      scenarios. Calculates the minimum rate limit required to make each abuse
+      form economically irrational (adversary spend exceeds damage caused), and
+      produces a rate limit policy recommendation grounded in the asymmetry
+      calculation rather than in infrastructure capacity alone.
+    implementation_notes: |
+      Single quotes throughout per book convention. No external dependencies.
+      All economic parameters are data-driven via AbuseEconomicsScenario
+      dataclass. Rate limit recommendation is computed from the asymmetry
+      inversion formula -- no hardcoded policy values.
+    code: |
+      # adversary_economics_calculator.py
+      # Chapter 9 Section 9.8 -- Adversary-Operator Cost Asymmetry Calculator
+      # Single quotes throughout per book convention.
+
+      from dataclasses import dataclass, field
+      from typing import List, Optional
+
+
+      @dataclass
+      class AbuseEconomicsScenario:
+          name: str
+          abuse_form: str
+          adversary_cost_per_query_usd: float
+          operator_cost_per_query_usd: float
+          operator_daily_budget_usd: float
+          legitimate_queries_per_day: int
+          note: str
+
+
+      @dataclass
+      class AsymmetryResult:
+          scenario: AbuseEconomicsScenario
+          asymmetry_ratio: float
+          adversary_hourly_spend_at_10qph: float
+          operator_hourly_damage_at_10qph: float
+          budget_exhaustion_hours_at_10qph: float
+          economically_rational_for_adversary: bool
+          # Rate limit in queries/hour that makes asymmetry <= 1.0
+          rate_limit_for_parity_qph: Optional[float]
+          # Rate limit that caps operator hourly damage to 5% of daily budget
+          rate_limit_for_5pct_hourly_cap_qph: float
+
+
+      def compute_asymmetry(
+          scenario: AbuseEconomicsScenario,
+          reference_queries_per_hour: float = 10.0,
+      ) -> AsymmetryResult:
+          adv_hourly = reference_queries_per_hour * scenario.adversary_cost_per_query_usd
+          op_hourly = reference_queries_per_hour * scenario.operator_cost_per_query_usd
+          if scenario.adversary_cost_per_query_usd > 0:
+              asymmetry = round(
+                  scenario.operator_cost_per_query_usd / scenario.adversary_cost_per_query_usd, 1
+              )
+          else:
+              asymmetry = float('inf')
+          rational = scenario.adversary_cost_per_query_usd < scenario.operator_cost_per_query_usd
+
+          exhaustion_hours = round(
+              scenario.operator_daily_budget_usd / max(op_hourly, 1e-10), 1
+          )
+
+          # Rate limit for cost parity (adversary spends as much as operator per query)
+          # Not achievable by rate limiting alone if adversary is on free tier
+          if scenario.adversary_cost_per_query_usd > 0 and asymmetry > 1.0:
+              # At parity, adversary spend / query == operator spend / query
+              # This is a property of the pricing model, not the rate limit
+              # Rate limiting does not change per-query asymmetry, only total volume
+              parity_qph = None  # not achievable via rate limiting
+          else:
+              parity_qph = None
+
+          # Rate limit to cap hourly operator damage at 5% of daily budget
+          max_hourly_damage = scenario.operator_daily_budget_usd * 0.05
+          if scenario.operator_cost_per_query_usd > 0:
+              cap_qph = round(max_hourly_damage / scenario.operator_cost_per_query_usd, 1)
+          else:
+              cap_qph = float('inf')
+
+          return AsymmetryResult(
+              scenario=scenario,
+              asymmetry_ratio=asymmetry,
+              adversary_hourly_spend_at_10qph=round(adv_hourly, 4),
+              operator_hourly_damage_at_10qph=round(op_hourly, 4),
+              budget_exhaustion_hours_at_10qph=exhaustion_hours,
+              economically_rational_for_adversary=rational,
+              rate_limit_for_parity_qph=parity_qph,
+              rate_limit_for_5pct_hourly_cap_qph=cap_qph,
+          )
+
+
+      EXAMPLE_SCENARIOS: List[AbuseEconomicsScenario] = [
+          AbuseEconomicsScenario(
+              name='free_tier_amplification',
+              abuse_form='denial_of_wallet',
+              adversary_cost_per_query_usd=0.0,
+              operator_cost_per_query_usd=0.25,
+              operator_daily_budget_usd=50.0,
+              legitimate_queries_per_day=5000,
+              note='Adversary exploits free tier; operator pays all costs',
+          ),
+          AbuseEconomicsScenario(
+              name='paid_amplification',
+              abuse_form='cost_amplification',
+              adversary_cost_per_query_usd=0.025,
+              operator_cost_per_query_usd=0.30,
+              operator_daily_budget_usd=500.0,
+              legitimate_queries_per_day=20000,
+              note='Adversary on paid tier; 12x asymmetry',
+          ),
+          AbuseEconomicsScenario(
+              name='rate_exhaustion_minimal',
+              abuse_form='rate_limit_exhaustion',
+              adversary_cost_per_query_usd=0.0001,
+              operator_cost_per_query_usd=0.001,
+              operator_daily_budget_usd=500.0,
+              legitimate_queries_per_day=20000,
+              note='Minimal queries; 10x cost asymmetry; harm is availability not budget',
+          ),
+      ]
+
+
+      def render_asymmetry_report(scenarios: List[AbuseEconomicsScenario]) -> None:
+          print('ADVERSARY ECONOMICS CALCULATOR -- Chapter 9 Section 9.8')
+          print('=' * 60)
+          for scenario in scenarios:
+              result = compute_asymmetry(scenario)
+              rational_str = 'YES' if result.economically_rational_for_adversary else 'No'
+              asym_str = f'{result.asymmetry_ratio:.1f}x' if result.asymmetry_ratio != float('inf') else 'Infinite'
+              print(f'\nScenario: {scenario.name}')
+              print(f'  Abuse form:              {scenario.abuse_form}')
+              print(f'  Note:                    {scenario.note}')
+              print(f'  Asymmetry ratio:         {asym_str}')
+              print(f'  Economically rational:   {rational_str}')
+              print(f'  Adv hourly spend @10qph: ${result.adversary_hourly_spend_at_10qph:.4f}')
+              print(f'  Op hourly damage @10qph: ${result.operator_hourly_damage_at_10qph:.4f}')
+              print(f'  Budget exhaustion @10qph: {result.budget_exhaustion_hours_at_10qph:.1f}h')
+              print(f'  Rate limit for 5%% cap:  {result.rate_limit_for_5pct_hourly_cap_qph:.1f} queries/hour/user')
+
+
+      if __name__ == '__main__':
+          render_asymmetry_report(EXAMPLE_SCENARIOS)
+
+common_mistakes:
+
+  - id: 1
+    description: 'Setting input token limits based on user experience requirements rather than security requirements'
+    why_it_happens: |
+      Input token limits are typically set by product managers and engineers to
+      match the use case: a document summarisation product should accept long
+      documents, so a 100K token limit feels appropriate. Security teams are
+      not consulted. The limit is a feature specification, not a security control.
+    consequence: |
+      A 100K input token limit is an invitation for context padding attacks.
+      The adversary fills the context window with padded content on every query,
+      maximising input processing cost with no corresponding user value. A product
+      that legitimately needs to accept 100K-token documents will find it difficult
+      to distinguish legitimate long-document queries from padding attacks, because
+      the content structure may be similar.
+    correct_approach: |
+      Set the input token limit at the minimum required for the product use case
+      plus a reasonable buffer. For products where most legitimate queries use
+      under 5K tokens, a 10K limit is justified -- not 100K. For products where
+      long-document processing is genuinely required, instrument the cost-per-query
+      distribution to detect anomalous high-cost users and apply per-user cost
+      budgets in addition to per-request limits.
+
+  - id: 2
+    description: 'Treating denial-of-wallet and rate-limit exhaustion as the same attack with the same defence'
+    why_it_happens: |
+      Both attacks involve high API usage. Both are addressed by rate limits. The
+      common feature obscures the difference: denial-of-wallet harms the operator
+      financially, while rate-limit exhaustion harms users operationally. Defending
+      against one does not fully defend against the other.
+    consequence: |
+      A deployment with robust per-user request rate limits but no per-user cost
+      budget tracking is defended against rate-limit exhaustion but exposed to
+      denial-of-wallet from high-cost queries issued within the rate limit.
+      An adversary who issues ten maximum-cost queries per hour -- well within
+      a 60-requests-per-minute limit -- can still exhaust a small deployment''s
+      daily budget in a few hours while never triggering the rate limit monitor.
+    correct_approach: |
+      Implement both dimensions independently. Rate-limit controls (requests per
+      minute, tokens per minute) defend against rate-limit exhaustion. Per-user
+      cost budget tracking defends against denial-of-wallet. The Section 9.11
+      adaptive rate limiter implements both dimensions with independent thresholds
+      in a unified policy framework.
+
+  - id: 3
+    description: 'Implementing rate limits only on request count and ignoring token-level limits'
+    why_it_happens: |
+      Request-count rate limits are the standard HTTP infrastructure control.
+      They are easy to implement at the API gateway layer without application-level
+      awareness. Token-level limits require knowledge of the model''s tokenisation
+      and per-request cost, which is deeper instrumentation.
+    consequence: |
+      An adversary constrained by a request-rate limit but not a token-rate limit
+      maximises token consumption per request: each of the allowed requests is a
+      context-padding maximum-output query. Ten requests per minute at 100K input
+      and 4K output tokens per request consumes 1.04M tokens per minute -- far
+      beyond what ten average queries would consume -- while staying within the
+      request rate limit.
+    correct_approach: |
+      Implement token-per-minute limits in addition to request-per-minute limits.
+      Monitor both dimensions independently. For LLM deployments where inference
+      cost is token-driven, the token-per-minute limit is the more directly
+      relevant security control. Both limits are implemented in the Section 9.11
+      adaptive rate limiter as independent policy dimensions.
+
+  - id: 4
+    description: 'Assuming that paying customers cannot be abusers and exempting high-tier users from cost monitoring'
+    why_it_happens: |
+      Enterprise or paid-tier users are perceived as having a business relationship
+      with the operator that reduces their likelihood of abuse. High-tier users
+      are often given elevated limits to support their stated use cases. Monitoring
+      and rate limiting are perceived as bad customer experience for paying customers.
+    consequence: |
+      Paid-tier users who abuse the API cause disproportionate damage precisely
+      because their elevated limits allow them to issue more high-cost queries
+      before any monitoring fires. A malicious enterprise user exploiting
+      a 10M tokens-per-month paid tier for context-padding attacks exhausts
+      that allocation in hours at maximum query cost, then disputes the invoice
+      or simply accepts the cost as the price of their disruption campaign.
+    correct_approach: |
+      Apply cost monitoring and anomaly detection uniformly across all user tiers.
+      High-tier users have higher absolute limits but the same relative anomaly
+      thresholds: a user whose cost per query is five sigma above their own
+      historical mean is anomalous regardless of tier. The cost-per-query analyser
+      (Deliverable 4) builds per-user baselines that adapt to the user''s typical
+      usage pattern, making tier-independent anomaly detection straightforward.
+
+  - id: 5
+    description: 'Treating economic abuse as an operational problem rather than a security problem and routing it to the infrastructure team'
+    why_it_happens: |
+      Budget overruns and service degradation are infrastructure and operations
+      concerns. Security teams focus on data theft, privilege escalation, and
+      compliance. Economic abuse looks like a billing problem, not a security
+      incident, until it is examined through the threat model lens.
+    consequence: |
+      The infrastructure team addresses the symptom (high billing, service lag)
+      without investigating the cause (adversarial query engineering). The response
+      is to increase capacity or budget, which makes the deployment more expensive
+      but does not stop the attack. Security monitoring for the attack''s query
+      patterns is never implemented because the attack was not classified as a
+      security incident.
+    correct_approach: |
+      Classify API economic abuse as a security threat class with the same
+      treatment as extraction and privacy attacks: threat model documentation,
+      detection control requirements, incident response playbook, and security
+      monitoring coverage. The detection primitives for economic abuse overlap
+      substantially with extraction detection (Table 4) -- implementing both
+      requires only one additional signal track (cost-per-query outlier) in the
+      Section 9.11 query monitor.
+
+section_summary:
+  compact: |
+    API economic abuse attacks operational viability rather than intellectual
+    property. Cost amplification engineers individual queries to maximise inference
+    expense through context padding and verbose output demands, achieving 50x to
+    360x cost multipliers over average queries. Denial-of-wallet sustains
+    amplification until the operator''s budget is exhausted -- a free-tier
+    deployment with a $50 daily budget can be drained in one hour at ten
+    amplified queries per hour by an adversary spending nothing. Rate-limit
+    exhaustion distributes minimal queries across many accounts to consume
+    the service''s request quota and block legitimate users without triggering
+    per-user monitors. The adversary-operator cost asymmetry is 10x to infinite
+    depending on pricing model, making economic abuse economically rational
+    wherever it is technically feasible. Economic abuse and extraction share
+    the query volume and user concentration detection primitives; economic
+    abuse adds cost-per-query outlier detection and input length anomaly
+    monitoring as additional tracks. The Section 9.11 adaptive rate limiter
+    defends against both threat classes through four independent policy
+    dimensions: requests per minute, tokens per minute, cost per hour,
+    and input tokens per request.
+
+  key_takeaways:
+    - 'Context padding at 100K tokens with verbose output demands achieves 360x cost amplification within model limits'
+    - 'Free-tier deployments have infinite adversary-operator cost asymmetry -- denial-of-wallet costs the adversary nothing'
+    - 'Rate-limit exhaustion requires only request-count consumption; minimal queries bypass cost monitors while blocking legitimate users'
+    - 'Economic abuse and extraction share query volume and user concentration primitives -- one monitoring deployment covers both'
+    - 'Four independent rate limit dimensions are required: request rate, token rate, cost budget, and input token cap'
+    - 'Classifying economic abuse as an infrastructure problem rather than a security problem leads to symptom treatment instead of attack detection'
+
+preview_section_09:
+  title: 'Section 9.9: Real-World Incident -- Documented Model Extraction Against a Commercial API'
+  preview: |
+    Section 9.8 completed the attack arc: six sections covering the five attack
+    classes from the Section 9.2 taxonomy plus economic abuse. Section 9.9
+    grounds this arc in documented reality. The Tramer et al. 2016 commercial
+    API extractions, the Carlini et al. GPT-2 training data extraction, and
+    more recent documented LLM distillation incidents are reconstructed as
+    formal incident timelines with root cause analysis and detection opportunity
+    mapping. Each incident is examined for which Section 9.10 through 9.12 controls
+    would have detected or prevented the attack, producing the lessons-learned
+    checklist that informs the production capstone sections. Section 9.9 is the
+    bridge between the attack catalogue and the production defence.
+
+metadata:
+  cross_chapter_references:
+    - ref: 'Chapter 3: LLM architecture and token-based inference costs'
+      usage: 'Mechanistic basis for long-context cost amplification in prose Part 5'
+    - ref: 'Chapter 4 Section 4.8: API architecture and rate limiting mechanisms'
+      usage: 'Rate-limit policy framework prerequisites for prose Parts 4 and 8'
+    - ref: 'Section 9.1: query budget as the defining constraint'
+      usage: 'Economic abuse inverts the query budget constraint -- the operator has the budget ceiling, not the adversary'
+    - ref: 'Section 9.2: economic abuse as the fifth threat class'
+      usage: 'Taxonomy position; shared detection primitive connection established in Section 9.2 Table 3'
+    - ref: 'Section 9.4: distillation cost economics'
+      usage: 'Shared pricing model framework; distillation economics and abuse economics use the same data structures'
+
+  forward_references:
+    - ref: 'Section 9.9: Real-World Incident'
+      usage: 'Economic abuse incidents (documented denial-of-wallet cases against commercial LLM APIs) reconstructed in Section 9.9'
+    - ref: 'Section 9.11: Adaptive Rate Limiter'
+      usage: 'All four rate limit dimensions established in this section are implemented in rate_limiter.py'
+    - ref: 'Section 9.10: Detection Primitives'
+      usage: 'Cost-per-query outlier detection and input length anomaly monitoring are the economic-abuse-specific tracks added in Section 9.10'

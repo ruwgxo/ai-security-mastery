@@ -1,0 +1,1087 @@
+# section_10_01_evasion_threat_model.yaml
+
+---
+document_info:
+  title: 'Evasion Threat Model: From Chapter 9 Boundary Mapping to Adversarial Examples'
+  chapter: 10
+  section: 1
+  section_code: '1001'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-05-21'
+  estimated_pages: 6
+  estimated_reading_time: '45-55 minutes'
+
+section_overview:
+  one_line_summary: 'Chapter 9 mapped the decision surface; Chapter 10 weaponises that map to force specific wrong outputs.'
+  why_this_section_exists: |
+    Chapter 9 ended with an adversary holding a decision-boundary map and a distillation surrogate
+    of the victim model. Section 10.1 establishes what those artefacts enable next: adversarial
+    example generation. The threat model shifts from population-level extraction to instance-level
+    evasion, the detection architecture shifts from stateful query pattern monitoring to per-input
+    preprocessing, and the formal attack budget shifts from query count to Lp perturbation norm.
+    Every attack section in Chapter 10 builds on the threat model defined here.
+  position_in_chapter: |
+    Section 10.1 is the threat model anchor for all 15 subsequent sections. It establishes the
+    evasion adversary, the access ladder, the perturbation constraint taxonomy, the ATLAS technique
+    mapping, and the Track 7 architectural motivation. It mirrors the role Section 9.1 played in
+    Chapter 9: resetting the threat model before the attack catalogue begins.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain the shift from extraction (population-level model reconstruction) to evasion (instance-level misclassification) as a change in adversary goal and detection architecture'
+    - 'Describe the mechanistic bridge from Section 9.3 boundary maps and Section 9.4 surrogates to FGSM, PGD, and transfer attacks'
+    - 'Define targeted and untargeted adversarial misclassification and state which is harder for the adversary and which is more dangerous for the defender'
+    - 'Describe the three access tiers (white-box, grey-box, black-box) and their query budget implications for evasion attacks'
+    - 'Explain L0, L2, and L-infinity perturbation constraints as formal attack budgets and state which is most common for image adversarial examples and why'
+    - 'Map AML.T0043 and AML.T0015 to their position in the Chapter 10 section structure'
+    - 'Articulate why Track 7 operates pre-inference while Track 6 operates post-request'
+
+  skills:
+    - 'Produce an extraction-vs-evasion threat model contrast across the eight dimensions defined in this section'
+    - 'Classify any adversarial evasion scenario into the access tier taxonomy and estimate its query budget'
+    - 'Visualise L0, L2, and L-infinity norm balls in 2D input space and identify which perturbation type a given attack uses'
+    - 'Map an adversarial attack to its ATLAS sub-technique and identify the Chapter 10 section that addresses it'
+    - 'Describe the pre-inference vs post-request architectural split between Track 7 and Track 6'
+
+  security_mindset:
+    - 'Recognise that a completed Chapter 9 extraction campaign is the prerequisite for the most powerful Chapter 10 transfer attacks -- defending extraction reduces evasion attack capacity'
+    - 'Internalise that evasion attacks are instance-level: the adversary has a specific input they want misclassified, not a general capability they want to replicate'
+    - 'Understand that Lp norms are a formal contract between attacker and defender -- the norm choice determines what counts as imperceptible and what detection signals are available'
+    - 'Appreciate that the shift to pre-inference detection in Track 7 reflects the threat model, not arbitrary design: adversarial perturbations must be detected before the model acts on them'
+
+prerequisites:
+  - 'Section 9.1: inference-time threat model and adversary access ladder (access tier framing reused here)'
+  - 'Section 9.2: extraction taxonomy (population-level goal contrast; instance-level is the Chapter 10 shift)'
+  - 'Section 9.3: decision boundary mapping (boundary maps are the direct computational input to FGSM and PGD)'
+  - 'Section 9.4: distillation attacks (surrogate models are the transfer vehicles for Chapter 10 transfer attacks)'
+  - 'Section 9.11: production gateway Track 6 (Track 7 extends this; same async dispatch pattern)'
+  - 'Chapter 1 Section 1.9: loss functions (loss gradient with respect to input is the FGSM primitive)'
+  - 'Chapter 2 Section 2.3: backpropagation and chain rule (gradient of loss w.r.t. input requires this)'
+  - 'Chapter 5 Section 5.8: AML Sigma stub pattern (AML.T0043 and AML.T0015 completed in Section 10.13)'
+
+prose_content:
+
+  part_1:
+    title: 'The Threat Model Shift: From What the Model Knows to What the Model Decides'
+    body: |
+      Chapter 9 established a precise threat model: the adversary wants to reconstruct the
+      victim model''s behaviour across its input distribution. The goal is population-level --
+      the surrogate they produce should match the victim on any input they care to query. The
+      attack is measured in query budget (how many API calls to achieve target fidelity), and
+      the defence detects anomalous query distributions over time.
+
+      Chapter 10 begins where Chapter 9 ends, but with a different goal. The adversary already
+      understands how the model behaves. Now they have a specific input -- a malware binary, a
+      fraudulent transaction, a piece of prohibited content -- that the model classifies
+      correctly against their interest. Their goal is to modify that input by the minimum
+      amount necessary to make the model classify it incorrectly. The scope is instance-level:
+      one input, one wrong output, one adversary-chosen outcome.
+
+      This shift changes everything downstream. The attack is no longer measured in queries --
+      it is measured in perturbation magnitude, the formal distance between the original input
+      and the adversarial example. The defence is no longer a query distribution analyser -- it
+      is a preprocessing stage that detects or removes adversarial perturbations before the
+      model acts on them. The formal guarantee is no longer about query budget exhaustion -- it
+      is about perturbation radius: can we certify that no perturbation within a given norm ball
+      changes the model''s output?
+
+      For security engineers: the practical consequence is that evasion attacks bypass controls
+      at the final stage of the pipeline. A malware classifier that survived data poisoning
+      (Chapter 8) and extraction (Chapter 9) can still be bypassed by an adversarially perturbed
+      sample at inference time. Track 7 exists because the first six tracks do not address this
+      attack surface.
+
+  part_2:
+    title: 'The Mechanistic Bridge: How Chapter 9 Output Becomes Chapter 10 Input'
+    body: |
+      The connection between Chapter 9 and Chapter 10 is not conceptual -- it is computational.
+      Understanding this bridge is essential for two reasons: it explains why defending extraction
+      partially defends against the strongest evasion attacks, and it explains why the most
+      dangerous adversaries in Chapter 10 are those who completed a Chapter 9 campaign first.
+
+      The Fast Gradient Sign Method (FGSM), introduced in Section 10.3, generates adversarial
+      examples by computing the gradient of the loss function with respect to the input:
+      x_adv = x + epsilon * sign(nabla_x J(theta, x, y)). In a white-box setting this gradient
+      is computed directly against the victim model. In the black-box setting that characterises
+      most production deployments, the adversary cannot access the victim''s gradients. They need
+      a substitute -- and that substitute is exactly the surrogate model produced by Section 9.4
+      distillation. The surrogate''s loss gradient approximates the victim''s loss gradient in
+      regions where the two models'' decision boundaries align, which is precisely what the
+      distillation optimisation ensures.
+
+      The decision boundary maps from Section 9.3 contribute differently. FGSM requires only a
+      gradient direction; the map alone is overkill for a single adversarial example. But Projected
+      Gradient Descent (PGD, Section 10.4) iterates multiple steps within an epsilon ball, and
+      initialising those steps from boundary-proximate points -- points the Chapter 9 boundary
+      mapper already identified -- dramatically reduces the number of iterations to convergence.
+      The boundary map is not just intelligence; it is a computational accelerant for the inner
+      optimisation loop.
+
+      Transfer attacks (Section 10.7) complete the bridge. Adversarial examples crafted against
+      a well-matched surrogate transfer to the victim at 20--80% rates depending on architecture
+      similarity. The adversary''s workflow is: extract the victim via Chapter 9 distillation,
+      craft adversarial examples against the surrogate using Chapter 10 gradient methods, submit
+      those examples to the victim API. Zero additional victim queries after the extraction
+      campaign. The Chapter 9 surrogate is both the extraction product and the Chapter 10 attack
+      vehicle.
+
+  part_3:
+    title: 'Adversary Goal Taxonomy: Targeted vs Untargeted Misclassification'
+    body: |
+      Adversarial evasion attacks divide into two goal classes based on what the adversary wants
+      the model to output.
+
+      Untargeted misclassification requires only that the model output any class other than the
+      correct one. The adversary succeeds if the malware binary is classified as anything other
+      than malware -- benign software, a different malware family, an unknown file type. The
+      optimisation problem is relatively unconstrained: perturb x by at most epsilon such that
+      argmax f(x_adv) != y_true. This is the easier attack goal. The gradient of any loss that
+      pushes the model away from the correct class is sufficient.
+
+      Targeted misclassification requires that the model output a specific wrong class chosen by
+      the adversary. The adversary does not just want the malware classified as not-malware --
+      they want it classified as a specific trusted application, a specific benign file hash, or
+      a specific low-risk category that triggers a different downstream action. The optimisation
+      problem is more constrained: perturb x by at most epsilon such that argmax f(x_adv) = y_target
+      where y_target is the adversary''s chosen wrong class. This is harder for the adversary but
+      more dangerous for the defender. Targeted attacks force a specific wrong decision with
+      specific operational consequences: a transaction classified as legitimate (not just not-fraud),
+      content classified as allowed (not just not-prohibited), a user authenticated as a specific
+      identity (not just not-rejected).
+
+      For production security systems, the targeted/untargeted distinction determines the threat
+      model for downstream controls. An untargeted adversarial example that evades a malware
+      classifier might still trigger anomaly detection, rate limiting, or manual review because
+      the output is unusual. A targeted adversarial example that produces a specific trusted
+      classification can suppress all downstream controls simultaneously.
+
+  part_4:
+    title: 'Adversary Access Ladder: Gradient Access, Query Budget, and the Ch9 Elevation Path'
+    body: |
+      The adversary access ladder for evasion mirrors the Chapter 9 extraction ladder with one
+      critical addition: the distillation pathway from Chapter 9 allows access elevation.
+
+      White-box access means the adversary has the model''s weights, architecture, and can compute
+      exact gradients. This produces the strongest adversarial examples with the fewest operations --
+      a single forward-backward pass generates the FGSM perturbation. In practice, white-box access
+      against production APIs is uncommon except in two scenarios: open-weight models deployed by
+      the operator, and adversaries who successfully exfiltrated model weights via supply chain
+      compromise (Chapter 8).
+
+      Grey-box access means the adversary receives soft-label outputs -- class probabilities or
+      confidence scores. This enables gradient estimation via finite differences or Natural Evolution
+      Strategies (NES, Section 10.6): query the model at x + delta_i and x - delta_i for many
+      directions delta_i, then estimate the gradient direction from the score differences. Grey-box
+      attacks require O(d) to O(d log d) queries per gradient step where d is input dimension.
+      For a 224x224x3 image that is 150,000+ queries per gradient step -- expensive but feasible
+      against commercial APIs with sufficient budget.
+
+      Black-box access means the adversary receives only hard-label outputs: the top-1 class
+      prediction with no probability. This is the most common production configuration and the
+      hardest attack condition. The Boundary Attack (Section 10.6) operates in this condition:
+      it starts from a trivially misclassified input and iteratively reduces distance to the
+      natural image while remaining adversarial, requiring only a binary oracle (correctly classified
+      or not). Query budgets for black-box attacks range from 10,000 to 100,000 per adversarial
+      example depending on perturbation budget and input dimension.
+
+      The Chapter 9 elevation path is the critical addition. An adversary who completed a Section
+      9.4 distillation campaign begins Chapter 10 with a surrogate model approximating the victim''s
+      decision boundary. Against their surrogate they have white-box access. Against the victim
+      they execute a transfer attack (Section 10.7): craft adversarial examples against the
+      surrogate, submit to the victim. The victim query cost drops to near zero -- the extraction
+      campaign traded query budget for adversarial example access. This is why defending extraction
+      (Chapter 9) partially defends evasion (Chapter 10).
+
+  part_5:
+    title: 'Perturbation Constraints: Lp Norm Balls as Formal Attack Budgets'
+    body: |
+      The Lp norm constraint formalises the concept of imperceptible perturbation. Given an
+      original input x and adversarial perturbation delta, the constraint ||delta||_p <= epsilon
+      limits the perturbation to the surface and interior of an Lp ball of radius epsilon
+      centred on x.
+
+      The L0 norm counts the number of features that changed: ||delta||_0 = |{i : delta_i != 0}|.
+      An L0 attack with budget k changes at most k input features by any amount. For image inputs
+      this produces sparse perturbations -- a small number of pixels changed significantly. For
+      malware inputs L0 attacks are natural: the adversary can modify specific bytes (header fields,
+      padding, appended content) while leaving execution-critical code untouched. L0 constraints
+      are less common in academic benchmarks because the non-differentiability of the L0 norm
+      makes gradient-based optimisation difficult, but they are practically important for structured
+      inputs with discrete modification budgets.
+
+      The L2 norm measures Euclidean distance: ||delta||_2 = sqrt(sum_i delta_i^2). An L2 attack
+      distributes the perturbation budget smoothly across all features. The Carlini-Wagner attack
+      (Section 10.5) operates under an L2 constraint by construction: it directly minimises
+      ||delta||_2 subject to the misclassification constraint, producing minimum-Euclidean-distance
+      adversarial examples. L2 attacks are the right budget model when the adversary cares about
+      total distortion rather than worst-case per-feature change.
+
+      The L-infinity norm measures the maximum absolute change across all features:
+      ||delta||_inf = max_i |delta_i|. An L-infinity attack changes every feature by at most
+      epsilon. This produces uniform fine-grained perturbations -- in images each pixel shifts
+      by at most epsilon/255 intensity units, producing perturbations visually indistinguishable
+      from the original at small epsilon. FGSM and PGD operate under L-infinity constraints by
+      construction: the gradient sign operation produces exactly an L-infinity perturbation.
+      L-infinity is the dominant constraint in adversarial ML research for image inputs and the
+      most relevant constraint for continuous-feature tabular inputs.
+
+      For text inputs none of the Lp constraints apply directly because text is discrete. Token
+      edit distance (the number of token substitutions) and semantic similarity (cosine distance
+      between sentence embeddings) are the text analogues. Section 10.9 addresses text adversarial
+      attacks under these constraints.
+
+  part_6:
+    title: 'Security-Critical Classifier Threat Models'
+    body: |
+      Four production classifier categories carry the highest adversarial evasion risk because
+      successful evasion has immediate operational security consequences.
+
+      Malware classifiers are the highest-stakes target for L0 evasion. PE binaries have a rich
+      structure of metadata fields -- import tables, section names, resource directories, overlay
+      content -- that can be modified without affecting execution behaviour. An adversary can append
+      benign content to a malicious binary, rename exported functions, or pad sections with benign
+      bytes to shift the binary''s feature representation toward the benign class while preserving
+      full malicious functionality. The perturbation constraint is functional equivalence rather
+      than Lp distance: any modification that preserves execution behaviour is admissible.
+
+      Fraud scoring models face both untargeted and targeted evasion. Untargeted: modify transaction
+      features (merchant category, time, amount) by small amounts to push the fraud score below the
+      decision threshold. Targeted: craft a transaction that scores as a specific legitimate merchant
+      pattern. Feature-space evasion against fraud models is complicated by the fact that not all
+      feature combinations are physically realisable -- the effective perturbation constraint is the
+      set of feature combinations achievable under the adversary''s operational constraints.
+
+      Content moderation systems face text adversarial attacks. The adversary substitutes words
+      with synonyms or near-synonyms (TextFooler, Section 10.9), introduces character-level
+      variations (homoglyphs, zero-width characters), or uses semantic-preserving paraphrases
+      that shift the text''s embedding-space representation outside the classifier''s decision
+      boundary. The constraint is semantic preservation: the text must remain meaningful and
+      approximately semantically equivalent to a human reader.
+
+      Safety filters for LLMs face the same attack surface as content moderation systems plus
+      the adversarial trigger attack class: fixed token sequences that, when appended to any
+      prompt, universally cause the safety filter to output a permissive decision regardless of
+      prompt content. Section 10.9 covers LLM adversarial attacks; Section 10.12 covers
+      consistency checking as the primary detection primitive.
+
+  part_7:
+    title: 'Detection Architecture Shift: From Post-Request Query Patterns to Pre-Inference Preprocessing'
+    body: |
+      The distinction between Track 6 and Track 7 is architectural, not incidental, and it follows
+      directly from the threat model difference between extraction and evasion.
+
+      Track 6 (Section 9.11) is stateful and post-request. It accumulates query patterns across
+      many requests from a user or session, analyses the distribution of inputs over time (are they
+      concentrating near decision boundaries? is OOD query rate anomalous?), and fires an alert or
+      rate limit action after enough evidence accumulates. The extraction adversary has a campaign
+      footprint: they must send hundreds or thousands of queries to extract useful information, and
+      that footprint is detectable in aggregate even when individual queries look benign.
+
+      Track 7 is stateless and pre-inference. The evasion adversary''s footprint is a single input:
+      one adversarial example submitted once. There is no multi-query campaign to detect. The
+      detection must happen before the model produces its output -- because once the model classifies
+      the adversarial example as benign malware, legitimate, or safe, the downstream security
+      control has already been bypassed. Pre-inference feature squeezing (Section 10.11) transforms
+      the input before it reaches the model, comparing the model''s output on the original versus the
+      squeezed version. A large prediction change signals adversarial perturbation. Consistency
+      checking (Section 10.12) submits N randomly perturbed variants of the input and flags inputs
+      whose classification is unstable -- adversarial examples live near decision boundaries and
+      are typically fragile under small random perturbation.
+
+      The unified seven-track gateway (Section 10.13) preserves the 50ms P99 latency budget by
+      running Track 7 pre-inference squeezing before the main model inference begins. Track 7
+      post-inference stages (consistency checking, adversarial classifier) run in parallel with
+      each other and with Tracks 1--6 using the same async dispatch pattern Track 6 introduced.
+      The pre-inference stage is Track 7''s unique contribution to the gateway architecture --
+      no prior chapter required a stage that transforms the input before the primary model sees it.
+
+reference_materials:
+
+  table_1:
+    title: 'Extraction vs Evasion Threat Model Contrast'
+    description: 'Eight-dimension comparison of Chapter 9 extraction and Chapter 10 evasion threat models'
+    columns: ['Dimension', 'Extraction (Chapter 9)', 'Evasion (Chapter 10)']
+    rows:
+      - ['Adversary goal', 'Reconstruct model behaviour across input distribution', 'Force specific wrong output on a specific input']
+      - ['Attack scope', 'Population-level (full decision surface)', 'Instance-level (one input, one output)']
+      - ['Primary metric', 'Query budget (queries per fidelity level)', 'Perturbation norm (||delta||_p <= epsilon)']
+      - ['Detection signal', 'Query distribution anomaly over time', 'Input distribution shift on single request']
+      - ['Detection timing', 'Post-request, stateful, multi-query accumulation', 'Pre-inference, stateless, single-request']
+      - ['Adversary artefact', 'Surrogate model and decision boundary map', 'Adversarial example (perturbed input)']
+      - ['Defence location', 'Input-side query monitor + output-side watermark', 'Input-side preprocessor + consistency checker']
+      - ['ATLAS technique', 'AML.T0040 / AML.T0024', 'AML.T0043 / AML.T0015']
+
+  table_2:
+    title: 'Adversary Access Ladder: Evasion Query Budget by Access Tier'
+    description: 'Three access tiers with attack method, query budget per adversarial example, and Chapter 9 elevation path'
+    columns: ['Tier', 'Information', 'Attack Methods', 'Queries/Example', 'Ch9 Elevation Path']
+    rows:
+      - ['White-box', 'Weights, architecture, exact gradients', 'FGSM (10.3), PGD (10.4), C&W (10.5)', '1 (single forward-backward pass)', 'Open-weight model or Ch8 supply chain weight exfiltration']
+      - ['Grey-box', 'Soft-label outputs (class probabilities)', 'NES gradient estimation (10.6)', '1,000 -- 10,000 per gradient step', 'Most commercial APIs; Ch9 surrogate approximates victim gradients']
+      - ['Black-box', 'Hard-label outputs (top-1 class only)', 'Boundary Attack (10.6)', '10,000 -- 100,000', 'Most restricted production APIs; Ch9 distillation elevates to near-white-box via surrogate']
+      - ['Transfer (surrogate)', 'Ch9 distillation surrogate (white-box to surrogate)', 'FGSM/PGD against surrogate then submit to victim (10.7)', '~0 additional victim queries', 'Ch9 extraction output IS Ch10 attack input; 20--80% transfer rate']
+
+  table_3:
+    title: 'Lp Norm Constraint Summary'
+    description: 'L0, L2, and L-infinity constraints with definition, character, primary attack methods, and primary input domains'
+    columns: ['Norm', 'Definition', 'Perturbation Character', 'Primary Attack Methods', 'Primary Input Domain']
+    rows:
+      - ['L0', '||delta||_0 = count of non-zero features', 'Sparse: few features changed by any amount', 'Sparse C&W L0 (Section 10.5)', 'Malware binaries, structured discrete fields']
+      - ['L2', '||delta||_2 = sqrt(sum delta_i^2)', 'Smooth: perturbation distributed across features', 'C&W L2 (10.5), L2-PGD (10.4)', 'Images, embeddings, continuous feature vectors']
+      - ['L-inf', '||delta||_inf = max |delta_i|', 'Uniform: each feature changes by at most epsilon', 'FGSM (10.3), PGD (10.4)', 'Images (dominant), continuous tabular features']
+      - ['Semantic (text)', 'Token edit distance or embedding cosine distance', 'Discrete substitution preserving meaning', 'TextFooler, HotFlip, BERT-Attack (10.9)', 'Text, tokens, discrete sequences']
+
+  table_4:
+    title: 'ATLAS Technique Mapping for Chapter 10'
+    description: 'AML.T0043 and AML.T0015 with tactic, chapter 10 section coverage, and detection primitive'
+    columns: ['ATLAS Technique', 'Tactic', 'Description', 'Chapter 10 Coverage', 'Track 7 Primitive']
+    rows:
+      - ['AML.T0043', 'ML Attack Staging', 'Craft Adversarial Data: generate inputs designed to cause misclassification', 'Sections 10.3-10.9 (all attack sections)', 'Feature squeezing (10.11), adversarial classifier (10.12)']
+      - ['AML.T0015', 'Impact', 'Evade ML Model: use adversarial inputs to cause incorrect deployed-model output', 'Sections 10.13-10.15 (gateway, certified robustness, adversarial training)', 'Consistency checker (10.12), Track 7 three-primitive ensemble (10.13)']
+      - ['AML.T0029', 'ML Attack Staging', 'Adversarial Patch: physical printable perturbation applied to sensor input', 'Section 10.8', 'Patch localisation detector (10.8); sub-condition in AML.T0043 Sigma rule']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Threat Model Contrast Reference'
+    filename: 'threat_model_contrast.py'
+    description: 'Structured comparison of extraction (Chapter 9) vs evasion (Chapter 10) threat models across eight dimensions, formatted for use as a reference document or team briefing tool'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, no external dependencies'
+    code: |
+      # threat_model_contrast.py
+      # Section 10.1: Extraction vs Evasion Threat Model Contrast
+      # 20260521 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from typing import List
+
+
+      @dataclass
+      class ThreatModelDimension:
+          dimension: str
+          extraction_ch9: str
+          evasion_ch10: str
+
+
+      THREAT_MODEL_CONTRAST: List[ThreatModelDimension] = [
+          ThreatModelDimension(
+              dimension='Adversary goal',
+              extraction_ch9='Reconstruct model behaviour across input distribution',
+              evasion_ch10='Force specific wrong output on a specific input',
+          ),
+          ThreatModelDimension(
+              dimension='Attack scope',
+              extraction_ch9='Population-level (full decision surface)',
+              evasion_ch10='Instance-level (one input, one output)',
+          ),
+          ThreatModelDimension(
+              dimension='Primary metric',
+              extraction_ch9='Query budget (queries per fidelity level)',
+              evasion_ch10='Perturbation norm (||delta||_p <= epsilon)',
+          ),
+          ThreatModelDimension(
+              dimension='Detection signal',
+              extraction_ch9='Query distribution anomaly over time',
+              evasion_ch10='Input distribution shift on single request',
+          ),
+          ThreatModelDimension(
+              dimension='Detection timing',
+              extraction_ch9='Post-request, stateful, multi-query accumulation',
+              evasion_ch10='Pre-inference, stateless, single-request',
+          ),
+          ThreatModelDimension(
+              dimension='Adversary artefact',
+              extraction_ch9='Surrogate model and decision boundary map',
+              evasion_ch10='Adversarial example (perturbed input)',
+          ),
+          ThreatModelDimension(
+              dimension='Defence location',
+              extraction_ch9='Input-side query monitor + output-side watermark',
+              evasion_ch10='Input-side preprocessor + consistency checker',
+          ),
+          ThreatModelDimension(
+              dimension='ATLAS technique',
+              extraction_ch9='AML.T0040 / AML.T0024',
+              evasion_ch10='AML.T0043 / AML.T0015',
+          ),
+      ]
+
+
+      def print_contrast_table(dimensions: List[ThreatModelDimension]) -> None:
+          col_w = [22, 44, 44]
+          sep = '+' + '+'.join('-' * (w + 2) for w in col_w) + '+'
+          row_fmt = '| {:<{}} | {:<{}} | {:<{}} |'
+
+          print(sep)
+          print(row_fmt.format(
+              'Dimension', col_w[0],
+              'Extraction (Ch9)', col_w[1],
+              'Evasion (Ch10)', col_w[2],
+          ))
+          print(sep)
+          for d in dimensions:
+              print(row_fmt.format(
+                  d.dimension, col_w[0],
+                  d.extraction_ch9, col_w[1],
+                  d.evasion_ch10, col_w[2],
+              ))
+          print(sep)
+
+
+      def print_key_shifts() -> None:
+          shifts = [
+              ('Goal', 'population-level reconstruction -> instance-level misclassification'),
+              ('Metric', 'query budget -> perturbation norm (Lp ball)'),
+              ('Detection', 'stateful multi-query analysis -> stateless per-input preprocessing'),
+              ('Defence', 'query monitor + watermark -> preprocessor + consistency checker'),
+              ('ATLAS', 'AML.T0040/T0024 -> AML.T0043/T0015'),
+          ]
+          print('\nKey threat model shifts (Ch9 -> Ch10):')
+          for label, shift in shifts:
+              print(f'  {label}: {shift}')
+
+
+      if __name__ == '__main__':
+          print('Extraction vs Evasion Threat Model Contrast')
+          print('=' * 42)
+          print_contrast_table(THREAT_MODEL_CONTRAST)
+          print_key_shifts()
+
+  deliverable_2:
+    title: 'Adversary Access Ladder with Evasion Query Budget'
+    filename: 'access_ladder_evasion.py'
+    description: 'Adversary access ladder for evasion attacks with query budget estimates per tier and the Chapter 9 elevation path that reduces victim query cost to near zero'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, no external dependencies'
+    code: |
+      # access_ladder_evasion.py
+      # Section 10.1: Adversary Access Ladder for Evasion Attacks
+      # 20260521 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import List
+
+
+      @dataclass
+      class AccessTier:
+          name: str
+          information_available: str
+          attack_methods: List[str]
+          queries_low: int
+          queries_high: int
+          ch9_elevation_path: str
+          notes: str = ''
+
+
+      ACCESS_LADDER: List[AccessTier] = [
+          AccessTier(
+              name='White-box',
+              information_available='Model weights, architecture, exact gradients',
+              attack_methods=['FGSM (Section 10.3)', 'PGD (Section 10.4)', 'C&W (Section 10.5)'],
+              queries_low=1,
+              queries_high=1,
+              ch9_elevation_path='Open-weight model deployment or Ch8 supply chain weight exfiltration',
+              notes='Single forward-backward pass; strongest adversarial examples, fewest operations',
+          ),
+          AccessTier(
+              name='Grey-box',
+              information_available='Soft-label outputs (class probabilities)',
+              attack_methods=['NES gradient estimation (Section 10.6)', 'Score-based boundary walk'],
+              queries_low=1_000,
+              queries_high=10_000,
+              ch9_elevation_path=(
+                  'Most commercial APIs return probabilities. '
+                  'Ch9 distillation surrogate approximates victim gradients.'
+              ),
+              notes='NES estimates gradient direction from antithetic query pairs; O(d) per gradient step',
+          ),
+          AccessTier(
+              name='Black-box',
+              information_available='Hard-label outputs (top-1 class only)',
+              attack_methods=['Boundary Attack (Section 10.6)', 'Hard-label transfer'],
+              queries_low=10_000,
+              queries_high=100_000,
+              ch9_elevation_path=(
+                  'Most restricted production APIs. '
+                  'Ch9 distillation elevates adversary to near-white-box via surrogate.'
+              ),
+              notes='Binary oracle only: correctly classified or not',
+          ),
+          AccessTier(
+              name='Transfer (via Ch9 surrogate)',
+              information_available='Ch9 distillation surrogate -- white-box access to surrogate',
+              attack_methods=['FGSM/PGD against surrogate; submit adversarial examples to victim (Section 10.7)'],
+              queries_low=0,
+              queries_high=100,
+              ch9_elevation_path='Ch9 extraction output IS Ch10 attack input. Zero additional victim queries.',
+              notes='Transfer rate 20-80 percent depending on architecture and training distribution match',
+          ),
+      ]
+
+
+      def format_budget(low: int, high: int) -> str:
+          if low == high:
+              return str(low)
+          if low == 0:
+              return f'~0 -- {high}'
+          return f'{low:,} -- {high:,}'
+
+
+      def print_access_ladder(ladder: List[AccessTier]) -> None:
+          for i, tier in enumerate(ladder, 1):
+              print(f'\n[Tier {i}] {tier.name}')
+              print(f'  Information:  {tier.information_available}')
+              print(f'  Methods:      {", ".join(tier.attack_methods)}')
+              print(f'  Queries/ex:   {format_budget(tier.queries_low, tier.queries_high)}')
+              print(f'  Ch9 path:     {tier.ch9_elevation_path}')
+              if tier.notes:
+                  print(f'  Notes:        {tier.notes}')
+
+
+      def query_cost_reduction_analysis(ladder: List[AccessTier]) -> None:
+          black_box = ladder[2]
+          transfer = ladder[3]
+          if transfer.queries_high > 0:
+              reduction = black_box.queries_low // transfer.queries_high
+          else:
+              reduction = black_box.queries_low
+          print('\n--- Query cost reduction via Ch9 extraction campaign ---')
+          print(f'  Black-box minimum:   {black_box.queries_low:,} victim queries per adversarial example')
+          print(f'  Transfer post-Ch9:   ~{transfer.queries_high} victim queries per adversarial example')
+          print(f'  Reduction factor:    {reduction}x fewer victim queries')
+          print()
+          print('  Security implication:')
+          print('    Defending model extraction (Ch9) reduces transfer attack capacity (Ch10).')
+          print('    An adversary blocked from distillation cannot trivially mount transfer attacks.')
+
+
+      if __name__ == '__main__':
+          print('Adversary Access Ladder: Evasion Attacks')
+          print('=' * 42)
+          print_access_ladder(ACCESS_LADDER)
+          query_cost_reduction_analysis(ACCESS_LADDER)
+
+  deliverable_3:
+    title: 'Lp Norm Constraint Visualiser'
+    filename: 'lp_norm_visualiser.py'
+    description: 'Visualises L0, L2, and L-infinity norm balls in 2D input space showing how each constraint shapes the admissible perturbation region around an original input'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, requires numpy and matplotlib'
+    code: |
+      # lp_norm_visualiser.py
+      # Section 10.1: Lp Norm Ball Visualisation
+      # 20260521 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import numpy as np
+      import matplotlib.pyplot as plt
+
+
+      def l2_boundary(epsilon: float, n: int = 500):
+          angles = np.linspace(0, 2 * np.pi, n)
+          return epsilon * np.cos(angles), epsilon * np.sin(angles)
+
+
+      def linf_boundary(epsilon: float, n: int = 500):
+          t = np.linspace(-epsilon, epsilon, n // 4)
+          ones = np.ones_like(t)
+          top = np.column_stack([t, ones * epsilon])
+          right = np.column_stack([ones * epsilon, t[::-1]])
+          bottom = np.column_stack([t[::-1], -ones * epsilon])
+          left = np.column_stack([-ones * epsilon, t])
+          pts = np.vstack([top, right, bottom, left])
+          return pts[:, 0], pts[:, 1]
+
+
+      def l0_points(epsilon: float):
+          # In 2D, L0 ball with k=1: only the four axis-aligned extreme points
+          return (
+              np.array([epsilon, -epsilon, 0.0, 0.0]),
+              np.array([0.0, 0.0, epsilon, -epsilon]),
+          )
+
+
+      def plot_lp_balls(epsilon: float = 0.35, save_path: str = 'lp_norm_balls.png') -> None:
+          fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+          fig.suptitle(
+              f'Lp Norm Balls (epsilon={epsilon}) -- Admissible Perturbation Regions',
+              fontsize=13,
+          )
+          configs = [
+              ('L0  ||delta||_0 <= 1', 'l0', '#e74c3c'),
+              ('L2  ||delta||_2 <= epsilon', 'l2', '#2980b9'),
+              ('L-inf  ||delta||_inf <= epsilon', 'linf', '#27ae60'),
+          ]
+          lim = epsilon * 1.6
+
+          for ax, (title, norm_type, col) in zip(axes, configs):
+              ax.set_xlim(-lim, lim)
+              ax.set_ylim(-lim, lim)
+              ax.axhline(0, color='grey', linewidth=0.5, linestyle='--', alpha=0.6)
+              ax.axvline(0, color='grey', linewidth=0.5, linestyle='--', alpha=0.6)
+              ax.scatter([0], [0], color='black', zorder=5, s=80, label='Original input x')
+              ax.set_title(title, fontsize=10)
+              ax.set_xlabel('Feature 1')
+              ax.set_ylabel('Feature 2')
+              ax.set_aspect('equal')
+
+              if norm_type == 'l0':
+                  xs, ys = l0_points(epsilon)
+                  ax.scatter(xs, ys, color=col, zorder=4, s=100, label='Admissible (k=1)')
+                  ax.annotate(
+                      'Sparse: at most 1\nfeature changes\n(any magnitude)',
+                      xy=(0.05, 0.78), xycoords='axes fraction', fontsize=8,
+                  )
+              elif norm_type == 'l2':
+                  xs, ys = l2_boundary(epsilon)
+                  ax.fill(xs, ys, alpha=0.15, color=col)
+                  ax.plot(xs, ys, color=col, linewidth=2, label=f'L2 ball r={epsilon}')
+                  ax.annotate(
+                      'Smooth: perturbation\ndistributed across\nall features',
+                      xy=(0.05, 0.78), xycoords='axes fraction', fontsize=8,
+                  )
+              elif norm_type == 'linf':
+                  xs, ys = linf_boundary(epsilon)
+                  ax.fill(xs, ys, alpha=0.15, color=col)
+                  ax.plot(xs, ys, color=col, linewidth=2, label=f'L-inf r={epsilon}')
+                  ax.annotate(
+                      f'Uniform: each feature\nchanges by at most\n{epsilon}',
+                      xy=(0.05, 0.78), xycoords='axes fraction', fontsize=8,
+                  )
+
+              ax.legend(fontsize=8, loc='lower right')
+
+          plt.tight_layout()
+          plt.savefig(save_path, dpi=150, bbox_inches='tight')
+          print(f'Saved: {save_path}')
+          plt.show()
+
+
+      def print_norm_summary() -> None:
+          norms = [
+              ('L0', 'count(delta_i != 0)', 'Sparse: few features, any magnitude', 'Malware byte modification'),
+              ('L2', 'sqrt(sum delta_i^2)', 'Smooth: distributed perturbation', 'C&W minimum-norm attack'),
+              ('L-inf', 'max(|delta_i|)', 'Uniform: bounded per-feature', 'FGSM and PGD (image domain)'),
+              ('Semantic', 'token edit / cosine sim', 'Discrete substitution', 'TextFooler, HotFlip (text)'),
+          ]
+          print('\nNorm summary:')
+          for name, formula, character, use_case in norms:
+              print(f'  {name:<10} {formula:<25} {character:<35} {use_case}')
+
+
+      if __name__ == '__main__':
+          print_norm_summary()
+          plot_lp_balls(epsilon=0.35)
+
+  deliverable_4:
+    title: 'ATLAS Technique Mapper'
+    filename: 'atlas_technique_mapper.py'
+    description: 'Structured mapping of AML.T0043 and AML.T0015 to Chapter 10 sections, attack families, and Track 7 detection primitives'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, no external dependencies'
+    code: |
+      # atlas_technique_mapper.py
+      # Section 10.1: ATLAS Technique Mapping for Chapter 10
+      # 20260521 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import List, Dict
+
+
+      @dataclass
+      class AtlasTechnique:
+          technique_id: str
+          tactic: str
+          name: str
+          description: str
+          ch10_sections: List[str]
+          attack_families: List[str]
+          track7_primitives: List[str]
+          sigma_status: str
+
+
+      ATLAS_CH10: List[AtlasTechnique] = [
+          AtlasTechnique(
+              technique_id='AML.T0043',
+              tactic='ML Attack Staging',
+              name='Craft Adversarial Data',
+              description=(
+                  'Adversary generates inputs designed to cause a target ML model '
+                  'to produce an incorrect output at inference time'
+              ),
+              ch10_sections=[
+                  'Section 10.3 (FGSM)',
+                  'Section 10.4 (PGD)',
+                  'Section 10.5 (C&W)',
+                  'Section 10.6 (Black-box: Boundary Attack, NES)',
+                  'Section 10.7 (Transfer attacks)',
+                  'Section 10.8 (Physical adversarial patches)',
+                  'Section 10.9 (LLM token substitution)',
+              ],
+              attack_families=['FGSM', 'PGD', 'C&W', 'Boundary Attack', 'NES', 'TextFooler', 'HotFlip'],
+              track7_primitives=[
+                  'Feature squeezing (Section 10.11)',
+                  'Adversarial detector classifier (Section 10.12)',
+              ],
+              sigma_status='Completed in Section 10.13',
+          ),
+          AtlasTechnique(
+              technique_id='AML.T0015',
+              tactic='Impact',
+              name='Evade ML Model',
+              description=(
+                  'Adversary uses crafted adversarial inputs to cause a deployed ML model '
+                  'to produce an attacker-chosen incorrect output, bypassing a security control'
+              ),
+              ch10_sections=[
+                  'Section 10.13 (Production Track 7 Gateway)',
+                  'Section 10.14 (Certified Robustness)',
+                  'Section 10.15 (Adversarial Training)',
+              ],
+              attack_families=['All adversarial example families', 'Physical patches (AML.T0029)'],
+              track7_primitives=[
+                  'Consistency checker (Section 10.12)',
+                  'Track 7 three-primitive ensemble (Section 10.13)',
+              ],
+              sigma_status='Completed in Section 10.13',
+          ),
+          AtlasTechnique(
+              technique_id='AML.T0029',
+              tactic='ML Attack Staging',
+              name='Adversarial Patch',
+              description=(
+                  'Adversary creates a physical printable patch that causes misclassification '
+                  'when present in the scene captured by a vision model sensor'
+              ),
+              ch10_sections=['Section 10.8 (Physical Adversarial Examples)'],
+              attack_families=['Universal adversarial patch', 'Stop sign attack', '3D adversarial objects'],
+              track7_primitives=['Patch localisation detector (Section 10.8)'],
+              sigma_status='Sub-condition in AML.T0043 Sigma rule',
+          ),
+      ]
+
+
+      def print_technique_report(techniques: List[AtlasTechnique]) -> None:
+          for t in techniques:
+              print(f'\n{"=" * 58}')
+              print(f'  {t.technique_id}: {t.name}')
+              print(f'  Tactic:      {t.tactic}')
+              print(f'  Description: {t.description}')
+              print(f'\n  Chapter 10 sections:')
+              for s in t.ch10_sections:
+                  print(f'    - {s}')
+              print(f'\n  Attack families:')
+              for af in t.attack_families:
+                  print(f'    - {af}')
+              print(f'\n  Track 7 primitives:')
+              for p in t.track7_primitives:
+                  print(f'    - {p}')
+              print(f'\n  Sigma rule: {t.sigma_status}')
+
+
+      def coverage_summary(techniques: List[AtlasTechnique]) -> Dict[str, int]:
+          return {
+              'total_techniques': len(techniques),
+              'sections_covered': sum(len(t.ch10_sections) for t in techniques),
+              'attack_families': sum(len(t.attack_families) for t in techniques),
+              'track7_primitives': sum(len(t.track7_primitives) for t in techniques),
+          }
+
+
+      if __name__ == '__main__':
+          print('ATLAS Technique Mapping: Chapter 10 Adversarial ML')
+          print_technique_report(ATLAS_CH10)
+          summary = coverage_summary(ATLAS_CH10)
+          print(f'\nCoverage summary:')
+          for k, v in summary.items():
+              print(f'  {k}: {v}')
+
+  deliverable_5:
+    title: 'Track Architecture Comparator'
+    filename: 'track_architecture_comparator.py'
+    description: 'Structured comparison of Track 6 (Chapter 9 query pattern monitoring) and Track 7 (Chapter 10 adversarial detection) detection architectures, highlighting the pre-inference vs post-request timing distinction'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, no external dependencies'
+    code: |
+      # track_architecture_comparator.py
+      # Section 10.1: Track 6 vs Track 7 Detection Architecture Comparison
+      # 20260521 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import List
+
+
+      @dataclass
+      class TrackArchitecture:
+          track_number: int
+          chapter: int
+          name: str
+          threat_addressed: str
+          timing: str
+          state: str
+          detection_signal: str
+          stages: List[str]
+          latency_profile: str
+          atlas_techniques: List[str]
+          gateway_position: str
+
+
+      TRACK_6 = TrackArchitecture(
+          track_number=6,
+          chapter=9,
+          name='Query Pattern Monitor',
+          threat_addressed='Model extraction: functionality, fidelity, decision-boundary, prompt',
+          timing='Post-request: fires after model returns response',
+          state='Stateful: accumulates per-user query patterns across many requests',
+          detection_signal='Anomalous query distribution over time (OOD rate, boundary proximity, entropy)',
+          stages=[
+              '1. Per-request: extract query embedding, compute OOD score',
+              '2. Per-user: update rolling window of query features',
+              '3. Distributional anomaly test against per-user baseline',
+              '4. Alert or adaptive rate limit if threshold exceeded',
+          ],
+          latency_profile=(
+              'Fully parallel with response delivery. '
+              'Does not add to user-facing latency. '
+              'Never on the critical path.'
+          ),
+          atlas_techniques=[
+              'AML.T0040 (ML Model Inference API Access)',
+              'AML.T0024 (Exfiltration via ML Inference API)',
+          ],
+          gateway_position='Track 6 of six-track ensemble (Tracks 1-5 from Ch6/7)',
+      )
+
+      TRACK_7 = TrackArchitecture(
+          track_number=7,
+          chapter=10,
+          name='Adversarial Example Detector',
+          threat_addressed='Adversarial evasion: FGSM, PGD, C&W, black-box, transfer, physical, LLM text',
+          timing='Pre-inference (squeezing) + post-inference (consistency, classifier) within single request',
+          state='Stateless: each request analysed independently with no cross-request accumulation',
+          detection_signal='Input distribution shift on single request: squeezer disagreement, prediction instability',
+          stages=[
+              '1. Pre-inference: feature squeezer transforms input BEFORE main model inference',
+              '2. Main inference: primary model produces output on original input',
+              '3. Post-inference: consistency checker submits N perturbed input variants',
+              '4. Post-inference: adversarial classifier scores original input independently',
+              '5. Ensemble: combine squeezer + consistency + classifier scores; block/flag/pass',
+          ],
+          latency_profile=(
+              'Stage 1 (squeezer) IS on the critical path: squeezer latency + main inference <= 50ms P99. '
+              'Stages 3-4 run async in parallel with each other. '
+              'Track 7 unique: first gateway track requiring pre-inference transformation.'
+          ),
+          atlas_techniques=[
+              'AML.T0043 (Craft Adversarial Data)',
+              'AML.T0015 (Evade ML Model)',
+          ],
+          gateway_position='Track 7 of seven-track ensemble (Tracks 1-6 from Ch6/7/9)',
+      )
+
+
+      def print_field_comparison(t6: TrackArchitecture, t7: TrackArchitecture) -> None:
+          fields = [
+              ('Track / Ch', lambda t: f'Track {t.track_number} (Ch{t.chapter})'),
+              ('Name', lambda t: t.name),
+              ('Threat', lambda t: t.threat_addressed),
+              ('Timing', lambda t: t.timing),
+              ('State', lambda t: t.state),
+              ('Signal', lambda t: t.detection_signal),
+              ('ATLAS', lambda t: ' | '.join(t.atlas_techniques)),
+              ('Position', lambda t: t.gateway_position),
+          ]
+          col_w = [12, 52, 52]
+          sep = '+' + '+'.join('-' * (w + 2) for w in col_w) + '+'
+          fmt = '| {:<{}} | {:<{}} | {:<{}} |'
+          print(sep)
+          print(fmt.format('Field', col_w[0], 'Track 6 (Ch9)', col_w[1], 'Track 7 (Ch10)', col_w[2]))
+          print(sep)
+          for label, accessor in fields:
+              v6 = accessor(t6)
+              v7 = accessor(t7)
+              lines6 = [v6[i:i + col_w[1]] for i in range(0, len(v6), col_w[1])]
+              lines7 = [v7[i:i + col_w[2]] for i in range(0, len(v7), col_w[2])]
+              for j in range(max(len(lines6), len(lines7))):
+                  lbl = label if j == 0 else ''
+                  l6 = lines6[j] if j < len(lines6) else ''
+                  l7 = lines7[j] if j < len(lines7) else ''
+                  print(fmt.format(lbl, col_w[0], l6, col_w[1], l7, col_w[2]))
+          print(sep)
+
+
+      def print_stages(t6: TrackArchitecture, t7: TrackArchitecture) -> None:
+          print('\n--- Track 6 stages ---')
+          for s in t6.stages:
+              print(f'  {s}')
+          print('\n--- Track 7 stages ---')
+          for s in t7.stages:
+              print(f'  {s}')
+
+
+      def print_key_difference() -> None:
+          print('\nKey architectural difference:')
+          print('  Track 6: stateful, post-request, never on critical path.')
+          print('  Track 7: stateless, pre-inference stage IS on critical path.')
+          print('  Implication: Track 7 pre-inference squeezer latency must be benchmarked')
+          print('  at production input dimensions (Section 10.11 squeezer_latency_benchmark.py).')
+
+
+      if __name__ == '__main__':
+          print('Track 6 vs Track 7 Detection Architecture Comparison')
+          print('=' * 54)
+          print_field_comparison(TRACK_6, TRACK_7)
+          print_stages(TRACK_6, TRACK_7)
+          print_key_difference()
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Treating evasion detection as a harder variant of extraction detection and reusing Track 6 stateful query monitoring for Track 7'
+    why_it_happens: |
+      Both extraction and evasion attacks operate against inference-time APIs and use the same
+      adversary access tiers. Engineers who built Track 6 for extraction assume the same
+      architecture applies to evasion because the attack surface looks identical from the outside.
+    consequence: |
+      A stateful query pattern monitor fires on extraction campaigns but produces no signal for
+      a single adversarial example submission. The evasion attack succeeds without triggering any
+      alert because the Track 6 detection was designed for the wrong footprint -- multi-query
+      campaign vs single-request attack.
+    correct_approach: |
+      Treat extraction and evasion as architecturally distinct. Track 6 accumulates multi-request
+      signal; Track 7 analyses a single request in two stages (pre-inference transformation and
+      post-inference consistency check). Both tracks must be present in the seven-track gateway
+      for full coverage.
+
+  mistake_2:
+    description: 'Calibrating adversarial defences against L-infinity attacks only and missing L0 and L2 attack families'
+    why_it_happens: |
+      FGSM and PGD use L-infinity constraints by construction and dominate published adversarial
+      ML benchmarks. Security engineers implementing defences calibrate against L-infinity and
+      report robustness against the most-cited attacks.
+    consequence: |
+      Feature squeezing with Gaussian blur -- effective against fine-grained L-infinity perturbations
+      -- does not generalise to sparse L0 attacks (malware byte modification) or minimum-norm L2
+      attacks (C&W). A malware classifier hardened against L-infinity image-style attacks may be
+      trivially vulnerable to sparse header byte modification.
+    correct_approach: |
+      Evaluate defences across all three norm families. For domain-specific inputs (malware PE
+      headers, fraud transaction features, text tokens), identify the physically realisable
+      perturbation set and calibrate detection thresholds against that set, not against
+      L-infinity image benchmarks.
+
+  mistake_3:
+    description: 'Assuming black-box API access by the adversary and underestimating transfer attack risk from prior Ch9 extraction'
+    why_it_happens: |
+      Engineers design evasion defences for the access tier that matches their deployment
+      configuration (hard-label API = black-box adversary). They do not account for the fact
+      that an adversary who completed a Chapter 9 distillation campaign has elevated to near-
+      white-box conditions against their surrogate model.
+    consequence: |
+      Defences sized for black-box query budgets (10,000--100,000 queries per adversarial example)
+      fail against transfer attacks that require near-zero additional victim queries. The adversary
+      amortises the query cost entirely in the Ch9 extraction campaign, then submits transfer
+      adversarial examples that bypass the query-count-based rate limits.
+    correct_approach: |
+      For any model that has been or could be targeted by a Ch9 extraction campaign, treat transfer
+      attacks as the primary evasion threat. Defences must address adversarial examples crafted
+      with white-box access to a surrogate, not just the query budget of direct black-box attacks.
+
+  mistake_4:
+    description: 'Interpreting a certified L2 robustness guarantee as general adversarial robustness'
+    why_it_happens: |
+      Randomised smoothing (Section 10.14) provides a formal certificate for L2 perturbations.
+      Security teams receiving a robustness certification report interpret it as general adversarial
+      robustness and deprioritise Track 7 detection.
+    consequence: |
+      The certified L2 radius does not bound L-infinity robustness or L0 robustness. A model
+      certified against L2 perturbation of radius 0.5 may be trivially vulnerable to an L-infinity
+      perturbation of epsilon=0.01. Removing Track 7 detection on the basis of a norm-specific
+      certificate leaves the model exposed to the attack families the certificate does not cover.
+    correct_approach: |
+      Treat certified robustness certificates as norm-specific and radius-specific guarantees,
+      not as general defences. Supplement L2 certification with empirical robustness evaluation
+      under FGSM and PGD (L-infinity) and C&W L0. Certified robustness and Track 7 detection
+      are complementary -- both must be present in a production defence stack.
+
+  mistake_5:
+    description: 'Adding Track 7 pre-inference squeezing to the gateway without benchmarking squeezer latency at production input dimensions'
+    why_it_happens: |
+      Track 7 squeezing is added to a test environment with small inputs, meets the latency budget,
+      and gets deployed to production. Latency benchmarks are not repeated at production input size
+      (large images, long context windows) under production concurrency.
+    consequence: |
+      At production scale each squeezer adds 5--20ms of critical-path latency. An ensemble of three
+      squeezers running sequentially before the main model can push total gateway latency above the
+      50ms P99 budget, degrading user experience and triggering SLO violations.
+    correct_approach: |
+      Benchmark each squeezer individually at production input dimensions under production concurrency
+      before committing to the ensemble size. Use the squeezer_latency_benchmark.py from Section 10.11
+      and the Track 7 calibration harness from Section 10.13. Run squeezers in parallel where possible
+      to keep them off the sequential critical path.
+
+section_summary:
+
+  compact: |
+    Chapter 10 shifts the threat model from extraction (Chapter 9) to evasion: the adversary has a
+    specific input they want misclassified, not a full model reconstruction goal. The primary formal
+    tools are Lp norm constraints (L0 sparse, L2 Euclidean, L-infinity uniform) that define the
+    admissible perturbation budget. The adversary access ladder mirrors Chapter 9 with one critical
+    addition: Chapter 9 distillation surrogates elevate black-box adversaries to near-white-box
+    conditions via transfer attacks, eliminating most of the victim query cost. Detection shifts from
+    stateful post-request query pattern analysis (Track 6) to stateless pre-inference preprocessing
+    (Track 7). ATLAS techniques AML.T0043 and AML.T0015 anchor the chapter to the detection
+    engineering framework. Both are completed as Sigma rules in Section 10.13.
+
+  key_takeaways:
+    - 'Evasion is instance-level; extraction is population-level -- different goals require different detection architectures (Track 6 vs Track 7)'
+    - 'Chapter 9 boundary maps are computational inputs to FGSM/PGD; Chapter 9 surrogates are transfer vehicles -- defending extraction partially defends evasion'
+    - 'Lp norm constraints are formal attack budgets: L0 sparse, L2 Euclidean, L-infinity uniform -- each favours different input domains'
+    - 'Targeted misclassification is harder for the adversary but more dangerous for the defender because it suppresses all downstream controls simultaneously'
+    - 'Track 7 is the first gateway track with a pre-inference transformation stage -- squeezer latency is on the critical path, not parallel to it'
+    - 'AML.T0043 (Craft Adversarial Data) covers all attack families in Sections 10.3-10.9; AML.T0015 (Evade ML Model) covers the runtime impact -- both completed as Sigma rules in Section 10.13'
+
+preview_section_10_02:
+  title: 'Section 10.2: Adversarial Example Taxonomy -- Goals, Constraints, and Detection Signals'
+  summary: |
+    Section 10.2 builds the complete adversarial example taxonomy: four attack goals
+    (targeted, untargeted, confidence reduction, detection evasion) by three access tiers
+    (white-box, grey-box, black-box) by four input modalities (image, text, tabular, audio).
+    Each cell in the taxonomy matrix maps to a canonical technique and a query budget estimate.
+    The section produces the goal-to-detection-signal mapper that tells the Track 7 engineer
+    which primitive covers which attack class, and the defender decision tree that classifies
+    an observed evasion attempt from its observable signals. The taxonomy is the scaffold that
+    all attack sections (10.3-10.9) occupy and that the Track 7 gateway uses to route alerts.
+
+metadata:
+  cross_chapter_references:
+    - 'Section 9.1: inference-time threat model and adversary access ladder (framing reused in this section)'
+    - 'Section 9.3: decision boundary mapping (boundary maps as direct FGSM/PGD computational input)'
+    - 'Section 9.4: distillation attacks (surrogates as transfer vehicles for Chapter 10)'
+    - 'Section 9.11: production gateway Track 6 (architectural contrast for Track 7)'
+    - 'Chapter 1 Section 1.9: loss functions (loss gradient w.r.t. input is FGSM primitive)'
+    - 'Chapter 2 Section 2.3: backpropagation and chain rule (gradient computation prerequisite)'
+    - 'Chapter 5 Section 5.8: AML Sigma stub pattern (completed for AML.T0043/T0015 in Section 10.13)'
+  forward_references:
+    - 'Section 10.2: adversarial taxonomy matrix (scaffold for all attack sections 10.3-10.9)'
+    - 'Section 10.3: FGSM (uses loss gradient w.r.t. input introduced here)'
+    - 'Section 10.4: PGD (iterative extension of FGSM gradient primitive)'
+    - 'Section 10.7: transfer attacks (Chapter 9 surrogate as transfer vehicle introduced here)'
+    - 'Section 10.11: feature squeezing (pre-inference Track 7 primitive introduced here)'
+    - 'Section 10.13: production Track 7 gateway (two-stage pre/post-inference architecture introduced here)'
+  tags:
+    - evasion-threat-model
+    - lp-norms
+    - l0-l2-linf
+    - targeted-untargeted
+    - adversary-access-ladder
+    - track-7-architecture
+    - pre-inference-detection
+    - atlas-aml-t0043
+    - atlas-aml-t0015
+    - chapter-9-bridge
+    - transfer-attacks

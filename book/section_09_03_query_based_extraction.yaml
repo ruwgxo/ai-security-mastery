@@ -1,0 +1,1469 @@
+# section_09_03_query_based_extraction.yaml
+
+---
+document_info:
+  title: 'Section 9.3: Query-Based Extraction Fundamentals'
+  subtitle: 'Black-Box Decision Boundary Mapping'
+  chapter: 9
+  section: 3
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/raghavpoonia/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  estimated_pages: 6
+  estimated_reading_time: '24 minutes'
+  created: '2026-05-09'
+
+section_overview:
+  one_line_summary: |
+    Black-box decision boundary mapping is the foundational extraction primitive:
+    every API query reveals boundary information for its input, linear models
+    extract in O(d) queries, and extraction queries cluster near decision surfaces
+    in ways that benign queries never do -- the detection insight that drives the
+    Section 9.11 query monitor.
+
+  why_this_section_exists: |
+    Section 9.2 named the four extraction goals. Section 9.3 implements the first
+    attack: black-box decision boundary mapping -- the primitive that underlies
+    decision-boundary extraction directly and informs the distillation attacks in
+    Section 9.4. Understanding this attack at the implementation level is what
+    makes the detection design in Section 9.10 defensible rather than heuristic.
+
+    The Tramer et al. 2016 result is the anchor: a linear model can be extracted
+    in O(d) queries where d is the feature dimension, using equation-solving
+    techniques that treat each API query as a linear constraint on the model''s
+    weight vector. Tree models extract via path probing: the adversary submits
+    inputs that traverse different branches until the tree''s structure is fully
+    mapped. Neural networks require more queries but the same boundary-probing
+    logic applies -- active learning makes the campaign budget-efficient by
+    choosing inputs that maximally reduce boundary uncertainty.
+
+    The detection insight established here -- extraction queries cluster near
+    decision boundaries while benign queries cluster in high-density input regions
+    -- is the mechanistic foundation for the boundary query detector and OOD
+    detector in Section 9.10. Building the attack first is what makes the detector
+    design principled: the detector targets the structural property of extraction
+    query distributions, not a surface-level heuristic.
+
+  position_in_chapter: |
+    Section 9.3 of 13. First attack implementation section. Establishes the
+    boundary mapping primitive that Section 9.4 (distillation) builds on, and
+    the detection insight that Section 9.10 operationalises. Section 9.9''s
+    incident reconstruction references the Tramer et al. MLaaS extractions
+    documented here.
+
+learning_objectives:
+  knowledge:
+    - 'Define black-box extraction and explain what the adversary can and cannot observe'
+    - 'Explain how every API query reveals decision boundary information for its input'
+    - 'Describe the Tramer et al. 2016 equation-solving result: linear model extraction in O(d) queries'
+    - 'Explain path-finding extraction for tree models: how branch traversal maps model structure'
+    - 'Describe active learning as the adversary''s query selection strategy and its budget efficiency gain'
+    - 'Articulate why extraction query distributions differ structurally from benign query distributions'
+
+  skills:
+    - 'Implement black-box decision boundary mapping against a binary classifier'
+    - 'Reproduce the Tramer et al. equation-solving extraction for a linear model'
+    - 'Build a path-finding extraction loop for a decision tree'
+    - 'Implement an active learning query selector that targets boundary-adjacent inputs'
+    - 'Measure and visualise the query distribution difference between extraction and benign usage'
+
+  security_mindset:
+    - 'Internalise that every query to a classifier leaks boundary information -- the API cannot avoid this'
+    - 'Recognise that the O(d) result means simple linear models are trivially extractable regardless of rate limits set in throughput terms'
+    - 'Understand that active learning is what makes extraction dangerous at modest query budgets'
+    - 'Appreciate that the boundary-clustering detection signal is mechanistically grounded, not heuristic'
+
+prerequisites:
+  - 'Section 9.1: adversary access ladder (black-box access level mechanics)'
+  - 'Section 9.2: extraction taxonomy (decision-boundary goal definition and budget-fidelity framing)'
+  - 'Chapter 2: decision boundaries and classification surfaces (geometric intuition required)'
+  - 'Chapter 1: ML fundamentals including linear models and decision trees (prerequisite for equation-solving and path-finding)'
+  - 'Chapter 4 Section 4.8: API architecture (prerequisite for understanding MLaaS extraction context)'
+
+prose_content:
+
+  - part: 1
+    title: 'Black-Box Extraction: What the Adversary Has and Does Not Have'
+    body: |
+      Black-box extraction begins with a strict constraint: the adversary has
+      exactly what every legitimate API user has. They can submit an input and
+      receive an output. They cannot inspect weights, compute gradients, or access
+      the model''s internal representations. The inference API is their only
+      channel, and every interaction costs money.
+
+      Within this constraint, the adversary has one powerful property working in
+      their favour: determinism. A deployed model with fixed weights returns
+      the same output for the same input. More importantly, it returns outputs
+      that are consistent functions of its internal decision boundary. Every
+      output the adversary receives is a data point about where the boundary lies.
+      There is no noise in the labels (for deterministic models) and no cost
+      to the adversary for the information each query provides -- beyond the
+      API fee.
+
+      This is the foundational extraction insight. The model cannot withhold
+      boundary information when it answers a query. By answering at all, it
+      reveals which side of its classification surface the input falls on. An
+      adversary who submits enough inputs -- chosen strategically -- can reconstruct
+      the surface from the accumulated answers. The model''s helpfulness is the
+      extraction mechanism.
+
+      Three practical constraints bound the adversary. First, query cost: each
+      API call has a monetary or computational cost that limits the total query
+      budget. Second, rate limits: the operator may enforce throughput limits that
+      pace the extraction timeline. Third, detection: a well-instrumented API
+      will log query patterns and flag anomalous distributions. These three
+      constraints are the defender''s leverage. None of them prevents extraction
+      in principle; all of them impose costs that make extraction less attractive
+      relative to training from scratch.
+
+  - part: 2
+    title: 'Decision Boundary Mapping: The Core Primitive'
+    body: |
+      Decision boundary mapping is the process of determining where a model
+      transitions between output classes by submitting input pairs and observing
+      which class each input is assigned to. The boundary is the set of points
+      in input space where the model''s class assignment changes -- the surface
+      that separates the model''s output regions.
+
+      The basic procedure has two phases. In the sampling phase, the adversary
+      submits inputs drawn from the input distribution and records the label each
+      receives. This partitions the observed input space into labelled regions.
+      In the boundary refinement phase, the adversary identifies pairs of inputs
+      with different labels and searches for the boundary between them using
+      binary search or other interpolation techniques. Given input A labelled
+      class 0 and input B labelled class 1, the midpoint between them is closer
+      to the boundary than either endpoint. Querying the midpoint and recursing
+      on the appropriate half narrows the boundary to arbitrary precision.
+
+      Binary search boundary refinement between two points requires O(log(1/ε))
+      queries to locate the boundary to within ε precision. For a d-dimensional
+      input space, covering the boundary globally requires identifying enough
+      pairs to reconstruct the boundary''s geometry -- the query count scales
+      with the boundary''s complexity, not with the input dimension directly.
+
+      The key insight for linear classifiers is that binary search is not needed.
+      A linear classifier has a single hyperplane boundary defined by d+1
+      parameters (the weight vector and bias). Each query that falls on the
+      boundary (or near it) provides a linear constraint on these parameters.
+      With d+1 linearly independent boundary points, the hyperplane is exactly
+      determined. This is the equation-solving approach -- and it requires only
+      O(d) queries for a d-dimensional linear classifier.
+
+  - part: 3
+    title: 'Tramer et al. 2016: The Canonical Result'
+    body: |
+      The Tramer et al. 2016 paper "Stealing Machine Learning Models via
+      Prediction APIs" established the foundational results for model extraction
+      against commercial ML APIs. The paper demonstrated attacks against Amazon
+      ML, Microsoft Azure ML, BigML, and other MLaaS platforms of the period,
+      extracting linear classifiers, decision trees, and neural networks with
+      documented query budgets.
+
+      The core theoretical result for linear models is equation-solving extraction.
+      A binary linear classifier assigns label 1 to inputs where w·x + b > 0 and
+      label 0 otherwise, where w is the d-dimensional weight vector and b is the
+      bias. The decision boundary is the hyperplane w·x + b = 0.
+
+      The adversary''s strategy is to find inputs on the boundary. Starting from
+      two inputs with opposite labels, binary search locates a point near the
+      boundary. Repeating this process from different starting pairs produces
+      multiple near-boundary points. Each near-boundary point x_i satisfies
+      approximately w·x_i + b ≈ 0 -- a linear constraint on the unknown weight
+      vector. With d+1 linearly independent constraints, the system w·x = -b
+      is solvable by standard linear algebra. The weight vector is recovered
+      exactly (up to numerical precision) from d+1 boundary points.
+
+      Query budget: finding each boundary point via binary search requires
+      O(log(1/ε)) queries for precision ε. Finding d+1 independent boundary
+      points requires O(d · log(1/ε)) queries total. For typical ML feature
+      dimensions (d in the tens to thousands), and typical precision requirements
+      (ε = 0.001), this is a few hundred to a few tens of thousands of queries --
+      trivially achievable against any commercial API without triggering
+      throughput-based rate limits.
+
+      The paper demonstrated this attack against production MLaaS platforms with
+      documented query counts matching the theoretical bound. The practical
+      extraction of a production linear classifier required fewer queries than a
+      typical user might issue in a day of legitimate API use. The implication
+      for defenders: linear models deployed via public APIs should be treated as
+      effectively public. Rate limits calibrated to legitimate usage will not
+      prevent equation-solving extraction.
+
+  - part: 4
+    title: 'Path-Finding Extraction: Tree Models via Branch Traversal'
+    body: |
+      Decision trees have a different extraction mechanism because their decision
+      boundary is piecewise constant rather than linear. A decision tree partitions
+      the input space into axis-aligned rectangular regions, with each leaf
+      assigning a class label to all inputs that fall in its region. The tree''s
+      structure is defined by a sequence of feature threshold comparisons at each
+      internal node.
+
+      Path-finding extraction maps the tree by finding which leaf each input falls
+      in and working backward to reconstruct the branching structure. The procedure
+      is recursive: the adversary submits a reference input, receives its class
+      label, then systematically varies one feature at a time to find the threshold
+      value at which the output label changes. That threshold is a split node in
+      the tree. Repeating this for each feature at each depth level reconstructs
+      the full tree.
+
+      The query budget for tree extraction scales with the number of internal
+      nodes and the number of features tested at each node. For a tree with N
+      leaves (and therefore N-1 internal nodes) with splits over d features, the
+      extraction requires O(N · d · log(feature_range / ε)) queries to locate
+      each threshold to precision ε. For typical shallow trees (N in the tens to
+      hundreds) with modest feature counts, this is a few thousand queries.
+
+      Tramer et al. demonstrated tree extraction against decision-tree classifiers
+      in the MLaaS platforms they studied, achieving complete structural recovery
+      within query budgets of a few thousand API calls. The extracted trees
+      matched the victim''s predictions exactly on held-out test sets -- not just
+      approximate fidelity but exact replication.
+
+      The detection implication differs from linear model extraction. Path-finding
+      extraction produces a distinctive query pattern: systematic variation of a
+      single feature while holding all others constant, repeated for each feature
+      in sequence. This one-feature-at-a-time pattern is statistically distinct
+      from legitimate usage, where queries vary across all features simultaneously
+      in ways that reflect real-world inputs. The query distribution analyser in
+      Section 9.10 includes a feature-isolation pattern detector for this reason.
+
+  - part: 5
+    title: 'Active Learning: Making Extraction Budget-Efficient'
+    body: |
+      The equation-solving and path-finding approaches are exact extraction
+      methods for specific model families. For neural networks, where the decision
+      boundary is non-linear and high-dimensional, exact extraction is generally
+      not achievable with a finite query budget. Instead, the adversary uses
+      active learning: a strategy for choosing queries that maximally reduce
+      uncertainty about the model''s behaviour at each step.
+
+      The core active learning principle for extraction is uncertainty sampling:
+      choose the next query to be the input for which the current surrogate model
+      is most uncertain about the victim''s response. Uncertainty is highest near
+      the decision boundary, because that is where the surrogate''s current
+      estimate of the boundary is least accurate. Active learning therefore
+      drives queries toward the boundary -- which is exactly where boundary
+      information density is highest.
+
+      The active learning extraction loop has three components. A query selector
+      maintains a pool of candidate inputs and scores each by the surrogate''s
+      uncertainty at that point. An oracle submits the selected input to the
+      victim API and receives the label. A surrogate updater retrains or fine-
+      tunes the surrogate on the accumulated labelled inputs. The loop iterates
+      until the query budget is exhausted or the surrogate reaches the target
+      fidelity.
+
+      Budget efficiency gains from active learning over random sampling are
+      substantial. Published results from Papernot et al. 2017 ("Practical
+      Black-Box Attacks Against Machine Learning") demonstrated 5 to 10x
+      reductions in required query count for neural network extraction compared
+      to random sampling baselines. This means an active-learning extractor
+      achieves the same surrogate fidelity as a random-sampling extractor at
+      10 to 20 percent of the query cost.
+
+      The detection implication is the critical one for Section 9.10. Active
+      learning concentrates queries near the decision boundary because that is
+      where uncertainty is highest. A legitimate user''s query distribution
+      reflects their actual use case -- queries cluster in the high-density
+      regions of the input space that the product serves. An active-learning
+      extractor''s query distribution clusters at the boundary -- which is,
+      by definition, the low-density region between classes. This distributional
+      difference is detectable. The boundary query detector in Section 9.10
+      is built precisely to identify this clustering.
+
+  - part: 6
+    title: 'Practical Extraction Against MLaaS Platforms'
+    body: |
+      Tramer et al. 2016 did not just prove theoretical bounds -- they ran
+      practical extractions against production ML APIs. The attacks targeted
+      Amazon ML, Microsoft Azure ML, BigML, and Google Prediction API as they
+      existed at the time of the research. The results demonstrated that the
+      theoretical extraction budgets translated directly to practical API
+      interactions.
+
+      Against Amazon ML''s logistic regression endpoint, the team extracted the
+      model using equation-solving with a query count matching the theoretical
+      O(d) bound. The extracted model''s predictions matched the victim''s on
+      a held-out test set to within noise. The extraction required fewer API
+      calls than a typical integration test would issue during development --
+      the attack was invisible to any throughput-based rate limit.
+
+      Against BigML''s decision tree endpoint, path-finding extraction recovered
+      the full tree structure in thousands of queries. The extracted tree achieved
+      exact fidelity on the target input distribution: it was not a surrogate
+      that approximated the victim but a structural clone that replicated the
+      victim''s logic completely.
+
+      Against neural network endpoints, the team used surrogate training on
+      API outputs -- the distillation approach that Section 9.4 covers in depth.
+      The surrogate achieved substantial fidelity with query counts far below
+      the victim''s original training data volume.
+
+      The significance of these results for production defenders is not historical
+      curiosity. The attack surface these extractions exploited -- a prediction
+      API that returns class labels -- remains the dominant deployment pattern
+      for ML models in 2026. The controls that were absent in 2016 (query pattern
+      monitoring, extraction-aware rate limiting, output perturbation) are the
+      controls that Sections 9.10 through 9.12 build. The Tramer et al. incidents
+      are the threat model that motivates every production control in this chapter.
+
+  - part: 7
+    title: 'The Detection Insight: Why Extraction Queries Differ from Benign Queries'
+    body: |
+      The mechanistic understanding of boundary-mapping extraction yields a
+      detection insight that is foundational for Section 9.10: extraction queries
+      and benign queries occupy structurally different regions of the input space,
+      and this difference is measurable.
+
+      Benign queries reflect the user''s actual use case. A legitimate user
+      of a credit-scoring API submits applicant profiles that fall within the
+      distribution of real applicants they encounter. A legitimate user of a
+      content moderation API submits text that reflects real content from their
+      platform. Benign queries cluster in the high-density regions of the input
+      distribution -- the regions the model was trained to serve.
+
+      Extraction queries, regardless of the specific technique, drift toward the
+      decision boundary. Equation-solving explicitly constructs boundary inputs.
+      Path-finding systematically walks toward feature thresholds. Active learning
+      maximises uncertainty by targeting the boundary directly. Even random-
+      sampling distillation (Section 9.4) produces a query distribution that is
+      more uniform across the input space than legitimate usage -- legitimate
+      users are concentrated in their use case, not spread uniformly.
+
+      The distributional difference has three measurable properties. First,
+      boundary proximity: extraction queries are closer to the decision boundary
+      in expectation than benign queries. Second, input diversity: extraction
+      queries for functionality extraction span more of the input space than any
+      single legitimate user''s queries. Third, feature coverage: path-finding
+      extraction produces queries with systematic feature variation that no
+      legitimate user would generate.
+
+      Importantly, none of these properties is individually definitive. A single
+      extraction query is not distinguishable from a benign query. The signal
+      emerges from the aggregate distribution across many queries. This is why
+      the Section 9.11 query monitor maintains per-user state: the detection
+      target is the query distribution over time, not the individual query''s
+      content. The boundary query detector, OOD detector, and query diversity
+      monitor built in Section 9.10 each target one of these three distributional
+      properties.
+
+reference_materials:
+
+  - table: 1
+    title: 'Model Type Extraction Summary: Tramer et al. 2016 Results'
+    description: |
+      Extraction characteristics for linear models, decision trees, and neural
+      networks based on the Tramer et al. 2016 theoretical and empirical results.
+    columns:
+      - 'Model Type'
+      - 'Extraction Technique'
+      - 'Query Budget (Theoretical)'
+      - 'Query Budget (Practical, Tramer et al.)'
+      - 'Fidelity Achieved'
+      - 'Detection Signal'
+    rows:
+      - model_type: 'Linear Classifier (logistic regression, SVM)'
+        technique: 'Equation-solving: boundary point accumulation and linear system solve'
+        budget_theoretical: 'O(d * log(1/epsilon)) -- d = feature dimension'
+        budget_practical: 'Hundreds to low thousands for typical d; matched theoretical bound'
+        fidelity: 'Exact weight recovery (up to numerical precision); 100% prediction match'
+        detection_signal: 'Boundary-seeking input pairs; near-zero confidence queries (grey-box); systematic near-boundary clustering'
+      - model_type: 'Decision Tree'
+        technique: 'Path-finding: one-feature-at-a-time threshold search per internal node'
+        budget_theoretical: 'O(N * d * log(range/epsilon)) -- N = leaves, d = features'
+        budget_practical: 'Thousands for typical shallow trees; matched theoretical bound'
+        fidelity: 'Exact structural recovery; 100% prediction match on target distribution'
+        detection_signal: 'One-feature-at-a-time variation pattern; systematic feature isolation queries'
+      - model_type: 'Neural Network (shallow)'
+        technique: 'Surrogate training on API outputs; equation-solving for final linear layer'
+        budget_theoretical: 'O(d_hidden * d_output) for final layer; full network requires more'
+        budget_practical: 'Tens of thousands; partial replication of full network'
+        fidelity: 'High fidelity on target distribution; lower on out-of-distribution inputs'
+        detection_signal: 'High query diversity; boundary proximity distribution shift'
+      - model_type: 'Deep Neural Network'
+        technique: 'Active-learning distillation; surrogate training on diverse API outputs'
+        budget_theoretical: 'No closed-form bound; empirically 10K-1M+ depending on capacity'
+        budget_practical: 'Substantial query budgets; fidelity scales with budget'
+        fidelity: '70-90% on target distribution with large query budgets; lower for OOD'
+        detection_signal: 'Broad input diversity; uniform coverage of input space; boundary clustering with active learning'
+
+  - table: 2
+    title: 'Active Learning vs Random Sampling: Budget Efficiency Comparison'
+    description: |
+      Query budget comparison between active learning and random sampling extraction
+      for neural network surrogates, based on Papernot et al. 2017 results.
+    columns:
+      - 'Surrogate Fidelity Target'
+      - 'Random Sampling Queries'
+      - 'Active Learning Queries'
+      - 'Efficiency Gain'
+      - 'Note'
+    rows:
+      - fidelity_target: '70% test accuracy on MNIST surrogate'
+        random_sampling: '~10,000'
+        active_learning: '~1,000'
+        efficiency_gain: '10x reduction'
+        note: 'Papernot et al. 2017 MNIST experiment'
+      - fidelity_target: '80% test accuracy on MNIST surrogate'
+        random_sampling: '~40,000'
+        active_learning: '~6,000'
+        efficiency_gain: '6-7x reduction'
+        note: 'Boundary clustering drives query efficiency at higher fidelity targets'
+      - fidelity_target: '90% test accuracy on MNIST surrogate'
+        random_sampling: '~200,000'
+        active_learning: '~30,000'
+        efficiency_gain: '6-7x reduction'
+        note: 'Efficiency gain is consistent across fidelity levels for MNIST-scale models'
+      - fidelity_target: '70% test accuracy on CIFAR-10 surrogate'
+        random_sampling: '~100,000'
+        active_learning: '~15,000'
+        efficiency_gain: '6-7x reduction'
+        note: 'Higher-complexity model; absolute budgets higher but relative gain consistent'
+
+  - table: 3
+    title: 'Extraction Query Distribution Properties vs Benign Query Distribution'
+    description: |
+      Measurable statistical properties distinguishing extraction query distributions
+      from legitimate user query distributions. These properties drive the detection
+      primitive design in Section 9.10.
+    columns:
+      - 'Property'
+      - 'Benign Query Distribution'
+      - 'Extraction Query Distribution'
+      - 'Detection Primitive'
+      - 'Signal Strength'
+    rows:
+      - property: 'Boundary proximity'
+        benign: 'Queries cluster in high-density input regions far from boundary'
+        extraction: 'Queries cluster near decision boundary (especially active learning)'
+        detection_primitive: 'Boundary query detector (Section 9.10)'
+        signal_strength: 'Strong for active learning and equation-solving; moderate for random sampling'
+      - property: 'Input space coverage'
+        benign: 'Concentrated in use-case-relevant input region; low coverage of full space'
+        extraction: 'Broad coverage of input space for functionality extraction; OOD queries common'
+        detection_primitive: 'Query diversity monitor and OOD detector (Section 9.10)'
+        signal_strength: 'Strong for functionality extraction; weaker for fidelity extraction'
+      - property: 'Feature variation pattern'
+        benign: 'All features vary together reflecting real-world inputs'
+        extraction: 'One-feature-at-a-time variation for tree extraction; systematic perturbation for neural nets'
+        detection_primitive: 'Feature isolation pattern detector (Section 9.10)'
+        signal_strength: 'Very strong for tree extraction; moderate for neural network probing'
+      - property: 'Query pair label distribution'
+        benign: 'Label distribution reflects class priors; pairs rarely opposite-label with small distance'
+        extraction: 'Opposite-label pairs with small input distance are deliberately constructed'
+        detection_primitive: 'Boundary query detector: near-boundary pair analysis (Section 9.10)'
+        signal_strength: 'Strong for equation-solving; moderate for active learning'
+      - property: 'Confidence score distribution (grey-box)'
+        benign: 'Confidence scores distributed across range; few near-0.5 scores'
+        extraction: 'Confidence scores concentrate near 0.5 (boundary) due to active learning targeting'
+        detection_primitive: 'Output entropy monitor (Section 9.10)'
+        signal_strength: 'Strong when grey-box access is available and active learning is used'
+
+  - table: 4
+    title: 'Extraction vs Defender Economics: Equation-Solving Attack'
+    description: |
+      Cost analysis comparing extraction attack cost to victim training cost and
+      defender detection cost. Illustrates the asymmetry that motivates detection
+      investment.
+    columns:
+      - 'Cost Item'
+      - 'Order of Magnitude'
+      - 'Notes'
+    rows:
+      - item: 'Victim training cost (linear model, d=1000)'
+        magnitude: '$10-$1,000 compute'
+        notes: 'Highly variable; includes data collection, pipeline, and engineering'
+      - item: 'Extraction query cost (equation-solving, d=1000)'
+        magnitude: '$0.01-$10 in API fees'
+        notes: 'O(d * log(1/epsilon)) queries at typical MLaaS per-query pricing'
+      - item: 'Attacker-to-victim cost ratio'
+        magnitude: '0.001x to 0.01x'
+        notes: 'Attacker spends 0.1-1% of victim training cost to replicate the model'
+      - item: 'Defender detection cost per request'
+        magnitude: '<$0.001 per query'
+        notes: 'Query pattern monitoring adds minimal latency and compute overhead'
+      - item: 'Defender extraction friction cost (2x budget required)'
+        magnitude: 'Doubles attacker API spend'
+        notes: 'Rate limiting and perturbation that doubles query budget is high ROI for defender'
+
+deliverables:
+
+  - id: 1
+    name: 'boundary_mapper.py'
+    description: |
+      Black-box decision boundary mapper using binary search between opposite-label
+      input pairs. Implements the core boundary refinement loop against any
+      sklearn-compatible classifier exposing a predict() interface. Tracks query
+      count and boundary point collection. Intended as the adversary-side
+      implementation that the Section 9.10 boundary query detector is designed
+      to catch.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and sklearn.
+      The victim_model parameter accepts any object with a predict(X) method --
+      no hardcoded model type. Binary search precision is configurable.
+      Query budget tracking is built into the oracle wrapper.
+    code: |
+      # boundary_mapper.py
+      # Chapter 9 Section 9.3 -- Black-Box Decision Boundary Mapper
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from dataclasses import dataclass, field
+      from typing import Callable, List, Optional, Tuple
+
+
+      @dataclass
+      class OracleStats:
+          total_queries: int = 0
+          boundary_points_found: int = 0
+          query_log: List[np.ndarray] = field(default_factory=list)
+
+
+      class BudgetedOracle:
+          '''
+          Wraps a victim model with query counting and budget enforcement.
+          Accepts any object with a predict(X) method.
+          '''
+
+          def __init__(self, victim_model, budget: int) -> None:
+              self._model = victim_model
+              self._budget = budget
+              self.stats = OracleStats()
+
+          def query(self, x: np.ndarray) -> int:
+              if self.stats.total_queries >= self._budget:
+                  raise RuntimeError(f'Query budget exhausted: {self._budget} queries used')
+              x_2d = x.reshape(1, -1)
+              label = int(self._model.predict(x_2d)[0])
+              self.stats.total_queries += 1
+              self.stats.query_log.append(x.copy())
+              return label
+
+          @property
+          def budget_remaining(self) -> int:
+              return self._budget - self.stats.total_queries
+
+
+      def find_boundary_point(
+          oracle: BudgetedOracle,
+          x_neg: np.ndarray,
+          x_pos: np.ndarray,
+          label_neg: int,
+          label_pos: int,
+          precision: float = 1e-4,
+          max_steps: int = 50,
+      ) -> Optional[np.ndarray]:
+          '''
+          Binary search between x_neg (label_neg) and x_pos (label_pos) to locate
+          a point near the decision boundary. Returns the boundary-adjacent point
+          or None if budget is exhausted before convergence.
+          precision: stop when ||x_pos - x_neg|| < precision.
+          '''
+          a, b = x_neg.copy(), x_pos.copy()
+          for _ in range(max_steps):
+              if np.linalg.norm(b - a) < precision:
+                  break
+              mid = (a + b) / 2.0
+              try:
+                  mid_label = oracle.query(mid)
+              except RuntimeError:
+                  return None
+              if mid_label == label_neg:
+                  a = mid
+              else:
+                  b = mid
+          return (a + b) / 2.0
+
+
+      def collect_seed_pairs(
+          oracle: BudgetedOracle,
+          input_dim: int,
+          n_pairs: int,
+          input_low: float = 0.0,
+          input_high: float = 1.0,
+          rng: Optional[np.random.Generator] = None,
+      ) -> List[Tuple[np.ndarray, int, np.ndarray, int]]:
+          '''
+          Sample random inputs until n_pairs opposite-label pairs are found.
+          Returns list of (x_neg, label_neg, x_pos, label_pos) tuples.
+          '''
+          if rng is None:
+              rng = np.random.default_rng(seed=42)
+          pairs: List[Tuple[np.ndarray, int, np.ndarray, int]] = []
+          pool: List[Tuple[np.ndarray, int]] = []
+
+          while len(pairs) < n_pairs and oracle.budget_remaining > 0:
+              x = rng.uniform(input_low, input_high, size=input_dim)
+              try:
+                  label = oracle.query(x)
+              except RuntimeError:
+                  break
+              pool.append((x, label))
+              # Check against existing pool for opposite-label pairs
+              for prev_x, prev_label in pool[:-1]:
+                  if prev_label != label and len(pairs) < n_pairs:
+                      if label == 0:
+                          pairs.append((x, label, prev_x, prev_label))
+                      else:
+                          pairs.append((prev_x, prev_label, x, label))
+          return pairs
+
+
+      def map_boundary(
+          oracle: BudgetedOracle,
+          input_dim: int,
+          n_boundary_points: int,
+          precision: float = 1e-4,
+          input_low: float = 0.0,
+          input_high: float = 1.0,
+          rng: Optional[np.random.Generator] = None,
+      ) -> List[np.ndarray]:
+          '''
+          Collect n_boundary_points points near the decision boundary.
+          Returns list of boundary-adjacent input vectors.
+          '''
+          pairs = collect_seed_pairs(oracle, input_dim, n_boundary_points, input_low, input_high, rng)
+          boundary_points: List[np.ndarray] = []
+          for x_neg, label_neg, x_pos, label_pos in pairs:
+              bp = find_boundary_point(oracle, x_neg, x_pos, label_neg, label_pos, precision)
+              if bp is not None:
+                  boundary_points.append(bp)
+                  oracle.stats.boundary_points_found += 1
+          return boundary_points
+
+
+      if __name__ == '__main__':
+          # Demonstration against a simple sklearn linear classifier
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.datasets import make_classification
+
+          X, y = make_classification(n_samples=500, n_features=10, random_state=42)
+          victim = LogisticRegression(random_state=42).fit(X, y)
+
+          oracle = BudgetedOracle(victim_model=victim, budget=2000)
+          boundary_pts = map_boundary(oracle, input_dim=10, n_boundary_points=15)
+
+          print(f'Boundary points found: {len(boundary_pts)}')
+          print(f'Total queries used:    {oracle.stats.total_queries}')
+          print(f'Budget remaining:      {oracle.budget_remaining}')
+
+  - id: 2
+    name: 'linear_extractor.py'
+    description: |
+      Equation-solving extraction for linear (logistic regression / linear SVM)
+      classifiers. Implements the Tramer et al. 2016 approach: collect d+1
+      linearly independent near-boundary points, then solve the linear system
+      to recover the weight vector and bias. Validates extraction by comparing
+      extracted model predictions to victim predictions on a held-out set.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and sklearn.
+      Extraction is model-agnostic on the victim side -- only predict() is called.
+      Linear system solve uses numpy.linalg.lstsq (tolerates near-singular systems).
+      No hardcoded feature dimension; dim is inferred from the first boundary point.
+    code: |
+      # linear_extractor.py
+      # Chapter 9 Section 9.3 -- Equation-Solving Linear Model Extractor (Tramer et al. 2016)
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from dataclasses import dataclass
+      from typing import List, Optional, Tuple
+
+      from boundary_mapper import BudgetedOracle, map_boundary
+
+
+      @dataclass
+      class ExtractionResult:
+          recovered_weights: np.ndarray
+          recovered_bias: float
+          queries_used: int
+          agreement_rate: float  # fraction of test inputs where extracted and victim agree
+          note: str
+
+
+      def extract_linear_model(
+          oracle: BudgetedOracle,
+          input_dim: int,
+          n_boundary_points: Optional[int] = None,
+          precision: float = 1e-5,
+          input_low: float = 0.0,
+          input_high: float = 1.0,
+      ) -> ExtractionResult:
+          '''
+          Extract a linear binary classifier using equation-solving.
+          Collects d+1 near-boundary points and solves the linear system
+          w . x_i + b = 0 for all boundary points x_i.
+
+          Returns recovered weight vector and bias, plus extraction statistics.
+          '''
+          if n_boundary_points is None:
+              n_boundary_points = input_dim + 2  # slight over-determination for stability
+
+          boundary_pts = map_boundary(
+              oracle, input_dim, n_boundary_points, precision, input_low, input_high
+          )
+
+          if len(boundary_pts) < input_dim + 1:
+              return ExtractionResult(
+                  recovered_weights=np.zeros(input_dim),
+                  recovered_bias=0.0,
+                  queries_used=oracle.stats.total_queries,
+                  agreement_rate=0.0,
+                  note=f'Insufficient boundary points: {len(boundary_pts)} of {input_dim + 1} needed',
+              )
+
+          # Build the linear system: [x_i | 1] * [w; b] = 0 for each boundary point
+          # Homogeneous system -- solve for null vector of A = [boundary_pts | ones_col]
+          A = np.column_stack([boundary_pts, np.ones(len(boundary_pts))])
+          # Use SVD to find the null space vector (last right singular vector)
+          _, _, Vt = np.linalg.svd(A)
+          solution = Vt[-1]  # smallest singular value direction
+          recovered_weights = solution[:input_dim]
+          recovered_bias = solution[input_dim]
+
+          # Normalise so ||w|| = 1
+          norm = np.linalg.norm(recovered_weights)
+          if norm > 1e-10:
+              recovered_weights = recovered_weights / norm
+              recovered_bias = recovered_bias / norm
+
+          return ExtractionResult(
+              recovered_weights=recovered_weights,
+              recovered_bias=float(recovered_bias),
+              queries_used=oracle.stats.total_queries,
+              agreement_rate=0.0,  # populated by caller after validation
+              note=f'Solved from {len(boundary_pts)} boundary points using SVD null space',
+          )
+
+
+      def validate_extraction(
+          result: ExtractionResult,
+          oracle: BudgetedOracle,
+          test_inputs: np.ndarray,
+      ) -> float:
+          '''
+          Validate the extracted model by comparing its predictions to the victim
+          on a held-out test set. Returns agreement rate (0.0 to 1.0).
+          Uses the recovered weight vector and bias as a linear threshold classifier.
+          '''
+          w = result.recovered_weights
+          b = result.recovered_bias
+          scores = test_inputs.dot(w) + b
+          extracted_labels = (scores > 0).astype(int)
+          victim_labels = np.array([oracle.query(x) for x in test_inputs])
+          agreement = float(np.mean(extracted_labels == victim_labels))
+          return agreement
+
+
+      if __name__ == '__main__':
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.datasets import make_classification
+
+          input_dim = 20
+          X, y = make_classification(n_samples=1000, n_features=input_dim, random_state=42)
+          victim = LogisticRegression(random_state=42).fit(X, y)
+
+          # Extraction oracle with generous budget
+          oracle = BudgetedOracle(victim_model=victim, budget=5000)
+          result = extract_linear_model(oracle, input_dim=input_dim)
+
+          # Validate on held-out inputs
+          rng = np.random.default_rng(seed=99)
+          test_X = rng.uniform(0.0, 1.0, size=(200, input_dim))
+          agreement = validate_extraction(result, oracle, test_X)
+          result.agreement_rate = agreement
+
+          print(f'Queries used:    {result.queries_used}')
+          print(f'Theoretical O(d): ~{input_dim * 15} (d={input_dim}, log factor ~15)')
+          print(f'Agreement rate:  {result.agreement_rate:.1%}')
+          print(f'Note: {result.note}')
+
+  - id: 3
+    name: 'tree_extractor.py'
+    description: |
+      Path-finding extraction for decision tree classifiers. Maps tree structure
+      by systematically varying one feature at a time to locate split thresholds
+      at each depth level. Reconstructs the full tree as a nested dictionary.
+      Validates extraction by comparing reconstructed tree predictions to victim
+      predictions on a held-out set.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and sklearn.
+      Tree reconstruction is stored as a schema-free nested dict -- no hardcoded
+      tree structure. Feature range is configurable. Extraction depth is bounded
+      by max_depth parameter to limit query budget.
+    code: |
+      # tree_extractor.py
+      # Chapter 9 Section 9.3 -- Path-Finding Decision Tree Extractor
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from dataclasses import dataclass, field
+      from typing import Any, Dict, List, Optional, Tuple
+
+      from boundary_mapper import BudgetedOracle
+
+
+      @dataclass
+      class TreeNode:
+          feature_index: Optional[int] = None
+          threshold: Optional[float] = None
+          left: Optional['TreeNode'] = None   # input[feature] <= threshold
+          right: Optional['TreeNode'] = None  # input[feature] > threshold
+          leaf_label: Optional[int] = None
+
+
+      def find_split_threshold(
+          oracle: BudgetedOracle,
+          reference: np.ndarray,
+          feature_idx: int,
+          feature_low: float,
+          feature_high: float,
+          precision: float = 1e-4,
+          max_steps: int = 40,
+      ) -> Optional[Tuple[float, int, int]]:
+          '''
+          Find the split threshold for feature_idx by binary search.
+          Returns (threshold, label_left, label_right) or None if no split exists
+          or budget is exhausted.
+          '''
+          ref_label = oracle.stats.total_queries  # will be overwritten
+          try:
+              probe_low = reference.copy()
+              probe_low[feature_idx] = feature_low
+              label_low = oracle.query(probe_low)
+
+              probe_high = reference.copy()
+              probe_high[feature_idx] = feature_high
+              label_high = oracle.query(probe_high)
+          except RuntimeError:
+              return None
+
+          if label_low == label_high:
+              return None  # no split on this feature in this range
+
+          # Binary search for the threshold
+          lo, hi = feature_low, feature_high
+          label_lo = label_low
+          for _ in range(max_steps):
+              if hi - lo < precision:
+                  break
+              mid_val = (lo + hi) / 2.0
+              probe_mid = reference.copy()
+              probe_mid[feature_idx] = mid_val
+              try:
+                  label_mid = oracle.query(probe_mid)
+              except RuntimeError:
+                  break
+              if label_mid == label_lo:
+                  lo = mid_val
+              else:
+                  hi = mid_val
+
+          threshold = (lo + hi) / 2.0
+          return threshold, label_low, label_high
+
+
+      def extract_tree_node(
+          oracle: BudgetedOracle,
+          reference: np.ndarray,
+          input_dim: int,
+          feature_ranges: List[Tuple[float, float]],
+          depth: int,
+          max_depth: int,
+      ) -> TreeNode:
+          '''
+          Recursively extract a tree node by probing each feature for a split threshold.
+          Returns a TreeNode (either internal with children or leaf with label).
+          '''
+          if depth >= max_depth or oracle.budget_remaining < 10:
+              try:
+                  label = oracle.query(reference)
+              except RuntimeError:
+                  label = 0
+              return TreeNode(leaf_label=label)
+
+          # Probe each feature for a split
+          for feat_idx in range(input_dim):
+              lo, hi = feature_ranges[feat_idx]
+              result = find_split_threshold(oracle, reference, feat_idx, lo, hi)
+              if result is not None:
+                  threshold, label_left, label_right = result
+                  node = TreeNode(feature_index=feat_idx, threshold=threshold)
+
+                  # Build reference points for left and right subtrees
+                  ref_left = reference.copy()
+                  ref_left[feat_idx] = (lo + threshold) / 2.0
+                  ref_right = reference.copy()
+                  ref_right[feat_idx] = (threshold + hi) / 2.0
+
+                  new_ranges_left = list(feature_ranges)
+                  new_ranges_left[feat_idx] = (lo, threshold)
+                  new_ranges_right = list(feature_ranges)
+                  new_ranges_right[feat_idx] = (threshold, hi)
+
+                  node.left = extract_tree_node(
+                      oracle, ref_left, input_dim, new_ranges_left, depth + 1, max_depth
+                  )
+                  node.right = extract_tree_node(
+                      oracle, ref_right, input_dim, new_ranges_right, depth + 1, max_depth
+                  )
+                  return node
+
+          # No split found on any feature -- this is a leaf
+          try:
+              label = oracle.query(reference)
+          except RuntimeError:
+              label = 0
+          return TreeNode(leaf_label=label)
+
+
+      def predict_with_tree(node: TreeNode, x: np.ndarray) -> int:
+          '''Predict the label for input x using an extracted TreeNode.'''
+          if node.leaf_label is not None:
+              return node.leaf_label
+          if x[node.feature_index] <= node.threshold:
+              return predict_with_tree(node.left, x)
+          return predict_with_tree(node.right, x)
+
+
+      if __name__ == '__main__':
+          from sklearn.tree import DecisionTreeClassifier
+          from sklearn.datasets import make_classification
+
+          input_dim = 5
+          X, y = make_classification(n_samples=500, n_features=input_dim, random_state=42)
+          victim = DecisionTreeClassifier(max_depth=4, random_state=42).fit(X, y)
+
+          oracle = BudgetedOracle(victim_model=victim, budget=3000)
+          feature_ranges = [(float(X[:, i].min()), float(X[:, i].max())) for i in range(input_dim)]
+          reference = X[0].copy()
+
+          root = extract_tree_node(oracle, reference, input_dim, feature_ranges, depth=0, max_depth=4)
+
+          # Validate on test inputs
+          rng = np.random.default_rng(seed=77)
+          test_X = rng.uniform(-3.0, 3.0, size=(200, input_dim))
+          extracted = np.array([predict_with_tree(root, x) for x in test_X])
+          victim_preds = victim.predict(test_X)
+          agreement = float(np.mean(extracted == victim_preds))
+
+          print(f'Queries used:   {oracle.stats.total_queries}')
+          print(f'Agreement rate: {agreement:.1%}')
+
+  - id: 4
+    name: 'active_learning_extractor.py'
+    description: |
+      Active learning extraction loop for neural network classifiers. Implements
+      the uncertainty sampling strategy: at each step, select the pool input for
+      which the current surrogate model is most uncertain (confidence closest to
+      0.5), query the victim, update the surrogate, and repeat. Tracks query count
+      and surrogate fidelity at each step for budget-efficiency analysis.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and sklearn.
+      Surrogate model is a LogisticRegression by default but accepts any sklearn
+      estimator with fit() and predict_proba() methods -- no hardcoded surrogate
+      type. Pool size and step count are configurable.
+    code: |
+      # active_learning_extractor.py
+      # Chapter 9 Section 9.3 -- Active Learning Extraction Loop
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from dataclasses import dataclass, field
+      from typing import Any, List, Optional, Tuple
+
+      from boundary_mapper import BudgetedOracle
+
+
+      @dataclass
+      class ActiveLearningStep:
+          step: int
+          queries_used: int
+          surrogate_accuracy: float
+          selected_uncertainty: float
+
+
+      @dataclass
+      class ActiveLearningResult:
+          steps: List[ActiveLearningStep] = field(default_factory=list)
+          final_surrogate: Any = None
+          total_queries: int = 0
+
+
+      def uncertainty_score(surrogate, X_pool: np.ndarray) -> np.ndarray:
+          '''
+          Compute uncertainty scores for pool inputs using the surrogate.
+          Uncertainty = 1 - max(predict_proba) per input.
+          Inputs closest to 0.5 confidence have highest uncertainty.
+          Returns array of uncertainty scores, shape (len(X_pool),).
+          '''
+          proba = surrogate.predict_proba(X_pool)
+          return 1.0 - proba.max(axis=1)
+
+
+      def run_active_learning_extraction(
+          oracle: BudgetedOracle,
+          surrogate_class,
+          surrogate_kwargs: dict,
+          X_pool: np.ndarray,
+          X_val: np.ndarray,
+          y_val_victim: np.ndarray,
+          n_initial: int = 20,
+          n_steps: int = 50,
+          batch_size: int = 10,
+          rng: Optional[np.random.Generator] = None,
+      ) -> ActiveLearningResult:
+          '''
+          Run active learning extraction against the oracle.
+
+          surrogate_class: sklearn estimator class (e.g. LogisticRegression)
+          surrogate_kwargs: kwargs passed to surrogate_class constructor
+          X_pool: unlabelled pool of candidate inputs for active selection
+          X_val: held-out validation inputs for fidelity measurement
+          y_val_victim: victim labels on X_val (pre-queried; not counted in budget)
+          n_initial: number of random seed queries before active learning begins
+          n_steps: number of active learning iterations
+          batch_size: number of inputs selected per iteration
+          '''
+          if rng is None:
+              rng = np.random.default_rng(seed=42)
+
+          result = ActiveLearningResult()
+          labelled_X: List[np.ndarray] = []
+          labelled_y: List[int] = []
+
+          # Seed phase: random initial queries
+          seed_indices = rng.choice(len(X_pool), size=min(n_initial, len(X_pool)), replace=False)
+          for idx in seed_indices:
+              try:
+                  label = oracle.query(X_pool[idx])
+                  labelled_X.append(X_pool[idx])
+                  labelled_y.append(label)
+              except RuntimeError:
+                  break
+
+          if len(labelled_X) < 2:
+              return result
+
+          surrogate = surrogate_class(**surrogate_kwargs)
+          surrogate.fit(np.array(labelled_X), np.array(labelled_y))
+
+          # Active learning phase
+          pool_mask = np.ones(len(X_pool), dtype=bool)
+          pool_mask[seed_indices] = False
+
+          for step in range(n_steps):
+              if oracle.budget_remaining < batch_size:
+                  break
+              pool_indices = np.where(pool_mask)[0]
+              if len(pool_indices) == 0:
+                  break
+
+              # Score pool by uncertainty
+              scores = uncertainty_score(surrogate, X_pool[pool_indices])
+              top_k = pool_indices[np.argsort(scores)[-batch_size:]]
+              max_uncertainty = float(scores.max())
+
+              # Query victim for selected inputs
+              for idx in top_k:
+                  try:
+                      label = oracle.query(X_pool[idx])
+                      labelled_X.append(X_pool[idx])
+                      labelled_y.append(label)
+                      pool_mask[idx] = False
+                  except RuntimeError:
+                      break
+
+              # Update surrogate
+              surrogate = surrogate_class(**surrogate_kwargs)
+              surrogate.fit(np.array(labelled_X), np.array(labelled_y))
+
+              # Measure fidelity on validation set
+              val_preds = surrogate.predict(X_val)
+              accuracy = float(np.mean(val_preds == y_val_victim))
+
+              result.steps.append(ActiveLearningStep(
+                  step=step + 1,
+                  queries_used=oracle.stats.total_queries,
+                  surrogate_accuracy=accuracy,
+                  selected_uncertainty=max_uncertainty,
+              ))
+
+          result.final_surrogate = surrogate
+          result.total_queries = oracle.stats.total_queries
+          return result
+
+
+      if __name__ == '__main__':
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.neural_network import MLPClassifier
+          from sklearn.datasets import make_classification
+
+          input_dim = 10
+          X, y = make_classification(n_samples=2000, n_features=input_dim, random_state=42)
+          victim = MLPClassifier(hidden_layer_sizes=(32, 16), random_state=42, max_iter=500).fit(X, y)
+
+          # Pool for active learning; validation set for fidelity measurement
+          rng = np.random.default_rng(seed=0)
+          X_pool = rng.uniform(-3.0, 3.0, size=(1000, input_dim))
+          X_val = rng.uniform(-3.0, 3.0, size=(300, input_dim))
+          y_val_victim = victim.predict(X_val)
+
+          oracle = BudgetedOracle(victim_model=victim, budget=800)
+          result = run_active_learning_extraction(
+              oracle=oracle,
+              surrogate_class=LogisticRegression,
+              surrogate_kwargs={'max_iter': 500},
+              X_pool=X_pool,
+              X_val=X_val,
+              y_val_victim=y_val_victim,
+              n_initial=20,
+              n_steps=30,
+              batch_size=20,
+          )
+
+          print(f'Total queries used: {result.total_queries}')
+          print(f'Steps completed:    {len(result.steps)}')
+          if result.steps:
+              final = result.steps[-1]
+              print(f'Final surrogate accuracy: {final.surrogate_accuracy:.1%}')
+              print(f'Fidelity curve (every 5 steps):')
+              for s in result.steps[::5]:
+                  print(f'  Step {s.step:3d} | Queries: {s.queries_used:4d} | Accuracy: {s.surrogate_accuracy:.1%}')
+
+  - id: 5
+    name: 'query_distribution_analyser.py'
+    description: |
+      Analyses and compares query distributions between extraction campaigns and
+      legitimate user traffic. Computes the three distributional properties
+      from Table 3 (boundary proximity, input space coverage, feature variation
+      pattern) and outputs a detection signal report. Intended as the analytical
+      foundation for the boundary query detector and query diversity monitor
+      built in Section 9.10.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and sklearn.
+      Distribution metrics are computed generically from query log arrays --
+      no hardcoded assumptions about input dimensionality or feature semantics.
+      All thresholds are parameterised, not hardcoded.
+    code: |
+      # query_distribution_analyser.py
+      # Chapter 9 Section 9.3 -- Extraction vs Benign Query Distribution Analyser
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from dataclasses import dataclass
+      from typing import List, Optional, Tuple
+
+
+      @dataclass
+      class DistributionReport:
+          label: str
+          n_queries: int
+          mean_pairwise_distance: float
+          input_space_coverage: float     # fraction of unit hypercube cells occupied
+          feature_variation_entropy: float # entropy of per-feature variation
+          boundary_proximity_score: float  # proxy: fraction of queries near distribution boundary
+          note: str
+
+
+      def pairwise_distance_mean(X: np.ndarray) -> float:
+          '''Compute mean pairwise L2 distance across a query set.'''
+          if len(X) < 2:
+              return 0.0
+          n = min(len(X), 500)  # cap for computational efficiency
+          sub = X[:n]
+          diffs = sub[:, np.newaxis, :] - sub[np.newaxis, :, :]
+          dists = np.sqrt((diffs ** 2).sum(axis=-1))
+          upper = dists[np.triu_indices(n, k=1)]
+          return float(upper.mean()) if len(upper) > 0 else 0.0
+
+
+      def input_space_coverage(X: np.ndarray, n_bins: int = 5) -> float:
+          '''
+          Estimate input space coverage by discretising each feature into n_bins
+          and counting the fraction of occupied cells relative to n_bins^d.
+          Caps at d=8 features to keep cell count tractable.
+          '''
+          d = min(X.shape[1], 8)
+          X_sub = X[:, :d]
+          # Normalise to [0, 1] per feature
+          col_min = X_sub.min(axis=0)
+          col_max = X_sub.max(axis=0)
+          span = col_max - col_min
+          span[span == 0] = 1.0
+          X_norm = (X_sub - col_min) / span
+          # Bin each input
+          bins = np.clip((X_norm * n_bins).astype(int), 0, n_bins - 1)
+          occupied = set(map(tuple, bins))
+          total_cells = n_bins ** d
+          return len(occupied) / total_cells
+
+
+      def feature_variation_entropy(X: np.ndarray) -> float:
+          '''
+          Compute the entropy of per-feature standard deviations.
+          High entropy = variation spread evenly across features (benign pattern).
+          Low entropy = variation concentrated in few features (tree extraction pattern).
+          '''
+          stds = X.std(axis=0)
+          stds_sum = stds.sum()
+          if stds_sum == 0:
+              return 0.0
+          probs = stds / stds_sum
+          probs = probs[probs > 0]
+          return float(-np.sum(probs * np.log2(probs)))
+
+
+      def boundary_proximity_score(X: np.ndarray, classifier=None) -> float:
+          '''
+          If a classifier is provided, estimate the fraction of queries with
+          predicted probability close to 0.5 (near-boundary proxy).
+          If no classifier is provided, returns 0.0 (caller must supply one for this metric).
+          '''
+          if classifier is None or not hasattr(classifier, 'predict_proba'):
+              return 0.0
+          proba = classifier.predict_proba(X)
+          max_proba = proba.max(axis=1)
+          near_boundary = (max_proba < 0.65).sum()
+          return float(near_boundary) / len(X)
+
+
+      def analyse_query_distribution(
+          X: np.ndarray,
+          label: str,
+          classifier=None,
+      ) -> DistributionReport:
+          '''Produce a DistributionReport for a query set.'''
+          return DistributionReport(
+              label=label,
+              n_queries=len(X),
+              mean_pairwise_distance=pairwise_distance_mean(X),
+              input_space_coverage=input_space_coverage(X),
+              feature_variation_entropy=feature_variation_entropy(X),
+              boundary_proximity_score=boundary_proximity_score(X, classifier),
+              note='Coverage capped at d=8 features; boundary proximity requires grey-box classifier',
+          )
+
+
+      def compare_distributions(
+          reports: List[DistributionReport],
+      ) -> None:
+          '''Print a comparison table of distribution reports.'''
+          print('QUERY DISTRIBUTION ANALYSIS -- Chapter 9 Section 9.3')
+          print('=' * 70)
+          header = f'{"Label":<25} {"Queries":>7} {"PairDist":>9} {"Coverage":>9} {"FeatEntropy":>12} {"BndryProx":>10}'
+          print(header)
+          print('-' * 70)
+          for r in reports:
+              print(
+                  f'{r.label:<25} {r.n_queries:>7} '
+                  f'{r.mean_pairwise_distance:>9.4f} '
+                  f'{r.input_space_coverage:>9.4f} '
+                  f'{r.feature_variation_entropy:>12.4f} '
+                  f'{r.boundary_proximity_score:>10.4f}'
+              )
+
+
+      if __name__ == '__main__':
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.datasets import make_classification
+          from boundary_mapper import BudgetedOracle, map_boundary
+
+          input_dim = 10
+          X, y = make_classification(n_samples=1000, n_features=input_dim, random_state=42)
+          victim = LogisticRegression(random_state=42).fit(X, y)
+
+          # Legitimate user queries: concentrated around a real use-case cluster
+          rng = np.random.default_rng(seed=1)
+          benign_queries = rng.normal(loc=0.5, scale=0.15, size=(200, input_dim))
+
+          # Extraction queries: boundary mapping
+          oracle = BudgetedOracle(victim_model=victim, budget=500)
+          extraction_points = map_boundary(oracle, input_dim=input_dim, n_boundary_points=30)
+          extraction_queries = np.array(extraction_points) if extraction_points else rng.uniform(0, 1, size=(30, input_dim))
+
+          # Random baseline
+          random_queries = rng.uniform(0.0, 1.0, size=(200, input_dim))
+
+          reports = [
+              analyse_query_distribution(benign_queries, label='benign_user', classifier=victim),
+              analyse_query_distribution(extraction_queries, label='boundary_extraction', classifier=victim),
+              analyse_query_distribution(random_queries, label='random_baseline', classifier=victim),
+          ]
+          compare_distributions(reports)
+
+common_mistakes:
+
+  - id: 1
+    description: 'Assuming linear model extraction requires a large query budget and is therefore protected by throughput rate limits'
+    why_it_happens: |
+      Defenders calibrate rate limits against intuitions about large-scale ML
+      training data volumes -- millions of examples. The O(d) result for linear
+      models is not intuitively obvious: a 100-feature linear classifier extracting
+      in a few hundred queries seems implausible until you work through the
+      equation-solving mechanics.
+    consequence: |
+      Rate limits set at thousands of queries per hour provide no meaningful
+      protection against equation-solving extraction of linear classifiers.
+      An adversary completing extraction in 300 queries is well below any
+      throughput-based ceiling. The model is extracted before any alert fires.
+    correct_approach: |
+      For linear classifiers, treat the model''s weights as effectively public
+      once they are accessible via a prediction API. Primary defences are output
+      perturbation (adding noise to confidence scores) and architectural: return
+      hard labels rather than confidence scores when the product permits. Rate
+      limits contribute but cannot prevent O(d) extraction.
+
+  - id: 2
+    description: 'Building the boundary query detector around confidence score thresholds only, ignoring structural query patterns'
+    why_it_happens: |
+      The near-boundary confidence score (close to 0.5) is the most visible
+      signal from grey-box APIs. It is easy to implement a threshold detector
+      and assume it covers boundary extraction. Hard-label APIs do not leak
+      confidence scores, so this detector has zero coverage there.
+    consequence: |
+      Hard-label boundary extraction -- which accounts for a substantial fraction
+      of real-world attacks against APIs that return only class labels -- is
+      completely undetected. The detector fires on grey-box APIs but misses
+      the black-box case where the adversary works with hard labels only.
+    correct_approach: |
+      The boundary query detector must cover both the confidence signal (grey-box)
+      and the structural signal: opposite-label inputs with small input distance,
+      systematic input perturbation patterns, and feature-isolation sequences
+      (tree extraction). Section 9.10 builds a multi-signal boundary detector
+      that covers both access levels.
+
+  - id: 3
+    description: 'Treating the Tramer et al. 2016 results as historical and not applicable to current deployments'
+    why_it_happens: |
+      The Tramer et al. paper targeted MLaaS platforms from 2014 to 2016.
+      Readers assume current platforms have mitigated the specific attack vectors
+      documented there, and that the results are a historical artifact rather
+      than a live threat model.
+    consequence: |
+      The underlying mechanism -- that every prediction API query reveals boundary
+      information, and that linear models extract in O(d) queries -- is
+      architecture-independent and time-independent. Any deployment of a linear
+      classifier behind a prediction API remains vulnerable to equation-solving
+      extraction in 2026, regardless of platform. The attack surface has not changed;
+      only the specific API endpoints have evolved.
+    correct_approach: |
+      Apply the Tramer et al. threat model to the current deployment regardless
+      of platform. Audit the API output format (hard vs soft labels), the model
+      architecture (linear, tree, or neural network), and the rate limit policy
+      against the extraction budget estimates in Table 1. The threat model is
+      architectural, not platform-specific.
+
+  - id: 4
+    description: 'Conflating active learning budget efficiency with detection evasion -- assuming active learning is stealthy'
+    why_it_happens: |
+      Active learning reduces query count by 5 to 10x. Readers interpret this
+      as making the extraction campaign harder to detect -- fewer queries means
+      less exposure to monitoring. The budget efficiency is conflated with
+      detection evasion.
+    consequence: |
+      The defence is weakened by removing rate limits or reducing monitoring
+      sensitivity on the assumption that active learning extractions are too
+      small to detect. In fact, active learning concentrates queries near the
+      decision boundary more intensely than random sampling -- it has a stronger
+      detection signal, not a weaker one, despite the lower query count.
+    correct_approach: |
+      Active learning reduces query count but increases the structural distinctiveness
+      of the query distribution. The boundary clustering is more pronounced, not
+      less, because every query is selected for maximum boundary informativeness.
+      Detection sensitivity should be increased for near-boundary query concentration,
+      not relaxed because of low volume.
+
+  - id: 5
+    description: 'Implementing the boundary query detector only on individual queries rather than on the accumulated query log'
+    why_it_happens: |
+      Per-request analysis is the natural architecture for a gateway classifier.
+      Applying a boundary proximity check to each incoming query individually seems
+      like the right extension: flag any query that is near the boundary.
+    consequence: |
+      Boundary proximity is not individually detectable for hard-label APIs -- the
+      adversary does not announce which inputs are near-boundary, and the defender
+      cannot determine this without running the model internally. The detection
+      signal requires the accumulated pair distribution: opposite-label inputs with
+      small distance become visible only when the query log is analysed across
+      multiple requests. A per-request detector misses the signal entirely.
+    correct_approach: |
+      The boundary query detector operates on the accumulated per-user query log,
+      not on individual queries. It analyses the distribution of (input, label) pairs
+      across many requests to identify near-boundary clustering. This requires
+      the persistent per-user state store described in Section 9.1 and implemented
+      in Section 9.11. The per-request gateway still receives every query; the
+      detector aggregates state from the query log asynchronously or within the
+      stateful monitor.
+
+section_summary:
+  compact: |
+    Black-box decision boundary mapping is the foundational extraction primitive.
+    Every prediction API query reveals which side of the classification boundary its
+    input falls on -- the model cannot withhold this information while remaining
+    useful. Linear classifiers extract in O(d) queries via equation-solving: d+1
+    near-boundary points overdetermine the linear system and the weight vector is
+    recovered exactly by SVD null-space computation. Decision trees extract via
+    path-finding: one-feature-at-a-time threshold search maps the branching structure
+    in queries proportional to node count times feature count. Neural networks
+    require surrogate training on API outputs but active learning reduces the
+    required query budget by 5 to 10x by concentrating queries near the decision
+    boundary where boundary information density is highest. The detection insight
+    from these mechanics is structural and measurable: extraction query distributions
+    differ from benign query distributions in boundary proximity, input space
+    coverage, and feature variation pattern. These three properties drive the
+    detection primitive design in Section 9.10 and the production query monitor
+    in Section 9.11.
+
+  key_takeaways:
+    - 'Every prediction API query reveals boundary information; the model cannot withhold this while remaining useful'
+    - 'Linear classifiers extract in O(d) queries via equation-solving -- trivial relative to any throughput-based rate limit'
+    - 'Decision trees extract via path-finding with query count proportional to node count times feature count'
+    - 'Active learning reduces extraction query budget by 5-10x by concentrating queries near the decision boundary'
+    - 'Extraction query distributions differ structurally from benign queries in boundary proximity, coverage, and feature variation'
+    - 'The boundary clustering detection signal is more pronounced for active learning, not less, despite lower query count'
+
+preview_section_04:
+  title: 'Section 9.4: Distillation Attacks -- Training Surrogate Models on Victim Outputs'
+  preview: |
+    Section 9.3 established the boundary mapping primitive for decision-boundary
+    extraction. Section 9.4 builds the dominant commercial extraction attack:
+    knowledge distillation. The adversary uses the victim API as a teacher,
+    collects a large labelled dataset of victim outputs, and trains a student
+    model to mimic the teacher. The resulting surrogate is a deployable clone
+    that achieves high fidelity on the victim''s input distribution at a fraction
+    of the original training cost. Section 9.4 covers soft-label vs hard-label
+    distillation, the budget efficiency advantage of soft labels (which is why
+    output design is a security decision), active distillation against LLM APIs,
+    and the cost economics that make distillation the adversary''s preferred
+    extraction method. The detection challenge introduced in Section 9.3 --
+    distributed distillation campaigns that stay below any individual rate limit
+    -- is the motivation for output watermarking (Section 9.12) as the defence
+    that survives when input-side query monitoring does not.
+
+metadata:
+  cross_chapter_references:
+    - ref: 'Chapter 1: linear models and decision trees'
+      usage: 'Equation-solving and path-finding extraction prerequisites'
+    - ref: 'Chapter 2: decision boundaries and classification surfaces'
+      usage: 'Geometric intuition for boundary mapping and binary search refinement'
+    - ref: 'Chapter 4 Section 4.8: API architecture and MLaaS platforms'
+      usage: 'Context for the Tramer et al. commercial API extraction demonstrations'
+    - ref: 'Section 9.1: black-box access level definition'
+      usage: 'Adversary constraint framing for all three extraction techniques in this section'
+    - ref: 'Section 9.2: decision-boundary extraction goal and budget-fidelity curves'
+      usage: 'Taxonomy position and budget-fidelity parameterisation for this section''s techniques'
+
+  forward_references:
+    - ref: 'Section 9.4: Distillation Attacks'
+      usage: 'Extends boundary mapping primitive to full surrogate training; covers soft-label extraction'
+    - ref: 'Section 9.9: Real-World Incident'
+      usage: 'Tramer et al. commercial API extractions documented here are reconstructed in Section 9.9'
+    - ref: 'Section 9.10: Detection Primitives'
+      usage: 'Boundary query detector, OOD detector, and query diversity monitor target the three distributional properties established in Part 7 and Table 3'
+    - ref: 'Section 9.11: Production Query Monitor'
+      usage: 'Per-user state store required by the accumulated-log detection approach established in Common Mistake 5'
+    - ref: 'Chapter 10: Adversarial Machine Learning'
+      usage: 'Decision boundary maps produced by this section''s techniques are the input to Chapter 10 adversarial example generation'

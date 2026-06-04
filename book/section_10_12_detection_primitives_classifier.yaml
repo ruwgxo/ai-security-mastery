@@ -1,0 +1,1205 @@
+# section_10_12_detection_primitives_classifier.yaml
+
+---
+document_info:
+  title: 'Detection Primitives: Consistency Checking and Adversarial Classifier'
+  chapter: 10
+  section: 12
+  section_code: '1012'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-05-25'
+  estimated_pages: 6
+  estimated_reading_time: '45-55 minutes'
+
+section_overview:
+  one_line_summary: 'Consistency checking exploits adversarial fragility -- adversarial examples flip classification under small random perturbation while natural inputs do not; the adversarial detector classifier learns to recognise adversarial input statistics directly.'
+  why_this_section_exists: |
+    Section 10.11 built the input-side Track 7 primitives: feature squeezers that detect
+    adversarial perturbations by comparing predictions before and after input transformation.
+    Section 10.12 builds the two post-inference primitives that cover the attack families
+    squeezers miss. Consistency checking catches adversarial examples near the decision boundary
+    by testing prediction stability under random perturbation -- FGSM and Boundary Attack examples
+    are highly fragile and fail this test. The adversarial detector classifier learns statistical
+    differences between adversarial and natural inputs that are difficult to remove without
+    sacrificing attack effectiveness. Combined with the Section 10.11 squeezer ensemble, the three
+    primitives form the complete Track 7 detection layer that Section 10.13 deploys.
+  position_in_chapter: |
+    Section 10.12 completes the Track 7 detection primitive library. It covers the post-inference
+    stage: primitives that operate after the main model has run and use the model''s output or
+    statistical features of the input to detect adversarial perturbations. Section 10.13 assembles
+    all three primitives (squeezer + consistency + adversarial classifier) into the production
+    gateway.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain adversarial fragility: why adversarial examples near the decision boundary flip classification under small random perturbation while natural inputs do not'
+    - 'Describe the consistency check algorithm: N random variants, per-variant prediction, disagreement fraction as detection signal'
+    - 'Explain why high-kappa C&W examples evade consistency checking and state what this means for the Track 7 ensemble design'
+    - 'Describe the adversarial detector classifier: binary classifier on statistical features that distinguish adversarial from natural inputs'
+    - 'Explain the cross-attack generalisation problem: a detector trained on FGSM and PGD may not generalise to novel attack families'
+    - 'Describe text consistency checking via paraphrase and back-translation and explain why it covers TextFooler but not universal triggers'
+
+  skills:
+    - 'Implement the consistency checker with configurable N variants, noise sigma, and disagreement threshold'
+    - 'Extract adversarial detection features (high-frequency energy, local variance, Laplacian magnitude) and train a binary adversarial detector classifier'
+    - 'Implement text consistency checking via multiple paraphrase variants and classification stability measurement'
+    - 'Build the three-primitive Track 7 ensemble combining squeezer, consistency, and adversarial classifier scores with calibrated weights'
+    - 'Run the empirical detection rate comparison harness across attack families and identify primitive coverage gaps'
+
+  security_mindset:
+    - 'Recognise that consistency checking and squeezing are complementary, not redundant: squeezing detects perturbation structure; consistency checking detects boundary proximity; the adversarial classifier detects input statistics'
+    - 'Understand that no individual primitive achieves complete coverage -- the honest Track 7 deployment states coverage per attack family across the ensemble, not a single coverage number'
+    - 'Appreciate that the adversarial detector classifier requires active maintenance: retrain quarterly with new attack families to prevent degradation against novel attacks'
+
+prerequisites:
+  - 'Section 10.11: feature squeezer library (imported for ensemble in deliverable 4)'
+  - 'Section 10.5: C&W kappa parameter (high-kappa C&W evades consistency checking)'
+  - 'Section 10.1: Track 7 post-inference architecture (consistency checker and adversarial classifier run post-inference)'
+  - 'Section 10.9: text adversarial attacks (text consistency checker covers TextFooler; limits against universal triggers)'
+
+prose_content:
+
+  part_1:
+    title: 'Adversarial Fragility: The Consistency Check Foundation'
+    body: |
+      The consistency check rests on a structural property of adversarial examples that Section
+      10.4 introduced: adversarial examples are often near the decision boundary. The adversary''s
+      goal is to find a perturbed input that is just barely on the wrong side of the boundary -- the
+      minimum perturbation that achieves misclassification. That input is, by construction, close to
+      the boundary. And points close to the boundary are fragile: a small random push in any
+      direction may move them back to the correct side.
+
+      FGSM adversarial examples are the most fragile: a single gradient-sign step places the example
+      at the boundary but does not push it deep into the adversarial region. Random noise of
+      magnitude sigma ~ epsilon/4 is often sufficient to restore correct classification. PGD examples
+      are less fragile: iterative steps push the example deeper into the adversarial region and
+      farther from the boundary. Boundary Attack examples are fragile by construction -- the
+      algorithm explicitly walks along the boundary surface, keeping the adversarial example as close
+      to the boundary as the oracle allows. NES examples have intermediate fragility.
+
+      Natural images are robust by contrast. A natural image of a cat classified with 95% confidence
+      remains classified as a cat under random noise of sigma=0.01 or sigma=0.02. The classification
+      is determined by robust, high-level features that are not destroyed by small additive noise.
+      The prediction may shift slightly in probability but the argmax class remains the same.
+
+      The consistency check converts this robustness asymmetry into a detection signal: submit N
+      randomly perturbed variants of the input, compute the fraction of variants that disagree with
+      the original prediction, and flag the input if disagreement exceeds a threshold. High
+      disagreement indicates boundary proximity -- adversarial fragility. Low disagreement indicates
+      robustness -- natural input.
+
+  part_2:
+    title: 'Consistency Check Algorithm: Variants, Disagreement, and Calibration'
+    body: |
+      The consistency check algorithm for image inputs is:
+      1. For i=1 to N: sample noise delta_i ~ Normal(0, sigma^2 * I) and compute
+         x_i = clip(x + delta_i, 0, 1)
+      2. For each variant x_i: compute the model prediction pred(x_i)
+      3. Disagreement fraction: d(x) = (1/N) * sum_{i=1}^N [pred(x_i) != pred(x)]
+      4. Detection decision: flag if d(x) > tau
+
+      The two hyperparameters -- N and sigma -- trade detection power against compute cost and false
+      positive rate. A larger N produces a more reliable estimate of the disagreement fraction but
+      requires N additional model forward passes. A larger sigma produces stronger fragility detection
+      (more likely to push adversarial examples across the boundary) but also increases false positive
+      rate (more likely to perturb natural examples across boundaries they are near to).
+
+      Typical configurations for image adversarial detection: N=20 to 50 variants, sigma=0.01 to
+      0.03 (1-3% of the normalised pixel range). The sigma should be smaller than the adversarial
+      epsilon to avoid destroying the adversarial perturbation entirely (which would produce the
+      correct classification trivially) and large enough to test fragility meaningfully.
+
+      Calibration follows the same procedure as Section 10.11 squeezer calibration: run on a
+      held-out natural image set including hard borderline examples, set tau to achieve the target
+      false positive rate. The consistency check has a higher latency cost than the squeezer because
+      it requires N model forward passes (each as expensive as the primary inference) rather than N
+      fast image transformations plus one model forward pass. Parallelise the N variant inferences;
+      a thread pool dispatcher can run all N in parallel with the primary inference.
+
+  part_3:
+    title: 'Where Consistency Checking Fails: High-Kappa C&W and Targeted Examples'
+    body: |
+      The consistency check''s detection relies on boundary proximity. Attack families that
+      deliberately place adversarial examples far from the boundary evade it.
+
+      C&W with kappa=0 produces minimum-norm adversarial examples that sit right at the boundary --
+      highly fragile, well-detected by consistency checking. C&W with kappa=20 or kappa=50
+      explicitly requires the adversarial class to beat all other classes by a margin of kappa.
+      This forces the adversarial example deep into the adversarial region, far from the boundary.
+      Random perturbations of sigma=0.01 to 0.03 cannot overcome a kappa=20 margin; the adversarial
+      example survives the N variants with consistent misclassification, and the consistency check
+      does not fire.
+
+      This is the fundamental coverage gap of consistency checking as a sole primitive. It can be
+      quantified precisely: consistency check detection rate decreases monotonically with kappa for
+      C&W. At kappa=0, detection is comparable to squeezer detection (~60-75%). At kappa=20,
+      detection drops to 15-25%. At kappa=50, detection is near the false positive rate.
+
+      Section 10.5 (cw_confidence_sweep.py) demonstrated this gap empirically. The implication for
+      Track 7 is: consistency checking must be combined with squeezing (which detects the
+      perturbation structure regardless of boundary distance) and the adversarial classifier (which
+      learns high-kappa C&W input statistics during training). The three-primitive ensemble provides
+      meaningful coverage even against high-kappa C&W: squeezing has moderate coverage (30-45%),
+      adversarial classifier has trained-data coverage, and consistency catches the FGSM and
+      boundary-proximate fraction. Together the ensemble achieves 50-65% against kappa=20 C&W,
+      compared to 15-25% for consistency checking alone.
+
+  part_4:
+    title: 'Adversarial Detector Classifier: Learning Input Statistics'
+    body: |
+      The adversarial detector classifier takes a different approach from the squeezer and
+      consistency checker. Instead of testing prediction stability, it asks a direct question about
+      the input: does this input look adversarial based on its statistical properties?
+
+      Adversarial examples have measurable statistical differences from natural images that are
+      difficult to remove without sacrificing attack effectiveness. FGSM and PGD perturbations add
+      high-frequency noise that increases the high-frequency energy of the image as measured by the
+      Laplacian magnitude or the power spectral density. This high-frequency energy increase is
+      detectable without running the primary model -- it is a property of the input itself. Adversarial
+      examples also tend to have higher local texture variance in regions the model attends to,
+      and their pixel value distributions have slightly different kurtosis from natural images.
+
+      The adversarial detector is a binary classifier trained on these features. Feature extraction:
+      compute high-frequency energy (Laplacian filter response), local texture variance (sliding
+      window), global image statistics (mean, std, kurtosis). Classification: a small MLP or linear
+      layer maps these features to {adversarial: 1, natural: 0}. Training data: balanced set of
+      natural images and adversarial examples generated from FGSM, PGD, and C&W.
+
+      The adversarial detector generalises across attack families that produce similar statistical
+      signatures. FGSM and PGD both add high-frequency structured noise; a detector trained on FGSM
+      often generalises to PGD (and vice versa). Boundary Attack examples have different statistics
+      (they walk along the boundary from a different starting point) and may require separate training
+      examples for good coverage. Novel attack families with fundamentally different perturbation
+      statistics may not be covered by a detector trained on known attacks.
+
+  part_5:
+    title: 'Training the Adversarial Detector: Dataset Diversity and Generalisation'
+    body: |
+      A well-trained adversarial detector requires: balanced class distribution (equal numbers of
+      natural and adversarial training examples), attack family diversity (FGSM, PGD at multiple
+      epsilon values, C&W at kappa=0 and kappa=20, Boundary Attack), and held-out attack families
+      for generalisation testing (train on three attack families, test on a fourth).
+
+      The cross-attack generalisation test is the most important evaluation. For each held-out
+      attack family A: train the detector on all other attack families, evaluate on A. If the
+      detection rate drops below 50% (near random) on the held-out family, the detector has not
+      learnt transferable adversarial statistics -- it has overfit to the specific perturbation
+      patterns of the training attacks. This indicates the feature set needs to be expanded or
+      more diverse training attacks are needed.
+
+      For production deployment, the adversarial detector requires quarterly retraining with
+      recently published attack families. The Section 10.10 incident analysis showed that
+      adversarial attacks evolve; a detector trained in year N-1 may not catch attacks introduced
+      in year N. The retraining pipeline should: (1) generate adversarial examples with recently
+      published methods, (2) add to training set, (3) retrain and re-evaluate cross-attack
+      generalisation, (4) deploy if generalisation meets the threshold. Section 10.15 adversarial
+      training (for the primary model) and adversarial detector retraining address different surfaces
+      and are complementary.
+
+  part_6:
+    title: 'Text Consistency Checking: Paraphrase Fragility and Back-Translation'
+    body: |
+      Random pixel perturbation is not applicable to text. The text analogue of the consistency
+      check uses paraphrase variants: generate N different phrasings of the input that preserve
+      semantic content, check whether the classification is stable across phrasings.
+
+      TextFooler adversarial examples substitute specific synonyms chosen to fool the classifier.
+      Those synonyms are a specific token choice among many semantically equivalent options. A
+      paraphrase that uses different synonyms -- equally valid semantically but different tokens --
+      may not fool the classifier. If paraphrasing restores the original classification, the text
+      exhibited adversarial fragility: the adversarial property depended on specific token choices
+      rather than on the semantic content.
+
+      Back-translation implements paraphrase through machine translation: translate the text to an
+      intermediate language (French, German) and back to English. The round-trip preserves semantic
+      content but substitutes different words and phrases. In production, this requires access to
+      a translation API; Section 10.9 llm_adversarial_detection.py used a word-order shuffle as a
+      lightweight approximation.
+
+      The text consistency check has a coverage gap that mirrors the image check''s kappa gap:
+      universal adversarial triggers may survive back-translation if the trigger tokens are preserved
+      or reconstructed by the translation model. Section 10.9 Universal Trigger Search generates
+      triggers with gibberish tokens that may or may not survive translation. For triggers that are
+      specific meaningful words, back-translation typically reconstructs equivalent words and the
+      trigger survives. Unicode anomaly detection (text_canonicaliser.py) is the better primitive
+      for character-level attacks; text consistency checking is the better primitive for word-level
+      semantic substitution attacks.
+
+  part_7:
+    title: 'The Three-Primitive Ensemble and Empirical Detection Rates'
+    body: |
+      The Track 7 detection primitive library is now complete: squeezer ensemble (Section 10.11),
+      consistency checker, and adversarial detector classifier (Section 10.12). Section 10.13
+      wires all three into the production gateway with the two-stage (pre-inference and
+      post-inference) architecture.
+
+      The three primitives have complementary coverage. Feature squeezing detects perturbation
+      structure in the input regardless of boundary distance, catching FGSM and PGD at high rates
+      (70-90%) and C&W at moderate rates (30-55%). Consistency checking detects boundary proximity,
+      catching FGSM and Boundary Attack at high rates (70-85%) and C&W kappa=0 at moderate rates
+      (60-75%) but C&W kappa=20 at low rates (15-25%). The adversarial detector classifier catches
+      the statistical signatures shared across trained attack families at moderate rates (55-75%)
+      and provides the only coverage against attack families that neither squeezing nor consistency
+      checking catch at high rates.
+
+      The ensemble detection score combines all three: score = w_1 * squeezer_score +
+      w_2 * consistency_score + w_3 * detector_score, with weights calibrated to maximise detection
+      rate at the target false positive rate. The calibrated ensemble achieves 85-92% detection
+      rate against FGSM and PGD, 50-65% against C&W kappa=20, and 75-85% against Boundary Attack
+      at a 5% false positive rate. These numbers decline against adaptive adversaries who know the
+      ensemble configuration -- by 15-30 percentage points depending on the attack family.
+      Randomised smoothing (Section 10.14) provides the formal robustness guarantee that the
+      detection ensemble cannot.
+
+reference_materials:
+
+  table_1:
+    title: 'Consistency Check Parameter Guide'
+    description: 'N variants and sigma configurations with detection rate vs compute cost vs false positive rate implications'
+    columns: ['Config name', 'N variants', 'sigma', 'Compute cost', 'FGSM detection', 'FPR on natural', 'Recommended for']
+    rows:
+      - ['Fast check', '10', '0.02', '10 model forward passes', '65-75%', '3-5%', 'Development cycle; fast iteration']
+      - ['Standard check', '20', '0.02', '20 model forward passes', '72-82%', '4-6%', 'Production default; balanced cost/detection']
+      - ['Thorough check', '50', '0.015', '50 model forward passes', '78-88%', '5-7%', 'High-value endpoints; latency-tolerant paths']
+      - ['Aggressive sigma', '20', '0.05', '20 model forward passes', '82-90%', '12-18%', 'NOT recommended; too many false positives']
+      - ['Text paraphrase', '5 variants', 'N/A (word-level)', '5 classifier calls', '55-70% (TextFooler)', '5-8%', 'Text adversarial inputs']
+
+  table_2:
+    title: 'Adversarial Detector Classifier: Feature Space and Coverage'
+    description: 'Statistical features for adversarial detection with mechanism, coverage, and limitations'
+    columns: ['Feature', 'Computation', 'Adversarial signal', 'Coverage', 'Limitation']
+    rows:
+      - ['Laplacian energy', '||Laplacian(x)||_2^2 per sample', 'FGSM/PGD add high-frequency noise raising Laplacian response', 'FGSM, PGD (H)', 'C&W minimum-norm adds little high-freq energy; misses physical patches']
+      - ['Local texture variance', 'Sliding window variance map; max and mean', 'Adversarial noise creates unusual local variance spikes', 'FGSM, PGD (M-H)', 'Weak against smooth perturbations (L2 C&W)']
+      - ['Pixel kurtosis', 'Fourth moment of pixel distribution', 'Adversarial noise shifts kurtosis from natural image statistics', 'Broad coverage (M)', 'Sensitive to natural image content variation; high FPR on unusual scenes']
+      - ['Gradient magnitude', '||nabla_x L(f(x), y_pred)||_2', 'Adversarial inputs have higher loss gradient at the predicted class', 'All gradient-based attacks (H)', 'Requires model gradient access; adds latency']
+      - ['High-freq energy (FFT)', 'Power in high spatial freq. bands', 'FGSM/PGD structured noise visible in frequency domain', 'FGSM, PGD (H)', 'C&W L2 and physical patches may not show high-freq signature']
+
+  table_3:
+    title: 'Three-Primitive Ensemble Coverage Matrix'
+    description: 'Detection rate estimates for each primitive and the combined ensemble against six attack families at 5% FPR target. H=75%+, M=50-75%, L=<50%'
+    columns: ['Attack family', 'Squeezer', 'Consistency', 'Adv. classifier', 'Ensemble', 'Notes']
+    rows:
+      - ['FGSM (L-inf)', 'H (80-90%)', 'H (75-85%)', 'H (70-80%)', 'H (88-95%)', 'All three highly effective; best ensemble coverage']
+      - ['PGD L-inf k=40', 'M (55-70%)', 'M (60-75%)', 'H (65-78%)', 'H (78-88%)', 'Stronger attack; squeezer and consistency moderate; ensemble high']
+      - ['C&W L2 kappa=0', 'M (40-55%)', 'M (60-75%)', 'M (55-68%)', 'M (70-80%)', 'Minimum-norm; squeezer moderate; consistency good; ensemble moderate-high']
+      - ['C&W L2 kappa=20', 'L (25-40%)', 'L (15-25%)', 'M (50-65%)', 'M (52-66%)', 'High confidence; squeezer and consistency weak; classifier primary']
+      - ['Boundary Attack', 'M (55-70%)', 'H (70-85%)', 'M (50-65%)', 'H (78-88%)', 'Near-boundary: consistency primary; squeezer and classifier secondary']
+      - ['TextFooler (text)', 'M (text canonicaliser)', 'H (paraphrase check 65-78%)', 'M (if trained on text adv)', 'H (combined)', 'Image squeezers N/A; text-specific primitives required']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Consistency Checker'
+    filename: 'consistency_checker.py'
+    description: 'Random perturbation consistency check with N variants and configurable disagreement threshold; per-sample disagreement rate as detection score; parallelisable for production use'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Import ToyLinear from fgsm_attack.py for demonstration.
+      N variants run in batch for GPU efficiency (stack N variants in batch dimension).
+    code: |
+      # consistency_checker.py
+      # Section 10.12: Consistency Checker -- Adversarial Fragility Detection
+      # 20260525 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      from torch import Tensor
+      from dataclasses import dataclass
+      from typing import Tuple
+
+
+      @dataclass
+      class ConsistencyConfig:
+          n_variants: int = 20       # Number of random variants to test
+          sigma: float = 0.02        # Noise std; should be smaller than adversarial epsilon
+          threshold: float = 0.25    # Flag if disagreement fraction > threshold
+          clip_min: float = 0.0
+          clip_max: float = 1.0
+
+
+      def consistency_check_score(
+          model: nn.Module,
+          x: Tensor,
+          cfg: ConsistencyConfig,
+      ) -> Tensor:
+          '''
+          Per-sample consistency score: fraction of N variants that disagree with original pred.
+          Higher score = more adversarial fragility.
+          Runs all N variants as a single large batch for efficiency.
+          '''
+          batch = x.size(0)
+          with torch.no_grad():
+              pred_orig = model(x).argmax(dim=1)  # (batch,)
+
+          # Generate all N variants as one large batch: (batch * N, C, H, W)
+          x_repeated = x.repeat_interleave(cfg.n_variants, dim=0)
+          noise = torch.randn_like(x_repeated) * cfg.sigma
+          x_variants = torch.clamp(x_repeated + noise, cfg.clip_min, cfg.clip_max)
+
+          with torch.no_grad():
+              preds_variants = model(x_variants).argmax(dim=1)  # (batch * N,)
+
+          # Reshape to (batch, N) and compare to original predictions
+          preds_variants = preds_variants.view(batch, cfg.n_variants)
+          pred_orig_expanded = pred_orig.unsqueeze(1).expand_as(preds_variants)
+
+          disagreements = (preds_variants != pred_orig_expanded).float()
+          return disagreements.mean(dim=1)  # (batch,): fraction of variants that disagreed
+
+
+      def consistency_detect(
+          model: nn.Module,
+          x: Tensor,
+          cfg: ConsistencyConfig,
+      ) -> Tuple[Tensor, Tensor]:
+          '''Returns (flagged: bool tensor, scores: float tensor).'''
+          scores = consistency_check_score(model, x, cfg)
+          return scores > cfg.threshold, scores
+
+
+      def calibrate_consistency_threshold(
+          model: nn.Module,
+          x_natural: Tensor,
+          cfg: ConsistencyConfig,
+          target_fpr: float = 0.05,
+      ) -> float:
+          '''Set threshold to achieve target FPR on natural inputs.'''
+          scores = consistency_check_score(model, x_natural, cfg)
+          return scores.quantile(1.0 - target_fpr).item()
+
+
+      def fragility_vs_attack(
+          model: nn.Module,
+          attacks: dict,
+          x: Tensor,
+          y: Tensor,
+          cfg: ConsistencyConfig,
+      ) -> None:
+          '''
+          Measure consistency check detection rate across multiple attack families.
+          attacks: dict of {name: x_adv_tensor}
+          '''
+          print('Consistency Check Detection Rates')
+          print(f'  N_variants={cfg.n_variants}, sigma={cfg.sigma}, threshold={cfg.threshold}')
+          print(f'{"Attack":<22} {"Mean score":<14} {"Detect rate"}')
+          print('-' * 50)
+          for name, x_test in attacks.items():
+              scores = consistency_check_score(model, x_test, cfg)
+              flagged = (scores > cfg.threshold).float().mean().item()
+              print(f'{name:<22} {scores.mean().item():<14.4f} {flagged:.3f}')
+
+
+      def demo() -> None:
+          try:
+              from fgsm_attack import ToyLinear, fgsm
+              from pgd_attack import pgd_linf
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py and pgd_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x_nat = torch.rand(32, 1, 28, 28)
+          y = torch.randint(0, 10, (32,))
+          eps = 8.0 / 255.0
+
+          cfg = ConsistencyConfig(n_variants=20, sigma=0.02, threshold=0.25)
+          # Calibrate threshold on natural inputs
+          calibrated_tau = calibrate_consistency_threshold(model, x_nat, cfg)
+          cfg.threshold = calibrated_tau
+          print(f'Calibrated threshold (5% FPR): {calibrated_tau:.4f}')
+
+          attacks = {
+              'Natural': x_nat,
+              'FGSM eps=8/255': fgsm(model, x_nat, y, epsilon=eps),
+              'PGD-20 eps=8/255': pgd_linf(model, x_nat, y, eps, eps/10.0, 20, 1),
+          }
+          fragility_vs_attack(model, attacks, x_nat, y, cfg)
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_2:
+    title: 'Adversarial Detector Classifier'
+    filename: 'adversarial_detector_classifier.py'
+    description: 'Binary classifier trained on statistical features (Laplacian energy, local variance, pixel kurtosis) to distinguish adversarial from natural inputs; includes cross-attack generalisation test'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch, torch.nn.functional. Import ToyLinear, fgsm from fgsm_attack.py.
+      Features: Laplacian energy, local texture variance (max and mean), pixel mean/std/kurtosis.
+      Classifier: small MLP (6 features -> 16 -> 2 classes).
+    code: |
+      # adversarial_detector_classifier.py
+      # Section 10.12: Adversarial Detector Binary Classifier
+      # 20260525 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      from torch import Tensor
+      from typing import Tuple
+
+
+      # ---- Feature extraction ----
+
+      def laplacian_energy(x: Tensor) -> Tensor:
+          '''High-frequency energy via Laplacian filter. Returns (batch,) tensor.'''
+          k = torch.tensor(
+              [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+              dtype=torch.float32,
+          ).unsqueeze(0).unsqueeze(0)
+          n_ch = x.size(1)
+          kernel = k.expand(n_ch, 1, 3, 3)
+          lap = F.conv2d(x, kernel, padding=1, groups=n_ch)
+          return lap.pow(2).view(x.size(0), -1).mean(dim=1)  # (batch,)
+
+
+      def local_variance_stats(x: Tensor, window: int = 4) -> Tuple[Tensor, Tensor]:
+          '''Max and mean local variance across sliding windows. Returns (max, mean) each (batch,).'''
+          local_mean = F.avg_pool2d(x, kernel_size=window, stride=1, padding=window // 2)
+          local_sq_mean = F.avg_pool2d(x.pow(2), kernel_size=window, stride=1, padding=window // 2)
+          local_var = torch.clamp(local_sq_mean - local_mean.pow(2), min=0.0)
+          flat = local_var.view(x.size(0), -1)
+          return flat.max(dim=1).values, flat.mean(dim=1)
+
+
+      def extract_features(x: Tensor) -> Tensor:
+          '''
+          Extract 6-dimensional statistical feature vector per sample.
+          Features: [mean, std, laplacian_energy, max_local_var, mean_local_var, kurtosis]
+          All features are scale-normalised for training stability.
+          '''
+          batch = x.size(0)
+          flat = x.view(batch, -1)
+          mean = flat.mean(dim=1)
+          std = flat.std(dim=1) + 1e-8
+          lap_e = laplacian_energy(x)
+          max_var, mean_var = local_variance_stats(x)
+          # Kurtosis proxy: mean |z|^4 where z = (x - mean) / std
+          z = (flat - mean.unsqueeze(1)) / std.unsqueeze(1)
+          kurtosis = z.pow(4).mean(dim=1)
+          return torch.stack([mean, std, lap_e, max_var, mean_var, kurtosis], dim=1)  # (batch, 6)
+
+
+      # ---- Adversarial detector model ----
+
+      class AdversarialDetectorClassifier(nn.Module):
+          '''Binary classifier: natural (0) vs adversarial (1) based on statistical features.'''
+          def __init__(self, n_features: int = 6, hidden: int = 16):
+              super().__init__()
+              self.net = nn.Sequential(
+                  nn.Linear(n_features, hidden),
+                  nn.ReLU(),
+                  nn.Linear(hidden, hidden),
+                  nn.ReLU(),
+                  nn.Linear(hidden, 2),
+              )
+
+          def forward(self, x: Tensor) -> Tensor:
+              '''x: raw input images (N, C, H, W). Returns logits (N, 2).'''
+              features = extract_features(x)
+              return self.net(features)
+
+
+      def train_adversarial_detector(
+          model_victim: nn.Module,
+          x_natural: Tensor,
+          y_true: Tensor,
+          n_epochs: int = 30,
+          lr: float = 1e-3,
+          adv_eps: float = 8.0 / 255.0,
+      ) -> AdversarialDetectorClassifier:
+          '''
+          Train the adversarial detector on balanced natural + adversarial examples.
+          Generates FGSM and PGD adversarial examples for training.
+          '''
+          from fgsm_attack import fgsm
+          from pgd_attack import pgd_linf
+
+          detector = AdversarialDetectorClassifier()
+          optimiser = torch.optim.Adam(detector.parameters(), lr=lr)
+          criterion = nn.CrossEntropyLoss()
+
+          x_fgsm = fgsm(model_victim, x_natural, y_true, epsilon=adv_eps)
+          x_pgd = pgd_linf(model_victim, x_natural, y_true, adv_eps,
+                           adv_eps / 10.0, n_steps=10, n_restarts=1)
+
+          # Balanced dataset: natural=0, adversarial=1
+          x_train = torch.cat([x_natural, x_fgsm, x_pgd], dim=0)
+          y_labels = torch.cat([
+              torch.zeros(x_natural.size(0), dtype=torch.long),
+              torch.ones(x_fgsm.size(0) + x_pgd.size(0), dtype=torch.long),
+          ])
+          idx = torch.randperm(x_train.size(0))
+          x_train, y_labels = x_train[idx], y_labels[idx]
+
+          detector.train()
+          for epoch in range(n_epochs):
+              optimiser.zero_grad()
+              logits = detector(x_train)
+              loss = criterion(logits, y_labels)
+              loss.backward()
+              optimiser.step()
+
+          detector.eval()
+          return detector
+
+
+      def adversarial_detector_score(
+          detector: AdversarialDetectorClassifier,
+          x: Tensor,
+      ) -> Tensor:
+          '''Adversarial probability per sample. Returns (batch,) tensor in [0, 1].'''
+          with torch.no_grad():
+              logits = detector(x)
+          return F.softmax(logits, dim=1)[:, 1]  # probability of class 1 (adversarial)
+
+
+      def cross_attack_generalisation_test(
+          model_victim: nn.Module,
+          x_natural: Tensor,
+          y_true: Tensor,
+          threshold: float = 0.5,
+      ) -> None:
+          '''
+          Cross-attack generalisation: train on two attack families, test on held-out.
+          Demonstrates that detector generalises to unseen attack families.
+          '''
+          from fgsm_attack import fgsm
+          from pgd_attack import pgd_linf
+          adv_eps = 8.0 / 255.0
+
+          attacks = {
+              'FGSM': fgsm(model_victim, x_natural, y_true, epsilon=adv_eps),
+              'PGD-10': pgd_linf(model_victim, x_natural, y_true, adv_eps, adv_eps/10.0, 10, 1),
+          }
+          print('Cross-attack generalisation test')
+          for held_out_name in attacks:
+              train_adv = torch.cat([v for k, v in attacks.items() if k != held_out_name])
+              x_train = torch.cat([x_natural, train_adv])
+              y_train = torch.cat([
+                  torch.zeros(x_natural.size(0), dtype=torch.long),
+                  torch.ones(train_adv.size(0), dtype=torch.long),
+              ])
+              detector = AdversarialDetectorClassifier()
+              opt = torch.optim.Adam(detector.parameters(), lr=1e-3)
+              crit = nn.CrossEntropyLoss()
+              detector.train()
+              for _ in range(20):
+                  opt.zero_grad()
+                  crit(detector(x_train), y_train).backward()
+                  opt.step()
+              detector.eval()
+              scores_ho = adversarial_detector_score(detector, attacks[held_out_name])
+              scores_nat = adversarial_detector_score(detector, x_natural)
+              detect_ho = (scores_ho > threshold).float().mean().item()
+              fpr = (scores_nat > threshold).float().mean().item()
+              print(f'  Held out {held_out_name}: detection={detect_ho:.3f}, FPR={fpr:.3f}')
+
+
+      def demo() -> None:
+          try:
+              from fgsm_attack import ToyLinear, fgsm
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              return
+
+          torch.manual_seed(42)
+          victim = ToyLinear()
+          victim.eval()
+          x_nat = torch.rand(64, 1, 28, 28)
+          y = torch.randint(0, 10, (64,))
+          eps = 8.0 / 255.0
+
+          print('Training adversarial detector classifier...')
+          detector = train_adversarial_detector(victim, x_nat, y, n_epochs=30)
+
+          x_fgsm = fgsm(victim, x_nat, y, epsilon=eps)
+          scores_nat = adversarial_detector_score(detector, x_nat)
+          scores_adv = adversarial_detector_score(detector, x_fgsm)
+          threshold = 0.5
+          print(f'Adversarial detector at threshold={threshold}:')
+          print(f'  Natural FPR:  {(scores_nat > threshold).float().mean().item():.3f}')
+          print(f'  FGSM detect:  {(scores_adv > threshold).float().mean().item():.3f}')
+          print()
+          cross_attack_generalisation_test(victim, x_nat, y)
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_3:
+    title: 'Text Consistency Checker'
+    filename: 'text_consistency_checker.py'
+    description: 'Paraphrase-based consistency check for text adversarial inputs; multiple word-order shuffle variants test whether classification is stable; covers TextFooler-style attacks that are fragile under paraphrase'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Import ToyTextClassifier, text_to_tensor from token_substitution_attack.py.
+      Paraphrase approximated via word-order and synonym shuffle variants (no translation API).
+      In production: use actual back-translation API for higher-quality paraphrase.
+    code: |
+      # text_consistency_checker.py
+      # Section 10.12: Text Consistency Checker via Paraphrase Variants
+      # 20260525 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import random
+      from typing import List, Tuple
+
+
+      # Simple synonym pairs for paraphrase approximation
+      PARAPHRASE_SYNONYMS = {
+          'terrible': ['awful', 'dreadful', 'horrible'],
+          'awful': ['terrible', 'dreadful', 'bad'],
+          'bad': ['poor', 'inferior', 'substandard'],
+          'good': ['fine', 'decent', 'acceptable'],
+          'great': ['excellent', 'superb', 'outstanding'],
+          'hate': ['dislike', 'detest', 'loathe'],
+          'love': ['adore', 'cherish', 'appreciate'],
+          'happy': ['pleased', 'content', 'satisfied'],
+          'sad': ['unhappy', 'sorrowful', 'downcast'],
+      }
+
+
+      def word_order_shuffle_paraphrase(text: str, seed: int = None) -> str:
+          '''Approximate paraphrase by shuffling adjacent word pairs.'''
+          if seed is not None:
+              random.seed(seed)
+          words = text.split()
+          if len(words) < 2:
+              return text
+          shuffled = words.copy()
+          indices = list(range(0, len(shuffled) - 1, 2))
+          random.shuffle(indices)
+          for i in indices[:max(1, len(indices) // 2)]:
+              shuffled[i], shuffled[i + 1] = shuffled[i + 1], shuffled[i]
+          return ' '.join(shuffled)
+
+
+      def synonym_paraphrase(text: str) -> str:
+          '''Substitute words with synonyms from the paraphrase dictionary.'''
+          words = text.split()
+          result = []
+          for word in words:
+              lower = word.lower()
+              if lower in PARAPHRASE_SYNONYMS:
+                  syns = PARAPHRASE_SYNONYMS[lower]
+                  result.append(random.choice(syns))
+              else:
+                  result.append(word)
+          return ' '.join(result)
+
+
+      def generate_text_variants(text: str, n_variants: int = 5) -> List[str]:
+          '''Generate N paraphrase variants using word-order shuffle and synonym substitution.'''
+          variants = []
+          for i in range(n_variants):
+              if i % 2 == 0:
+                  variants.append(word_order_shuffle_paraphrase(text, seed=i))
+              else:
+                  variants.append(synonym_paraphrase(text))
+          return variants
+
+
+      def text_consistency_score(
+          model,
+          text: str,
+          n_variants: int = 5,
+          max_len: int = 64,
+      ) -> float:
+          '''
+          Fraction of N paraphrase variants that disagree with original classification.
+          TextFooler adversarial text is often fragile: specific synonym choices
+          carry the adversarial property; different synonyms restore correct classification.
+          '''
+          try:
+              from token_substitution_attack import text_to_tensor
+          except ImportError:
+              return 0.0
+
+          x_orig = text_to_tensor(text, max_len)
+          with torch.no_grad():
+              pred_orig = model(x_orig).argmax(dim=1).item()
+
+          variants = generate_text_variants(text, n_variants)
+          disagreements = 0
+          for variant in variants:
+              x_var = text_to_tensor(variant, max_len)
+              with torch.no_grad():
+                  pred_var = model(x_var).argmax(dim=1).item()
+              if pred_var != pred_orig:
+                  disagreements += 1
+
+          return disagreements / n_variants
+
+
+      def text_consistency_detect(
+          model,
+          text: str,
+          threshold: float = 0.4,
+          n_variants: int = 5,
+      ) -> Tuple[bool, float]:
+          '''Returns (detected, disagreement_rate).'''
+          score = text_consistency_score(model, text, n_variants)
+          return score > threshold, score
+
+
+      def demo() -> None:
+          try:
+              import torch
+              from token_substitution_attack import ToyTextClassifier
+          except ImportError:
+              print('Run from directory containing token_substitution_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyTextClassifier()
+          model.eval()
+
+          test_cases = [
+              ('this product is terrible bad and awful', 'natural text'),
+              ('this product is dreadful poor and horrible', 'natural near-adversarial synonym'),
+              ('this product is dreadful bаd and horrible', 'homoglyph variant'),
+          ]
+
+          print('Text Consistency Checker (Paraphrase Fragility)')
+          print(f'{"Text type":<40} {"score":<8} {"detected"}')
+          print('-' * 58)
+          for text, label in test_cases:
+              detected, score = text_consistency_detect(model, text, threshold=0.4, n_variants=8)
+              print(f'{label:<40} {score:<8.3f} {detected}')
+          print()
+          print('Paraphrase variants of first text:')
+          for v in generate_text_variants(test_cases[0][0], n_variants=3):
+              print(f'  {v}')
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_4:
+    title: 'Three-Primitive Track 7 Detection Ensemble'
+    filename: 'detection_ensemble_ch10.py'
+    description: 'Combines squeezer ensemble (Section 10.11), consistency checker, and adversarial detector classifier into a unified Track 7 detection ensemble with calibrated weights and a combined detection score'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Imports from feature_squeezer.py, squeezer_ensemble.py,
+      consistency_checker.py, adversarial_detector_classifier.py.
+    code: |
+      # detection_ensemble_ch10.py
+      # Section 10.12: Three-Primitive Track 7 Detection Ensemble
+      # 20260525 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      from torch import Tensor
+      from dataclasses import dataclass
+      from typing import Tuple
+      from feature_squeezer import build_default_squeezers
+      from squeezer_ensemble import ensemble_score, calibrate_threshold
+      from consistency_checker import ConsistencyConfig, consistency_check_score
+      from adversarial_detector_classifier import (AdversarialDetectorClassifier,
+                                                    adversarial_detector_score,
+                                                    train_adversarial_detector)
+
+
+      @dataclass
+      class EnsembleConfig:
+          # Squeezer ensemble
+          squeezer_threshold: float = 0.10
+          squeezer_weight: float = 0.35
+          # Consistency checker
+          consistency_cfg: ConsistencyConfig = None
+          consistency_threshold: float = 0.25
+          consistency_weight: float = 0.35
+          # Adversarial classifier
+          detector_threshold: float = 0.50
+          detector_weight: float = 0.30
+
+          def __post_init__(self):
+              if self.consistency_cfg is None:
+                  self.consistency_cfg = ConsistencyConfig()
+
+
+      class Track7Ensemble:
+          '''
+          Three-primitive Track 7 detection ensemble.
+          Score = w1 * normalised_squeezer + w2 * consistency + w3 * detector_prob
+          '''
+          def __init__(
+              self,
+              model: nn.Module,
+              cfg: EnsembleConfig = None,
+              adversarial_detector: AdversarialDetectorClassifier = None,
+          ):
+              self.model = model
+              self.cfg = cfg or EnsembleConfig()
+              self.squeezers = build_default_squeezers()
+              self.detector = adversarial_detector
+
+          def score(self, x: Tensor) -> dict:
+              '''
+              Compute detection scores from all three primitives.
+              Returns dict with individual and combined scores.
+              '''
+              cfg = self.cfg
+
+              # 1. Squeezer ensemble score (range: 0 to ~2, normalise to [0,1])
+              sq_score = ensemble_score(self.model, x, self.squeezers, mode='max')
+              sq_normalised = torch.clamp(sq_score / 1.0, 0.0, 1.0)
+
+              # 2. Consistency checker score (already in [0,1])
+              cc_score = consistency_check_score(self.model, x, cfg.consistency_cfg)
+
+              # 3. Adversarial detector score (already in [0,1])
+              if self.detector is not None:
+                  det_score = adversarial_detector_score(self.detector, x)
+              else:
+                  det_score = torch.zeros(x.size(0))
+
+              # Combined weighted score
+              combined = (
+                  cfg.squeezer_weight * sq_normalised
+                  + cfg.consistency_weight * cc_score
+                  + cfg.detector_weight * det_score
+              )
+
+              return {
+                  'squeezer_score': sq_score,
+                  'consistency_score': cc_score,
+                  'detector_score': det_score,
+                  'combined_score': combined,
+              }
+
+          def detect(self, x: Tensor, threshold: float = 0.30) -> Tuple[Tensor, dict]:
+              '''Returns (flagged, score_dict).'''
+              scores = self.score(x)
+              flagged = scores['combined_score'] > threshold
+              return flagged, scores
+
+          def calibrate(self, x_natural: Tensor, target_fpr: float = 0.05) -> float:
+              '''Calibrate combined threshold for target FPR on natural inputs.'''
+              scores = self.score(x_natural)
+              return scores['combined_score'].quantile(1.0 - target_fpr).item()
+
+
+      def build_track7_ensemble(
+          model: nn.Module,
+          x_natural: Tensor,
+          y_true: Tensor,
+          train_detector: bool = True,
+      ) -> Track7Ensemble:
+          '''
+          Factory: build and return a calibrated Track 7 ensemble.
+          Optionally trains the adversarial detector classifier.
+          '''
+          detector = None
+          if train_detector:
+              print('Training adversarial detector classifier...')
+              detector = train_adversarial_detector(model, x_natural, y_true, n_epochs=20)
+          return Track7Ensemble(model, adversarial_detector=detector)
+
+
+      def demo() -> None:
+          try:
+              from fgsm_attack import ToyLinear, fgsm
+              from pgd_attack import pgd_linf
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py and pgd_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x_nat = torch.rand(32, 1, 28, 28)
+          y = torch.randint(0, 10, (32,))
+          eps = 8.0 / 255.0
+
+          ensemble = build_track7_ensemble(model, x_nat, y, train_detector=True)
+          threshold = ensemble.calibrate(x_nat, target_fpr=0.05)
+          print(f'Calibrated ensemble threshold (5% FPR): {threshold:.4f}')
+
+          attacks = {
+              'Natural': x_nat,
+              'FGSM eps=8/255': fgsm(model, x_nat, y, epsilon=eps),
+              'PGD-20': pgd_linf(model, x_nat, y, eps, eps/10.0, 20, 1),
+          }
+          print()
+          print(f'{"Attack":<22} {"sq_score":<12} {"cc_score":<12} {"det_score":<12} {"combined":<10} {"detect"}')
+          print('-' * 80)
+          for name, x_test in attacks.items():
+              flagged, sc = ensemble.detect(x_test, threshold=threshold)
+              print(f'{name:<22} '
+                    f'{sc["squeezer_score"].mean().item():<12.4f} '
+                    f'{sc["consistency_score"].mean().item():<12.4f} '
+                    f'{sc["detector_score"].mean().item():<12.4f} '
+                    f'{sc["combined_score"].mean().item():<10.4f} '
+                    f'{flagged.float().mean().item():.3f}')
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_5:
+    title: 'Detection Rate Comparison Harness'
+    filename: 'detection_rate_comparison_harness.py'
+    description: 'Empirical detection rate comparison across attack families for each Track 7 primitive individually and the ensemble; produces the coverage matrix used in Section 10.13 deployment decisions'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Imports from all previous Track 7 deliverables.
+    code: |
+      # detection_rate_comparison_harness.py
+      # Section 10.12: Track 7 Detection Rate Comparison Harness
+      # 20260525 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      from feature_squeezer import build_default_squeezers
+      from squeezer_ensemble import ensemble_score, calibrate_threshold
+      from consistency_checker import ConsistencyConfig, consistency_check_score
+      from adversarial_detector_classifier import (train_adversarial_detector,
+                                                    adversarial_detector_score)
+
+
+      def build_attack_suite(model, x, y, eps=8.0/255.0):
+          '''Generate adversarial examples from multiple attack families.'''
+          from fgsm_attack import fgsm
+          from pgd_attack import pgd_linf
+
+          suite = {}
+          suite['FGSM eps=8/255'] = fgsm(model, x, y, epsilon=eps)
+          suite['PGD-20 eps=8/255'] = pgd_linf(model, x, y, eps, eps/10.0, 20, 1)
+          suite['PGD-40 eps=4/255'] = pgd_linf(model, x, y, eps/2, eps/20.0, 40, 1)
+          return suite
+
+
+      def run_comparison_harness(
+          model,
+          x_natural,
+          y_true,
+          target_fpr: float = 0.05,
+      ) -> None:
+          eps = 8.0 / 255.0
+          print('Building attack suite...')
+          attacks = build_attack_suite(model, x_natural, y_true, eps)
+          attacks_all = {'Natural': x_natural, **attacks}
+
+          squeezers = build_default_squeezers()
+          cc_cfg = ConsistencyConfig(n_variants=20, sigma=0.02)
+
+          print('Training adversarial detector...')
+          x_adv_train = torch.cat(list(attacks.values()))
+          y_adv_labels = torch.ones(x_adv_train.size(0), dtype=torch.long)
+          y_nat_labels = torch.zeros(x_natural.size(0), dtype=torch.long)
+          detector = train_adversarial_detector(model, x_natural, y_true, n_epochs=25)
+
+          # Calibrate thresholds on natural inputs
+          sq_scores_nat = ensemble_score(model, x_natural, squeezers)
+          sq_threshold = sq_scores_nat.quantile(1.0 - target_fpr).item()
+          cc_scores_nat = consistency_check_score(model, x_natural, cc_cfg)
+          cc_threshold = cc_scores_nat.quantile(1.0 - target_fpr).item()
+          det_scores_nat = adversarial_detector_score(detector, x_natural)
+          det_threshold = det_scores_nat.quantile(1.0 - target_fpr).item()
+
+          print(f'\nCalibrated thresholds (target FPR={target_fpr}):')
+          print(f'  Squeezer ensemble: {sq_threshold:.4f}')
+          print(f'  Consistency check: {cc_threshold:.4f}')
+          print(f'  Adv. detector:     {det_threshold:.4f}')
+
+          print(f'\n{"Attack":<28} {"Squeezer":<12} {"Consistency":<14} {"Detector":<12} {"Ensemble (max)"}')
+          print('-' * 80)
+          for name, x_test in attacks_all.items():
+              sq = (ensemble_score(model, x_test, squeezers) > sq_threshold).float().mean().item()
+              cc = (consistency_check_score(model, x_test, cc_cfg) > cc_threshold).float().mean().item()
+              det = (adversarial_detector_score(detector, x_test) > det_threshold).float().mean().item()
+              ensemble_rate = max(sq, cc, det)
+              print(f'{name:<28} {sq:<12.3f} {cc:<14.3f} {det:<12.3f} {ensemble_rate:.3f}')
+
+          print()
+          print('Ensemble (max) = flag if ANY primitive fires.')
+          print('Coverage gaps visible in table motivate the three-primitive design.')
+
+
+      if __name__ == '__main__':
+          try:
+              from fgsm_attack import ToyLinear
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              raise SystemExit
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x_nat = torch.rand(32, 1, 28, 28)
+          y = torch.randint(0, 10, (32,))
+          run_comparison_harness(model, x_nat, y, target_fpr=0.05)
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Using sigma much larger than the adversarial epsilon in the consistency check, producing high false positive rates by perturbing natural borderline inputs across their boundaries'
+    why_it_happens: |
+      A larger sigma seems to produce stronger adversarial fragility detection -- the noise more
+      reliably pushes adversarial examples back across the boundary. Engineers set sigma=0.05 or
+      sigma=0.10 without checking the false positive rate on natural inputs.
+    consequence: |
+      Natural inputs near decision boundaries are consistently flipped by the large random noise.
+      At sigma=0.05, false positive rates typically exceed 15-20%, making the consistency check
+      unusable in production. The gate must be set so high to reduce false positives that
+      adversarial examples at small epsilon also pass.
+    correct_approach: |
+      Set sigma < adversarial_epsilon / 4. For epsilon=8/255=0.031, use sigma=0.01 to 0.02.
+      The noise should be enough to reveal fragility of boundary-proximate adversarial examples
+      but not so large that it routinely flips natural images. Always calibrate sigma by running
+      the consistency checker on a natural image set and measuring the false positive rate first.
+
+  mistake_2:
+    description: 'Running N consistency check variants sequentially, multiplying gateway latency by N+1'
+    why_it_happens: |
+      The consistency check is implemented as a for loop: for each variant, forward pass the
+      variant through the model. N=20 variants means 20 model forward passes sequentially.
+    consequence: |
+      For a model with 20ms inference latency, consistency checking adds 400ms sequentially.
+      Total gateway latency becomes 420ms, well beyond the 50ms P99 budget. The consistency
+      checker is disabled under production load. Section 10.12 consistency checking was removed
+      from the Track 7 ensemble because it could not fit the latency budget.
+    correct_approach: |
+      Run all N variants as a single batch: stack N variants in the batch dimension (batch * N
+      samples), run one model forward pass, reshape and compare. The consistency_checker.py
+      deliverable implements exactly this: x_variants = x.repeat_interleave(N, dim=0) + noise,
+      then a single model(x_variants) call. This reduces N forward passes to one forward pass
+      (on a batch N times larger), which is much faster than N sequential passes.
+
+  mistake_3:
+    description: 'Training the adversarial detector classifier only on FGSM examples, producing a detector that does not generalise to PGD or C&W'
+    why_it_happens: |
+      FGSM adversarial examples are the cheapest to generate (one forward-backward pass). Training
+      data generation uses FGSM because it is fast, without realising that FGSM examples have
+      distinctive perturbation statistics (exact L-infinity magnitude per pixel) that differ from
+      PGD and C&W perturbation statistics.
+    consequence: |
+      The detector trained only on FGSM achieves 80-90% detection against FGSM but 30-40% against
+      PGD (worse than the squeezer alone). C&W examples are not caught at all. The "adversarial
+      detector" is effectively a FGSM detector, not a general adversarial detector. This is
+      invisible in the benchmark unless the evaluation includes held-out attack families.
+    correct_approach: |
+      Always train on multiple attack families: FGSM, PGD (at at least two epsilon values), and
+      C&W. Run the cross_attack_generalisation_test from adversarial_detector_classifier.py to
+      verify generalisation before deployment. A detection rate below 50% on any held-out attack
+      family indicates the feature set or training data needs to be expanded.
+
+  mistake_4:
+    description: 'Deploying text consistency checking that generates paraphrases via word-order shuffle and claiming it covers back-translation semantics'
+    why_it_happens: |
+      Word-order shuffle is a simple approximation implemented in the deliverables for environments
+      without a translation API. Engineers deploy this approximation in production without noting
+      that it provides much weaker paraphrase diversity than actual back-translation and misses many
+      TextFooler adversarial examples that survive word-order shuffling.
+    consequence: |
+      TextFooler adversarial examples with synonym substitutions survive word-order shuffling
+      because the adversarial tokens are preserved -- the substitution is the adversarial signal,
+      not the order. Back-translation may substitute different synonyms, restoring the original
+      classification. Word-order shuffle does not change the token vocabulary and misses this
+      substitution fragility. Detection rates for TextFooler are 15-25% with word-order shuffle
+      but 55-70% with actual back-translation.
+    correct_approach: |
+      In production text adversarial detection: use an actual paraphrase model (T5, PEGASUS)
+      or back-translation API (DeepL, Google Translate) for production-quality consistency
+      checking. The word-order shuffle in text_consistency_checker.py is documented explicitly
+      as a development approximation. Replace with a paraphrase model before deploying to
+      production text adversarial detection workloads.
+
+  mistake_5:
+    description: 'Setting ensemble weights equal for all three primitives regardless of their calibrated detection rates on the deployment-specific attack threat model'
+    why_it_happens: |
+      Equal weighting (w_squeezer = w_consistency = w_detector = 1/3) is the default in
+      detection_ensemble_ch10.py. Engineers deploy with default weights without benchmarking
+      which primitives have higher detection rates against the specific attack families the
+      deployment faces.
+    consequence: |
+      For a deployment primarily facing FGSM-style attacks (common for content moderation
+      evasion), the squeezer and consistency checker have high detection rates (~80-90%) but
+      the adversarial classifier has moderate rates (~65-75%). Equal weighting reduces the
+      effective ensemble sensitivity below what squeezer-dominated weighting would achieve.
+      The combined score is pulled down by the weaker primitive.
+    correct_approach: |
+      Calibrate ensemble weights by running detection_rate_comparison_harness.py against the
+      specific attack families the deployment faces, then set weights proportional to per-primitive
+      detection rates. For FGSM-heavy threat models: higher squeezer and consistency weight.
+      For C&W-heavy threat models: higher adversarial classifier weight. Rebalance weights
+      quarterly as the threat model evolves.
+
+section_summary:
+
+  compact: |
+    Consistency checking exploits adversarial fragility: adversarial examples near the decision
+    boundary flip classification under small random perturbation (sigma = 0.01-0.02); natural
+    inputs are stable. Running N variants as a single batch keeps latency to one forward pass
+    rather than N. High-kappa C&W defeats consistency checking by placing adversarial examples
+    far from the boundary -- the squeezer and adversarial classifier cover this gap. The
+    adversarial detector classifier learns statistical features (Laplacian energy, local variance,
+    kurtosis) that distinguish adversarial from natural inputs; it requires diverse attack families
+    in training (FGSM + PGD + C&W) and quarterly retraining to cover new attack methods. Text
+    consistency checking uses paraphrase variants (word-order shuffle as proxy; back-translation
+    in production). The three-primitive Track 7 ensemble (squeezer + consistency + classifier)
+    achieves 85-95% detection against FGSM/PGD and 50-65% against high-kappa C&W at 5% FPR;
+    adaptive adversaries reduce these by 15-30 percentage points.
+
+  key_takeaways:
+    - 'Consistency check signal: fraction of N variants that disagree with original prediction; run all N as one batch for latency efficiency'
+    - 'sigma < epsilon/4: too-large sigma produces high false positives; calibrate against hard natural examples near decision boundaries'
+    - 'High-kappa C&W evades consistency checking (not near boundary); adversarial classifier and squeezer are the primary primitives against it'
+    - 'Adversarial detector requires diverse training attacks (FGSM + PGD + C&W) and cross-attack generalisation testing before deployment'
+    - 'Text consistency: word-order shuffle is a development proxy; use actual back-translation for production coverage against TextFooler'
+    - 'Ensemble weights must be calibrated per deployment threat model -- equal weights are a default, not an optimum'
+
+preview_section_10_13:
+  title: 'Section 10.13: Production Gateway Track 7 -- Adversarial Example Detection'
+  summary: |
+    Section 10.13 wires the complete Track 7 detection primitive library into the production
+    seven-track gateway. It implements the two-stage architecture: pre-inference (feature squeezer
+    ensemble runs before the main model sees the input), and post-inference (consistency checker
+    and adversarial classifier run after the main model output is produced). Both stages run with
+    async parallel dispatch to keep total latency within 50ms P99. Section 10.13 delivers the
+    complete gateway_track7.py, the adversarial_filter.py pre-inference component, the
+    seven_track_gateway_ensemble.py that integrates all tracks from Chapters 6-10, the Track 7
+    latency benchmark, the completed AML.T0043/T0015 Sigma rule, the eight-item deployment
+    checklist, the adaptive adversary detection test, and the false positive calibration harness
+    against natural edge-case inputs.
+
+metadata:
+  cross_chapter_references:
+    - 'Section 10.11: squeezer ensemble (imported directly in detection_ensemble_ch10.py)'
+    - 'Section 10.5: C&W kappa sweep (kappa=20 C&W is the consistency check coverage gap)'
+    - 'Section 10.1: Track 7 post-inference architecture'
+    - 'Section 9.10: Ch9 five-primitive detection ensemble (Track 7 ensemble follows same pattern)'
+    - 'Section 10.9: text adversarial attacks (text consistency checker covers TextFooler)'
+  forward_references:
+    - 'Section 10.13: Track 7 production gateway (assembles all three primitives with async dispatch)'
+    - 'Section 10.14: randomised smoothing (formal guarantee that detection ensemble cannot provide)'
+    - 'Section 10.15: adversarial training (upstream robustness complement to Track 7 detection)'
+  tags:
+    - consistency-checking
+    - adversarial-fragility
+    - boundary-proximity
+    - adversarial-detector-classifier
+    - laplacian-energy
+    - local-variance
+    - text-consistency
+    - back-translation
+    - three-primitive-ensemble
+    - track-7-complete
+    - cross-attack-generalisation
+    - kappa-coverage-gap

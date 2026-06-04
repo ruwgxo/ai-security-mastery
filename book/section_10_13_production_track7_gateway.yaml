@@ -1,0 +1,1422 @@
+# section_10_13_production_track7_gateway.yaml
+
+---
+document_info:
+  title: 'Production Gateway Track 7: Adversarial Example Detection'
+  chapter: 10
+  section: 13
+  section_code: '1013'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-05-25'
+  estimated_pages: 8
+  estimated_reading_time: '60-70 minutes'
+
+section_overview:
+  one_line_summary: 'Track 7 extends the six-track gateway with the only pre-inference stage in the ensemble: squeezing transforms the input before the main model sees it, while consistency checking and the adversarial classifier run post-inference in parallel.'
+  why_this_section_exists: |
+    Sections 10.11-10.12 built the three Track 7 detection primitives. Section 10.13 wires
+    them into the production seven-track gateway: the two-stage architecture where squeezing
+    occupies the pre-inference stage and consistency checking plus the adversarial classifier
+    occupy the post-inference stage. This is the Chapter 10 capstone deliverable: the complete
+    gateway extending Chapters 6/7/9''s six-track ensemble to seven tracks, the completed
+    AML.T0043/T0015 Sigma rules that replace the Chapter 5 stubs, the eight-item deployment
+    checklist, and the adaptive adversary test and false positive calibration harness that
+    together make Track 7 production-ready.
+  position_in_chapter: |
+    Section 10.13 is the input-side production capstone for Chapter 10. It closes the detection
+    arc (Sections 10.11-10.13) before the upstream defence arc (Sections 10.14-10.15). The
+    two-stage architecture first introduced in Section 10.1 is fully implemented here. Section
+    10.16 references this section when describing the Part 2 closure.
+
+learning_objectives:
+
+  knowledge:
+    - 'Describe the two-stage Track 7 architecture: pre-inference squeezer stage and post-inference consistency/classifier stage, and explain why the pre-inference stage creates a new latency constraint'
+    - 'Explain the parallel execution model: squeezer transform runs before main inference; squeezer model inference runs in parallel with main inference; consistency check runs after main inference'
+    - 'Describe the seven-track gateway response policy: block (high combined score), flag (moderate), monitor (low), and pass (below threshold across all tracks)'
+    - 'State what the completed AML.T0043/T0015 Sigma rule detects and which log fields it references'
+    - 'List the eight deployment checklist items and explain why each is required before Track 7 goes to production'
+
+  skills:
+    - 'Implement the two-stage Track 7 gateway with async parallel dispatch for squeezer and consistency checker'
+    - 'Build the pre-inference adversarial filter as a standalone component'
+    - 'Integrate Track 7 into the full seven-track gateway ensemble with unified response policy'
+    - 'Generate the completed AML.T0043/T0015 Sigma rule with Track 7 detection log fields'
+    - 'Run the Track 7 deployment checklist and calibration harness against a model and test suite'
+
+  security_mindset:
+    - 'Understand that Track 7 is the only gateway track with a component on the critical inference path: the squeezer adds latency before the model responds, which is fundamentally different from all Tracks 1-6'
+    - 'Recognise that the adaptive adversary test must be run against the full seven-track ensemble, not just Track 7 in isolation -- adversaries who know the whole gateway can exploit gaps between tracks'
+    - 'Treat the deployment checklist as a gate, not a suggestion: skipping any item produces a Track 7 deployment that appears functional but has calibrated thresholds for the wrong inputs, wrong attack families, or wrong latency budget'
+
+prerequisites:
+  - 'Section 10.11: squeezer ensemble (pre-inference stage)'
+  - 'Section 10.12: consistency checker and adversarial classifier (post-inference stage), plus detection_ensemble_ch10.py'
+  - 'Section 9.11: production gateway Track 6 (Track 7 joins and extends this)'
+  - 'Chapter 6 Section 6.17: production injection classifier (Tracks 1 that Track 7 joins)'
+  - 'Chapter 7 Section 7.14: jailbreak detection ensemble (Tracks 2-5 that Track 7 joins)'
+  - 'Chapter 5 Section 5.8: AML Sigma stub pattern (completed for AML.T0043/T0015 here)'
+
+prose_content:
+
+  part_1:
+    title: 'Design Brief: Track 7 as the Gateway''s Unique Pre-Inference Track'
+    body: |
+      The six-track gateway assembled across Chapters 6, 7, and 9 runs all detection tracks
+      in parallel with the main model inference and aggregates their results post-request. Every
+      track in Tracks 1-6 operates on the request as delivered: the input is sent to the model,
+      the tracks observe the same unmodified input and the model''s output, and detection decisions
+      are made based on the unmodified signal. No track in Chapters 6-9 changes what the model
+      sees before the model responds.
+
+      Track 7 breaks this pattern. Feature squeezing (Section 10.11) requires transforming the
+      input before the model processes it. The detection signal is the comparison between what the
+      model says about the original input and what it says about the squeezed input. If the squeezer
+      runs after the model, there is no comparison with the primary inference -- only a secondary
+      inference on a transformed version. The result is still informative (squeezer disagreement
+      with the transformed prediction vs a natural-image reference), but the semantically richer
+      detection signal (original prediction changed by squeezing) requires the squeezer to run
+      before or alongside the main inference.
+
+      This creates Track 7''s architectural signature: a pre-inference stage and a post-inference
+      stage. The pre-inference stage applies the squeezer transform (fast, ~1-3ms) and dispatches
+      parallel model inference on the squeezed input alongside the primary model inference. Both
+      inferences complete before the gateway produces its response; the squeezer disagreement is
+      computed from the two parallel inference outputs. The post-inference stage runs the consistency
+      checker (N variants on the main model) and the adversarial classifier (on the original input)
+      after the primary inference completes.
+
+  part_2:
+    title: 'Pre-Inference Stage: Parallel Squeezer Execution'
+    body: |
+      The pre-inference stage executes as follows. When a request arrives at the gateway:
+
+      Step 1 -- Squeezer transform (synchronous, <3ms): apply each squeezer in the ensemble
+      to the input tensor. These are fast tensor operations (Gaussian convolution, rounding,
+      bilinear resize) that complete in 1-3ms on CPU or sub-millisecond on GPU. The transforms
+      are deterministic and do not require a model forward pass.
+
+      Step 2 -- Parallel inference dispatch (async): dispatch three concurrent tasks:
+      (a) primary model inference on the original input,
+      (b) squeezer model inferences on each squeezed variant (one per squeezer),
+      (c) adversarial detector classifier on the original input (feature extraction + linear).
+
+      Step 3 -- Wait for completion: all parallel tasks complete within approximately one model
+      inference time (20ms for a medium model), because they run concurrently. The squeezer
+      inferences have the same model and the same latency as the primary inference; they just
+      operate on slightly different inputs.
+
+      Step 4 -- Pre-inference squeezer decision: compare primary inference output with each
+      squeezer inference output. Compute the squeezer disagreement scores. If any squeezer score
+      exceeds the high-confidence threshold (block tier), the gateway may reject the request
+      immediately without waiting for the post-inference stage. This is the early-exit optimisation
+      for obvious adversarial inputs.
+
+      The latency model with parallel execution: total pre-inference latency = squeezer_transform
+      + max(primary_inference, squeezer_inference). Since both inferences use the same model,
+      max is approximately one inference time. The squeezer_transform overhead is 1-3ms. The
+      parallelisation effectively costs one inference time regardless of the number of squeezers
+      in the ensemble.
+
+  part_3:
+    title: 'Post-Inference Stage: Consistency Check and Adversarial Classifier'
+    body: |
+      The post-inference stage runs after the primary model inference completes. It adds the
+      two remaining detection primitives whose signals depend on the primary model''s output or
+      can reuse the model that just ran.
+
+      Consistency checking generates N randomly perturbed variants of the input and queries the
+      model on each. Section 10.12 optimised this by batching all N variants in a single forward
+      pass (batch size N vs N separate forward passes). The post-inference consistency check
+      starts immediately after the primary inference: the primary model is still warm, and the
+      N-variant batch uses the same model. The latency is one additional batch forward pass (at
+      batch size N) rather than N sequential passes.
+
+      The adversarial detector classifier was dispatched in parallel with the primary inference
+      (Step 2c above). Its result is available without additional latency by the time the primary
+      inference completes. No additional wait is needed.
+
+      Sub-sampling is a viable operational optimisation: run the consistency check on only a
+      fraction (e.g., 10%) of requests and rely on the squeezer ensemble and adversarial classifier
+      for per-request coverage. Sub-sampling reduces average latency at the cost of per-request
+      consistency check coverage. For high-QPS deployments where every microsecond matters, a
+      configurable sub-sample rate (track7_config.consistency_subsample_rate) allows operators to
+      tune the cost-coverage tradeoff without disabling the primitive entirely.
+
+  part_4:
+    title: 'Seven-Track Gateway: Unified Response Policy'
+    body: |
+      The unified seven-track gateway produces one response action per request. Each track
+      contributes a score and a fired/not-fired binary decision. The response policy maps the
+      combination of track decisions to an action tier.
+
+      Action tier structure:
+      BLOCK (immediate reject, 429 Too Many Requests or 403 Forbidden): fired when any track
+      produces a high-confidence signal (score above the block threshold). Used for high-confidence
+      adversarial examples (squeezer score > 0.50), confirmed injection (Track 1-5 high confidence),
+      or confirmed extraction campaign (Track 6 rate-limit hit). The block tier must respond quickly;
+      Track 7 pre-inference squeezer provides the fastest block signal.
+
+      FLAG (serve response but log and alert): fired when moderate-confidence signals appear across
+      multiple tracks. The request is served normally (the model''s response is returned) but the
+      event is logged to the SIEM with Track 7 scores. Human review queue picks up flagged requests.
+      The flag tier is the correct response for adversarial examples that may be false positives --
+      preserve user experience while generating an investigation signal.
+
+      MONITOR (serve response with enhanced telemetry): fired when low-confidence signals appear
+      from individual tracks below the flag threshold. The request is served normally. Enhanced
+      telemetry is attached to the request log (all Track 7 scores captured even though no alert
+      fires). Monitoring data feeds the Track 7 calibration cycle.
+
+      PASS: no track fired above its threshold. Request is served normally with standard telemetry.
+
+  part_5:
+    title: 'AML.T0043/T0015 Sigma Rule: Completing the Chapter 5 Stubs'
+    body: |
+      Chapter 5 Section 5.8 introduced the AML Sigma stub pattern: placeholder detection rules
+      anchored to ATLAS techniques that are completed as each chapter builds the production
+      detection mechanism. Chapter 10 Section 10.13 completes AML.T0043 (Craft Adversarial Data)
+      and AML.T0015 (Evade ML Model) with the Track 7 detection fields.
+
+      The completed AML.T0043 Sigma rule fires when the Track 7 squeezer ensemble disagreement
+      score exceeds the block or flag threshold. The log source is the AI gateway''s Track 7
+      telemetry, which must include: the squeezer scores per squeezer (for the highest-sensitivity
+      squeezer), the consistency check score, the adversarial classifier probability, the combined
+      ensemble score, and the action tier decision. These fields are produced by the gateway_track7.py
+      deliverable and stored in a structured log entry per request.
+
+      AML.T0015 (Evade ML Model) maps to the combined ensemble firing: evidence that adversarial
+      data reached the deployed model and caused or attempted to cause misclassification. The Sigma
+      condition for AML.T0015 uses an OR across the three detection fields: if any primitive fires
+      above its threshold, the evasion attempt is recorded. The rule level is HIGH for block-tier
+      events and MEDIUM for flag-tier events.
+
+      The Sigma rules include explicit false positive entries: natural inputs near decision
+      boundaries produce squeezer and consistency scores above their thresholds at low but
+      non-zero rates. The false positive entries direct analysts to verify with the adversarial
+      classifier score (which is lower for natural borderline inputs than for adversarial examples)
+      before escalating.
+
+  part_6:
+    title: 'Deployment Checklist: Eight Gates Before Track 7 Goes to Production'
+    body: |
+      The eight-item deployment checklist encodes the lessons of Sections 10.11-10.12 and
+      the Section 10.10 incident analysis into a mandatory pre-production gate.
+
+      Item 1 -- Squeezer threshold calibration on production-representative inputs: the threshold
+      must be set using inputs drawn from the actual production distribution, not from a benchmark
+      dataset. Hard borderline inputs in the production domain produce higher squeezer scores than
+      easy benchmark images; calibrating on benchmarks underestimates the false positive rate.
+
+      Item 2 -- Consistency check sigma and N calibration: sigma must be < adversarial_epsilon/4;
+      N must be sufficient for stable disagreement estimates (at least N=20). Both must be validated
+      against the production domain at the expected production QPS (not single-request testing).
+
+      Item 3 -- Adversarial detector training on deployment-specific attack families: the detector
+      must include adversarial examples generated against the specific model being deployed, not
+      a generic image classifier. Cross-attack generalisation must pass the Section 10.12 test
+      before deployment.
+
+      Item 4 -- Latency benchmark at production load: measure Track 7 P99 latency under production
+      QPS using the track7_latency_benchmark.py deliverable. Single-request latency is not
+      representative; under load, thread pool contention may push squeezer parallel execution back
+      toward sequential.
+
+      Item 5 -- Adversarial example test suite coverage: run Track 7 against adversarial examples
+      from all relevant taxonomy cells (FGSM, PGD, C&W, boundary attack, text adversarial for
+      text classifiers, physical patch detector if camera-facing system). Detection rate must meet
+      or exceed the documented coverage targets.
+
+      Item 6 -- Sigma rule validation: verify that the completed AML.T0043/T0015 Sigma rule fires
+      on known adversarial examples in the test suite and does not fire on the natural input
+      calibration set above the target FPR.
+
+      Item 7 -- False positive audit on production traffic sample: run Track 7 in monitor-only
+      mode (no blocks or flags) on a sample of production traffic for 24-48 hours; measure the
+      actual FPR. Adjust thresholds if actual FPR exceeds the target.
+
+      Item 8 -- Circuit breaker configuration: if Track 7 throws unhandled exceptions (model
+      inference failure, OOM, timeout), the gateway must fail open (serve the request without
+      detection) rather than fail closed (block all requests). Configure explicit circuit breaker
+      logic with alerting on Track 7 error rate.
+
+  part_7:
+    title: 'Adaptive Adversary and Operational False Positive Management'
+    body: |
+      The adaptive adversary who knows the Track 7 configuration faces a harder optimisation
+      problem than the non-adaptive adversary. They must craft adversarial examples that
+      simultaneously survive: (a) the squeezer ensemble (no detectable squeezer disagreement),
+      (b) the consistency check (prediction stable under N random variants), and (c) the
+      adversarial classifier (input statistics indistinguishable from natural images). As shown
+      in Section 10.12, jointly satisfying all three constraints typically requires larger
+      perturbation budgets or lower attack success rates, raising the attack cost.
+
+      However, the adaptive adversary advantage is not zero. An adversary who can craft examples
+      against the full three-primitive ensemble (using Section 10.5 adaptive C&W adapted to
+      include all three detection objectives) can achieve 50-60% of the non-adaptive attack
+      success rate against the ensemble. The track7_adaptive_adversary_test.py deliverable
+      measures this gap for the specific deployed configuration. If the gap exceeds 30 percentage
+      points (non-adaptive detection 85%, adaptive detection <55%), the ensemble configuration
+      should be revisited: add a fourth primitive or change squeezer parameters.
+
+      False positive management is the operational challenge that determines whether Track 7
+      remains deployed long-term. The track7_calibration_harness.py deliverable tests Track 7
+      against natural edge-case inputs: low-quality sensor captures, heavily compressed images,
+      unusual colour distributions, natural images of unusual objects near decision boundaries.
+      If the false positive rate on these inputs exceeds 5%, operators will disable Track 7 under
+      load, not because it fails to detect adversarial examples but because the alert volume is
+      unmanageable. Threshold calibration on production-representative hard examples (not just
+      easy benchmark images) is the preventive measure.
+
+reference_materials:
+
+  table_1:
+    title: 'Track 7 Two-Stage Architecture Summary'
+    description: 'Pre-inference and post-inference stages with components, latency profile, and critical path status'
+    columns: ['Stage', 'Component', 'Runs when', 'Latency (parallel)', 'Critical path?', 'Block on?']
+    rows:
+      - ['Pre-inference', 'Squeezer transform', 'On request arrival', '1-3ms', 'Yes (before main model)', 'High squeezer score (block tier)']
+      - ['Pre-inference (parallel)', 'Squeezer model inference', 'Parallel with main model', '~0ms additional', 'No (parallel)', 'High squeezer score after comparison']
+      - ['Pre-inference (parallel)', 'Adversarial classifier', 'Parallel with main model', '~0ms additional', 'No (parallel)', 'No block; contributes to post-inference score']
+      - ['Main inference', 'Primary model', 'After squeezer transform', '20ms (P99)', 'Yes (primary response)', 'N/A']
+      - ['Post-inference', 'Consistency checker (N variants)', 'After main model', '1 batch forward pass (~20ms)', 'No (response already produced)', 'High consistency score triggers flag/block if sub-sampled']
+      - ['Post-inference', 'Score aggregation + action', 'After all parallel tasks', '<0.1ms', 'No', 'Combined ensemble score exceeds tier thresholds']
+
+  table_2:
+    title: 'Seven-Track Gateway Response Policy'
+    description: 'Action tiers with track combination logic, response, and latency impact'
+    columns: ['Tier', 'Trigger condition', 'Response', 'Latency impact', 'Use case']
+    rows:
+      - ['BLOCK', 'Any track at high-confidence threshold (squeezer >0.50, injection >0.90, query limit hit)', 'Reject request (429/403); log to SIEM', 'Minimal: squeezer provides fast signal', 'Confirmed adversarial; confirmed injection; rate limit exceeded']
+      - ['FLAG', 'Moderate-confidence from Track 7 (ensemble 0.30-0.50) or moderate Track 1-5 signal', 'Serve response; log and alert; add to human review queue', 'Normal; alert is async', 'Possibly adversarial; needs analyst review']
+      - ['MONITOR', 'Low-confidence signal below flag threshold (0.15-0.30)', 'Serve response; enhanced telemetry; no alert', 'Normal; telemetry is async', 'Feed calibration data; track drift in adversarial attempt rates']
+      - ['PASS', 'All tracks below monitoring threshold', 'Serve response; standard telemetry', 'Normal; minimal overhead', 'Majority of benign traffic']
+
+  table_3:
+    title: 'Track 7 Deployment Checklist Summary'
+    description: 'Eight pre-production gates with verification method and failure consequence'
+    columns: ['Item', 'Gate', 'Verification method', 'Failure consequence if skipped']
+    rows:
+      - ['1', 'Squeezer threshold calibrated on production-representative inputs', 'track7_calibration_harness.py: FPR <= 5% target on production input sample', 'Excessive false positives on production borderline inputs; Track 7 disabled']
+      - ['2', 'Consistency check sigma and N calibrated', 'Consistency check FPR <= 5%; sigma < epsilon/4', 'False positives for high-QPS inputs; detection gap against kappa=0 C&W']
+      - ['3', 'Adversarial detector trained on deployment-specific attacks', 'Cross-attack generalisation: all held-out attack families > 50% detection', 'Poor generalisation; FGSM-only detector misses PGD and C&W']
+      - ['4', 'Latency benchmark at production load', 'track7_latency_benchmark.py: P99 <= 50ms at production QPS', 'Latency violations under load; Track 7 disabled by ops']
+      - ['5', 'Adversarial test suite coverage verified', 'All taxonomy cells >= coverage target (per Table 3, Section 10.12)', 'Uncovered attack families bypass Track 7 entirely']
+      - ['6', 'Sigma rule validated', 'Sigma rule fires on test adversarial examples; does not fire on natural calibration set', 'SIEM has no adversarial detection signal; AML.T0043/T0015 coverage gap']
+      - ['7', 'False positive audit on production traffic', '24-48 hours monitor-only mode; FPR measured on actual traffic', 'Hidden false positive rate surprises ops after go-live; disruptive recalibration']
+      - ['8', 'Circuit breaker configured', 'Track 7 exception causes fail-open, not fail-closed; alert on Track 7 error rate', 'Unhandled Track 7 exception blocks all requests; outage']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Track 7 Production Gateway'
+    filename: 'gateway_track7.py'
+    description: 'Production Track 7 adversarial detection gateway with pre-inference squeezer stage and post-inference consistency/classifier stage; async parallel dispatch; configurable action tiers'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch, concurrent.futures. Import from feature_squeezer, squeezer_ensemble,
+      consistency_checker, adversarial_detector_classifier, detection_ensemble_ch10.
+      Uses ThreadPoolExecutor for parallel squeezer + primary model dispatch.
+    code: |
+      # gateway_track7.py
+      # Section 10.13: Track 7 Production Gateway
+      # 20260525 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      from torch import Tensor
+      from concurrent.futures import ThreadPoolExecutor, as_completed
+      from dataclasses import dataclass, field
+      from typing import Optional
+      from feature_squeezer import build_default_squeezers
+      from squeezer_ensemble import ensemble_score
+      from consistency_checker import ConsistencyConfig, consistency_check_score
+      from adversarial_detector_classifier import (AdversarialDetectorClassifier,
+                                                    adversarial_detector_score)
+
+
+      @dataclass
+      class Track7Config:
+          block_threshold: float = 0.55
+          flag_threshold: float = 0.30
+          monitor_threshold: float = 0.15
+          squeezer_weight: float = 0.35
+          consistency_weight: float = 0.35
+          detector_weight: float = 0.30
+          consistency_cfg: ConsistencyConfig = field(default_factory=ConsistencyConfig)
+          consistency_subsample_rate: float = 1.0  # 1.0 = every request; 0.1 = 10% sampling
+          n_workers: int = 4
+
+
+      ACTION_PASS = 'pass'
+      ACTION_MONITOR = 'monitor'
+      ACTION_FLAG = 'flag'
+      ACTION_BLOCK = 'block'
+
+
+      class Track7Gateway:
+          '''
+          Two-stage Track 7 adversarial detection gateway.
+          Pre-inference: squeezer transform + parallel squeezer model inference.
+          Post-inference: consistency check + aggregate scores.
+          '''
+          def __init__(
+              self,
+              model: nn.Module,
+              cfg: Track7Config = None,
+              adversarial_detector: Optional[AdversarialDetectorClassifier] = None,
+          ):
+              self.model = model
+              self.cfg = cfg or Track7Config()
+              self.squeezers = build_default_squeezers()
+              self.detector = adversarial_detector
+              self.executor = ThreadPoolExecutor(max_workers=self.cfg.n_workers)
+
+          def _primary_inference(self, x: Tensor) -> Tensor:
+              with torch.no_grad():
+                  return self.model(x)
+
+          def _squeezer_inference(self, x: Tensor) -> Tensor:
+              with torch.no_grad():
+                  return ensemble_score(self.model, x, self.squeezers)
+
+          def _detector_score(self, x: Tensor) -> Tensor:
+              if self.detector is None:
+                  return torch.zeros(x.size(0))
+              return adversarial_detector_score(self.detector, x)
+
+          def _should_run_consistency(self) -> bool:
+              import random
+              return random.random() < self.cfg.consistency_cfg and \
+                     self.cfg.consistency_subsample_rate >= random.random()
+
+          def process(self, x: Tensor) -> dict:
+              '''
+              Process one request through Track 7 two-stage gateway.
+              Returns result dict with scores, action tier, and telemetry.
+              '''
+              import random
+              cfg = self.cfg
+
+              # --- Pre-inference stage ---
+              # Step 1: Squeezer transform (synchronous, fast)
+              # (Transforms are applied inside ensemble_score below)
+
+              # Step 2: Dispatch parallel inferences
+              fut_primary = self.executor.submit(self._primary_inference, x)
+              fut_squeezer = self.executor.submit(self._squeezer_inference, x)
+              fut_detector = self.executor.submit(self._detector_score, x)
+
+              # Step 3: Collect parallel results
+              primary_logits = fut_primary.result()
+              sq_score = fut_squeezer.result()
+              det_score = fut_detector.result()
+
+              # Step 4: Pre-inference squeezer decision
+              sq_normalised = torch.clamp(sq_score / 1.0, 0.0, 1.0)
+
+              # --- Post-inference stage ---
+              # Consistency check (sub-sampled for latency)
+              run_cc = random.random() < cfg.consistency_subsample_rate
+              if run_cc:
+                  cc_score = consistency_check_score(self.model, x, cfg.consistency_cfg)
+              else:
+                  cc_score = torch.zeros(x.size(0))
+
+              # Combined ensemble score
+              combined = (
+                  cfg.squeezer_weight * sq_normalised
+                  + cfg.consistency_weight * cc_score
+                  + cfg.detector_weight * det_score
+              )
+
+              # Action tier decision (per-sample)
+              actions = []
+              for score in combined.tolist():
+                  if score >= cfg.block_threshold:
+                      actions.append(ACTION_BLOCK)
+                  elif score >= cfg.flag_threshold:
+                      actions.append(ACTION_FLAG)
+                  elif score >= cfg.monitor_threshold:
+                      actions.append(ACTION_MONITOR)
+                  else:
+                      actions.append(ACTION_PASS)
+
+              return {
+                  'primary_logits': primary_logits,
+                  'squeezer_score': sq_score,
+                  'consistency_score': cc_score,
+                  'detector_score': det_score,
+                  'combined_score': combined,
+                  'actions': actions,
+                  'consistency_ran': run_cc,
+              }
+
+          def shutdown(self):
+              self.executor.shutdown(wait=False)
+
+
+      def demo() -> None:
+          try:
+              from fgsm_attack import ToyLinear, fgsm
+              from adversarial_detector_classifier import train_adversarial_detector
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x_nat = torch.rand(8, 1, 28, 28)
+          y = torch.randint(0, 10, (8,))
+          eps = 8.0 / 255.0
+          x_adv = fgsm(model, x_nat, y, epsilon=eps)
+
+          detector = train_adversarial_detector(model, x_nat, y, n_epochs=15)
+          cfg = Track7Config(block_threshold=0.55, flag_threshold=0.30,
+                             consistency_subsample_rate=1.0)
+          gw = Track7Gateway(model, cfg=cfg, adversarial_detector=detector)
+
+          print('Track 7 Gateway: Natural vs Adversarial')
+          print(f'{"Input":<12} {"sq_score":<12} {"cc_score":<12} {"det_score":<10} {"combined":<10} {"actions"}')
+          print('-' * 72)
+          for label, x_test in [('Natural', x_nat[:4]), ('FGSM', x_adv[:4])]:
+              result = gw.process(x_test)
+              sq = result['squeezer_score'].mean().item()
+              cc = result['consistency_score'].mean().item()
+              det = result['detector_score'].mean().item()
+              comb = result['combined_score'].mean().item()
+              from collections import Counter
+              action_counts = Counter(result['actions'])
+              print(f'{label:<12} {sq:<12.4f} {cc:<12.4f} {det:<10.4f} {comb:<10.4f} {dict(action_counts)}')
+
+          gw.shutdown()
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_2:
+    title: 'Pre-Inference Adversarial Filter'
+    filename: 'adversarial_filter.py'
+    description: 'Standalone pre-inference adversarial filter: applies the squeezer ensemble and returns a filter decision before the main model inference; enables early reject for high-confidence adversarial inputs'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Import from feature_squeezer.py, squeezer_ensemble.py.
+      Designed as a stateless callable that wraps any model with pre-inference adversarial filtering.
+    code: |
+      # adversarial_filter.py
+      # Section 10.13: Pre-Inference Adversarial Filter
+      # 20260525 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      from torch import Tensor
+      from dataclasses import dataclass
+      from typing import Tuple, Optional
+      from feature_squeezer import build_default_squeezers
+      from squeezer_ensemble import ensemble_score
+
+
+      @dataclass
+      class FilterConfig:
+          block_threshold: float = 0.50   # Reject input above this squeezer score
+          flag_threshold: float = 0.20    # Flag for post-inference review
+
+
+      class AdversarialFilter:
+          '''
+          Pre-inference adversarial filter.
+          Wraps a model: filter(x) -> (logits, filter_result).
+          If squeezer score >= block_threshold: returns None logits (blocked).
+          Otherwise: returns model(x) with filter score attached.
+          '''
+          def __init__(
+              self,
+              model: nn.Module,
+              cfg: FilterConfig = None,
+          ):
+              self.model = model
+              self.cfg = cfg or FilterConfig()
+              self.squeezers = build_default_squeezers()
+
+          def __call__(
+              self,
+              x: Tensor,
+          ) -> Tuple[Optional[Tensor], dict]:
+              '''
+              Returns (logits_or_none, filter_result_dict).
+              logits_or_none is None if blocked; otherwise model output.
+              '''
+              sq_score = ensemble_score(self.model, x, self.squeezers)
+              sq_max = sq_score.max().item()
+              sq_mean = sq_score.mean().item()
+
+              if sq_mean >= self.cfg.block_threshold:
+                  return None, {
+                      'decision': 'blocked',
+                      'squeezer_score_mean': sq_mean,
+                      'squeezer_score_max': sq_max,
+                  }
+
+              with torch.no_grad():
+                  logits = self.model(x)
+
+              decision = 'flagged' if sq_mean >= self.cfg.flag_threshold else 'passed'
+              return logits, {
+                  'decision': decision,
+                  'squeezer_score_mean': sq_mean,
+                  'squeezer_score_max': sq_max,
+              }
+
+
+      def demo() -> None:
+          try:
+              from fgsm_attack import ToyLinear, fgsm
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x = torch.rand(4, 1, 28, 28)
+          y = torch.randint(0, 10, (4,))
+          x_adv = fgsm(model, x, y, epsilon=8.0 / 255.0)
+
+          filt = AdversarialFilter(model, FilterConfig(block_threshold=0.20, flag_threshold=0.10))
+          for label, x_test in [('Natural', x), ('FGSM', x_adv)]:
+              logits, result = filt(x_test)
+              blocked = logits is None
+              print(f'{label}: decision={result["decision"]}, sq_score={result["squeezer_score_mean"]:.4f}, blocked={blocked}')
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_3:
+    title: 'Seven-Track Gateway Ensemble'
+    filename: 'seven_track_gateway_ensemble.py'
+    description: 'Full seven-track gateway integrating stub Tracks 1-6 (injection, jailbreak, query monitor) with the complete Track 7 adversarial detection; unified response policy across all tracks'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention. Requires: torch.
+      Tracks 1-5 and Track 6 are stub implementations (full implementations in Chapters 6/7/9).
+      This file demonstrates the integration pattern and unified response policy.
+    code: |
+      # seven_track_gateway_ensemble.py
+      # Section 10.13: Full Seven-Track Gateway Ensemble
+      # 20260525 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      from torch import Tensor
+      from dataclasses import dataclass, field
+      from typing import List, Optional
+      from gateway_track7 import Track7Gateway, Track7Config, ACTION_BLOCK, ACTION_FLAG
+
+
+      @dataclass
+      class TrackResult:
+          track_id: int
+          name: str
+          score: float
+          fired: bool
+          action: str
+
+
+      # --- Stub implementations for Tracks 1-6 ---
+      # Full implementations: Ch6 (Tracks 1-5), Ch9 (Track 6)
+
+      def stub_tracks_1_to_5(x: Tensor) -> List[TrackResult]:
+          '''Injection and jailbreak detection stubs (Chapters 6/7).'''
+          # In production: call the real injection/jailbreak classifiers
+          # Stub: simulate low-score benign result
+          return [
+              TrackResult(i, f'track_{i}_injection', score=0.05, fired=False, action='pass')
+              for i in range(1, 6)
+          ]
+
+
+      def stub_track_6(user_id: str, x: Tensor) -> TrackResult:
+          '''Query pattern monitor stub (Chapter 9).'''
+          return TrackResult(6, 'track_6_query_monitor', score=0.02, fired=False, action='pass')
+
+
+      class SevenTrackGateway:
+          '''
+          Full seven-track gateway.
+          Tracks 1-5: injection/jailbreak detection (Chapters 6/7).
+          Track 6: query pattern monitor (Chapter 9).
+          Track 7: adversarial example detection (Chapter 10).
+          '''
+          def __init__(
+              self,
+              model: nn.Module,
+              track7_cfg: Track7Config = None,
+              adversarial_detector=None,
+          ):
+              self.model = model
+              self.track7 = Track7Gateway(model, track7_cfg, adversarial_detector)
+
+          def process(
+              self,
+              x: Tensor,
+              user_id: str = 'anonymous',
+          ) -> dict:
+              # Tracks 1-5: injection / jailbreak
+              t1_5_results = stub_tracks_1_to_5(x)
+
+              # Track 6: query pattern
+              t6_result = stub_track_6(user_id, x)
+
+              # Track 7: adversarial detection (full implementation)
+              t7_result = self.track7.process(x)
+
+              # --- Unified response policy ---
+              all_actions = [r.action for r in t1_5_results]
+              all_actions.append(t6_result.action)
+              all_actions.extend(t7_result['actions'])
+
+              # Final action: most severe across all tracks
+              severity = {ACTION_BLOCK: 3, ACTION_FLAG: 2, 'monitor': 1, 'pass': 0}
+              final_action = max(all_actions, key=lambda a: severity.get(a, 0))
+
+              return {
+                  'tracks_1_to_5': t1_5_results,
+                  'track_6': t6_result,
+                  'track_7': t7_result,
+                  'final_action': final_action,
+                  'primary_logits': t7_result['primary_logits'],
+              }
+
+          def shutdown(self):
+              self.track7.shutdown()
+
+
+      def demo() -> None:
+          try:
+              from fgsm_attack import ToyLinear, fgsm
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x_nat = torch.rand(2, 1, 28, 28)
+          y = torch.randint(0, 10, (2,))
+          x_adv = fgsm(model, x_nat, y, epsilon=8.0 / 255.0)
+
+          gw = SevenTrackGateway(model)
+          for label, x_test in [('Natural', x_nat), ('FGSM', x_adv)]:
+              result = gw.process(x_test)
+              print(f'{label}: final_action={result["final_action"]}, '
+                    f'track7_combined={result["track_7"]["combined_score"].mean().item():.4f}')
+          gw.shutdown()
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_4:
+    title: 'Track 7 Latency Benchmark'
+    filename: 'track7_latency_benchmark.py'
+    description: 'Measures Track 7 contribution to total gateway P99 latency under production load; compares sequential vs parallel execution; produces recommendation for production configuration'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention. Requires: torch, time.
+      Import gateway_track7. Tests at multiple batch sizes and concurrency levels.
+    code: |
+      # track7_latency_benchmark.py
+      # Section 10.13: Track 7 Latency Benchmark
+      # 20260525 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import time
+      import statistics
+      from gateway_track7 import Track7Gateway, Track7Config
+
+
+      N_WARMUP = 3
+      N_RUNS = 10
+      BUDGET_MS = 50.0
+
+
+      def measure_gateway_latency(
+          gateway: Track7Gateway,
+          x: torch.Tensor,
+          n_runs: int = N_RUNS,
+          n_warmup: int = N_WARMUP,
+      ) -> dict:
+          for _ in range(n_warmup):
+              gateway.process(x)
+          times = []
+          for _ in range(n_runs):
+              t0 = time.perf_counter()
+              gateway.process(x)
+              times.append((time.perf_counter() - t0) * 1000.0)
+          return {
+              'mean_ms': statistics.mean(times),
+              'p50_ms': statistics.median(times),
+              'p99_ms': sorted(times)[int(len(times) * 0.99)] if len(times) > 1 else times[-1],
+              'max_ms': max(times),
+          }
+
+
+      def benchmark_across_configs(model, x_single):
+          configs = {
+              'Subsample=1.0 (all consistency checks)': Track7Config(consistency_subsample_rate=1.0),
+              'Subsample=0.5 (50% consistency)': Track7Config(consistency_subsample_rate=0.5),
+              'Subsample=0.1 (10% consistency)': Track7Config(consistency_subsample_rate=0.1),
+              'No consistency (squeezer + classifier only)': Track7Config(consistency_subsample_rate=0.0),
+          }
+
+          print(f'Track 7 Latency Benchmark (budget={BUDGET_MS}ms P99)')
+          print(f'{"Config":<46} {"mean_ms":<10} {"p99_ms":<10} {"budget?"}')
+          print('-' * 76)
+          for name, cfg in configs.items():
+              gw = Track7Gateway(model, cfg=cfg)
+              stats = measure_gateway_latency(gw, x_single)
+              within = 'YES' if stats['p99_ms'] <= BUDGET_MS else 'EXCEEDS'
+              print(f'{name:<46} {stats["mean_ms"]:<10.2f} {stats["p99_ms"]:<10.2f} {within}')
+              gw.shutdown()
+
+          print()
+          print('Recommendation: set consistency_subsample_rate based on QPS and latency budget.')
+          print('At low QPS: 1.0 (every request gets consistency check).')
+          print('At high QPS: 0.1-0.2 (sample; squeezer + classifier provide per-request coverage).')
+
+
+      if __name__ == '__main__':
+          try:
+              from fgsm_attack import ToyLinear
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              raise SystemExit
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x_single = torch.rand(1, 1, 28, 28)
+          benchmark_across_configs(model, x_single)
+
+  deliverable_5:
+    title: 'AML.T0043/T0015 Sigma Rule Generator'
+    filename: 'aml_t0043_t0015_sigma_rule_generator.py'
+    description: 'Generates completed Sigma rules for AML.T0043 (Craft Adversarial Data) and AML.T0015 (Evade ML Model) using Track 7 detection log fields; replaces Chapter 5 AML Sigma stubs'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention. No external dependencies.
+      Output: YAML-formatted Sigma rules (printed and/or saved to file).
+    code: |
+      # aml_t0043_t0015_sigma_rule_generator.py
+      # Section 10.13: AML.T0043 / AML.T0015 Sigma Rule Generator
+      # 20260525 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+      # Completes stubs introduced in Chapter 5 Section 5.8
+
+      from dataclasses import dataclass
+      from typing import List
+
+
+      @dataclass
+      class SigmaThresholds:
+          squeezer_block: float = 0.50
+          squeezer_flag: float = 0.20
+          consistency_block: float = 0.45
+          consistency_flag: float = 0.25
+          detector_block: float = 0.75
+          detector_flag: float = 0.55
+          ensemble_block: float = 0.55
+          ensemble_flag: float = 0.30
+
+
+      def generate_aml_t0043_rule(thresholds: SigmaThresholds) -> str:
+          return (
+              'title: Adversarial Data Crafting Detected via Track 7 Feature Squeezing\n'
+              'id: track7-aml-t0043-adversarial-data\n'
+              'status: production\n'
+              'description: |\n'
+              '  Detects adversarial example inputs via Track 7 feature squeezer ensemble disagreement.\n'
+              '  Completes AML.T0043 (Craft Adversarial Data) stub from Chapter 5 Section 5.8.\n'
+              '  High squeezer disagreement indicates the model prediction changes significantly\n'
+              '  when the input is transformed, consistent with adversarial perturbation.\n'
+              'references:\n'
+              '  - https://atlas.mitre.org/techniques/AML.T0043\n'
+              '  - https://github.com/ruwgxo/ai-security-mastery\n'
+              'author: Raghav Dinesh\n'
+              'date: 2026/01/10\n'
+              'tags:\n'
+              '  - attack.ml_attack_staging\n'
+              '  - atlas.aml.t0043\n'
+              'logsource:\n'
+              '  product: ai_gateway\n'
+              '  category: track7_detection\n'
+              'detection:\n'
+              '  squeezer_block:\n'
+              f'    track7.squeezer_score_mean|gte: {thresholds.squeezer_block}\n'
+              '  squeezer_flag:\n'
+              f'    track7.squeezer_score_mean|gte: {thresholds.squeezer_flag}\n'
+              f'    track7.squeezer_score_mean|lt: {thresholds.squeezer_block}\n'
+              '  condition: squeezer_block or squeezer_flag\n'
+              'falsepositives:\n'
+              '  - Natural inputs near classification decision boundaries\n'
+              '  - Heavily compressed or noisy sensor inputs\n'
+              '  - Calibrate thresholds using track7_calibration_harness.py\n'
+              'level: |\n'
+              '  high (squeezer_block condition)\n'
+              '  medium (squeezer_flag condition)\n'
+          )
+
+
+      def generate_aml_t0015_rule(thresholds: SigmaThresholds) -> str:
+          return (
+              'title: ML Model Evasion Detected via Track 7 Three-Primitive Ensemble\n'
+              'id: track7-aml-t0015-model-evasion\n'
+              'status: production\n'
+              'description: |\n'
+              '  Detects attempted ML model evasion via Track 7 combined ensemble score.\n'
+              '  Fires when squeezer disagreement, consistency check, or adversarial classifier\n'
+              '  signals indicate an adversarial input reached the deployed model.\n'
+              '  Completes AML.T0015 (Evade ML Model) stub from Chapter 5 Section 5.8.\n'
+              'references:\n'
+              '  - https://atlas.mitre.org/techniques/AML.T0015\n'
+              '  - https://github.com/ruwgxo/ai-security-mastery\n'
+              'author: Raghav Dinesh\n'
+              'date: 2026/01/10\n'
+              'tags:\n'
+              '  - attack.impact\n'
+              '  - atlas.aml.t0015\n'
+              'logsource:\n'
+              '  product: ai_gateway\n'
+              '  category: track7_detection\n'
+              'detection:\n'
+              '  high_squeezer:\n'
+              f'    track7.squeezer_score_mean|gte: {thresholds.squeezer_block}\n'
+              '  high_consistency:\n'
+              f'    track7.consistency_score|gte: {thresholds.consistency_block}\n'
+              '  high_detector:\n'
+              f'    track7.detector_score|gte: {thresholds.detector_block}\n'
+              '  flag_ensemble:\n'
+              f'    track7.combined_score|gte: {thresholds.ensemble_flag}\n'
+              '  condition: high_squeezer or high_consistency or high_detector or flag_ensemble\n'
+              'falsepositives:\n'
+              '  - Near-boundary natural inputs (verify with adversarial classifier score < 0.5)\n'
+              '  - Inputs from unusual natural domains not represented in calibration data\n'
+              'level: |\n'
+              '  high (any high_* condition)\n'
+              '  medium (flag_ensemble only)\n'
+          )
+
+
+      def save_sigma_rules(output_dir: str = '.') -> None:
+          import os
+          thresholds = SigmaThresholds()
+          for filename, rule_fn in [
+              ('sigma_aml_t0043_adversarial_data.yml', generate_aml_t0043_rule),
+              ('sigma_aml_t0015_model_evasion.yml', generate_aml_t0015_rule),
+          ]:
+              rule_text = rule_fn(thresholds)
+              path = os.path.join(output_dir, filename)
+              with open(path, 'w') as f:
+                  f.write(rule_text)
+              print(f'Saved: {path}')
+
+
+      if __name__ == '__main__':
+          thresholds = SigmaThresholds()
+          print('=== AML.T0043 Sigma Rule ===')
+          print(generate_aml_t0043_rule(thresholds))
+          print('=== AML.T0015 Sigma Rule ===')
+          print(generate_aml_t0015_rule(thresholds))
+          save_sigma_rules(output_dir='.')
+
+  deliverable_6:
+    title: 'Track 7 Deployment Checklist'
+    filename: 'track7_deployment_checklist.py'
+    description: '8-item pre-production checklist for Track 7 deployment; each item has a verification function; checklist output documents pass/fail status for each gate'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention. Requires: torch.
+      Each checklist item runs a verification function; items requiring manual review are documented.
+    code: |
+      # track7_deployment_checklist.py
+      # Section 10.13: Track 7 Deployment Checklist (8 items)
+      # 20260525 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      from dataclasses import dataclass
+      from typing import List, Callable, Optional
+
+
+      @dataclass
+      class ChecklistItem:
+          item_number: int
+          gate: str
+          verification: str
+          auto_verify: bool
+          result: Optional[str] = None  # 'PASS', 'FAIL', 'MANUAL_REQUIRED'
+
+
+      CHECKLIST: List[ChecklistItem] = [
+          ChecklistItem(1, 'Squeezer threshold calibrated on production-representative inputs',
+                        'Run track7_calibration_harness.py; FPR <= target on production input sample',
+                        auto_verify=False),
+          ChecklistItem(2, 'Consistency check sigma < epsilon/4 and N >= 20',
+                        'Verify ConsistencyConfig.sigma < adversarial_epsilon/4 and n_variants >= 20',
+                        auto_verify=True),
+          ChecklistItem(3, 'Adversarial detector trained on deployment-specific attack families',
+                        'Run cross_attack_generalisation_test; all held-out families > 50% detection',
+                        auto_verify=False),
+          ChecklistItem(4, 'Latency benchmark at production load passes 50ms P99',
+                        'Run track7_latency_benchmark.py at production QPS; P99 <= 50ms',
+                        auto_verify=False),
+          ChecklistItem(5, 'Adversarial test suite coverage verified',
+                        'All attack families meet documented detection rate targets',
+                        auto_verify=False),
+          ChecklistItem(6, 'Sigma rules validated on test adversarial examples',
+                        'Sigma rules fire on known adversarial; do not fire on natural calibration set',
+                        auto_verify=False),
+          ChecklistItem(7, 'False positive audit on production traffic (24-48 hours monitor-only)',
+                        'Monitor-only deployment; FPR on actual traffic <= target',
+                        auto_verify=False),
+          ChecklistItem(8, 'Circuit breaker configured: Track 7 exceptions fail open, not closed',
+                        'Unhandled Track 7 exception returns model output without blocking; alert fires',
+                        auto_verify=True),
+      ]
+
+
+      def auto_verify_item_2(consistency_sigma: float, n_variants: int,
+                              adversarial_epsilon: float) -> bool:
+          return consistency_sigma < (adversarial_epsilon / 4.0) and n_variants >= 20
+
+
+      def auto_verify_item_8(has_circuit_breaker: bool) -> bool:
+          return has_circuit_breaker
+
+
+      def run_checklist(
+          consistency_sigma: float = 0.02,
+          n_variants: int = 20,
+          adversarial_epsilon: float = 8.0 / 255.0,
+          has_circuit_breaker: bool = True,
+      ) -> None:
+          print('Track 7 Deployment Checklist')
+          print('=' * 60)
+          results = []
+          for item in CHECKLIST:
+              if item.item_number == 2:
+                  passed = auto_verify_item_2(consistency_sigma, n_variants, adversarial_epsilon)
+                  item.result = 'PASS' if passed else 'FAIL'
+              elif item.item_number == 8:
+                  passed = auto_verify_item_8(has_circuit_breaker)
+                  item.result = 'PASS' if passed else 'FAIL'
+              else:
+                  item.result = 'MANUAL_REQUIRED'
+              results.append(item)
+
+          for item in results:
+              status = item.result
+              icon = 'OK' if status == 'PASS' else ('--' if status == 'MANUAL_REQUIRED' else 'FAIL')
+              print(f'[{icon}] Item {item.item_number}: {item.gate}')
+              if status != 'PASS':
+                  print(f'       -> {item.verification}')
+
+          auto_passed = sum(1 for r in results if r.result == 'PASS')
+          manual_needed = sum(1 for r in results if r.result == 'MANUAL_REQUIRED')
+          failed = sum(1 for r in results if r.result == 'FAIL')
+          print()
+          print(f'Auto-verified PASS: {auto_passed}/8')
+          print(f'Manual verification required: {manual_needed}/8')
+          print(f'Auto-verified FAIL: {failed}/8')
+          if failed > 0:
+              print('ACTION REQUIRED: fix FAIL items before deploying Track 7 to production.')
+
+
+      if __name__ == '__main__':
+          run_checklist(
+              consistency_sigma=0.02,
+              n_variants=20,
+              adversarial_epsilon=8.0 / 255.0,
+              has_circuit_breaker=True,
+          )
+
+  deliverable_7:
+    title: 'Track 7 Adaptive Adversary Test'
+    filename: 'track7_adaptive_adversary_test.py'
+    description: 'Measures Track 7 detection rate against adversaries who know the Track 7 configuration (adaptive C&W against full ensemble) vs non-adaptive adversaries; quantifies ensemble resistance gap'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Import from gateway_track7, feature_squeezer, squeezer_ensemble.
+    code: |
+      # track7_adaptive_adversary_test.py
+      # Section 10.13: Track 7 Adaptive Adversary Test
+      # 20260525 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      from feature_squeezer import build_default_squeezers, gaussian_squeeze
+      from squeezer_ensemble import ensemble_score
+      from consistency_checker import ConsistencyConfig, consistency_check_score
+
+
+      def adaptive_cw_vs_ensemble(
+          model: nn.Module,
+          x: torch.Tensor,
+          y: torch.Tensor,
+          n_steps: int = 80,
+          lr: float = 5e-3,
+          c: float = 1.0,
+          kappa: float = 0.0,
+      ) -> torch.Tensor:
+          '''
+          Adaptive CW: optimises misclassification through the squeezer (ensemble-aware).
+          Uses gaussian squeezer as the representative pre-inference transformation.
+          Full ensemble adaptive attack would include all primitives; squeezer is primary.
+          '''
+          batch = x.size(0)
+          x_cl = x.clamp(1e-6, 1 - 1e-6)
+          w = torch.atanh(2.0 * x_cl - 1.0).detach().requires_grad_(True)
+          opt = torch.optim.Adam([w], lr=lr)
+
+          for _ in range(n_steps):
+              opt.zero_grad()
+              x_adv = 0.5 * (torch.tanh(w) + 1.0)
+              l2_sq = (x_adv - x).pow(2).view(batch, -1).sum(1)
+              # Adaptive: misclassify on squeezed input (squeezer-aware)
+              x_squeezed = gaussian_squeeze(x_adv, sigma=1.0)
+              logits = model(x_squeezed)
+              z_correct = logits.gather(1, y.view(-1, 1)).squeeze(1)
+              mask = torch.ones_like(logits, dtype=torch.bool)
+              mask.scatter_(1, y.view(-1, 1), False)
+              best_other = logits[mask].view(batch, -1).max(1).values
+              f_val = torch.clamp(z_correct - best_other, min=-kappa)
+              (l2_sq + c * f_val).sum().backward()
+              opt.step()
+
+          with torch.no_grad():
+              return (0.5 * (torch.tanh(w) + 1.0)).detach()
+
+
+      def evaluate_adaptive_gap(
+          model: nn.Module,
+          x: torch.Tensor,
+          y: torch.Tensor,
+          combined_threshold: float = 0.30,
+      ) -> None:
+          from fgsm_attack import fgsm
+          squeezers = build_default_squeezers()
+          cc_cfg = ConsistencyConfig(n_variants=10, sigma=0.02)
+          eps = 8.0 / 255.0
+
+          # Non-adaptive: FGSM (no squeezer knowledge)
+          x_nonadaptive = fgsm(model, x, y, epsilon=eps)
+
+          # Adaptive: CW through squeezer
+          x_adaptive = adaptive_cw_vs_ensemble(model, x, y, n_steps=60, lr=5e-3, c=1.0)
+
+          def ensemble_detect_rate(x_test):
+              sq = torch.clamp(ensemble_score(model, x_test, squeezers), 0, 1)
+              cc = consistency_check_score(model, x_test, cc_cfg)
+              combined = 0.35 * sq + 0.35 * cc
+              return (combined > combined_threshold).float().mean().item()
+
+          nat_fpr = ensemble_detect_rate(x)
+          na_detect = ensemble_detect_rate(x_nonadaptive)
+          ad_detect = ensemble_detect_rate(x_adaptive)
+
+          print('Track 7 Adaptive Adversary Test')
+          print(f'  Natural FPR (baseline):    {nat_fpr:.3f}')
+          print(f'  Non-adaptive detection:    {na_detect:.3f}  (FGSM, no squeezer knowledge)')
+          print(f'  Adaptive detection:        {ad_detect:.3f}  (C&W through squeezer)')
+          print(f'  Adaptive resistance gap:   {na_detect - ad_detect:.3f}')
+          print()
+          if (na_detect - ad_detect) > 0.30:
+              print('FLAG: adaptive adversary reduces detection by > 30 percentage points.')
+              print('Consider: add consistency check weight, change squeezer parameters,')
+              print('or add randomised smoothing (Section 10.14) for formal guarantee.')
+          else:
+              print('OK: ensemble resistance gap within acceptable range.')
+
+
+      if __name__ == '__main__':
+          try:
+              from fgsm_attack import ToyLinear
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              raise SystemExit
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x = torch.rand(8, 1, 28, 28)
+          y = torch.randint(0, 10, (8,))
+          evaluate_adaptive_gap(model, x, y, combined_threshold=0.25)
+
+  deliverable_8:
+    title: 'Track 7 Calibration Harness'
+    filename: 'track7_calibration_harness.py'
+    description: 'False positive calibration harness for Track 7 against natural edge-case inputs; measures FPR across multiple natural input categories and recommends threshold adjustments'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Import from gateway_track7, detection_ensemble_ch10.
+    code: |
+      # track7_calibration_harness.py
+      # Section 10.13: Track 7 False Positive Calibration Harness
+      # 20260525 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      from gateway_track7 import Track7Gateway, Track7Config
+      from detection_ensemble_ch10 import Track7Ensemble, EnsembleConfig, build_track7_ensemble
+
+
+      def generate_edge_case_inputs(batch_size: int = 32) -> dict:
+          '''
+          Generate natural edge-case input categories for FPR calibration.
+          In production: replace with actual production traffic samples.
+          '''
+          return {
+              'uniform_natural': torch.rand(batch_size, 1, 28, 28),
+              'low_contrast': torch.rand(batch_size, 1, 28, 28) * 0.2 + 0.4,
+              'high_noise': torch.clamp(torch.randn(batch_size, 1, 28, 28) * 0.3 + 0.5, 0, 1),
+              'near_zero': torch.rand(batch_size, 1, 28, 28) * 0.05,
+              'near_one': 1.0 - torch.rand(batch_size, 1, 28, 28) * 0.05,
+              'bimodal': (torch.rand(batch_size, 1, 28, 28) > 0.5).float(),
+          }
+
+
+      def run_calibration_harness(
+          ensemble: Track7Ensemble,
+          threshold: float,
+          target_fpr: float = 0.05,
+      ) -> dict:
+          '''
+          Run calibration harness across edge-case natural input categories.
+          Returns FPR per category and overall FPR.
+          '''
+          edge_cases = generate_edge_case_inputs()
+          results = {}
+          all_flags = []
+
+          for category, x_test in edge_cases.items():
+              flagged, scores = ensemble.detect(x_test, threshold=threshold)
+              fpr = flagged.float().mean().item()
+              results[category] = {
+                  'fpr': fpr,
+                  'mean_score': scores['combined_score'].mean().item(),
+                  'exceeds_target': fpr > target_fpr,
+              }
+              all_flags.extend(flagged.tolist())
+
+          overall_fpr = sum(all_flags) / len(all_flags)
+          results['overall'] = {'fpr': overall_fpr, 'exceeds_target': overall_fpr > target_fpr}
+          return results
+
+
+      def print_calibration_report(
+          results: dict,
+          threshold: float,
+          target_fpr: float = 0.05,
+      ) -> None:
+          print(f'Track 7 Calibration Harness (threshold={threshold:.4f}, target FPR={target_fpr})')
+          print(f'{"Category":<26} {"FPR":<8} {"Mean score":<14} {"Status"}')
+          print('-' * 58)
+          for category, r in results.items():
+              status = 'EXCEEDS TARGET' if r['exceeds_target'] else 'OK'
+              score_str = f'{r.get("mean_score", 0):.4f}' if 'mean_score' in r else 'N/A'
+              print(f'{category:<26} {r["fpr"]:<8.3f} {score_str:<14} {status}')
+
+          if results['overall']['exceeds_target']:
+              print()
+              print('ACTION: overall FPR exceeds target. Raise threshold or recalibrate squeezers.')
+              print('Run squeezer_latency_benchmark.py to verify latency budget after recalibration.')
+
+
+      if __name__ == '__main__':
+          try:
+              from fgsm_attack import ToyLinear
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              raise SystemExit
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x_natural = torch.rand(32, 1, 28, 28)
+          y = torch.randint(0, 10, (32,))
+
+          ensemble = build_track7_ensemble(model, x_natural, y, train_detector=True)
+          threshold = ensemble.calibrate(x_natural, target_fpr=0.05)
+          print(f'Calibrated threshold: {threshold:.4f}')
+
+          results = run_calibration_harness(ensemble, threshold, target_fpr=0.05)
+          print_calibration_report(results, threshold, target_fpr=0.05)
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Running squeezer model inferences sequentially before the primary model inference, tripling or quadrupling gateway latency'
+    why_it_happens: |
+      The pre-inference squeezer stage is described as running "before" the main model. Engineers
+      implement this as a loop: for each squeezer, transform and infer; then run main model.
+      Three squeezers = three additional sequential inferences before the primary.
+    consequence: |
+      With a 20ms primary model P99, sequential squeezer execution adds 60ms (3 squeezers x 20ms)
+      before the primary model runs. Total Track 7 latency: 80ms, well above the 50ms P99 budget.
+      Latency violations disable Track 7 in production within days of deployment.
+    correct_approach: |
+      Use ThreadPoolExecutor to dispatch all squeezer inferences and the primary inference
+      concurrently. The gateway_track7.py deliverable implements this with concurrent.futures.
+      Latency overhead is one squeezer_transform_time (~1-3ms) rather than N * model_inference.
+      Always verify parallel execution is actually happening in the benchmark, not accidentally
+      serialised by GIL or batch contention.
+
+  mistake_2:
+    description: 'Configuring consistency_subsample_rate=1.0 at high QPS without accounting for the N-variant batch cost at production load'
+    why_it_happens: |
+      The consistency check runs N=20 variants as a single batch (correct implementation from
+      Section 10.12). In single-request testing this is fast -- one batch forward pass. Under
+      production load with high concurrency, the N=20 batch competes for GPU memory with other
+      concurrent requests, causing OOM errors or queue saturation.
+    consequence: |
+      Under production load, consistency check inferences fail with OOM or timeout. The circuit
+      breaker fails open (correct behaviour per Item 8 of the checklist), but the consistency
+      check is effectively disabled for all requests under load. Track 7 runs with only two
+      of three primitives in production.
+    correct_approach: |
+      Set consistency_subsample_rate to a fraction appropriate for production QPS. At 1000 QPS
+      with GPU batch size limit of 128, sampling 5-10% of requests for consistency check
+      reduces the batch-competing load by 10-20x while still providing meaningful adversarial
+      detection coverage. Document the subsample rate in the deployment configuration and
+      acknowledge the per-request coverage reduction.
+
+  mistake_3:
+    description: 'Not verifying Sigma rule log fields are actually populated in the gateway telemetry before deploying to the SIEM'
+    why_it_happens: |
+      The Sigma rules reference fields like track7.squeezer_score_mean and track7.combined_score.
+      These fields must be present in the structured log events the gateway emits. Engineers
+      generate the Sigma rules without verifying the actual gateway log format.
+    consequence: |
+      The Sigma rules deploy to the SIEM but never fire because the referenced fields are absent
+      (or named differently) in the actual log events. AML.T0043/T0015 appear covered in the
+      compliance mapping but generate zero alerts. Adversarial inputs transit the system
+      undetected and unlogged despite Track 7 running and producing scores.
+    correct_approach: |
+      Before deploying the Sigma rule, emit a test adversarial example through the gateway and
+      verify the structured log entry contains all Sigma rule fields with correct types. Use the
+      Sigma rule validation step (Item 6 of the deployment checklist) to catch this. Maintain a
+      log schema document alongside the Sigma rules.
+
+  mistake_4:
+    description: 'Setting the block tier threshold based on benchmark datasets rather than production traffic, producing either excessive false positives or missed adversarial examples'
+    why_it_happens: |
+      The block tier threshold is set during development by running the calibration harness on
+      CIFAR-10 test images (or equivalent benchmark). Production traffic has a different
+      distribution -- potentially harder natural examples, different class distributions, and
+      domain-specific visual content that the benchmark does not represent.
+    consequence: |
+      If the benchmark has easy natural examples (all well-classified with high confidence),
+      the block threshold is set low. Production borderline inputs exceed the low threshold,
+      and Track 7 blocks legitimate production requests. Alternatively, if the benchmark is
+      harder than production, the threshold is set high and most adversarial examples are
+      flagged but not blocked, reducing the effectiveness of the block tier.
+    correct_approach: |
+      Deploy Track 7 in monitor-only mode (no blocks or flags, just logging) for 24-48 hours
+      on production traffic as specified in Item 7 of the deployment checklist. Set all
+      thresholds based on the actual production traffic distribution, not benchmark data.
+      This is the only way to calibrate for production-specific edge cases.
+
+  mistake_5:
+    description: 'Treating Track 7 as the primary defence against adversarial examples and deprioritising adversarial training (Section 10.15)'
+    why_it_happens: |
+      Track 7 is visible and produces alerts. Adversarial training is a training-time investment
+      with no direct operational visibility (the model does not announce "I was adversarially
+      trained"). Security teams allocate resources to Track 7 because it generates measurable
+      incident counts; adversarial training does not.
+    consequence: |
+      A model without adversarial training and with Track 7 detection has a single layer of
+      defence: Track 7 must catch every adversarial example because the model itself has no
+      robustness. When Track 7 misses a detection (adaptive adversary, novel attack, threshold
+      miss), the adversarial example causes misclassification with no upstream resistance.
+      The two-surface defence (adversarial training upstream + Track 7 runtime) is substantially
+      stronger than runtime detection alone.
+    correct_approach: |
+      Treat adversarial training (Section 10.15) and Track 7 as complementary surfaces:
+      adversarial training reduces the fraction of inputs for which adversarial examples exist
+      at a given epsilon; Track 7 catches the adversarial examples that survive into production.
+      Prioritise adversarial training for models in high-security deployments (safety filters,
+      malware classifiers, fraud detectors) and deploy Track 7 as the runtime detection layer
+      on top of adversarially trained models.
+
+section_summary:
+
+  compact: |
+    Track 7 is the production gateway''s only track with a pre-inference stage. Feature squeezer
+    transforms run before the main model inference; squeezer model inferences run in parallel with
+    the primary inference using async dispatch. Consistency checking and the adversarial classifier
+    run post-inference. The unified seven-track gateway routes all track signals to a four-tier
+    response policy (block/flag/monitor/pass). The AML.T0043/T0015 Sigma rules complete the
+    Chapter 5 stubs with Track 7 log fields (squeezer_score_mean, consistency_score, detector_score,
+    combined_score). The eight-item deployment checklist -- calibration, sigma verification, detector
+    training, latency benchmark, test suite coverage, Sigma validation, production FPR audit, circuit
+    breaker -- must all pass before Track 7 goes to production. The adaptive adversary test
+    quantifies how much detection rate an adaptive adversary who knows the ensemble configuration
+    can recover; the ensemble resistance gap greater than 30 percentage points signals reconfiguration
+    is needed.
+
+  key_takeaways:
+    - 'Track 7 is unique: squeezer transform runs synchronously pre-inference; squeezer model inferences run in parallel with primary model -- latency overhead is one transform time, not N inference times'
+    - 'Seven-track response policy: block (high confidence), flag (moderate, serve + alert), monitor (low, serve + telemetry), pass -- the consistency check subsample rate trades per-request coverage for latency'
+    - 'AML.T0043 Sigma rule: fires on squeezer_score_mean >= block_threshold; AML.T0015 fires on any primitive exceeding its threshold (OR condition)'
+    - 'Eight deployment checklist items are all mandatory: Item 7 (production traffic FPR audit) and Item 4 (latency benchmark at production load) are the two most commonly skipped'
+    - 'Adaptive adversary resistance gap > 30 percentage points signals the need for configuration change or addition of randomised smoothing (Section 10.14)'
+    - 'Track 7 and adversarial training (Section 10.15) are complementary surfaces: Train adversarially to reduce attack surface; deploy Track 7 to catch what survives'
+
+preview_section_10_14:
+  title: 'Section 10.14: Certified Robustness -- Randomised Smoothing and Formal Guarantees'
+  summary: |
+    Section 10.14 introduces the only defence in Chapter 10 with a formal, per-input robustness
+    guarantee: randomised smoothing (Cohen et al. 2019). The smoothed classifier replaces the
+    base classifier by returning the majority vote class across many Gaussian-perturbed copies of
+    the input. For an L2 perturbation of radius r, if the smoothed classifier returns class c with
+    probability above 0.5 + delta, the certificate guarantees that no L2-bounded perturbation
+    within radius r can change the output -- analogous to differential privacy''s formal bound in
+    Chapter 8. The section derives the certificate radius, implements the randomised_smoother.py
+    wrapper, and quantifies the accuracy-robustness tradeoff that makes certification impossible
+    at high accuracy on complex datasets. The certificate complements Track 7 detection rather
+    than replacing it: certified examples have a provable resistance bound; uncertified examples
+    still need Track 7 for runtime detection.
+
+metadata:
+  cross_chapter_references:
+    - 'Section 10.11: squeezer ensemble (pre-inference stage; imported in gateway_track7.py)'
+    - 'Section 10.12: consistency checker, adversarial classifier, detection_ensemble_ch10 (post-inference; imported)'
+    - 'Section 9.11: Track 6 production gateway (Track 7 joins; seven_track_gateway_ensemble.py extends this)'
+    - 'Chapter 5 Section 5.8: AML Sigma stubs (completed for AML.T0043/T0015 in aml_t0043_t0015_sigma_rule_generator.py)'
+    - 'Chapter 6 Section 6.17: production injection classifier (Tracks 1 in seven_track_gateway_ensemble.py)'
+  forward_references:
+    - 'Section 10.14: randomised smoothing (formal guarantee complementing Track 7 detection)'
+    - 'Section 10.15: adversarial training (upstream robustness; complementary surface to Track 7)'
+    - 'Section 10.16: chapter summary (Track 7 is referenced as the production input-side capstone)'
+  tags:
+    - track-7-gateway
+    - pre-inference-stage
+    - post-inference-stage
+    - async-parallel-dispatch
+    - seven-track-ensemble
+    - aml-t0043
+    - aml-t0015
+    - sigma-rule-completion
+    - deployment-checklist
+    - adaptive-adversary-test
+    - false-positive-calibration
+    - circuit-breaker
+    - response-policy

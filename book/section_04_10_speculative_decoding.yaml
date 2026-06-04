@@ -1,0 +1,980 @@
+# section_04_10_speculative_decoding.yaml
+
+---
+document_info:
+  section: "04_10"
+  title: "Speculative Decoding and Inference Optimization"
+  chapter: "04"
+  chapter_title: "Modern LLM Internals"
+  part: "Part I: Machine Learning Foundations"
+  book: "AI Security Mastery: From ML Fundamentals to Production Detection Systems"
+  version: "1.0.0"
+  author: "Raghav Dinesh"
+  github: "github.com/ruwgxo"
+  license: "MIT"
+  created: "2026-01-19"
+  estimated_pages: 6
+  tags:
+    - "speculative-decoding"
+    - "draft-model"
+    - "verification"
+    - "token-acceptance"
+    - "medusa"
+    - "jacobi-decoding"
+    - "inference-acceleration"
+    - "rejection-sampling"
+    - "security-implications"
+
+section_overview:
+
+  purpose: |
+    Speculative decoding is the most recent major inference optimization in production
+    LLM deployments. KV caching (Section 8) eliminated redundant recomputation across
+    generation steps. Flash Attention (Section 9) eliminated the N×N memory bottleneck
+    in prefill. Speculative decoding attacks the remaining bottleneck: even with both
+    optimizations, generating one token at a time is inherently sequential and slow
+    because each token depends on the previous token's output.
+
+    Speculative decoding breaks this sequential dependency by using a small "draft model"
+    to speculatively generate multiple tokens in parallel, then using the large "target
+    model" to verify them all in a single forward pass. The result: 2-4× throughput
+    improvement with mathematically guaranteed identical output distribution to
+    the original target model.
+
+    For security engineers the relevant question is: does speculative decoding change
+    the security properties of the system? The answer is nuanced and important.
+    The output distribution guarantee means the model's alignment and safety behaviors
+    are theoretically preserved. But the draft model is a new component in the system
+    with its own attack surface — and practical implementations have real deviations
+    from the theoretical guarantee that create exploitable gaps. This section makes
+    those gaps precise.
+
+  position_in_chapter: |
+    Section 10 of 17 content sections. Final section of the inference optimization
+    arc (Sections 8-10). After this section the complete inference stack is covered:
+    pre-training (Section 7) → KV cache (Section 8) → Flash Attention (Section 9)
+    → Speculative decoding (Section 10). The chapter then shifts to context windows
+    (Section 11), quantization (Section 12), and distillation (Section 13) before
+    the prompt engineering and system design sections (14-16).
+
+  prerequisites:
+    - "Section 04_08: KV cache — speculative decoding builds on cached generation"
+    - "Section 04_09: Flash Attention — prefill optimization used in verification step"
+    - "Chapter 1, Section 10: Gradient descent — contrast with rejection sampling"
+    - "Basic probability: conditional distributions, rejection sampling concept"
+
+  what_you_will_build:
+    primary: "Speculative decoding implementation — draft model + target model verification"
+    secondary:
+      - "Token acceptance rate analyzer: measure draft model quality"
+      - "Throughput benchmark: tokens/second with and without speculative decoding"
+      - "Draft model attack simulator: adversarial draft token injection"
+      - "Speculative decoding correctness verifier: output distribution comparison"
+    notebooks:
+      - "03-llm-internals/speculative_decoding.ipynb"
+      - "03-llm-internals/speculative_decoding_security.ipynb"
+
+# ============================================================================
+# CONTENT
+# ============================================================================
+
+content:
+
+  # --------------------------------------------------------------------------
+  # 1. THE REMAINING BOTTLENECK AFTER KV CACHE AND FLASH ATTENTION
+  # --------------------------------------------------------------------------
+
+  subsection_1:
+    title: "The Sequential Bottleneck: Why Token-by-Token Generation Is Slow"
+    pages: 1
+
+    after_all_optimizations: |
+      With KV cache and Flash Attention, the per-token generation cost is:
+        - Load KV cache from HBM: O(L × H_kv × seq_len × d_head) bytes
+        - Compute attention over cached KV: O(seq_len) operations per layer
+        - Compute FFN: O(d_model × d_ffn) operations per layer
+        - Sample next token from logits
+
+      This is fast per token. But it is inherently sequential: token n cannot
+      be generated until token n-1 is complete, because token n's input depends
+      on token n-1's output. There is no obvious way to parallelize across
+      generation steps.
+
+      For a model generating 200 tokens from a 1000-token prompt:
+        200 sequential forward passes, each loading the full model weights
+        from HBM, processing them, and producing one token.
+
+      The memory bandwidth bottleneck (Section 8) means each forward pass is
+      limited by how fast we can read model weights and KV cache from HBM.
+      On an A100: ~2 TB/s bandwidth. For Llama-2 7B (7B parameters, FP16 = 14 GB):
+        Each decode step reads at least 14 GB of model weights
+        Minimum time per step: 14 GB / 2000 GB/s = 7ms
+        Maximum throughput: 1 / 0.007 = ~143 tokens/second (theoretical)
+
+      Measured: Llama-2 7B achieves ~50-80 tokens/second in practice —
+      well below the compute peak because the model is not the only memory read.
+
+    the_key_observation: |
+      The target model (large, slow, high quality) and a draft model (small, fast,
+      lower quality) have a crucial relationship: for most tokens in typical text,
+      the small model predicts the same token as the large model would.
+
+      Typical text has high predictability: common words, function words, and
+      predictable continuations make up the majority of tokens. For these, a
+      much smaller model (1/10 the size) produces the same prediction.
+
+      Speculative decoding exploits this: let the small draft model quickly
+      generate K candidate tokens, then verify all K with the large model in
+      a single batched forward pass. If the draft tokens are correct, we accept
+      them all. If some are wrong, we reject from the first error and continue.
+
+      The target model runs K times less often if the draft model is accurate.
+      Throughput improvement ≈ average accepted tokens per verification step.
+
+    formal_efficiency_gain: |
+      Let α = average acceptance rate (probability a draft token is accepted)
+      Let K = number of draft tokens generated per speculation step
+      Let T_draft = time for K draft model steps
+      Let T_target = time for 1 target model verification (processes K+1 tokens)
+
+      Without speculative decoding: time per token = T_target / 1
+      With speculative decoding: time per token ≈ (T_draft + T_target) / (αK + 1)
+
+      For αK >> 1 (high acceptance rate with many draft tokens):
+        Speedup ≈ T_target / (T_draft/K + T_target/(αK))
+               ≈ T_target × αK / T_target   (when T_draft << T_target)
+               = αK
+
+      Practical numbers (Llama-2 70B target, Llama-2 7B draft):
+        K = 4 draft tokens per step
+        α ≈ 0.7-0.8 (70-80% acceptance rate on typical text)
+        T_draft ≈ 0.1 × T_target (7B is ~10× faster than 70B)
+        Effective speedup: ~2-3× throughput on typical text
+
+  # --------------------------------------------------------------------------
+  # 2. SPECULATIVE DECODING ALGORITHM
+  # --------------------------------------------------------------------------
+
+  subsection_2:
+    title: "Speculative Decoding: Draft, Verify, Accept or Reject"
+    pages: 1
+
+    algorithm_overview: |
+      Speculative decoding (Leviathan et al. 2023, Chen et al. 2023) uses
+      rejection sampling to guarantee that the output distribution exactly matches
+      the target model's distribution — even when some draft tokens are rejected.
+
+      The algorithm:
+        1. Draft phase: use small draft model M_q to autoregressively generate
+           K draft tokens x_1, ..., x_K from current context x_0
+           M_q produces draft probabilities: q(x_1|x_0), q(x_2|x_0,x_1), ...
+
+        2. Verification phase: run large target model M_p on
+           [x_0, x_1, ..., x_K] in a single forward pass
+           M_p produces verification probabilities: p(x_1|x_0), p(x_2|x_0,x_1), ...
+
+        3. Accept/reject each draft token using rejection sampling:
+           For i = 1 to K:
+             Draw u ~ Uniform(0, 1)
+             If u < p(x_i|...) / q(x_i|...): accept x_i, continue
+             Else: reject x_i, sample new token from corrected distribution, stop
+
+        4. If all K accepted: sample K+1 token from M_p(·|x_0,...,x_K) using
+           one additional logit from the verification pass
+
+    rejection_sampling_guarantee: |
+      The critical property: the rejection sampling step guarantees that accepted
+      tokens follow exactly the target model's distribution p(x).
+
+      Proof sketch:
+        P(accepted token = x) = Σ_x q(x) × min(1, p(x)/q(x))
+                               = min(q(x), p(x))
+
+        When q(x) < p(x): accept with probability 1 (target wants this token more)
+        When q(x) > p(x): accept with probability p(x)/q(x) (reject excess draft probability)
+
+        Rejected drafts: sample from the "residual" distribution
+          p_residual(x) ∝ max(0, p(x) - q(x))
+
+        This produces exactly p(x) in expectation. The output distribution of
+        speculative decoding is provably identical to the target model's distribution.
+
+    acceptance_rate_determinants: |
+      The acceptance rate α depends on how well the draft model approximates the target:
+
+        α(x) = Σ_x min(q(x|context), p(x|context))
+              = 1 - (1/2) × Σ_x |p(x|context) - q(x|context)|   (total variation distance)
+
+      High acceptance rate: draft model closely approximates target → TV distance is small
+      Low acceptance rate: draft model diverges from target → frequent rejections
+
+      Factors that reduce acceptance rate:
+        - Different training data distributions between draft and target
+        - Different alignment training (RLHF) — large targets are more aligned than small drafts
+        - Out-of-distribution prompts for which draft model performs poorly
+        - Adversarial inputs specifically designed to maximize draft-target divergence
+
+    what_happens_on_rejection: |
+      When draft token x_i is rejected:
+        1. All subsequent draft tokens x_{i+1}, ..., x_K are discarded
+        2. The corrected distribution p_residual is sampled for position i
+        3. Generation continues from position i with new context
+
+      The verification forward pass is not wasted: M_p computed logits for all K+1
+      positions. The logit for position i (the rejected token's position) is used to
+      sample the corrected token. No extra computation needed for the correction.
+
+      Worst case: K=4 draft tokens, first draft is rejected → 3 draft tokens wasted.
+      Expected tokens per speculation cycle with α=0.7, K=4:
+        E[accepted] = 1 + α + α² + α³ + α⁴ = (1 - 0.7⁵)/(1 - 0.7) ≈ 2.6 tokens
+      Still a 2.6× improvement over 1 token per full target model forward pass.
+
+  # --------------------------------------------------------------------------
+  # 3. DRAFT MODEL SELECTION AND ARCHITECTURE
+  # --------------------------------------------------------------------------
+
+  subsection_3:
+    title: "Draft Model Design: Speed, Accuracy, and the Security Surface"
+    pages: 1
+
+    draft_model_requirements: |
+      The draft model must satisfy two competing requirements:
+
+      Speed: draft model must be fast enough that K draft steps cost less than
+      one target model step. Rule of thumb: draft model should be 5-10× smaller
+      than target model to achieve net speedup after accounting for verification.
+
+        For Llama-2 70B target: draft model should be ≤ 14B parameters
+        For GPT-4 scale (~175-1800B): draft model could be up to ~180B
+
+      Quality: draft model acceptance rate α must be high enough for net speedup.
+      If α = 0.3 (30%), expected accepted tokens per cycle = 1.3 — barely better
+      than direct target model decoding. Practical implementations target α ≥ 0.7.
+
+      Common draft model configurations:
+        Target: Llama-2 70B  → Draft: Llama-2 7B (same training, 10× smaller)
+        Target: GPT-4        → Draft: GPT-3.5-turbo (same family, cheaper model)
+        Target: Claude Opus  → Draft: Claude Haiku (same family, fastest tier)
+        Target: Custom model → Draft: Distilled version of target (Section 13)
+
+    same_family_requirement: |
+      Acceptance rate is highest when draft and target are from the same model family,
+      trained on the same data with the same tokenizer. Key reasons:
+
+        - Same tokenizer: draft and target produce comparable probability distributions
+          over the same vocabulary
+        - Same training data distribution: similar priors over text
+        - Same alignment training: similar safety behaviors → safety tokens accepted
+
+      Mismatched families (e.g., GPT-2 draft for Llama-2 target) have low acceptance
+      rates due to different tokenizers, training distributions, and capability levels.
+
+    draft_model_security_surface: |
+      The draft model is an independent model component in the inference pipeline.
+      It is smaller, potentially less well-tested, and may have different security
+      properties than the target model.
+
+      Alignment asymmetry:
+        Large target models receive extensive RLHF and safety testing.
+        Small draft models often receive less rigorous alignment training.
+        A smaller/less-aligned draft model may generate harmful draft tokens at
+        higher rates than the target model would spontaneously generate.
+
+        However: the target model's verification step rejects these harmful drafts
+        if p(harmful_token) < q(harmful_token) — the target is less likely to
+        produce harmful tokens than the unaligned draft.
+
+        The theoretical guarantee holds: output distribution matches target model.
+        But in practice: if the target model has residual harmful capability
+        (even after alignment), the draft model's overconfidence in harmful tokens
+        may systematically probe and expose this residual capability.
+
+      Draft model quality as inference attack surface:
+        A compromised draft model (poisoned during training) could be designed to:
+        1. Generate high-probability harmful tokens in the draft phase
+        2. These tokens are accepted when target model assigns non-negligible probability
+        3. Harmful content appears in output more frequently than target model alone would produce
+
+        This is a supply chain attack targeting the draft model specifically.
+        Verification: does the target model verify the draft's safety? Only weakly —
+        verification checks if the target assigns non-negligible probability,
+        not if the content is safe.
+
+    medusa_architecture:
+      description: |
+        Medusa (Cai et al. 2024) is an alternative to a separate draft model.
+        Multiple prediction heads are attached to the target model itself, each
+        predicting tokens at future positions.
+
+        Architecture:
+          Target model: produces hidden state h for current token
+          Head 1: linear projection of h → predicts token at position +1
+          Head 2: linear projection of h → predicts token at position +2
+          Head K: linear projection of h → predicts token at position +K
+
+        No separate draft model required. K prediction heads add ~K × d_model × vocab
+        parameters — minimal overhead (~1% of model size for K=4).
+
+      acceptance_mechanism: |
+        Unlike standard speculative decoding, Medusa uses a tree-based attention
+        structure to verify multiple candidate continuations simultaneously:
+
+        The K heads each predict the top-C candidates for each position.
+        This creates a tree of C^K possible continuations.
+        Target model verifies all paths in the tree in a single forward pass.
+        Best accepted path is selected.
+
+      security_note: |
+        Medusa's heads are fine-tuned on top of the frozen target model.
+        The fine-tuning data for Medusa heads must be treated as part of the
+        target model's security perimeter — poisoned fine-tuning data for Medusa
+        heads can influence which continuations the model is "optimistic" about,
+        affecting both speed and output distribution.
+
+    lookahead_decoding:
+      description: |
+        Lookahead decoding (Fu et al. 2023) uses Jacobi iteration to generate
+        draft tokens. Instead of a separate model, it uses parallel fixed-point
+        iteration on the target model itself.
+
+        Observation: autoregressive generation is solving
+          x_t = argmax P(x | x_{<t}) for all t simultaneously.
+        This is a fixed-point equation. Jacobi iteration finds fixed points
+        iteratively by updating all positions simultaneously from a current guess.
+
+      mechanism: |
+        1. Initialize: guess tokens for positions n, n+1, ..., n+K-1
+        2. Run target model on full sequence including guesses
+        3. Check: do the model's predictions at each position match the guesses?
+        4. Accept consistent positions, update inconsistent ones
+        5. Repeat until all K positions are consistent (fixed point reached)
+
+      advantage: "No draft model required — single model, no alignment asymmetry"
+      disadvantage: "Typically lower acceptance rate than separate draft model of same family"
+
+  # --------------------------------------------------------------------------
+  # 4. SECURITY ANALYSIS: DOES SPECULATIVE DECODING CHANGE SAFETY PROPERTIES?
+  # --------------------------------------------------------------------------
+
+  subsection_4:
+    title: "Security Analysis: Theoretical Guarantee vs Practical Reality"
+    pages: 1
+
+    the_theoretical_guarantee: |
+      Speculative decoding's mathematical guarantee: output tokens are drawn from
+      exactly the target model's distribution p(x | context).
+
+      This means: if the target model would refuse a harmful request, speculative
+      decoding also refuses — because the refusal tokens have high p(refusal | context)
+      and will be accepted when the draft model correctly predicts them, and the
+      target model will always produce refusal tokens from the corrected distribution
+      if draft harmful tokens are rejected.
+
+      In theory: speculative decoding preserves all safety properties of the target model.
+      The output distribution is identical. Any behavior the target model exhibits,
+      speculative decoding exhibits with the same probability.
+
+    where_the_guarantee_breaks_down: |
+      The theoretical guarantee has practical limitations that create exploitable gaps:
+
+      floating_point_non_determinism: |
+        The rejection sampling step computes p(x)/q(x). Both p and q are floating-point
+        numbers computed on GPU hardware. Non-deterministic GPU operations (common in
+        production for performance) mean the same logical computation may produce slightly
+        different floating-point values across runs.
+
+        When p(x) ≈ q(x) (draft token is borderline), the accept/reject decision is
+        determined by a thin floating-point margin. Non-determinism at this boundary
+        creates behavioral differences between speculative and direct decoding even
+        for the same random seed.
+
+        Security implication: borderline harmful tokens (p ≈ q near the accept/reject
+        threshold) may be accepted in speculative decoding but not in direct decoding,
+        or vice versa. Safety evaluation on direct decoding does not guarantee
+        identical behavior in speculative decoding deployment.
+
+      temperature_and_sampling_interaction: |
+        Speculative decoding's guarantee holds exactly when both draft and target use
+        the same temperature and sampling configuration. In practice:
+
+        Implementations often apply temperature to the target model's verification
+        logits differently from how temperature is applied during draft generation.
+        If draft uses greedy (temperature=0) but target uses temperature=0.7,
+        the rejection sampling math breaks down — the distributions being compared
+        are not the distributions that would produce the output token.
+
+        This is a common implementation error that causes behavioral drift:
+        the output is not drawn from p(x) but from some mixed distribution
+        that is harder to characterize for safety analysis.
+
+      draft_model_as_distribution_probing_tool: |
+        Even though the output distribution matches the target model, the draft model
+        probes the target model's distribution at each step. An adversary who can
+        observe which draft tokens are accepted vs rejected learns information about
+        the target model's probability distribution.
+
+        Specifically: if a draft token x is accepted, p(x|context) ≥ q(x|context).
+        If rejected: p(x|context) < q(x|context).
+        Observing enough accept/reject decisions allows reconstructing p(·|context)
+        with higher precision than just observing output tokens.
+
+        This is a model extraction side channel unique to speculative decoding:
+        accept/reject signals reveal probability ratios that output-only observation
+        cannot provide.
+
+      prefix_caching_interaction: |
+        When prefix caching (Section 8) is combined with speculative decoding,
+        the draft model and target model must both use the same cached KV state
+        for consistency. Implementations that cache target model KV but not draft
+        model KV will have the draft model recomputing context that the target
+        has cached — creating a time inconsistency where the draft and target
+        are reasoning from different effective context representations.
+
+        In long-context deployments with both prefix caching and speculative decoding,
+        context synchronization bugs between draft and target are a potential source
+        of behavioral inconsistency.
+
+  # --------------------------------------------------------------------------
+  # 5. VARIANTS AND PRODUCTION DEPLOYMENTS
+  # --------------------------------------------------------------------------
+
+  subsection_5:
+    title: "Production Speculative Decoding: Variants and Real Deployments"
+    pages: 1
+
+    self_speculative_decoding: |
+      A variant that uses the same model for both draft and verification, but with
+      different layer depths.
+
+      Mechanism:
+        Draft phase: run only the first L_draft layers of the model (e.g., first 16
+        of 80 layers for Llama-2 70B). Use the early-exit representation to predict
+        tokens with a draft head.
+        Verification phase: run all L layers of the model to verify.
+
+      Properties:
+        - No separate model: single model binary, no distribution mismatch
+        - Cache-friendly: draft uses the same KV cache as target
+        - Lower acceptance rate than separate smaller model (shallow layers
+          are less capable than a full small model)
+
+      Security note: using a subset of the model's layers as a draft means
+      the draft has the same training data and alignment as the target —
+      eliminating the alignment asymmetry risk. The draft is less capable but
+      not less aligned.
+
+    online_speculative_decoding: |
+      The fixed draft model assumption breaks down when the target model is updated
+      (fine-tuned, RLHF-refined) but the draft model is not. Acceptance rate drops
+      as target distribution shifts away from draft distribution.
+
+      Online speculative decoding continuously updates the draft model to track
+      the target model's distribution. The draft model is fine-tuned on recent
+      outputs from the target model — it learns to approximate the updated target.
+
+      Security implication: if the target model is fine-tuned to be safer (more RLHF),
+      but the draft model is not updated, the draft model will be less aligned than
+      the target. The rejection sampling will reject harmful draft tokens (target is
+      safer than draft), but at a lower acceptance rate — degrading throughput.
+
+      Conversely: if the target model is fine-tuned to be more capable for a specific
+      domain (enterprise customization), the draft model should be updated to match —
+      otherwise throughput degrades for the customized capability.
+
+    production_deployments:
+
+      openai_gpt4:
+        evidence: "OpenAI has referenced using a smaller model for draft in GPT-4 inference"
+        draft_candidate: "GPT-3.5-turbo (speculative, not confirmed)"
+        impact: "Reduced latency for common generations; GPT-4 response times inconsistent with naive 70B+ inference"
+
+      anthropic_claude:
+        evidence: "Claude's tiered model family (Haiku, Sonnet, Opus) is well-suited for speculative decoding"
+        draft_candidate: "Claude Haiku drafting for Claude Opus (speculative, not confirmed)"
+        note: "Prompt caching + speculative decoding is the likely production stack for long-context efficiency"
+
+      open_source:
+        huggingface_tgi: "Text Generation Inference supports speculative decoding with configurable draft model"
+        vllm: "vLLM supports speculative decoding — draft model specified in server config"
+        ollama: "Recent versions support speculative decoding for supported model families"
+
+    throughput_vs_latency_tradeoff: |
+      Speculative decoding improves throughput (tokens per second) but can
+      INCREASE latency for the first token. Reasons:
+
+        Time to first token (TTFT): depends on prefill time — not affected by speculative decoding
+        Time between tokens (TPOT): improved by 2-4× with speculative decoding
+
+        For latency-sensitive applications: speculative decoding may not help
+        if the bottleneck is TTFT (large prompt) rather than TPOT (generation speed).
+
+      Security implication: latency measurements are more useful for system
+      characterization with speculative decoding. TTFT reveals prompt processing
+      time (relates to prompt length and model complexity). TPOT reveals generation
+      rate (indicates whether speculative decoding is active and acceptance rate).
+
+  # --------------------------------------------------------------------------
+  # 6. ADVERSARIAL EXPLOITATION OF SPECULATIVE DECODING
+  # --------------------------------------------------------------------------
+
+  subsection_6:
+    title: "Adversarial Attacks on Speculative Decoding Infrastructure"
+    pages: 1
+
+    draft_model_targeting: |
+      The draft model is the most accessible attack surface in speculative decoding.
+      It is smaller, often less carefully audited, and may be distributed separately
+      from the target model (especially in open-source deployments where users
+      select their own draft model).
+
+      Attack scenario 1 — poisoned draft model:
+        1. Attacker publishes a "compatible draft model" for a popular target model
+        2. Draft model is poisoned to generate tokens that are just above the
+           acceptance threshold for harmful content in the target model
+        3. Users who adopt the poisoned draft model see increased harmful output
+           rates that are subtle enough to evade automated detection
+        4. Because output distribution "approximately matches" target, the violation
+           is hard to prove without statistical analysis
+
+        Defense: verify that published draft models were trained by the same
+        organization as the target model, or derive draft models from target
+        via distillation rather than independent training.
+
+    acceptance_rate_as_attack_surface: |
+      An adversary who can measure accept/reject rates can exploit speculative decoding
+      infrastructure in two ways:
+
+      throughput_degradation:
+        attack: |
+          Craft inputs that minimize the draft model's acceptance rate.
+          If acceptance rate drops from 0.7 to 0.1, effective throughput drops
+          by ~5× (below direct target model decoding speed in some configurations).
+          The attack: find prompts where draft and target disagree most often.
+        implementation: |
+          Use the accept/reject signal (observable via timing if not directly exposed)
+          to search for high-rejection prompts via black-box optimization.
+          Each request that measures time-per-token reveals acceptance rate information.
+        impact: |
+          Targeted DoS: certain prompt types cause severe throughput degradation
+          without triggering content filters (the inputs are not necessarily harmful).
+
+      distribution_extraction:
+        attack: |
+          Use accept/reject signals to reconstruct target model probability distribution.
+          Standard model extraction requires observing only output tokens.
+          With speculative decoding, the draft model (often publicly known) produces
+          q(x), and accept/reject reveals whether p(x) ≥ q(x) or p(x) < q(x).
+          This is a richer signal than output token observation alone.
+        information_gain: |
+          Per observation: one bit of information (accept/reject)
+          For K=4 draft tokens per step: 4 bits per API call
+          Standard extraction: only the sampled token (log2(vocab_size) ≈ 16 bits but uncertain)
+          Effective information: accept/reject gives a ratio comparison, highly informative
+          about the exact probability mass the target assigns to each token
+
+    timing_side_channels_specific_to_speculative_decoding: |
+      Speculative decoding creates two distinct timing profiles:
+
+        High acceptance step: draft tokens mostly accepted → fast generation
+        (minimal verification overhead, few rejected tokens to resample)
+
+        Low acceptance step: many draft tokens rejected → slow generation
+        (each rejection requires sampling from corrected distribution, added latency)
+
+      Measuring time per generated token reveals whether the current step had
+      high or low acceptance rate — which reveals whether the current context is
+      "in distribution" for the draft model or not.
+
+      Information leakage:
+        An attacker who measures response timing at the token level can infer:
+        - Whether the prompt is in-distribution for the draft model
+        - The approximate acceptance rate for the target model on this context
+        - Whether a safety-relevant prefix (like a jailbreak attempt) causes
+          the draft model to disagree with the target model (low acceptance = safety behavior)
+
+      The timing oracle reveals structural information about where target and draft
+      disagree — precisely the regions of probability space where safety training
+      has diverged most from the draft model's pretraining distribution.
+
+    correctness_testing_for_speculative_systems: |
+      A production security audit for speculative decoding systems should verify:
+
+        1. Output distribution equivalence:
+           Generate 1000 responses with and without speculative decoding
+           for the same prompts and random seeds.
+           Distribution should match within statistical noise.
+           Flag: if safety-relevant prompts show systematically different
+           refusal rates between speculative and direct decoding.
+
+        2. Temperature consistency:
+           Verify that temperature is applied consistently to draft and target
+           in the accept/reject computation.
+
+        3. Draft model provenance:
+           Confirm draft model was trained by the same organization as target,
+           or derived from target via distillation with auditable training data.
+
+        4. Acceptance rate monitoring:
+           Log average acceptance rates by prompt category.
+           Anomalously low acceptance rates indicate adversarial inputs or
+           draft/target distribution drift.
+
+        5. Version synchronization:
+           After any target model update, verify that draft model acceptance rate
+           remains acceptable before re-enabling speculative decoding in production.
+
+# ============================================================================
+# IMPLEMENTATION
+# ============================================================================
+
+implementation:
+  title: "Speculative Decoding Implementation and Security Testing"
+  notebooks:
+    - "03-llm-internals/speculative_decoding.ipynb"
+    - "03-llm-internals/speculative_decoding_security.ipynb"
+
+  speculative_decoding_implementation:
+    description: |
+      Implement speculative decoding using GPT-2 XL (1.5B) as target and
+      GPT-2 small (124M) as draft. Both use the same tokenizer and training
+      distribution — ideal conditions for high acceptance rate.
+    code_sketch: |
+      def speculative_decode(
+          target_model, draft_model, prompt_tokens,
+          max_new_tokens=100, K=4, temperature=1.0
+      ):
+          """
+          Speculative decoding with rejection sampling.
+          Returns token sequence identical in distribution to target_model.generate().
+          """
+          # Initialize KV caches for both models
+          target_cache = KVCache(target_model.config)
+          draft_cache = KVCache(draft_model.config)
+
+          # Prefill both models on prompt
+          tokens = prompt_tokens.clone()
+          with torch.no_grad():
+              _ = target_model.forward_cached(tokens, target_cache)
+              _ = draft_model.forward_cached(tokens, draft_cache)
+
+          generated = []
+
+          while len(generated) < max_new_tokens:
+              # === DRAFT PHASE: generate K tokens with draft model ===
+              draft_tokens = []
+              draft_probs = []
+              draft_tokens_start = len(tokens) + len(generated)
+
+              for k in range(K):
+                  ctx = tokens[-1:] if k == 0 else torch.tensor([[draft_tokens[-1]]])
+                  logits = draft_model.forward_cached(ctx, draft_cache)[:, -1, :]
+                  probs = F.softmax(logits / temperature, dim=-1)
+                  next_tok = torch.multinomial(probs, 1)
+                  draft_tokens.append(next_tok.item())
+                  draft_probs.append(probs[0, next_tok.item()].item())
+
+              # === VERIFICATION PHASE: target model scores all K+1 positions ===
+              # Build full sequence including draft tokens
+              draft_seq = torch.tensor([draft_tokens])
+              # Run target on draft tokens (uses cached prefix for efficiency)
+              target_logits_all = []
+              verify_cache = target_cache.clone()  # snapshot current cache
+              for k in range(K):
+                  ctx = torch.tensor([[draft_tokens[k]]])
+                  logits = target_model.forward_cached(ctx, verify_cache)[:, -1, :]
+                  target_logits_all.append(logits)
+
+              # === ACCEPT/REJECT PHASE ===
+              accepted = []
+              for k in range(K):
+                  target_probs = F.softmax(target_logits_all[k] / temperature, dim=-1)
+                  p_xi = target_probs[0, draft_tokens[k]].item()
+                  q_xi = draft_probs[k]
+
+                  u = random.random()
+                  if u < p_xi / q_xi:
+                      # Accept draft token
+                      accepted.append(draft_tokens[k])
+                      # Advance target cache with this accepted token
+                      target_cache.advance_with(draft_tokens[k])
+                  else:
+                      # Reject — sample from corrected distribution
+                      residual = torch.clamp(target_probs - torch.tensor(q_xi), min=0)
+                      if residual.sum() > 0:
+                          residual = residual / residual.sum()
+                          corrected = torch.multinomial(residual, 1).item()
+                      else:
+                          corrected = torch.multinomial(target_probs, 1).item()
+                      accepted.append(corrected)
+                      # Reset draft cache to match accepted sequence
+                      draft_cache = rebuild_draft_cache(draft_model, tokens, accepted)
+                      break
+              else:
+                  # All K accepted — sample K+1 from target
+                  bonus_probs = F.softmax(target_logits_all[-1] / temperature, dim=-1)
+                  bonus = torch.multinomial(bonus_probs, 1).item()
+                  accepted.append(bonus)
+
+              generated.extend(accepted)
+              if any(t == EOT_TOKEN for t in accepted):
+                  break
+
+          return generated
+
+  acceptance_rate_analyzer:
+    description: |
+      Measure acceptance rate across different prompt categories to understand
+      where draft model works well vs poorly.
+    categories:
+      - "Common English text (expected: α ≈ 0.80)"
+      - "Technical content — code (expected: α ≈ 0.75)"
+      - "Safety-relevant prompts (expected: α ≈ 0.50 — draft less aligned)"
+      - "Adversarial prompts (expected: α ≈ 0.30 — out-of-distribution)"
+    code_sketch: |
+      def measure_acceptance_rate(target, draft, prompts, K=4, n_trials=100):
+          total_accepted = 0
+          total_proposed = 0
+          for prompt in prompts:
+              for _ in range(n_trials // len(prompts)):
+                  accepted_count, proposed_count = run_one_step(target, draft, prompt, K)
+                  total_accepted += accepted_count
+                  total_proposed += proposed_count
+          return total_accepted / total_proposed
+    deliverable: "acceptance_rate_report.md — acceptance rates by category, security interpretation"
+
+  throughput_benchmark:
+    description: |
+      Compare tokens/second: direct target decoding vs speculative decoding.
+    configurations:
+      - "Direct: GPT-2 XL only (baseline)"
+      - "Speculative K=1: one draft token"
+      - "Speculative K=4: four draft tokens (typical production)"
+      - "Speculative K=8: eight draft tokens"
+    metrics:
+      - "Tokens per second (throughput)"
+      - "Time to first token (TTFT)"
+      - "Time per output token (TPOT)"
+      - "Net speedup vs direct decoding"
+    expected_results: |
+      Direct GPT-2 XL: ~25 tokens/sec
+      Speculative K=4 (α≈0.75): ~60 tokens/sec (2.4× speedup)
+      Speculative K=8 (α≈0.65): ~50 tokens/sec (2.0× speedup — diminishing returns)
+
+  distribution_equivalence_test:
+    description: |
+      Statistical test that speculative decoding output matches direct decoding distribution.
+    method: |
+      For 100 prompts, generate 20 completions each with:
+        - Direct target model (greedy)
+        - Speculative decoding (greedy + rejection sampling)
+      Compare: are there systematically different responses for safety-relevant prompts?
+    statistical_test: "Chi-squared test on token distribution at each position"
+    expected: "No statistically significant difference (p > 0.05) for non-adversarial prompts"
+    flag: "If safety refusal rate differs between methods, implementation has a bug"
+
+# ============================================================================
+# EXERCISES
+# ============================================================================
+
+exercises:
+
+  exercise_1:
+    title: "Implement Speculative Decoding"
+    difficulty: "Hard"
+    estimated_time: "4 hours"
+    objective: "Build a working speculative decoding pipeline from scratch"
+    steps:
+      - "Use GPT-2 small (draft) and GPT-2 medium (target) — same family, different sizes"
+      - "Implement the three phases: draft generation, verification, accept/reject"
+      - "Verify correctness: generate 50 completions with direct and speculative decoding"
+        # Use greedy sampling for both to make comparison exact
+      - "Confirm: do greedy outputs match? (They should — greedy is deterministic)"
+      - "Measure acceptance rate for 5 different prompt types"
+      - "Benchmark: tokens/second for K=1, 2, 4, 8 draft tokens"
+    success_criteria:
+      - "Greedy outputs of direct and speculative decoding match exactly"
+      - "Acceptance rate measured and varies by prompt category as expected"
+      - "Net speedup measured: K=4 should give 1.5× or better on GPT-2 pair"
+      - "Speedup vs K curve plotted (should peak then decline)"
+    note: |
+      GPT-2 small → GPT-2 medium has lower acceptance rate than a 7B→70B same-family
+      pair, so speedup will be modest. The implementation correctness is more important
+      than the measured speedup numbers.
+
+  exercise_2:
+    title: "Acceptance Rate Profiling by Category"
+    difficulty: "Medium"
+    estimated_time: "1.5 hours"
+    objective: "Measure where draft-target agreement breaks down — especially for safety-relevant content"
+    steps:
+      - "Create 5 categories of prompts (20 examples each):"
+        # 1. Common factual questions (expected high α)
+        # 2. Creative writing prompts (expected moderate α)
+        # 3. Code generation (expected high α for same-family models)
+        # 4. Safety-relevant but benign (security questions, chemistry facts)
+        # 5. Boundary-testing prompts (things aligned models are more cautious about)
+      - "Run speculative decoding on all 100 prompts with K=4"
+      - "Record: acceptance rate per prompt per category"
+      - "Compare: do safety-relevant prompts have lower acceptance rates?"
+      - "Document: what does lower acceptance rate on category 5 tell you about the draft model?"
+    success_criteria:
+      - "100 prompts evaluated, acceptance rates by category measured"
+      - "Statistical difference between category 1 and category 5 demonstrated"
+      - "Interpretation documented: safety divergence between draft and target"
+      - "Security implication: what does this mean for a poisoned draft model?"
+
+  exercise_3:
+    title: "Throughput Degradation Attack"
+    difficulty: "Medium"
+    estimated_time: "2 hours"
+    objective: "Demonstrate that adversarial prompts can degrade speculative decoding throughput"
+    steps:
+      - "Establish baseline: measure tokens/second for 20 benign prompts"
+      - "Find adversarial prompts: search for prompts with low acceptance rate"
+        # Strategy: vary prompts systematically, keep those with acceptance rate < 0.3
+      - "Measure: what is tokens/second for adversarial vs benign prompts?"
+      - "Calculate: how many adversarial requests per minute would degrade server throughput by 50%?"
+      - "Propose: what rate limiting or detection would mitigate this attack?"
+    success_criteria:
+      - "Adversarial prompts found with acceptance rate < 0.3"
+      - "Throughput degradation measured: adversarial prompts are X× slower"
+      - "Attack volume calculated for 50% server degradation"
+      - "Mitigation proposed: acceptance rate monitoring + rate limiting"
+    security_deliverable: |
+      throughput_degradation_report.md: attack characterization + mitigation.
+      Used in Chapter 14 (Production Deployment) resource management section.
+
+  exercise_4:
+    title: "Output Distribution Equivalence Test"
+    difficulty: "Medium"
+    estimated_time: "1.5 hours"
+    objective: "Statistically verify that speculative decoding preserves target model output distribution"
+    steps:
+      - "Generate 200 completions for 10 prompts using temperature=0.8:"
+        # 100 completions via direct target model
+        # 100 completions via speculative decoding
+      - "For each prompt: compare token frequency distributions"
+      - "Apply chi-squared test at each token position: are distributions equivalent?"
+      - "Specifically test: are refusal rates identical for safety-relevant prompts?"
+      - "Intentionally break the implementation (skip temperature normalization in verify step)"
+      - "Re-run: does the broken implementation show detectable distribution drift?"
+    success_criteria:
+      - "Correct implementation: chi-squared p > 0.05 for all non-safety prompts"
+      - "Broken implementation: detectable distribution drift (p < 0.05)"
+      - "Safety refusal rates: no statistically significant difference between methods"
+      - "Documented: what implementation error most commonly breaks the guarantee?"
+    note: |
+      This exercise directly informs how to audit production speculative decoding
+      systems for the implementation errors documented in Section 4.
+
+# ============================================================================
+# KEY CONCEPTS SUMMARY
+# ============================================================================
+
+key_concepts_summary:
+
+  algorithm:
+    - concept: "Draft model proposes K tokens; target verifies all K in one forward pass"
+      implication: "2-4× throughput with mathematically guaranteed identical output distribution"
+
+    - concept: "Rejection sampling guarantees output distribution = target distribution"
+      implication: "Theoretical safety preservation — in practice, implementation errors create gaps"
+
+    - concept: "Acceptance rate α determines actual speedup"
+      implication: "Low-α inputs (adversarial or out-of-distribution) cause throughput degradation"
+
+  architecture:
+    - concept: "Draft model should be same family as target for high acceptance rate"
+      implication: "Mismatched or untrusted draft models reduce both throughput and safety guarantees"
+
+    - concept: "Medusa uses prediction heads on target itself — no separate model"
+      implication: "Eliminates alignment asymmetry risk; heads must be in security perimeter"
+
+  security:
+    - concept: "Accept/reject signal reveals target model probability ratios"
+      implication: "Speculative decoding enables richer model extraction than output-only observation"
+
+    - concept: "Timing differences between high/low acceptance steps are measurable"
+      implication: "Response timing reveals where draft-target disagree — safety-relevant signal"
+
+    - concept: "Poisoned draft model probes target for residual harmful capability"
+      implication: "Draft model provenance must be verified; distillation from target preferred"
+
+    - concept: "Temperature inconsistency in implementation breaks distribution guarantee"
+      implication: "Safety evaluations must use same temperature settings as production"
+
+# ============================================================================
+# CONNECTIONS
+# ============================================================================
+
+connections:
+
+  builds_on:
+    - section: "Section 04_08"
+      concept: "KV cache — speculative decoding's draft phase uses the same cached generation loop"
+    - section: "Section 04_09"
+      concept: "Flash Attention — verification step is a prefill that benefits from FA"
+    - section: "Section 04_06"
+      concept: "SFT and distillation — draft model is often a distilled version of target"
+
+  prepares_for:
+    - section: "Section 04_11"
+      concept: "Context windows — inference optimization arc completes; context window section follows"
+    - section: "Section 04_13"
+      concept: "Model distillation — best draft models are distilled from target; this section covers how"
+    - section: "Chapter 9 (Part 2)"
+      concept: "Model extraction — accept/reject side channel is an extraction vector"
+    - section: "Chapter 14 (Part 3)"
+      concept: "Production deployment — throughput degradation attack mitigation; acceptance rate monitoring"
+
+  security_thread: |
+    This section closes the inference optimization arc (Sections 8-10).
+    The complete inference attack surface is now established:
+    - Section 8 (KV cache): timing side channel, memory DoS, context eviction attacks
+    - Section 9 (Flash Attention): long-context injection/exfiltration surface, FA bugs,
+      lost-in-the-middle position attacks
+    - Section 10 (Speculative decoding): accept/reject extraction side channel,
+      throughput degradation DoS, poisoned draft model supply chain attack
+
+    Four chapters of Part 2 (Chapters 6-9) will systematically exploit these surfaces.
+    Four chapters of Part 3 (Chapters 11-14) will build defenses against them.
+    The inference optimization arc (Sections 8-10) has provided the attack surface map.
+
+# ============================================================================
+# FURTHER READING
+# ============================================================================
+
+further_reading:
+
+  primary:
+    - title: "Fast Inference from Transformers via Speculative Decoding"
+      authors: "Leviathan, Kalman, Matias (Google, 2023)"
+      note: "Original speculative decoding paper — Theorem 1 is the distribution guarantee proof"
+      url: "https://arxiv.org/abs/2211.17192"
+
+    - title: "Accelerating Large Language Model Decoding with Speculative Sampling"
+      authors: "Chen et al. (DeepMind, 2023)"
+      note: "Independent concurrent work — Algorithm 1 has cleaner pseudocode for implementation"
+      url: "https://arxiv.org/abs/2302.01318"
+
+  variants:
+    - title: "Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads"
+      authors: "Cai et al. (2024)"
+      note: "Medusa architecture — Section 3 on tree attention is essential for understanding the approach"
+      url: "https://arxiv.org/abs/2401.10774"
+
+    - title: "Break the Sequential Dependency of LLM Inference Using Lookahead Decoding"
+      authors: "Fu et al. (2023)"
+      note: "Lookahead/Jacobi decoding — single-model approach with no separate draft"
+      url: "https://arxiv.org/abs/2402.02057"
+
+  security:
+    - title: "Stealing Part of a Production Language Model"
+      authors: "Carlini et al. (2024)"
+      note: "Model extraction via logit observation — speculative decoding's accept/reject extends this"
+      url: "https://arxiv.org/abs/2403.06634"
+
+    - title: "SoK: Inference Attacks and Defenses in LLMs"
+      note: "Systematizes inference-time attack vectors including timing side channels"
+
+

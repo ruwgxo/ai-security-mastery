@@ -1,0 +1,956 @@
+# section_04_09_flash_attention.yaml
+
+---
+document_info:
+  section: "04_09"
+  title: "Flash Attention: Memory-Efficient Attention"
+  chapter: "04"
+  chapter_title: "Modern LLM Internals"
+  part: "Part I: Machine Learning Foundations"
+  book: "AI Security Mastery: From ML Fundamentals to Production Detection Systems"
+  version: "1.0.0"
+  author: "Raghav Dinesh"
+  github: "github.com/ruwgxo"
+  license: "MIT"
+  created: "2026-01-19"
+  estimated_pages: 6
+  tags:
+    - "flash-attention"
+    - "io-awareness"
+    - "tiling"
+    - "hbm"
+    - "sram"
+    - "prefill"
+    - "online-softmax"
+    - "numerical-stability"
+    - "long-context"
+    - "security-implications"
+
+section_overview:
+
+  purpose: |
+    Flash Attention is the algorithm that made long-context LLMs practical. Before it,
+    standard attention was O(n²) in memory — a 32K-token context required ~8GB just
+    to store the attention matrix. Flash Attention reduces this to O(n) by never
+    materializing the full attention matrix, instead computing attention in tiles
+    that fit in on-chip SRAM.
+
+    For security engineers: Flash Attention's existence changes the threat surface in
+    ways that matter operationally. The practical context window went from 2K-4K tokens
+    (GPT-3 era) to 128K-1M tokens (Flash Attention era). Every security property that
+    depends on context length — injection reach, safety instruction persistence, context
+    stuffing attacks, RAG retrieval windows — changes when the context window expands
+    by 100×. Understanding why long context became feasible is understanding why these
+    threat properties changed.
+
+    This section is deliberately more technical than most. Flash Attention's algorithm
+    is not trivially obvious — it requires understanding GPU memory hierarchy, tiling,
+    and the online softmax trick. This investment pays off: the security engineer who
+    understands why Flash Attention works can reason about what breaks it, what the
+    numerical properties mean for adversarial inputs, and how the algorithm's design
+    choices constrain what attacks are feasible against long-context models.
+
+  position_in_chapter: |
+    Section 9 of 17 content sections. Second section of the inference optimization
+    arc (Sections 8-10). Section 8 covered KV caching (decode phase optimization).
+    This section covers Flash Attention (prefill phase optimization). Section 10
+    covers speculative decoding (decode phase parallelism). Together Sections 8-10
+    complete the inference picture.
+
+  prerequisites:
+    - "Section 04_08: KV cache — memory hierarchy and bandwidth bottleneck concepts"
+    - "Chapter 3, Section 9: Attention mechanism — Q, K, V matrices and softmax"
+    - "Chapter 3, Section 13: Transformer decoder — where attention sits"
+    - "Basic GPU architecture: HBM (global memory) vs SRAM (on-chip cache)"
+    - "Matrix multiplication basics: tiling, cache blocking"
+
+  what_you_will_build:
+    primary: "Flash Attention forward pass implementation in pure PyTorch (tiled)"
+    secondary:
+      - "Memory usage comparator: standard attention vs Flash Attention at various context lengths"
+      - "Numerical stability tester: adversarial inputs that stress-test attention numerics"
+      - "Long-context security benchmark: measure attack surface expansion with context length"
+      - "Attention pattern visualizer: per-head attention maps for security analysis"
+    notebooks:
+      - "03-llm-internals/flash_attention_implementation.ipynb"
+      - "03-llm-internals/long_context_security.ipynb"
+
+# ============================================================================
+# CONTENT
+# ============================================================================
+
+content:
+
+  # --------------------------------------------------------------------------
+  # 1. THE PROBLEM: STANDARD ATTENTION MEMORY BOTTLENECK
+  # --------------------------------------------------------------------------
+
+  subsection_1:
+    title: "Standard Attention: The O(n²) Memory Wall"
+    pages: 1
+
+    standard_attention_algorithm: |
+      Standard scaled dot-product attention computes:
+
+        Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) × V
+
+      For a sequence of length n with head dimension d_k, the intermediate
+      matrices involved are:
+
+        Q: shape (n, d_k)        — n × d_k floats
+        K: shape (n, d_k)        — n × d_k floats
+        V: shape (n, d_k)        — n × d_k floats
+        S = QK^T / sqrt(d_k):   (n, n) — the attention scores matrix
+        P = softmax(S):          (n, n) — the attention weights matrix
+        O = P × V:               (n, d_k) — the output
+
+      The problem: S and P are both n × n matrices. They must be fully
+      materialized in memory before softmax and the final multiply can proceed.
+
+    memory_cost_at_scale: |
+      Memory required for the attention score matrix S = QK^T:
+        n² × bytes_per_element
+
+      For FP16 (2 bytes) at various context lengths:
+        n = 1,024:    1,024² × 2 = 2.1 MB      ← feasible
+        n = 4,096:    4,096² × 2 = 33.6 MB     ← feasible
+        n = 32,768:   32,768² × 2 = 2.15 GB    ← tight on A100 (80GB)
+        n = 128,000:  128,000² × 2 = 32.8 GB   ← consumes 40% of A100 per head
+        n = 1,000,000: 10^12 × 2 = 2,000 GB   ← physically impossible
+
+      With multi-head attention (H heads), multiply by H:
+        32K context, 96 heads (GPT-4 scale): 2.15 GB × 96 = 206 GB per layer
+        A100 has 80 GB total. A single attention layer would exceed total GPU memory.
+
+      This is the memory wall. Standard attention became the practical limit on
+      context length — not compute, not model quality, but the quadratic memory
+      requirement of storing n × n attention matrices.
+
+    io_bottleneck: |
+      Beyond memory capacity, there is an IO bottleneck. Even if GPU memory were
+      unlimited, reading and writing large matrices between HBM (high-bandwidth
+      memory, the GPU's main memory) and SRAM (on-chip cache, fast but tiny) is slow.
+
+      GPU memory hierarchy (A100):
+        SRAM (on-chip):  40 MB at 19 TB/s bandwidth
+        HBM (off-chip): 80 GB at 2 TB/s bandwidth
+
+      Standard attention reads Q, K, V from HBM (3 reads), writes S to HBM,
+      reads S back, applies softmax, writes P to HBM, reads P back, multiplies
+      by V, writes O to HBM. Each round trip to HBM costs 1/9.5 ≈ 10× the time
+      of reading the same data from SRAM.
+
+      For large n: the bottleneck is not the flops of the matrix multiply —
+      it is the HBM reads and writes of the n × n intermediate matrices.
+
+      This is the IO-awareness insight that Flash Attention exploits.
+
+  # --------------------------------------------------------------------------
+  # 2. FLASH ATTENTION: THE ALGORITHM
+  # --------------------------------------------------------------------------
+
+  subsection_2:
+    title: "Flash Attention: IO-Aware Tiled Attention Computation"
+    pages: 2
+
+    core_insight: |
+      Flash Attention (Dao et al., 2022) makes three key observations:
+
+      1. The attention score matrix S does not need to be fully stored.
+         We only need the final output O = softmax(QK^T / sqrt(d)) × V.
+         If we can compute O without storing S in full, we save the O(n²) memory.
+
+      2. The GPU's SRAM is fast but small. Operations that fit in SRAM run at
+         10× the speed of operations requiring HBM roundtrips.
+         If we can compute attention in tiles small enough to fit in SRAM, we
+         use fast memory throughout.
+
+      3. Softmax can be computed incrementally — you don't need all scores
+         simultaneously to compute the final normalized weights.
+         This is the online softmax trick.
+
+    online_softmax_trick: |
+      Standard softmax on a vector x of length n:
+        softmax(x)_i = exp(x_i) / Σ_j exp(x_j)
+
+      Requires: compute all n values before normalization denominator is known.
+      Memory: O(n) to store all unnormalized values.
+
+      Online softmax computes the same result incrementally:
+
+        Initialize: m = -∞ (running max), d = 0 (running denominator), o = 0 (running output)
+
+        For each new block of scores x_block:
+          m_new = max(m, max(x_block))
+          d_new = d × exp(m - m_new) + Σ exp(x_block - m_new)
+          o_new = o × exp(m - m_new) + Σ_block exp(x_i - m_new) × V_i
+          m, d, o = m_new, d_new, o_new
+
+        Final output: o / d
+
+      This produces numerically identical results to standard softmax while
+      requiring only O(block_size) memory at any time — regardless of total n.
+      The running statistics (m, d, o) are O(d_k) scalars, not O(n) vectors.
+
+    tiling_algorithm: |
+      Flash Attention tiles the Q, K, V matrices into blocks that fit in SRAM,
+      processes each tile using online softmax, and accumulates the output O
+      without ever materializing the full n × n attention matrix.
+
+      Algorithm (simplified):
+
+        # Tile sizes: B_r rows of Q, B_c columns of K/V
+        # B_r × B_c should fit in SRAM
+
+        O = zeros(n, d_k)          # Output (in HBM)
+        l = zeros(n)               # Running sum of exp scores (in HBM)
+        m = full(n, -inf)          # Running max of scores (in HBM)
+
+        # Outer loop: iterate over K, V blocks (columns)
+        for j in range(0, n, B_c):
+            K_j = load_from_HBM(K[j:j+B_c])    # Load K tile to SRAM
+            V_j = load_from_HBM(V[j:j+B_c])    # Load V tile to SRAM
+
+            # Inner loop: iterate over Q blocks (rows)
+            for i in range(0, n, B_r):
+                Q_i = load_from_HBM(Q[i:i+B_r])    # Load Q tile to SRAM
+                m_i = load_from_HBM(m[i:i+B_r])    # Load running max
+                l_i = load_from_HBM(l[i:i+B_r])    # Load running sum
+                O_i = load_from_HBM(O[i:i+B_r])    # Load running output
+
+                # All subsequent ops in SRAM (fast)
+                S_ij = Q_i × K_j.T / sqrt(d_k)     # Tile of attention scores
+                m_ij = row_max(S_ij)                 # Max in this tile
+                P_ij = exp(S_ij - m_ij)              # Unnormalized weights
+
+                # Update running statistics using online softmax
+                m_new = max(m_i, m_ij)
+                l_new = l_i × exp(m_i - m_new) + row_sum(P_ij) × exp(m_ij - m_new)
+                O_new = O_i × exp(m_i - m_new) + P_ij × exp(m_ij - m_new) × V_j
+
+                # Write back to HBM
+                write_to_HBM(m[i:i+B_r], m_new)
+                write_to_HBM(l[i:i+B_r], l_new)
+                write_to_HBM(O[i:i+B_r], O_new)
+
+        # Final normalization
+        O = O / l[:, None]
+
+    memory_and_io_analysis: |
+      Standard attention HBM accesses:
+        Read Q, K, V:          3 × O(nd)  reads
+        Write S = QK^T:        O(n²)      writes to HBM
+        Read S, write P:       O(n²)      reads + writes (softmax)
+        Read P, V, write O:    O(n² + nd) reads + writes
+        Total HBM IO: O(n² + nd) dominated by the n² attention matrix terms
+
+      Flash Attention HBM accesses:
+        Read Q, K, V once each:   3 × O(nd)  reads
+        Write O once:             O(nd)      write
+        Write/read running stats: O(n)       negligible
+        Total HBM IO: O(nd) — linear in sequence length!
+
+      Memory usage:
+        Standard: O(n²) — must store full attention matrix
+        Flash Attention: O(n) — only stores tiles in SRAM, running stats in HBM
+        Reduction: n/d_k times less memory — for n=32K, d_k=128: 256× reduction
+
+    flash_attention_2_and_3: |
+      Flash Attention 2 (Dao 2023) improved on FA1 by:
+        - Better work partitioning between GPU thread blocks
+        - Fewer non-matmul FLOPs (attention score scaling moved)
+        - Sequence parallelism: split sequence across GPUs for very long contexts
+        Performance: 2-3× faster than FA1, approaching peak GPU throughput
+
+      Flash Attention 3 (2024, with Hopper GPU features):
+        - Exploits H100-specific hardware (warp specialization, TMA tensor memory accelerator)
+        - Overlaps computation and memory IO using asynchronous operations
+        - Achieves 75% peak FLOPs utilization (vs 35% for standard attention)
+        Performance: Another 1.5-2× improvement over FA2
+
+      Security engineer relevance: FA2/FA3 are the production implementations in
+      all current inference frameworks (vLLM, TGI, TensorRT-LLM). Security analysis
+      of long-context deployments assumes Flash Attention is being used.
+
+  # --------------------------------------------------------------------------
+  # 3. NUMERICAL STABILITY AND ADVERSARIAL INPUTS
+  # --------------------------------------------------------------------------
+
+  subsection_3:
+    title: "Numerical Stability: Where Flash Attention Can Be Stressed"
+    pages: 1
+
+    numerical_challenges_in_attention: |
+      Attention involves exponentials: exp(QK^T / sqrt(d)). For large dot products,
+      exp overflows to infinity. For large negative dot products, exp underflows to zero.
+
+      The standard trick — subtract the row maximum before exponentiation — prevents
+      overflow:
+        softmax(x)_i = exp(x_i - max(x)) / Σ_j exp(x_j - max(x))
+
+      Flash Attention uses online softmax which continuously tracks the running maximum.
+      This is mathematically sound but has numerical edge cases that standard implementations
+      encounter in adversarial conditions.
+
+    adversarial_numerical_conditions:
+
+      extreme_score_distributions: |
+        If all attention scores in a tile are identical, the softmax output is uniform.
+        If all scores in a tile are very large (e.g., Q and K vectors with large norms),
+        even after subtracting the max, the differences may be small relative to floating
+        point precision.
+
+        Crafted scenario: an input sequence where a specific Q vector has very high dot
+        product with all K vectors in one block but not others. The online softmax updates
+        can produce slightly different results than standard softmax when transitions
+        between blocks have large magnitude jumps.
+
+        Security relevance: this is subtle and practically rare — but adversarially crafted
+        inputs that maximize inter-block score variance can produce numerical divergence
+        between FA and standard attention. If a safety filter uses standard attention but
+        the deployed model uses FA, inputs crafted to cause divergence might pass the filter
+        while behaving differently in deployment.
+
+      inf_and_nan_propagation: |
+        If a token embedding contains NaN or Inf (from earlier numerical instability in
+        deep models), the dot product QK^T may produce NaN scores. Flash Attention's
+        online softmax propagates NaN differently than standard attention:
+
+        Standard: max(scores including NaN) → NaN → entire row becomes NaN
+        Flash Attention: depends on tile boundary placement — NaN may propagate to
+        only some output positions if it appears in a specific tile
+
+        Production inference frameworks add NaN guards (clamp attention scores to
+        [-65504, 65504] in FP16 before exponentiation) to prevent this.
+        Security implication: inputs that cause NaN in attention scores may behave
+        differently in Flash Attention vs standard attention implementations —
+        a potential inconsistency between evaluation environments.
+
+      causal_mask_boundary_effects: |
+        Autoregressive attention uses a causal mask: position i cannot attend to
+        position j > i. In Flash Attention, the causal mask is applied tile-by-tile.
+        For tiles that straddle the causal boundary (some positions are masked, some are not),
+        the computation must correctly handle partial masking.
+
+        Flash Attention implements this with a conditional: tiles fully above the diagonal
+        are skipped (all masked), tiles on the diagonal are processed with masking applied,
+        tiles below are processed without masking.
+
+        Adversarial relevance: inputs crafted to maximize operations at causal mask
+        boundaries (e.g., sequences where important attention patterns concentrate near
+        the diagonal) are exactly the sequences that stress-test the partial-tile logic.
+
+    what_this_means_for_security_evaluation: |
+      Security evaluations run on standard attention implementations (PyTorch's
+      F.scaled_dot_product_attention or naive QKTV) may not reproduce the exact behavior
+      of Flash Attention in production deployments. This creates an evaluation gap:
+
+      Test environment: standard attention → specific model behavior
+      Production:        Flash Attention  → slightly different model behavior for some inputs
+
+      In most cases the difference is negligible. But for carefully crafted adversarial
+      inputs near numerical boundaries, the divergence can be meaningful.
+
+      Practical implication: red-team evaluations that test for jailbreaks or prompt
+      injections should run on the exact inference stack used in production (same Flash
+      Attention implementation, same precision, same hardware) to avoid false negatives
+      from evaluation environment mismatch.
+
+  # --------------------------------------------------------------------------
+  # 4. LONG CONTEXT SECURITY IMPLICATIONS
+  # --------------------------------------------------------------------------
+
+  subsection_4:
+    title: "Long Context: How Flash Attention Changed the Security Landscape"
+    pages: 1
+
+    context_length_evolution: |
+      Flash Attention's memory efficiency enabled a rapid expansion of practical context
+      windows across the industry:
+
+        GPT-2 (2019):     1,024 tokens  — standard attention, no optimizations
+        GPT-3 (2020):     2,048 tokens  — standard attention
+        PaLM (2022):      2,048 tokens  — before Flash Attention
+        GPT-4 (2023):     8,192 tokens  — Flash Attention era begins
+        Claude 2 (2023): 100,000 tokens — Flash Attention 2
+        Gemini 1.5 (2024): 1,000,000 tokens — Flash Attention 2 + custom architecture
+        Llama-3 (2024):  128,000 tokens — Flash Attention 2 + GQA
+
+      This 100-1000× expansion happened in under 3 years and is primarily attributable
+      to Flash Attention removing the n² memory bottleneck.
+
+    security_surface_expansion_per_capability:
+
+      injection_reach: |
+        Context stuffing attack (Section 04_08): flood context with benign tokens
+        to push safety instructions out of cache or attention range.
+
+        At 2K context: attacker has 2,000 tokens to work with per turn.
+        At 128K context: attacker has 128,000 tokens per turn.
+        At 1M context: attacker can inject novel-length sequences.
+
+        Injection attacks that require large amounts of benign padding to dilute
+        safety instructions are dramatically more feasible at long context.
+
+        The "lost in the middle" problem (Liu et al., 2023) is directly relevant:
+        models at long context attend less reliably to information in the middle
+        of the context window. Safety instructions placed in the middle of a
+        128K context may receive less attention weight than the same instructions
+        at the beginning or end. This creates positional injection opportunities
+        that did not exist at 2K context.
+
+      rag_retrieval_window: |
+        RAG (Retrieval-Augmented Generation) systems retrieve external documents and
+        inject them into the model's context. At short context: RAG can inject a few
+        documents (1-5 at 2K context). At long context: RAG can inject hundreds of
+        documents (50-100 at 128K context).
+
+        Each retrieved document is a potential injection vector. More documents
+        retrieved = more attack surface per query. The attacker who poisons one
+        document in a retrieval database may have that document retrieved and
+        injected into any number of user sessions.
+
+        Long context makes RAG-based injection attacks more powerful:
+          Short context: injection limited by context length, few retrieved docs
+          Long context: injection can include entire books, codebases, email archives
+
+      conversation_history_as_attack_surface: |
+        Long context enables multi-turn conversations that span 10K-100K tokens.
+        Each prior turn is another potential injection vector — either from direct
+        user inputs or from tool outputs that become part of conversation history.
+
+        The "infinite conversation" threat model: an adversary who can maintain
+        a conversation for many turns can gradually introduce context that shifts
+        the model's behavior through accumulated context manipulation. At 2K context,
+        old turns are evicted quickly. At 128K context, the adversary's early-session
+        manipulations remain in context indefinitely.
+
+      document_processing_attacks: |
+        Long context enables "upload and analyze" use cases: users upload entire books,
+        codebases, legal contracts, financial reports for analysis.
+
+        Each uploaded document is an injection vector. A malicious document upload
+        can contain hidden injection text (white-on-white text, tiny font, content
+        in appendices) that is processed as part of the long context.
+
+        At 2K context: documents are chunked and analyzed piecemeal (RAG approach).
+        Injection in one chunk doesn't affect other chunks' analysis.
+        At 128K context: entire documents are analyzed at once.
+        A single injection in a 100-page document affects the entire analysis session.
+
+    lost_in_the_middle: |
+      Liu et al. (2023) demonstrated that LLMs with long context perform poorly on
+      information that is in the middle of the context window. Models attend much
+      more reliably to information at the beginning and end of context.
+
+      Attention pattern at long context:
+        Position 0 - 5K: high attention weight (recent context effect)
+        Position 5K - (n-5K): low attention weight ("middle of context")
+        Position (n-5K) - n: high attention weight (recency bias)
+
+      Security implications:
+        1. Safety instructions buried in the middle of a long context are less likely
+           to be followed than instructions at the beginning or end.
+        2. Injected content placed near the end of a long context (recency position)
+           may receive more attention weight than the original instruction.
+        3. Important context (user identity, task specification) should be placed at
+           beginning or end of context for reliable retrieval.
+
+      Defensive pattern: repeat critical safety instructions at both the beginning
+      AND end of the system context for long-context deployments. The beginning
+      survives as a StreamingLLM sink; the end benefits from recency bias.
+
+  # --------------------------------------------------------------------------
+  # 5. FLASH ATTENTION IN PRODUCTION: FRAMEWORKS AND VARIANTS
+  # --------------------------------------------------------------------------
+
+  subsection_5:
+    title: "Flash Attention in Production: Implementation Details That Matter"
+    pages: 1
+
+    production_implementations: |
+      Flash Attention is available in every major inference framework:
+
+        PyTorch: torch.nn.functional.scaled_dot_product_attention()
+                 Automatically uses Flash Attention when available
+                 Behavioral flag: enable_flash_sdp(True)
+
+        vLLM: Native Flash Attention 2 support
+              xformers backend as fallback
+              Handles variable-length sequences with packed format
+
+        TensorRT-LLM (NVIDIA): Flash Attention with Hopper-specific optimizations
+                                MultiHeadAttention fusion with KV cache
+
+        Hugging Face Transformers: 
+                 use_flash_attention_2=True in model config
+                 Fallback to eager attention if not available
+
+      Versioning matters: FA1 (2022), FA2 (2023), FA3 (2024) have different
+      numerical properties and performance characteristics. Production systems
+      that upgrade Flash Attention versions may see subtle behavioral changes.
+      These changes are typically negligible but can affect the reproducibility
+      of specific adversarial inputs found during red-teaming.
+
+    variable_length_sequence_handling: |
+      Production deployments process batches of sequences with different lengths.
+      Flash Attention handles this with two approaches:
+
+      Padding: pad all sequences to the same length, mask padded positions.
+        Simple but wasteful — padded positions consume compute.
+        Security note: padded positions with all-zero or all-one tokens create
+        a consistent numerical context that could be exploited if an adversary
+        knows the padding scheme.
+
+      Packing (varlen FA): concatenate all sequences with position indices.
+        Efficient — no wasted compute on padding.
+        Security note: packing means multiple users' sequences share the same
+        batch computation. Position index management bugs could cause sequences
+        to bleed into each other — similar to PagedAttention isolation concerns.
+
+    precision_and_hardware_variants: |
+      Flash Attention is implemented at multiple precisions:
+
+        FP16: standard for most deployments, 2 bytes/element
+        BF16: better numerical range than FP16, same memory, used by newer models
+        FP32: full precision, 4 bytes/element, rarely used in production
+        INT8 / FP8: quantized attention, emerging for high-throughput deployments
+
+      Each precision has different numerical stability properties:
+        FP16: 65504 max value, overflows easily for large models
+        BF16: ~3.4×10^38 max value, rarely overflows, less precise mantissa
+        FP8: very limited range, requires careful scaling, can destabilize attention
+
+      Security implication: adversarial inputs crafted against FP16 deployments
+      may not transfer to BF16 deployments (and vice versa) because the numerical
+      limits differ. Red-teaming evaluations should specify the exact precision
+      configuration used in production.
+
+    attention_sinks_revisited: |
+      From Section 04_08: the first tokens in any sequence receive disproportionately
+      large attention weights regardless of content — "attention sinks."
+
+      The mechanism: in Flash Attention, the initial tiles set the running maximum m.
+      If the first tile's scores are lower than a later tile's scores, the online
+      softmax update rescales the entire running output (the exp(m - m_new) factor).
+      This rescaling means early high-scoring tokens can dominate the final output
+      through accumulated scaling.
+
+      The first few tokens in a sequence — typically BOS (beginning of sequence) or
+      the first words of the system prompt — naturally receive high attention because:
+      1. Every subsequent token attends to them (they are in every tile's context)
+      2. The online softmax normalization accumulates their contribution across tiles
+
+      Security connection: this mechanism validates the StreamingLLM finding from
+      Section 04_08 and reinforces the defensive pattern: place safety-critical
+      content in the first tokens of context where attention sink behavior will
+      ensure high attention weight throughout the session.
+
+  # --------------------------------------------------------------------------
+  # 6. BENCHMARKING FLASH ATTENTION AND CONTEXT LENGTH TRADEOFFS
+  # --------------------------------------------------------------------------
+
+  subsection_6:
+    title: "Benchmarking: When Long Context Helps and When It Hurts Security"
+    pages: 1
+
+    performance_benchmarks: |
+      Flash Attention performance at various context lengths (A100, FP16, batch=1):
+
+        Context length | Standard Attention | Flash Attention | Memory (FA)
+        1,024           | 0.2 ms            | 0.1 ms          | 0.04 GB
+        4,096           | 3.2 ms            | 0.6 ms          | 0.1 GB
+        16,384          | 51.2 ms           | 2.4 ms          | 0.4 GB
+        32,768          | OOM               | 9.6 ms          | 0.8 GB
+        131,072         | OOM               | 38.4 ms         | 3.2 GB
+
+      Observations:
+        - At 32K+: standard attention is simply not feasible (OOM)
+        - Flash Attention scales linearly in time (approximately)
+        - Memory usage is linear in context length (not quadratic)
+
+    security_cost_of_long_context: |
+      From a security operational perspective, long context has a cost structure:
+
+      For defenders:
+        More context to monitor per request
+        More surface for injection in any single request
+        Safety instruction placement is more complex (lost-in-middle effect)
+        Evaluation at 128K context is expensive — testing every safety probe at
+        full context length is 32× more expensive than at 4K context
+
+      For attackers:
+        More tokens to inject per request (larger payload)
+        More documents to poison in RAG (larger retrieval window)
+        Longer conversation manipulation window
+        Safety instruction dilution is easier at longer context
+
+      Asymmetry: long context benefits attackers more than defenders in most
+      scenarios. Defenders must evaluate all context; attackers only need to
+      find one effective injection position.
+
+    practical_context_length_recommendations: |
+      Security-conscious deployment decisions around context length:
+
+      1. Use the minimum context length sufficient for the use case:
+         Customer service chatbot: 4K-8K is usually sufficient
+         Code analysis tool: 32K may be needed for large files
+         Document analysis: 128K enables full-document analysis but expands attack surface
+
+      2. Segment long contexts into bounded windows with independent safety checks:
+         Rather than one 128K context, use 8 × 16K contexts with checkpoints
+
+      3. Monitor context fill rate per session:
+         If a session approaches max context, apply stricter output safety checks
+         High context fill = more opportunity for injection, more risk
+
+      4. Position safety instructions at both ends:
+         Beginning: benefits from attention sink preservation
+         End: benefits from recency bias
+         Middle: likely to be ignored in long-context deployments
+
+# ============================================================================
+# IMPLEMENTATION
+# ============================================================================
+
+implementation:
+  title: "Flash Attention Implementation and Long-Context Security Analysis"
+  notebooks:
+    - "03-llm-internals/flash_attention_implementation.ipynb"
+    - "03-llm-internals/long_context_security.ipynb"
+
+  flash_attention_pytorch:
+    description: |
+      Implement Flash Attention forward pass in pure PyTorch using tiling and
+      online softmax. Not a CUDA kernel — a pedagogical implementation that makes
+      the algorithm concrete. Profile against standard attention for correctness
+      and memory comparison.
+    implementation_sketch: |
+      def flash_attention_forward(Q, K, V, block_size=64, causal=True):
+          """
+          Q, K, V: (batch, n_heads, seq_len, d_head)
+          Returns: O (batch, n_heads, seq_len, d_head)
+          """
+          B, H, n, d = Q.shape
+          O = torch.zeros_like(Q)
+          l = torch.zeros(B, H, n, device=Q.device)       # Running sum
+          m = torch.full((B, H, n), -torch.inf, device=Q.device)  # Running max
+
+          # Split K, V into column blocks
+          for j in range(0, n, block_size):
+              K_j = K[:, :, j:j+block_size, :]    # (B, H, Bc, d)
+              V_j = V[:, :, j:j+block_size, :]    # (B, H, Bc, d)
+
+              # Split Q into row blocks
+              for i in range(0, n, block_size):
+                  Q_i = Q[:, :, i:i+block_size, :]  # (B, H, Br, d)
+
+                  # Compute tile of attention scores
+                  S_ij = torch.matmul(Q_i, K_j.transpose(-2, -1)) / (d ** 0.5)
+
+                  # Apply causal mask for diagonal tiles
+                  if causal:
+                      row_idx = torch.arange(i, min(i+block_size, n))
+                      col_idx = torch.arange(j, min(j+block_size, n))
+                      mask = col_idx[None, :] > row_idx[:, None]
+                      S_ij = S_ij.masked_fill(mask.to(Q.device), -torch.inf)
+
+                  # Online softmax update
+                  m_ij = S_ij.amax(dim=-1)          # Max in this tile
+                  P_ij = torch.exp(S_ij - m_ij[..., None])
+
+                  # Load current running stats
+                  m_i = m[:, :, i:i+block_size]
+                  l_i = l[:, :, i:i+block_size]
+                  O_i = O[:, :, i:i+block_size, :]
+
+                  # Rescale and update
+                  m_new = torch.maximum(m_i, m_ij)
+                  exp_m_diff_old = torch.exp(m_i - m_new)
+                  exp_m_diff_new = torch.exp(m_ij - m_new)
+                  l_new = l_i * exp_m_diff_old + P_ij.sum(dim=-1) * exp_m_diff_new
+                  O_new = O_i * exp_m_diff_old[..., None] + \
+                          torch.matmul(P_ij * exp_m_diff_new[..., None], V_j)
+
+                  # Write back
+                  m[:, :, i:i+block_size] = m_new
+                  l[:, :, i:i+block_size] = l_new
+                  O[:, :, i:i+block_size, :] = O_new
+
+          # Final normalization
+          O = O / l[..., None]
+          return O
+
+    correctness_test: |
+      # Verify Flash Attention matches standard attention exactly
+      Q, K, V = [torch.randn(1, 8, 512, 64) for _ in range(3)]
+
+      # Standard attention
+      scores = torch.matmul(Q, K.transpose(-2, -1)) / 64**0.5
+      attn = F.softmax(scores, dim=-1)
+      out_standard = torch.matmul(attn, V)
+
+      # Flash Attention
+      out_flash = flash_attention_forward(Q, K, V)
+
+      # Should match within floating point tolerance
+      max_diff = (out_standard - out_flash).abs().max()
+      print(f"Max difference: {max_diff:.2e}")  # Expected: < 1e-4
+
+    memory_benchmark: |
+      # Compare peak memory usage: standard vs Flash Attention
+      for seq_len in [512, 1024, 2048, 4096, 8192]:
+          Q, K, V = [torch.randn(1, 8, seq_len, 64).cuda() for _ in range(3)]
+
+          torch.cuda.reset_peak_memory_stats()
+          out = standard_attention(Q, K, V)
+          std_mem = torch.cuda.max_memory_allocated() / 1e9
+
+          torch.cuda.reset_peak_memory_stats()
+          out = flash_attention_forward(Q, K, V)
+          fa_mem = torch.cuda.max_memory_allocated() / 1e9
+
+          print(f"seq={seq_len}: standard={std_mem:.2f}GB, flash={fa_mem:.2f}GB, ratio={std_mem/fa_mem:.1f}x")
+
+  attention_pattern_visualizer:
+    description: |
+      Visualize per-head attention patterns for security analysis. Reveals which
+      tokens each head attends to — important for identifying injection success
+      and understanding how safety instructions are weighted.
+    output: |
+      Heatmaps for each attention head in each layer.
+      Key insights to extract:
+        - Which heads attend to system prompt (safety instruction) positions
+        - Which heads are dominated by user input (potential injection vector)
+        - Attention sink positions (tokens receiving uniform high attention)
+    security_application: |
+      "Attention pattern forensics": given a jailbreak that succeeded, visualize
+      the attention patterns to understand which tokens received high weight
+      during the safety instruction processing. This reveals the attack mechanism
+      in a way that word-level analysis cannot.
+
+  long_context_security_benchmark:
+    description: |
+      Measure attack surface expansion as context length increases.
+    experiments:
+      lost_in_middle_test: |
+        Place a safety instruction at positions: 0%, 25%, 50%, 75%, 100% of context.
+        Test whether the model follows the instruction at each position.
+        Measure: instruction following rate vs position in context.
+
+      injection_reach_test: |
+        Inject a steering instruction at the same positions.
+        Measure: steering effectiveness vs position in context.
+
+      context_stuffing_test: |
+        Fill context with benign tokens to push safety instruction from position 0.
+        Measure: safety instruction following rate as function of context fill.
+    deliverable: |
+      long_context_security_report.md: quantified attack surface expansion.
+      Used in Chapter 6 (Prompt Injection) to calibrate injection attacks for
+      long-context deployments.
+
+# ============================================================================
+# EXERCISES
+# ============================================================================
+
+exercises:
+
+  exercise_1:
+    title: "Implement Flash Attention and Verify Correctness"
+    difficulty: "Hard"
+    estimated_time: "3-4 hours"
+    objective: "Build a working Flash Attention implementation and verify numerical equivalence with standard attention"
+    steps:
+      - "Implement flash_attention_forward() using tiling and online softmax"
+      - "Test correctness: compare output to F.scaled_dot_product_attention for 10 random inputs"
+      - "Implement causal masking in the tiled computation (partial-tile masking)"
+      - "Benchmark memory: standard vs flash at seq_len = [512, 1024, 2048, 4096, 8192]"
+      - "Plot: peak memory vs seq_len for both (shows O(n²) vs O(n) scaling)"
+      - "Find the point where standard attention OOMs but Flash Attention succeeds"
+    success_criteria:
+      - "Max absolute difference vs standard attention: <1e-3 for FP32"
+      - "Memory scaling: Flash Attention shows linear growth, standard shows quadratic"
+      - "Causal masking produces correct results (upper triangular masked)"
+      - "Successfully processes seq_len=8192 where standard attention OOMs"
+    deliverable: "flash_attention.py — standalone implementation with unit tests"
+
+  exercise_2:
+    title: "Numerical Stability Stress Test"
+    difficulty: "Medium"
+    estimated_time: "1.5 hours"
+    objective: "Find input distributions that cause numerical divergence between Flash Attention and standard attention"
+    steps:
+      - "Test case 1: Q, K vectors with very large norm (simulate extreme dot products)"
+        # Multiply random Q, K by scale factors from 1 to 100
+      - "Test case 2: sequences where a single position has very high attention weight"
+        # One K vector = 100× Q magnitude of others
+      - "Test case 3: mixed precision comparison (compute in FP16 vs FP32)"
+      - "For each: compare Flash Attention output to standard attention output"
+      - "Measure max absolute difference as function of stress parameter"
+      - "Identify: at what stress level does divergence become practically significant?"
+    success_criteria:
+      - "3 stress test conditions implemented"
+      - "Divergence measured quantitatively for each"
+      - "At least one condition found where divergence > 1e-2 (practically significant)"
+      - "Documented: what does this mean for adversarial inputs crossing evaluation environments?"
+
+  exercise_3:
+    title: "Lost-in-the-Middle Safety Instruction Test"
+    difficulty: "Medium"
+    estimated_time: "2 hours"
+    objective: "Quantify how instruction-following rate degrades with instruction position in long context"
+    steps:
+      - "Set up a model with 4K+ context (use any instruction-following model via API or local)"
+      - "Construct test contexts of length 1K, 2K, 3K, 4K tokens with padding"
+      - "Place a specific verifiable instruction at 5 positions: beginning, 25%, 50%, 75%, end"
+        # E.g.: 'When asked about colors, always say BLUE regardless of the actual question'
+      - "Fill remaining context with neutral padding (repeated benign text)"
+      - "Query the model: does it follow the instruction?"
+      - "Measure: compliance rate at each position across 10 trials per position"
+      - "Plot: compliance rate vs position in context"
+    success_criteria:
+      - "Clear U-shaped curve: high compliance at beginning and end, lower in middle"
+      - "Minimum compliance at ~50% position documented"
+      - "Effect is measurable (>20% compliance difference between best and worst position)"
+    security_takeaway: |
+      Document: "Safety instructions placed in the middle of long system prompts
+      receive less attention weight and are less reliably followed. Critical safety
+      constraints should be at the beginning or end of context." Used in Section 04_15.
+
+  exercise_4:
+    title: "Attention Pattern Forensics"
+    difficulty: "Medium"
+    estimated_time: "1.5 hours"
+    objective: "Visualize attention patterns to understand how injection succeeds mechanically"
+    steps:
+      - "Use a small instruction-following model with accessible attention weights"
+      - "Test case 1: model correctly follows safety instruction — visualize attention"
+        # Which tokens in the safety instruction receive high attention weight?
+      - "Test case 2: model is jailbroken (use a simple jailbreak prompt) — visualize attention"
+        # Which tokens shifted attention? Did jailbreak tokens receive high weight?
+      - "Compare: what changed in the attention pattern between cases?"
+      - "Identify: which specific heads are most safety-relevant?"
+        # Heads that strongly attend to safety instructions when they work
+      - "Measure: average attention weight on safety instruction tokens, case 1 vs case 2"
+    success_criteria:
+      - "Attention heatmaps generated for both cases (per layer, per head)"
+      - "Safety-relevant heads identified (attend to safety instruction in case 1)"
+      - "Attention shift documented: which heads changed most in jailbreak case?"
+      - "Hypothesis: does the jailbreak work by diverting attention from safety tokens?"
+    deliverable: |
+      attention_forensics.ipynb — reusable analysis tool.
+      This forensic methodology is applied in Chapter 7 (Jailbreak Techniques) to
+      mechanistically understand which attacks work and why.
+
+# ============================================================================
+# KEY CONCEPTS SUMMARY
+# ============================================================================
+
+key_concepts_summary:
+
+  flash_attention_mechanics:
+    - concept: "Standard attention is O(n²) memory — Flash Attention is O(n)"
+      implication: "Long context (128K+) is only feasible because of Flash Attention"
+
+    - concept: "Online softmax enables correct tiled computation without full matrix"
+      implication: "No numerical approximation — exact attention with less memory"
+
+    - concept: "IO-awareness: SRAM vs HBM bandwidth determines algorithm design"
+      implication: "Flash Attention's advantage is memory IO reduction, not fewer FLOPs"
+
+  numerical_stability:
+    - concept: "Online softmax tracks running max to prevent overflow"
+      implication: "Adversarial inputs that maximize inter-tile score variance can cause divergence"
+
+    - concept: "FA behavior may differ subtly from standard attention at numerical extremes"
+      implication: "Red-team evaluations should use production FA configuration, not naive attention"
+
+  long_context_security:
+    - concept: "Context window expanded 100× in 3 years — threat surface expanded proportionally"
+      implication: "All injection attacks, RAG poisoning, context manipulation scale with context length"
+
+    - concept: "Lost-in-the-middle: models attend less to information at mid-context"
+      implication: "Safety instructions placed in middle of long contexts are less reliable"
+
+    - concept: "Recency bias + attention sinks: beginning and end of context get highest weight"
+      implication: "Safety instructions belong at beginning (sink) AND end (recency) of context"
+
+# ============================================================================
+# CONNECTIONS
+# ============================================================================
+
+connections:
+
+  builds_on:
+    - section: "Chapter 3, Section 9"
+      concept: "Scaled dot-product attention — Flash Attention is the same algorithm, different compute order"
+    - section: "Section 04_08"
+      concept: "KV cache memory hierarchy — Flash Attention solves the prefill counterpart to KV cache decode problem"
+    - section: "Section 04_01"
+      concept: "GPT-2 generation — Flash Attention optimizes the prefill phase of this generation loop"
+
+  prepares_for:
+    - section: "Section 04_10"
+      concept: "Speculative decoding — the third inference optimization (decode phase parallelism)"
+    - section: "Section 04_11"
+      concept: "Context windows — Flash Attention's memory efficiency is why 128K windows are feasible"
+    - section: "Section 04_15"
+      concept: "System prompt design — lost-in-middle finding informs instruction placement"
+    - section: "Chapter 6 (Part 2)"
+      concept: "Prompt injection — long-context injection attacks calibrated using Section 4 findings"
+    - section: "Chapter 7 (Part 2)"
+      concept: "Jailbreaks — attention forensics methodology applied to jailbreak analysis"
+    - section: "Chapter 14 (Part 3)"
+      concept: "Production deployment — Flash Attention versioning, precision choices as deployment decisions"
+
+  security_thread: |
+    This section adds two security threads:
+    1. Numerical stability divergence → evaluation environment mismatch risk (Chapter 14 QA)
+    2. Long context + lost-in-middle → safety instruction placement as defensive design (Section 04_15)
+    The inference optimization arc (Sections 8-10) is now 2/3 complete.
+    Section 8 covered the decode phase (KV cache).
+    Section 9 covered the prefill phase (Flash Attention).
+    Section 10 will cover decode phase parallelism (speculative decoding).
+    Together they establish the full inference attack surface before Chapter 14 defends it.
+
+# ============================================================================
+# FURTHER READING
+# ============================================================================
+
+further_reading:
+
+  primary:
+    - title: "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness"
+      authors: "Dao et al. (2022)"
+      note: "Original paper — Algorithm 1 in Section 3 is the exact algorithm implemented here"
+      url: "https://arxiv.org/abs/2205.14135"
+
+    - title: "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning"
+      authors: "Dao (2023)"
+      note: "The production-standard version — Section 3 explains the improved work partitioning"
+      url: "https://arxiv.org/abs/2307.08691"
+
+    - title: "FlashAttention-3: Fast and Accurate Attention on Hopper GPUs"
+      authors: "Shah et al. (2024)"
+      note: "H100-specific optimizations — relevant for high-throughput enterprise deployments"
+      url: "https://arxiv.org/abs/2407.08608"
+
+  long_context_security:
+    - title: "Lost in the Middle: How Language Models Use Long Contexts"
+      authors: "Liu et al. (2023)"
+      note: "Demonstrates the U-shaped attention pattern — required reading for long-context deployment"
+      url: "https://arxiv.org/abs/2307.03172"
+
+    - title: "Long Context is Not Long at Last: Reasoning with LLMs on 128k-Token Inputs"
+      authors: "Kuratov et al. (2024)"
+      note: "Quantifies how capability degrades with context length on reasoning tasks"
+      url: "https://arxiv.org/abs/2402.10171"
+
+  numerical_stability:
+    - title: "Online normalizer calculation for softmax"
+      authors: "Milakov & Gimelshein (NVIDIA, 2018)"
+      note: "The online softmax trick Flash Attention uses — short and precise"
+      url: "https://arxiv.org/abs/1805.02867"
+
+

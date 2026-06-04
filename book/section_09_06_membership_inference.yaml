@@ -1,0 +1,1493 @@
+# section_09_06_membership_inference.yaml
+
+---
+document_info:
+  title: 'Section 9.6: Membership Inference'
+  subtitle: 'Detecting Training Set Membership via Overfitting Signals'
+  chapter: 9
+  section: 6
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/raghavpoonia/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  estimated_pages: 6
+  estimated_reading_time: '24 minutes'
+  created: '2026-05-09'
+
+section_overview:
+  one_line_summary: |
+    Membership inference exploits the same overfitting that hurts generalisation:
+    a model optimised on training data assigns higher confidence and lower loss
+    to members than to non-members, leaking individual data inclusion through
+    the inference API and constituting a regulated privacy violation wherever
+    training data is personally identifiable.
+
+  why_this_section_exists: |
+    Sections 9.3 through 9.5 covered attacks that steal what the model knows
+    or how it is configured. Section 9.6 opens the privacy attack arc: attacks
+    that exploit the inference API to extract information about the training
+    data itself, rather than the model''s learned behaviour. Membership inference
+    is the entry point: it answers the question "was this specific record in the
+    training set?" without reconstructing the record''s content.
+
+    The Chapter 1 preview of overfitting as a property that reduces generalisation
+    accuracy gains a second meaning here: the same memorisation that causes a
+    model to overfit its training data is the signal that membership inference
+    exploits. A model that memorises training examples assigns them higher
+    confidence and lower loss than it assigns to unseen inputs drawn from the
+    same distribution. This gap is measurable through the inference API without
+    access to model weights.
+
+    The privacy consequence is direct. If the training data contains personally
+    identifiable information -- medical records, financial data, user-generated
+    content -- membership inference determines whether a specific individual''s
+    data was used to train the model. This is a HIPAA violation if the model
+    was trained on protected health information without proper authorisation.
+    It is a GDPR right-to-erasure violation if the model was trained on EU
+    personal data and the individual has exercised their erasure right. The
+    inference API becomes a privacy audit tool in the adversary''s hands.
+
+    Section 9.6 builds the attack in two variants (confidence-based and
+    loss-based), implements the shadow model attack (Shokri et al. 2017),
+    and introduces the simpler threshold attack that does not require shadow
+    model training. The defence connection to differential privacy training
+    (Section 8.13) is made explicit: DP training is the upstream defence
+    that bounds per-example information leakage; output perturbation
+    (Section 9.12) is the downstream control that reduces signal visibility
+    at the API level.
+
+  position_in_chapter: |
+    Section 9.6 of 13. First privacy attack section. Opens the two-section
+    privacy arc (9.6 membership inference, 9.7 model inversion) that shares
+    the inference-time attack surface with the four extraction goals. Establishes
+    the overfitting-as-privacy-leakage mechanism that Section 9.7 extends to
+    full training data reconstruction. The differential privacy training
+    connection made here recurs in Section 9.7.
+
+learning_objectives:
+  knowledge:
+    - 'Explain the overfitting mechanism that enables membership inference: why training members have higher confidence and lower loss'
+    - 'Describe confidence-based and loss-based membership inference and when each applies'
+    - 'Explain the shadow model attack (Shokri et al. 2017): how shadow models learn the membership classifier'
+    - 'Describe the threshold attack as a simpler alternative that does not require shadow model training'
+    - 'Articulate why membership inference against a model trained on PII is a HIPAA and GDPR violation'
+    - 'Explain how differential privacy training bounds membership inference success'
+
+  skills:
+    - 'Implement confidence-based membership inference against a binary classifier and measure attack accuracy'
+    - 'Implement loss-based membership inference and compare to the confidence baseline'
+    - 'Build a shadow model attack following the Shokri et al. 2017 framework'
+    - 'Implement a threshold attack and tune the threshold against a validation membership set'
+    - 'Analyse a training dataset for privacy exposure under HIPAA and GDPR membership inference threat models'
+
+  security_mindset:
+    - 'Internalise that overfitting is simultaneously a generalisation problem and a privacy problem -- the same property causes both'
+    - 'Recognise that membership inference against production models trained on PII is a current, regulated, legal liability'
+    - 'Understand that differential privacy training is the upstream defence -- output perturbation reduces signal but does not bound information leakage the way DP does'
+    - 'Appreciate that the membership inference signal is available through the standard inference API without any special access'
+
+prerequisites:
+  - 'Chapter 1: overfitting, generalisation gap, and train vs test accuracy (overfitting mechanism fully explained there; this section applies it as attack)'
+  - 'Chapter 2: cross-entropy loss, confidence scores, softmax (loss-based and confidence-based attack signals)'
+  - 'Chapter 8 Section 8.13: differential privacy training (upstream defence; this section explains why it is required)'
+  - 'Section 9.1: inference-time threat model (black-box access level; adversary sees only model outputs)'
+  - 'Section 9.2: privacy attacks sharing the inference surface (taxonomy position of this section)'
+
+prose_content:
+
+  - part: 1
+    title: 'The Overfitting Connection: Chapter 1 Mechanism Returns as Privacy Attack'
+    body: |
+      Chapter 1 introduced overfitting as a property that hurts model performance:
+      a model that memorises its training data learns the noise and idiosyncrasies
+      of training examples rather than the underlying pattern, producing high
+      training accuracy but poor generalisation to unseen data. The Chapter 1
+      treatment was diagnostic -- overfitting is something to detect and prevent
+      through regularisation, early stopping, and validation monitoring.
+
+      Section 9.6 reframes the same property from the adversary''s perspective.
+      Overfitting is not only a performance problem; it is a privacy leak. A model
+      that has memorised a training example responds to that example differently
+      than it responds to a similar but unseen example drawn from the same
+      distribution. The memorised example receives higher confidence, lower loss,
+      and in extreme cases, near-certain predictions that deviate from the model''s
+      typical uncertainty on that input class. This differential response is
+      detectable through the inference API.
+
+      The privacy consequence depends on what the training data contains. For a
+      model trained on public benchmark data, membership inference reveals which
+      benchmark examples were in the training set -- interesting academically but
+      low consequence. For a model trained on medical records, financial
+      transactions, legal documents, or user-generated content, membership
+      inference answers the question "was this specific person''s data used to
+      train this model?" against the operator''s stated privacy policy and
+      applicable regulation. The inference API becomes a compliance audit
+      instrument.
+
+      The attack surface is the same as extraction: the standard inference API.
+      No special access is required. The adversary submits a target record --
+      a medical note, a financial transaction, a user''s chat history -- and
+      observes whether the model''s confidence and loss on that record are
+      consistent with it having been a training example. High confidence
+      relative to the non-member baseline is the member signal.
+
+  - part: 2
+    title: 'Confidence-Based Membership Inference: The Foundational Signal'
+    body: |
+      Confidence-based membership inference uses the model''s predicted class
+      probability as the membership signal. The key observation is that a model
+      trained on an example assigns higher maximum confidence to that example
+      than to a similarly structured non-member example. The confidence gap is
+      the product of overfitting: the model has seen the training example during
+      optimisation and has adjusted its parameters to produce a confident
+      prediction on it.
+
+      The attack is straightforward. The adversary submits the target record
+      to the model and observes the maximum predicted probability (the confidence
+      of the top-1 prediction). They compare this confidence to a threshold:
+      if confidence exceeds the threshold, the record is predicted to be a
+      training member; below the threshold, a non-member. The threshold is
+      calibrated either from shadow model experiments (Section 9.6.3) or from
+      a small set of known members and non-members the adversary can access.
+
+      The attack accuracy depends on the model''s generalisation gap. A model
+      with large overfitting -- high train accuracy, low test accuracy -- has
+      a large confidence gap between members and non-members, making membership
+      inference highly accurate. A well-regularised model with small overfitting
+      has a small confidence gap, reducing attack accuracy toward the random
+      baseline (50% for binary classification).
+
+      This dependency is the mechanistic connection to Chapter 1: reducing
+      overfitting through regularisation, data augmentation, and early stopping
+      simultaneously improves generalisation and reduces membership inference
+      accuracy. Models trained with strong regularisation are harder to attack
+      via membership inference -- not because the attack is blocked, but because
+      the signal it exploits is weaker.
+
+      The attack works without knowing the true training set. The adversary
+      needs only the target record and a set of non-member records drawn from
+      the same distribution to calibrate the threshold. For many threat scenarios
+      -- an adversary who knows that a competitor''s model was trained on a
+      specific dataset and wants to confirm whether a specific record was included
+      -- this is a realistic capability.
+
+  - part: 3
+    title: 'Loss-Based Membership Inference: The Symmetric Signal'
+    body: |
+      Loss-based membership inference uses the model''s cross-entropy loss on
+      the target record and its true label as the membership signal. Training
+      set members were optimised to minimise this loss; the model has seen their
+      (input, label) pairs during training and has adjusted its parameters to
+      predict the correct label with high confidence. The loss on training members
+      is systematically lower than on non-members.
+
+      The loss signal is the symmetric dual of the confidence signal. High
+      confidence on the correct class implies low cross-entropy loss; low
+      confidence implies high loss. For binary classification with a single
+      output probability p, the cross-entropy loss is -log(p) for the correct
+      class: maximising p is equivalent to minimising the loss. The two signals
+      are formally equivalent for binary classification with known true labels.
+
+      For multi-class classification, the relationship is less tight. A model
+      can have high confidence on the wrong class (high max confidence, high
+      loss on the correct class) -- which would fool a confidence-based detector
+      if the adversary does not know the true label but would be correctly
+      identified as a non-member by the loss-based detector which requires the
+      true label.
+
+      The practical requirement for loss-based inference is that the adversary
+      knows the true label of the target record. For many membership inference
+      scenarios this is satisfied: the adversary who wants to determine whether
+      a specific medical record was in the training set already possesses that
+      record with its true diagnosis label. For scenarios where the adversary
+      does not have the true label -- attempting to infer membership of an
+      unlabelled record -- confidence-based inference is the applicable variant.
+
+      Song and Mittal 2021 ("Systematic Evaluation of Privacy Risks of Machine
+      Learning Models") demonstrated that loss-based membership inference is
+      the most reliably accurate attack across a wide range of model architectures
+      and training configurations when the true label is available. Confidence-
+      based inference is applicable more broadly but is somewhat less accurate.
+      Both should be implemented and compared for any serious privacy audit.
+
+  - part: 4
+    title: 'Shadow Model Attacks: The Shokri et al. 2017 Framework'
+    body: |
+      The Shokri et al. 2017 paper "Membership Inference Attacks Against Machine
+      Learning Models" introduced the shadow model framework, which remains the
+      canonical reference for membership inference attacks. The framework solves
+      a practical problem: the adversary does not know the distribution of
+      confidence scores for members versus non-members in the target model,
+      making threshold calibration difficult without known ground-truth membership
+      labels.
+
+      The shadow model approach trains a set of shadow models that mimic the
+      target model''s behaviour. Each shadow model is trained on a known subset
+      of available data, where the adversary knows exactly which records are
+      in-training (members) and which are held out (non-members). After training,
+      the adversary queries each shadow model on both its training members and its
+      held-out non-members, collecting the (confidence_vector, membership_label)
+      pairs as a labelled dataset for a meta-classifier.
+
+      The meta-classifier learns to distinguish the confidence distribution of
+      members from non-members based on the shadow model experiments. Because the
+      shadow models are trained on data from the same distribution as the target
+      model, the meta-classifier''s learned boundary generalises to the target
+      model: the confidence distribution of members in the target model is similar
+      to the confidence distribution of members in the shadow models.
+
+      The meta-classifier is typically a simple binary classifier -- logistic
+      regression or a small neural network -- trained on the (confidence_vector,
+      membership_label) pairs from all shadow models combined. At attack time,
+      the adversary queries the target model for the target record, obtains its
+      confidence vector, and passes it through the meta-classifier to obtain
+      a membership prediction.
+
+      The power of the shadow model approach is transferability: a meta-classifier
+      trained on shadow models of different architecture than the target still
+      achieves substantial attack accuracy if the training distribution is matched.
+      This means the adversary does not need to know the target model''s architecture
+      -- only the approximate distribution of the training data -- to mount an
+      effective shadow model attack.
+
+      Shokri et al. demonstrated attack accuracy of 73 to 95 percent on commercial
+      ML APIs using shadow models, substantially above the random 50 percent
+      baseline. The attack was particularly accurate against models with high
+      overfitting and against models trained on small datasets where every training
+      example received disproportionate parameter adjustment.
+
+  - part: 5
+    title: 'Threshold Attacks: The Simpler Approach'
+    body: |
+      The threshold attack is a simplified membership inference variant that
+      does not require shadow model training. The adversary directly thresholds
+      on a single scalar signal -- maximum confidence or cross-entropy loss --
+      rather than training a meta-classifier on the full confidence vector.
+      Despite its simplicity, the threshold attack achieves attack accuracy
+      competitive with the shadow model approach in many practical settings,
+      particularly when the model has a large generalisation gap.
+
+      The threshold attack procedure has two stages. In the calibration stage,
+      the adversary identifies a small set of known training members (records
+      the adversary knows were in the training set) and a set of known non-members
+      (records the adversary knows were not). They query the target model on both
+      sets and observe the distribution of the chosen signal (confidence or loss)
+      for each group. The threshold is set at the value that maximally separates
+      the two distributions -- typically the midpoint between the means, or the
+      value that maximises the F1 score on the calibration set.
+
+      In the inference stage, the adversary queries the target model for the
+      target record, obtains the signal value, and compares it to the threshold.
+      Records above the confidence threshold (or below the loss threshold)
+      are predicted as members.
+
+      The threshold attack''s advantage over the shadow model approach is
+      operational simplicity: no separate shadow model training infrastructure
+      is required, and the calibration can be performed with as few as ten
+      known members and ten known non-members. For an adversary whose goal is
+      a quick membership check on a small set of target records, the threshold
+      attack is the appropriate tool.
+
+      The threshold attack''s limitation is sensitivity to model and distribution
+      shift. If the target model''s confidence distribution differs substantially
+      from the calibration set''s distribution -- because the model architecture
+      is different, the training procedure is different, or the calibration set
+      is drawn from a different distribution -- the threshold will be miscalibrated
+      and attack accuracy will degrade. The shadow model approach is more robust
+      to these shifts because it learns the meta-classifier from models that
+      share the target''s training distribution.
+
+  - part: 6
+    title: 'Membership Inference Against LLMs: The Training Data Extraction Precursor'
+    body: |
+      Membership inference against LLMs uses a different signal than for
+      classifiers. LLMs do not output class probability vectors over a fixed
+      label set; they generate token sequences. The membership signal for LLMs
+      is perplexity: the average per-token cross-entropy loss that the model
+      assigns to a text sequence. A model that has memorised a text sequence
+      assigns it low perplexity; a model that has not seen the sequence assigns
+      it higher perplexity consistent with the base distribution.
+
+      Low perplexity on a specific text is the member signal: if the model assigns
+      a target document lower perplexity than it assigns to similar documents
+      drawn from the same distribution, the target document is likely a training
+      member. Carlini et al. 2019 ("The Secret Sharer") demonstrated this
+      systematically: canary sequences inserted into training data were assigned
+      significantly lower perplexity by models that had seen them during training
+      than by models that had not.
+
+      The LLM membership inference threat model has high practical consequence.
+      Many commercially deployed LLMs were trained on internet-sourced data that
+      contains personally identifiable information, copyrighted material, and
+      sensitive documents whose inclusion was not explicitly authorised. An
+      adversary who can determine with high probability that a specific document
+      was in the training set has evidence for a range of legal claims: GDPR
+      data subject rights, copyright infringement, privacy torts, and regulatory
+      compliance violations.
+
+      Membership inference against LLMs also serves as the precursor to the
+      model inversion attack in Section 9.7. The inversion attack reconstructs
+      training data content; membership inference determines which records are
+      worth targeting for reconstruction. A combined attack queries the model
+      for many candidate records, identifies the high-probability members via
+      perplexity scoring, and then applies inversion techniques to reconstruct
+      the exact content of those members.
+
+      The defence connection for LLM membership inference is the same as for
+      classifiers: differential privacy training (Section 8.13) bounds the
+      information leakage per training token and reduces the perplexity gap
+      between members and non-members. At very tight privacy budgets, DP
+      training makes the perplexity signal indistinguishable from noise at
+      the cost of degraded model capability. The utility-privacy tradeoff is
+      steeper for LLMs than for classifiers because perplexity-based performance
+      is sensitive to the randomness that DP introduces into the gradient updates.
+
+  - part: 7
+    title: 'Privacy Implications: HIPAA, GDPR, and Membership Inference as Regulated Harm'
+    body: |
+      Membership inference is not only a technical attack -- it is a legally
+      consequential one wherever training data is subject to privacy regulation.
+      Two regulatory frameworks make membership inference against production
+      models a current legal liability.
+
+      Under HIPAA, protected health information (PHI) includes individually
+      identifiable health data. A model trained on medical records is likely
+      trained on PHI if the records include names, dates, geographic identifiers,
+      or other direct or indirect identifiers. Membership inference against such
+      a model determines whether a specific patient''s records were in the training
+      set -- a disclosure of PHI to the adversary without the patient''s
+      authorisation and without the covered entity''s awareness. This constitutes
+      a HIPAA privacy rule violation. The breach notification rule requires
+      covered entities to notify affected individuals when PHI is disclosed without
+      authorisation; the difficulty is that the operator may not know a membership
+      inference attack occurred unless they are monitoring for it.
+
+      Under GDPR, the right to erasure (Article 17) allows data subjects to
+      request deletion of their personal data. For models trained on EU personal
+      data, erasure requests require that the data subject''s information be
+      removed from the training set and that the model be retrained or adjusted
+      accordingly. Membership inference provides a mechanism for data subjects
+      to verify whether their erasure request was implemented: if the model still
+      assigns higher confidence to the data subject''s records than to similar
+      non-member records, the erasure may not have been effective. Regulators
+      have begun treating this verification mechanism as a data subject right.
+
+      Beyond specific regulations, membership inference represents a fundamental
+      breach of the implicit contract between model operators and data subjects.
+      When a user''s data is used to train a model, the expectation is that the
+      model does not expose the data through its predictions. Membership inference
+      demonstrates that this expectation is not technically guaranteed by default --
+      it requires active defence through differential privacy training,
+      and even then only up to a measurable privacy budget ε.
+
+  - part: 8
+    title: 'Defence Connections: Differential Privacy Training and Output Perturbation'
+    body: |
+      Membership inference has two defensive layers, operating at different
+      points in the model lifecycle.
+
+      The upstream defence is differential privacy training from Section 8.13.
+      DP training adds calibrated noise to gradient updates during training,
+      bounding the influence of any individual training example on the model''s
+      parameters. The privacy budget ε quantifies this bound: lower ε means
+      stronger privacy guarantee but more noise added to gradients, which
+      degrades model accuracy. Formally, DP training guarantees that an
+      adversary''s ability to distinguish a model trained with a specific record
+      from a model trained without it is bounded by the factor exp(ε). At ε = 1,
+      this factor is approximately 2.7x -- a substantial but not absolute bound.
+
+      The practical consequence for membership inference: a model trained with
+      DP has a smaller confidence and loss gap between members and non-members
+      because the gradient noise during training prevents any individual example
+      from dominating the parameter updates. Attack accuracy on DP-trained models
+      degrades toward the random baseline as ε decreases. At ε ≈ 1 to 3, attack
+      accuracy drops to 55 to 65 percent compared to 75 to 95 percent for non-DP
+      models -- still above the random baseline but substantially reduced.
+
+      The downstream defence is output perturbation from Section 9.12. Output
+      perturbation adds calibrated noise to model predictions at inference time,
+      reducing the precision of the confidence signal available to the adversary.
+      If the model''s confidence on a training member is 0.92 but the API returns
+      a perturbed value drawn from a distribution around 0.92, the adversary''s
+      threshold calibration becomes less precise. Perturbation does not bound
+      information leakage the way DP training does -- a patient adversary with
+      enough queries can average out the perturbation noise -- but it raises
+      the query budget required for accurate threshold calibration.
+
+      The correct architecture is DP training as the primary control, output
+      perturbation as the secondary signal-reduction control, and query pattern
+      monitoring (Section 9.11) to detect systematic membership probing campaigns
+      that issue many queries against a target record to average out perturbation
+      noise. All three controls are required for production deployment of models
+      trained on sensitive personal data.
+
+reference_materials:
+
+  - table: 1
+    title: 'Membership Inference Attack Variants: Comparison'
+    description: |
+      Four membership inference attack variants with signal, adversary requirement,
+      attack accuracy, and defence sensitivity.
+    columns:
+      - 'Variant'
+      - 'Signal Used'
+      - 'Adversary Requirement'
+      - 'Typical Attack Accuracy'
+      - 'Advantage'
+      - 'Limitation'
+    rows:
+      - variant: 'Confidence-based threshold'
+        signal: 'Maximum predicted probability (top-1 confidence)'
+        requirement: 'Target record only; true label not required'
+        accuracy: '60-80% on overfit models; near 50% on well-regularised'
+        advantage: 'No true label required; simplest implementation'
+        limitation: 'Lower accuracy than loss-based when true label available'
+      - variant: 'Loss-based threshold'
+        signal: 'Cross-entropy loss on target record with true label'
+        requirement: 'Target record and its true label'
+        accuracy: '65-85% on overfit models; most reliable signal'
+        advantage: 'Most accurate when true label known; less sensitive to calibration'
+        limitation: 'Requires true label; not applicable to unlabelled target records'
+      - variant: 'Shadow model attack (Shokri et al. 2017)'
+        signal: 'Full confidence vector passed through trained meta-classifier'
+        requirement: 'Access to data from same distribution; compute for shadow models'
+        accuracy: '73-95% demonstrated on commercial MLaaS APIs'
+        advantage: 'Highest accuracy; robust to model architecture differences'
+        limitation: 'Requires shadow model training infrastructure; more complex'
+      - variant: 'Perplexity-based (LLMs)'
+        signal: 'Per-token cross-entropy loss (perplexity) on text sequences'
+        requirement: 'Target text; access to log-probabilities or perplexity API'
+        accuracy: 'Variable; depends on memorisation degree and sequence length'
+        advantage: 'Applicable to generative LLMs where class-probability signal absent'
+        limitation: 'Requires log-probability access; noisy for short sequences'
+
+  - table: 2
+    title: 'Attack Accuracy vs Model Overfitting Degree'
+    description: |
+      Relationship between generalisation gap (train accuracy minus test accuracy)
+      and membership inference attack accuracy across attack variants.
+      Values are approximate based on published benchmarks.
+    columns:
+      - 'Generalisation Gap'
+      - 'Model Condition'
+      - 'Confidence-Based Accuracy'
+      - 'Loss-Based Accuracy'
+      - 'Shadow Model Accuracy'
+    rows:
+      - gap: '<2%'
+        condition: 'Well-regularised; minimal overfitting'
+        confidence: '51-55%'
+        loss: '52-58%'
+        shadow: '55-62%'
+      - gap: '2-10%'
+        condition: 'Moderate overfitting; typical production model'
+        confidence: '60-70%'
+        loss: '65-75%'
+        shadow: '68-80%'
+      - gap: '10-20%'
+        condition: 'Substantial overfitting; small training set or under-regularised'
+        confidence: '70-80%'
+        loss: '75-85%'
+        shadow: '80-90%'
+      - gap: '>20%'
+        condition: 'Severe overfitting; training set memorisation'
+        confidence: '80-90%'
+        loss: '85-93%'
+        shadow: '88-95%'
+
+  - table: 3
+    title: 'Regulatory Framework Mapping: Membership Inference as Regulated Harm'
+    description: |
+      Maps membership inference attack outcomes to specific regulatory obligations
+      under HIPAA and GDPR.
+    columns:
+      - 'Regulatory Framework'
+      - 'Relevant Provision'
+      - 'Membership Inference Harm'
+      - 'Operator Obligation'
+      - 'Consequence of Violation'
+    rows:
+      - framework: 'HIPAA Privacy Rule'
+        provision: '45 CFR 164.502 -- minimum necessary and authorised use'
+        harm: 'Adversary determines that specific patient PHI was in training set -- unauthorised disclosure'
+        obligation: 'Prevent unauthorised disclosure of PHI; monitor for inference attacks against PHI-trained models'
+        consequence: 'Civil monetary penalties up to $1.9M per violation category per year; criminal liability for knowing violations'
+      - framework: 'HIPAA Breach Notification Rule'
+        provision: '45 CFR 164.400 -- breach notification to affected individuals'
+        harm: 'Confirmed membership inference attack against PHI-trained model constitutes a breach'
+        obligation: 'Notify affected individuals within 60 days of discovering a breach'
+        consequence: 'Civil penalties; reputational harm; HHS enforcement action'
+      - framework: 'GDPR Article 17'
+        provision: 'Right to erasure -- data subject may request deletion of personal data'
+        harm: 'Membership inference verifies that erasure was not implemented; personal data still encoded in model'
+        obligation: 'Implement erasure; retrain or apply machine unlearning to remove subject data'
+        consequence: 'Administrative fines up to 4% of annual global turnover or EUR 20M'
+      - framework: 'GDPR Article 22'
+        provision: 'Automated decision-making -- right to explanation of automated decisions'
+        harm: 'Membership inference reveals training data used in automated decisions affecting the data subject'
+        obligation: 'Disclose whether subject data was used; provide meaningful information about the logic'
+        consequence: 'Administrative fines; supervisory authority enforcement'
+
+  - table: 4
+    title: 'Defence Layer Summary: Differential Privacy vs Output Perturbation vs Query Monitoring'
+    description: |
+      Three defensive controls against membership inference with their mechanism,
+      formal guarantee, limitations, and interaction.
+    columns:
+      - 'Control'
+      - 'Mechanism'
+      - 'Formal Guarantee'
+      - 'Accuracy Reduction'
+      - 'Limitation'
+      - 'Chapter Reference'
+    rows:
+      - control: 'Differential privacy training'
+        mechanism: 'Adds calibrated noise to gradient updates; bounds per-example influence on model parameters'
+        guarantee: 'exp(epsilon) bound on adversary distinguishing ability per training example'
+        accuracy_reduction: 'Reduces attack accuracy to 55-65% at epsilon=1-3; cost is model accuracy degradation'
+        limitation: 'Utility-privacy tradeoff; strong DP guarantees require large epsilon-related accuracy cost'
+        chapter_reference: 'Section 8.13 (upstream defence)'
+      - control: 'Output perturbation'
+        mechanism: 'Adds noise to inference outputs; reduces precision of confidence and loss signals'
+        guarantee: 'No formal privacy guarantee; raises query budget for accurate threshold calibration'
+        accuracy_reduction: 'Moderate; patient adversary with many queries can average out perturbation'
+        limitation: 'Not a bound -- only friction; sufficient queries defeat perturbation'
+        chapter_reference: 'Section 9.12 (downstream control)'
+      - control: 'Query pattern monitoring'
+        mechanism: 'Detects repeated queries against the same target record (perturbation-averaging campaigns)'
+        guarantee: 'No formal guarantee; detection-based rather than prevention-based'
+        accuracy_reduction: 'Prevents high-query campaigns that overcome perturbation'
+        limitation: 'Adversary can slow query rate below detection threshold'
+        chapter_reference: 'Section 9.11 (runtime control)'
+
+deliverables:
+
+  - id: 1
+    name: 'confidence_membership_inference.py'
+    description: |
+      Confidence-based membership inference attack against a binary classifier.
+      Trains a target model on a subset of data (the members), then queries the
+      model on both members and non-members and uses maximum predicted confidence
+      as the membership signal. Tunes a threshold on a calibration split and
+      evaluates attack accuracy (true positive rate, false positive rate, AUC)
+      on a held-out evaluation set.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and sklearn.
+      Target model is a LogisticRegression by default but accepts any sklearn
+      estimator with predict_proba(). No hardcoded dataset or threshold.
+      Threshold tuning is data-driven across a configurable sweep range.
+    code: |
+      # confidence_membership_inference.py
+      # Chapter 9 Section 9.6 -- Confidence-Based Membership Inference Attack
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from dataclasses import dataclass, field
+      from typing import Any, List, Optional, Tuple
+
+
+      @dataclass
+      class MIAResult:
+          attack_variant: str
+          threshold: float
+          tpr: float   # true positive rate (members correctly identified)
+          fpr: float   # false positive rate (non-members incorrectly flagged)
+          accuracy: float
+          auc_approx: float
+          note: str
+
+
+      def train_target_model(
+          model_class,
+          model_kwargs: dict,
+          X_train: np.ndarray,
+          y_train: np.ndarray,
+      ):
+          '''Train and return a target model. Accepts any sklearn estimator.'''
+          model = model_class(**model_kwargs)
+          model.fit(X_train, y_train)
+          return model
+
+
+      def compute_confidence_scores(model, X: np.ndarray) -> np.ndarray:
+          '''
+          Return maximum predicted class probability for each input.
+          Requires model to expose predict_proba(X).
+          '''
+          proba = model.predict_proba(X)
+          return proba.max(axis=1)
+
+
+      def sweep_thresholds(
+          member_scores: np.ndarray,
+          non_member_scores: np.ndarray,
+          n_thresholds: int = 100,
+      ) -> List[Tuple[float, float, float, float]]:
+          '''
+          Sweep confidence thresholds and return (threshold, tpr, fpr, accuracy) tuples.
+          '''
+          all_scores = np.concatenate([member_scores, non_member_scores])
+          thresholds = np.linspace(all_scores.min(), all_scores.max(), n_thresholds)
+          results: List[Tuple[float, float, float, float]] = []
+          n_members = len(member_scores)
+          n_non_members = len(non_member_scores)
+          for t in thresholds:
+              tp = float((member_scores >= t).sum())
+              fp = float((non_member_scores >= t).sum())
+              tn = float((non_member_scores < t).sum())
+              fn = float((member_scores < t).sum())
+              tpr = tp / max(n_members, 1)
+              fpr = fp / max(n_non_members, 1)
+              acc = (tp + tn) / max(n_members + n_non_members, 1)
+              results.append((float(t), tpr, fpr, acc))
+          return results
+
+
+      def select_best_threshold(
+          sweep: List[Tuple[float, float, float, float]],
+      ) -> Tuple[float, float, float, float]:
+          '''Select the threshold with highest balanced accuracy (TPR + TNR) / 2.'''
+          best = max(sweep, key=lambda x: (x[1] + (1.0 - x[2])) / 2.0)
+          return best
+
+
+      def approximate_auc(sweep: List[Tuple[float, float, float, float]]) -> float:
+          '''Approximate AUC from the TPR/FPR sweep using the trapezoidal rule.'''
+          sweep_sorted = sorted(sweep, key=lambda x: x[2])  # sort by FPR
+          fprs = [s[2] for s in sweep_sorted]
+          tprs = [s[1] for s in sweep_sorted]
+          auc = float(np.trapz(tprs, fprs))
+          return abs(auc)
+
+
+      def run_confidence_mia(
+          model,
+          X_members: np.ndarray,
+          X_non_members: np.ndarray,
+          calibration_fraction: float = 0.5,
+          rng: Optional[np.random.Generator] = None,
+      ) -> MIAResult:
+          '''
+          Run confidence-based membership inference attack.
+          Splits members/non-members into calibration and evaluation sets.
+          Returns MIAResult with attack accuracy at the best threshold.
+          '''
+          if rng is None:
+              rng = np.random.default_rng(seed=42)
+          n_cal_m = max(1, int(len(X_members) * calibration_fraction))
+          n_cal_nm = max(1, int(len(X_non_members) * calibration_fraction))
+          cal_m = X_members[:n_cal_m]
+          eval_m = X_members[n_cal_m:]
+          cal_nm = X_non_members[:n_cal_nm]
+          eval_nm = X_non_members[n_cal_nm:]
+
+          cal_m_scores = compute_confidence_scores(model, cal_m)
+          cal_nm_scores = compute_confidence_scores(model, cal_nm)
+          sweep = sweep_thresholds(cal_m_scores, cal_nm_scores)
+          best_t, _, _, _ = select_best_threshold(sweep)
+          auc = approximate_auc(sweep)
+
+          eval_m_scores = compute_confidence_scores(model, eval_m)
+          eval_nm_scores = compute_confidence_scores(model, eval_nm)
+          tp = float((eval_m_scores >= best_t).sum())
+          fp = float((eval_nm_scores >= best_t).sum())
+          tn = float((eval_nm_scores < best_t).sum())
+          fn = float((eval_m_scores < best_t).sum())
+          n_total = len(eval_m) + len(eval_nm)
+          return MIAResult(
+              attack_variant='confidence_threshold',
+              threshold=round(float(best_t), 4),
+              tpr=round(tp / max(len(eval_m), 1), 4),
+              fpr=round(fp / max(len(eval_nm), 1), 4),
+              accuracy=round((tp + tn) / max(n_total, 1), 4),
+              auc_approx=round(auc, 4),
+              note=f'Calibrated on {n_cal_m} members and {n_cal_nm} non-members',
+          )
+
+
+      if __name__ == '__main__':
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.neural_network import MLPClassifier
+          from sklearn.datasets import make_classification
+
+          rng = np.random.default_rng(seed=0)
+          X, y = make_classification(n_samples=2000, n_features=20, random_state=42)
+
+          # Train on first 400 records only (members); rest are non-members
+          X_members = X[:400]
+          y_members = y[:400]
+          X_non_members = X[400:]
+
+          # Overfit model: no regularisation, small training set
+          target = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=1000,
+                                 alpha=0.0001, random_state=42)
+          target.fit(X_members, y_members)
+
+          train_acc = target.score(X_members, y_members)
+          test_acc = target.score(X_non_members, y[400:])
+          print(f'Train accuracy: {train_acc:.1%}  Test accuracy: {test_acc:.1%}')
+          print(f'Generalisation gap: {train_acc - test_acc:.1%}')
+
+          result = run_confidence_mia(target, X_members, X_non_members[:400])
+          print(f'\nConfidence-Based MIA Results:')
+          print(f'  Threshold:  {result.threshold}')
+          print(f'  TPR:        {result.tpr:.1%}')
+          print(f'  FPR:        {result.fpr:.1%}')
+          print(f'  Accuracy:   {result.accuracy:.1%}')
+          print(f'  AUC (approx): {result.auc_approx:.4f}')
+
+  - id: 2
+    name: 'loss_membership_inference.py'
+    description: |
+      Loss-based membership inference attack. Uses cross-entropy loss on the
+      target record and its true label as the membership signal, comparing
+      against the confidence-based baseline at matched datasets. Demonstrates
+      the superiority of the loss signal when true labels are available and
+      quantifies the accuracy difference between the two variants.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and sklearn.
+      Loss computation is generic: works with any model exposing predict_proba().
+      Imports MIAResult and sweep_thresholds from confidence_membership_inference
+      to enable direct comparison on the same calibration data.
+    code: |
+      # loss_membership_inference.py
+      # Chapter 9 Section 9.6 -- Loss-Based Membership Inference Attack
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from typing import Optional
+
+      from confidence_membership_inference import (
+          MIAResult, approximate_auc, select_best_threshold, sweep_thresholds,
+      )
+
+
+      def compute_cross_entropy_loss(
+          model,
+          X: np.ndarray,
+          y: np.ndarray,
+      ) -> np.ndarray:
+          '''
+          Compute per-sample cross-entropy loss: -log(p_true_class).
+          Lower loss = model more confident on the correct class = member signal.
+          Requires model to expose predict_proba(X).
+          '''
+          proba = model.predict_proba(X)
+          n_samples = len(X)
+          true_class_proba = np.array([
+              proba[i, int(y[i])] for i in range(n_samples)
+          ])
+          # Clip to avoid log(0)
+          true_class_proba = np.clip(true_class_proba, 1e-10, 1.0)
+          return -np.log(true_class_proba)
+
+
+      def run_loss_mia(
+          model,
+          X_members: np.ndarray,
+          y_members: np.ndarray,
+          X_non_members: np.ndarray,
+          y_non_members: np.ndarray,
+          calibration_fraction: float = 0.5,
+      ) -> MIAResult:
+          '''
+          Run loss-based membership inference.
+          Note: low loss = member signal, so threshold flipped vs confidence.
+          '''
+          n_cal_m = max(1, int(len(X_members) * calibration_fraction))
+          n_cal_nm = max(1, int(len(X_non_members) * calibration_fraction))
+
+          cal_m_loss = compute_cross_entropy_loss(model, X_members[:n_cal_m], y_members[:n_cal_m])
+          cal_nm_loss = compute_cross_entropy_loss(model, X_non_members[:n_cal_nm], y_non_members[:n_cal_nm])
+
+          # Invert loss: high inverted-loss = low actual-loss = member signal
+          inv_m = -cal_m_loss
+          inv_nm = -cal_nm_loss
+          sweep = sweep_thresholds(inv_m, inv_nm)
+          best_t, _, _, _ = select_best_threshold(sweep)
+          auc = approximate_auc(sweep)
+
+          eval_m_loss = compute_cross_entropy_loss(model, X_members[n_cal_m:], y_members[n_cal_m:])
+          eval_nm_loss = compute_cross_entropy_loss(model, X_non_members[n_cal_nm:], y_non_members[n_cal_nm:])
+          inv_eval_m = -eval_m_loss
+          inv_eval_nm = -eval_nm_loss
+
+          tp = float((inv_eval_m >= best_t).sum())
+          fp = float((inv_eval_nm >= best_t).sum())
+          tn = float((inv_eval_nm < best_t).sum())
+          n_eval_m = len(X_members) - n_cal_m
+          n_eval_nm = len(X_non_members) - n_cal_nm
+          n_total = n_eval_m + n_eval_nm
+          return MIAResult(
+              attack_variant='loss_threshold',
+              threshold=round(float(-best_t), 4),  # convert back to loss scale
+              tpr=round(tp / max(n_eval_m, 1), 4),
+              fpr=round(fp / max(n_eval_nm, 1), 4),
+              accuracy=round((tp + tn) / max(n_total, 1), 4),
+              auc_approx=round(auc, 4),
+              note=f'Calibrated on {n_cal_m} labelled members and {n_cal_nm} labelled non-members',
+          )
+
+
+      if __name__ == '__main__':
+          from sklearn.neural_network import MLPClassifier
+          from sklearn.datasets import make_classification
+          from confidence_membership_inference import run_confidence_mia
+
+          X, y = make_classification(n_samples=2000, n_features=20, random_state=42)
+          X_m, y_m = X[:400], y[:400]
+          X_nm, y_nm = X[400:800], y[400:800]
+
+          target = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=1000,
+                                 alpha=0.0001, random_state=42)
+          target.fit(X_m, y_m)
+
+          conf_result = run_confidence_mia(target, X_m, X_nm)
+          loss_result = run_loss_mia(target, X_m, y_m, X_nm, y_nm)
+
+          print('MEMBERSHIP INFERENCE COMPARISON -- Chapter 9 Section 9.6')
+          header = f'{'Variant':<25} {'Accuracy':>10} {'TPR':>8} {'FPR':>8} {'AUC':>8}'
+          print('-' * 65)
+          for r in [conf_result, loss_result]:
+              print(f'{r.attack_variant:<25} {r.accuracy:>9.1%} {r.tpr:>7.1%} {r.fpr:>7.1%} {r.auc_approx:>7.4f}')
+
+  - id: 3
+    name: 'shadow_model_attack.py'
+    description: |
+      Shadow model membership inference attack following Shokri et al. 2017.
+      Trains N shadow models on known-membership subsets of available data,
+      collects (confidence_vector, member_label) pairs from each shadow model,
+      trains a meta-classifier on the combined shadow model outputs, and applies
+      the meta-classifier to the target model to predict membership.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and sklearn.
+      Shadow model class and meta-classifier class are configurable -- no hardcoded
+      architectures. Number of shadow models is a parameter. Meta-classifier
+      training data collection is schema-free: any feature set from predict_proba
+      is accepted.
+    code: |
+      # shadow_model_attack.py
+      # Chapter 9 Section 9.6 -- Shadow Model Attack (Shokri et al. 2017)
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from dataclasses import dataclass, field
+      from typing import Any, List, Optional, Tuple
+
+      from confidence_membership_inference import MIAResult
+
+
+      @dataclass
+      class ShadowModelResult:
+          n_shadow_models: int
+          meta_train_size: int
+          meta_classifier: Any
+          attack_accuracy: float
+          attack_tpr: float
+          attack_fpr: float
+
+
+      def train_shadow_models(
+          shadow_model_class,
+          shadow_model_kwargs: dict,
+          X_pool: np.ndarray,
+          y_pool: np.ndarray,
+          n_shadow: int,
+          shadow_train_fraction: float = 0.5,
+          rng: Optional[np.random.Generator] = None,
+      ) -> List[Tuple[Any, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+          '''
+          Train n_shadow shadow models on random subsets of X_pool.
+          Returns list of (model, X_in, y_in, X_out, y_out) tuples.
+          X_in / y_in: training members; X_out / y_out: held-out non-members.
+          '''
+          if rng is None:
+              rng = np.random.default_rng(seed=0)
+          n = len(X_pool)
+          shadow_models = []
+          for _ in range(n_shadow):
+              n_train = max(2, int(n * shadow_train_fraction))
+              indices = rng.permutation(n)
+              in_idx = indices[:n_train]
+              out_idx = indices[n_train:]
+              X_in, y_in = X_pool[in_idx], y_pool[in_idx]
+              X_out, y_out = X_pool[out_idx], y_pool[out_idx]
+              model = shadow_model_class(**shadow_model_kwargs)
+              model.fit(X_in, y_in)
+              shadow_models.append((model, X_in, y_in, X_out, y_out))
+          return shadow_models
+
+
+      def collect_meta_training_data(
+          shadow_models: List[Tuple],
+      ) -> Tuple[np.ndarray, np.ndarray]:
+          '''
+          Collect (confidence_vector, membership_label) pairs from all shadow models.
+          Returns X_meta (confidence vectors) and y_meta (0=non-member, 1=member).
+          '''
+          X_meta_parts: List[np.ndarray] = []
+          y_meta_parts: List[np.ndarray] = []
+          for model, X_in, _, X_out, _ in shadow_models:
+              in_proba = model.predict_proba(X_in)
+              out_proba = model.predict_proba(X_out)
+              X_meta_parts.append(in_proba)
+              X_meta_parts.append(out_proba)
+              y_meta_parts.append(np.ones(len(X_in), dtype=int))
+              y_meta_parts.append(np.zeros(len(X_out), dtype=int))
+          return np.vstack(X_meta_parts), np.concatenate(y_meta_parts)
+
+
+      def run_shadow_model_attack(
+          target_model,
+          shadow_model_class,
+          shadow_model_kwargs: dict,
+          meta_classifier_class,
+          meta_classifier_kwargs: dict,
+          X_pool: np.ndarray,
+          y_pool: np.ndarray,
+          X_target_members: np.ndarray,
+          X_target_non_members: np.ndarray,
+          n_shadow: int = 5,
+          shadow_train_fraction: float = 0.5,
+          rng: Optional[np.random.Generator] = None,
+      ) -> ShadowModelResult:
+          '''
+          Full shadow model attack pipeline.
+          target_model: victim model (predict_proba required)
+          X_pool / y_pool: data available to adversary for shadow training
+          X_target_members / X_target_non_members: records to classify
+          '''
+          shadow_models = train_shadow_models(
+              shadow_model_class, shadow_model_kwargs,
+              X_pool, y_pool, n_shadow, shadow_train_fraction, rng,
+          )
+          X_meta, y_meta = collect_meta_training_data(shadow_models)
+          meta_clf = meta_classifier_class(**meta_classifier_kwargs)
+          meta_clf.fit(X_meta, y_meta)
+
+          # Apply meta-classifier to target model outputs
+          target_m_proba = target_model.predict_proba(X_target_members)
+          target_nm_proba = target_model.predict_proba(X_target_non_members)
+          m_preds = meta_clf.predict(target_m_proba)
+          nm_preds = meta_clf.predict(target_nm_proba)
+
+          tp = float(m_preds.sum())
+          fp = float(nm_preds.sum())
+          tn = float((nm_preds == 0).sum())
+          fn = float((m_preds == 0).sum())
+          n_total = len(X_target_members) + len(X_target_non_members)
+          return ShadowModelResult(
+              n_shadow_models=n_shadow,
+              meta_train_size=len(X_meta),
+              meta_classifier=meta_clf,
+              attack_accuracy=round((tp + tn) / max(n_total, 1), 4),
+              attack_tpr=round(tp / max(len(X_target_members), 1), 4),
+              attack_fpr=round(fp / max(len(X_target_non_members), 1), 4),
+          )
+
+
+      if __name__ == '__main__':
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.neural_network import MLPClassifier
+          from sklearn.datasets import make_classification
+
+          X, y = make_classification(n_samples=3000, n_features=20, random_state=42)
+          target = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500,
+                                 alpha=0.0001, random_state=42)
+          target.fit(X[:500], y[:500])
+
+          result = run_shadow_model_attack(
+              target_model=target,
+              shadow_model_class=MLPClassifier,
+              shadow_model_kwargs={'hidden_layer_sizes': (32,), 'max_iter': 300, 'random_state': 1},
+              meta_classifier_class=LogisticRegression,
+              meta_classifier_kwargs={'max_iter': 500},
+              X_pool=X[500:2000],
+              y_pool=y[500:2000],
+              X_target_members=X[:250],
+              X_target_non_members=X[2000:2250],
+              n_shadow=5,
+          )
+          print(f'Shadow Model Attack -- Chapter 9 Section 9.6')
+          print(f'Shadow models trained: {result.n_shadow_models}')
+          print(f'Meta-training samples: {result.meta_train_size}')
+          print(f'Attack accuracy:       {result.attack_accuracy:.1%}')
+          print(f'TPR:                   {result.attack_tpr:.1%}')
+          print(f'FPR:                   {result.attack_fpr:.1%}')
+
+  - id: 4
+    name: 'threshold_attack.py'
+    description: |
+      Threshold membership inference attack: the simplified variant requiring
+      only a small calibration set of known members and non-members. Tunes the
+      confidence threshold on the calibration set and evaluates on a held-out
+      set. Compares accuracy against the shadow model baseline at matched
+      evaluation datasets to demonstrate the conditions under which the simpler
+      attack is competitive.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and sklearn.
+      Threshold sweep range and step count are configurable parameters.
+      Imports shared utilities from confidence_membership_inference. No
+      hardcoded threshold or model assumptions.
+    code: |
+      # threshold_attack.py
+      # Chapter 9 Section 9.6 -- Threshold Membership Inference Attack
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from dataclasses import dataclass
+      from typing import Optional
+
+      from confidence_membership_inference import (
+          MIAResult, compute_confidence_scores,
+          approximate_auc, select_best_threshold, sweep_thresholds,
+      )
+
+
+      @dataclass
+      class ThresholdCalibration:
+          best_threshold: float
+          calibration_accuracy: float
+          n_cal_members: int
+          n_cal_non_members: int
+
+
+      def calibrate_threshold(
+          model,
+          X_cal_members: np.ndarray,
+          X_cal_non_members: np.ndarray,
+          n_sweep: int = 200,
+      ) -> ThresholdCalibration:
+          '''
+          Calibrate a confidence threshold from a small set of known members
+          and non-members. Returns the threshold with highest balanced accuracy.
+          '''
+          m_scores = compute_confidence_scores(model, X_cal_members)
+          nm_scores = compute_confidence_scores(model, X_cal_non_members)
+          sweep = sweep_thresholds(m_scores, nm_scores, n_thresholds=n_sweep)
+          best_t, best_tpr, best_fpr, best_acc = select_best_threshold(sweep)
+          return ThresholdCalibration(
+              best_threshold=round(float(best_t), 4),
+              calibration_accuracy=round(best_acc, 4),
+              n_cal_members=len(X_cal_members),
+              n_cal_non_members=len(X_cal_non_members),
+          )
+
+
+      def run_threshold_attack(
+          model,
+          calibration: ThresholdCalibration,
+          X_eval_members: np.ndarray,
+          X_eval_non_members: np.ndarray,
+      ) -> MIAResult:
+          '''Apply a calibrated threshold to evaluation members and non-members.'''
+          m_scores = compute_confidence_scores(model, X_eval_members)
+          nm_scores = compute_confidence_scores(model, X_eval_non_members)
+          sweep = sweep_thresholds(m_scores, nm_scores)
+          auc = approximate_auc(sweep)
+          t = calibration.best_threshold
+          tp = float((m_scores >= t).sum())
+          fp = float((nm_scores >= t).sum())
+          tn = float((nm_scores < t).sum())
+          n_total = len(X_eval_members) + len(X_eval_non_members)
+          return MIAResult(
+              attack_variant='threshold_attack',
+              threshold=t,
+              tpr=round(tp / max(len(X_eval_members), 1), 4),
+              fpr=round(fp / max(len(X_eval_non_members), 1), 4),
+              accuracy=round((tp + tn) / max(n_total, 1), 4),
+              auc_approx=round(auc, 4),
+              note=f'Calibrated on {calibration.n_cal_members} members + {calibration.n_cal_non_members} non-members',
+          )
+
+
+      if __name__ == '__main__':
+          from sklearn.neural_network import MLPClassifier
+          from sklearn.datasets import make_classification
+
+          X, y = make_classification(n_samples=2000, n_features=20, random_state=42)
+          target = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=1000,
+                                 alpha=0.0001, random_state=42)
+          target.fit(X[:400], y[:400])
+
+          # Adversary has 20 known members and 20 known non-members for calibration
+          calibration = calibrate_threshold(target, X[:20], X[400:420])
+          print(f'Calibrated threshold: {calibration.best_threshold}')
+          print(f'Calibration accuracy: {calibration.calibration_accuracy:.1%}')
+
+          result = run_threshold_attack(target, calibration, X[20:200], X[420:600])
+          print(f'\nThreshold Attack Evaluation:')
+          print(f'  TPR:        {result.tpr:.1%}')
+          print(f'  FPR:        {result.fpr:.1%}')
+          print(f'  Accuracy:   {result.accuracy:.1%}')
+          print(f'  AUC approx: {result.auc_approx:.4f}')
+
+  - id: 5
+    name: 'privacy_implications_analyser.py'
+    description: |
+      Analyses a training dataset for privacy exposure under HIPAA and GDPR
+      membership inference threat models. Classifies records by sensitivity
+      category, estimates per-record exposure risk given a specified attack
+      accuracy, and produces a regulatory obligation report with record counts
+      per risk tier and recommended controls.
+    implementation_notes: |
+      Single quotes throughout per book convention. No external dependencies
+      beyond stdlib. Risk classification is data-driven via SensitivityCategory
+      dataclass list. Regulatory obligation mapping is schema-free. All
+      thresholds are parameterised.
+    code: |
+      # privacy_implications_analyser.py
+      # Chapter 9 Section 9.6 -- Privacy Implications Analyser (HIPAA/GDPR)
+      # Single quotes throughout per book convention.
+
+      from dataclasses import dataclass, field
+      from typing import Dict, List, Optional, Tuple
+
+
+      @dataclass
+      class SensitivityCategory:
+          name: str
+          description: str
+          regulatory_frameworks: List[str]
+          base_exposure_weight: float  # multiplier on attack accuracy for effective risk
+          examples: List[str]
+
+
+      SENSITIVITY_CATEGORIES: List[SensitivityCategory] = [
+          SensitivityCategory(
+              name='protected_health_information',
+              description='HIPAA PHI: individually identifiable health data',
+              regulatory_frameworks=['HIPAA Privacy Rule', 'HIPAA Breach Notification'],
+              base_exposure_weight=1.0,
+              examples=['diagnosis codes', 'treatment records', 'patient identifiers', 'medication history'],
+          ),
+          SensitivityCategory(
+              name='eu_personal_data',
+              description='GDPR personal data: any information relating to an identified natural person',
+              regulatory_frameworks=['GDPR Article 17', 'GDPR Article 22'],
+              base_exposure_weight=0.9,
+              examples=['name', 'email', 'IP address', 'location data', 'biometric data'],
+          ),
+          SensitivityCategory(
+              name='financial_data',
+              description='Financial account records, transaction history, credit information',
+              regulatory_frameworks=['GLBA', 'PCI-DSS', 'GDPR Article 17'],
+              base_exposure_weight=0.85,
+              examples=['account numbers', 'transaction records', 'credit scores', 'salary data'],
+          ),
+          SensitivityCategory(
+              name='user_generated_content',
+              description='Private user communications, messages, documents not intended for public use',
+              regulatory_frameworks=['GDPR Article 17', 'CCPA'],
+              base_exposure_weight=0.7,
+              examples=['chat messages', 'emails', 'private documents', 'search queries'],
+          ),
+      ]
+
+
+      @dataclass
+      class RecordRiskAssessment:
+          record_id: str
+          sensitivity_category: str
+          attack_accuracy: float
+          effective_exposure_risk: float
+          risk_tier: str  # 'critical', 'high', 'moderate', 'low'
+          regulatory_obligations: List[str]
+          recommended_control: str
+
+
+      @dataclass
+      class PrivacyImplicationsReport:
+          total_records: int
+          attack_accuracy: float
+          records_by_tier: Dict[str, int]
+          highest_risk_category: str
+          regulatory_frameworks_triggered: List[str]
+          primary_recommendation: str
+
+
+      RISK_TIER_THRESHOLDS: List[Tuple[float, str]] = [
+          (0.85, 'critical'),
+          (0.70, 'high'),
+          (0.55, 'moderate'),
+          (0.0, 'low'),
+      ]
+
+      CONTROL_BY_TIER: Dict[str, str] = {
+          'critical': 'Implement DP training with epsilon <= 1; halt deployment pending privacy audit',
+          'high': 'Implement DP training with epsilon <= 3; add output perturbation; notify DPO',
+          'moderate': 'Add output perturbation; review training data provenance; increase monitoring',
+          'low': 'Monitor membership inference query patterns; document privacy risk assessment',
+      }
+
+
+      def assess_record(
+          record_id: str,
+          sensitivity_category_name: str,
+          attack_accuracy: float,
+      ) -> RecordRiskAssessment:
+          category = next(
+              (c for c in SENSITIVITY_CATEGORIES if c.name == sensitivity_category_name),
+              None,
+          )
+          if category is None:
+              weight = 0.5
+              frameworks = []
+          else:
+              weight = category.base_exposure_weight
+              frameworks = category.regulatory_frameworks
+
+          effective_risk = round(attack_accuracy * weight, 4)
+          tier = next(t for threshold, t in RISK_TIER_THRESHOLDS if effective_risk >= threshold)
+          return RecordRiskAssessment(
+              record_id=record_id,
+              sensitivity_category=sensitivity_category_name,
+              attack_accuracy=attack_accuracy,
+              effective_exposure_risk=effective_risk,
+              risk_tier=tier,
+              regulatory_obligations=frameworks,
+              recommended_control=CONTROL_BY_TIER.get(tier, 'review and monitor'),
+          )
+
+
+      def generate_implications_report(
+          assessments: List[RecordRiskAssessment],
+          attack_accuracy: float,
+      ) -> PrivacyImplicationsReport:
+          tiers: Dict[str, int] = {'critical': 0, 'high': 0, 'moderate': 0, 'low': 0}
+          all_frameworks: List[str] = []
+          for a in assessments:
+              tiers[a.risk_tier] = tiers.get(a.risk_tier, 0) + 1
+              all_frameworks.extend(a.regulatory_obligations)
+          unique_frameworks = sorted(set(all_frameworks))
+          category_counts: Dict[str, int] = {}
+          for a in assessments:
+              category_counts[a.sensitivity_category] = category_counts.get(a.sensitivity_category, 0) + 1
+          highest = max(category_counts, key=category_counts.get) if category_counts else 'none'
+          top_tier = next((t for t in ['critical', 'high', 'moderate', 'low'] if tiers[t] > 0), 'low')
+          return PrivacyImplicationsReport(
+              total_records=len(assessments),
+              attack_accuracy=attack_accuracy,
+              records_by_tier=tiers,
+              highest_risk_category=highest,
+              regulatory_frameworks_triggered=unique_frameworks,
+              primary_recommendation=CONTROL_BY_TIER.get(top_tier, 'review and monitor'),
+          )
+
+
+      def render_report(report: PrivacyImplicationsReport) -> None:
+          print('PRIVACY IMPLICATIONS REPORT -- Chapter 9 Section 9.6')
+          print('=' * 60)
+          print(f'Total records assessed:   {report.total_records}')
+          print(f'Attack accuracy assumed:  {report.attack_accuracy:.1%}')
+          print(f'Highest-risk category:    {report.highest_risk_category}')
+          print(f'\nRecords by risk tier:')
+          for tier, count in report.records_by_tier.items():
+              print(f'  {tier:<12}: {count}')
+          print(f'\nRegulatory frameworks triggered:')
+          for fw in report.regulatory_frameworks_triggered:
+              print(f'  - {fw}')
+          print(f'\nPrimary recommendation:')
+          print(f'  {report.primary_recommendation}')
+
+
+      if __name__ == '__main__':
+          sample_records = [
+              ('record_001', 'protected_health_information'),
+              ('record_002', 'protected_health_information'),
+              ('record_003', 'eu_personal_data'),
+              ('record_004', 'financial_data'),
+              ('record_005', 'user_generated_content'),
+              ('record_006', 'protected_health_information'),
+          ]
+          attack_accuracy = 0.82  # representative shadow model attack accuracy
+          assessments = [
+              assess_record(rid, cat, attack_accuracy)
+              for rid, cat in sample_records
+          ]
+          report = generate_implications_report(assessments, attack_accuracy)
+          render_report(report)
+          print(f'\nPer-record assessment:')
+          for a in assessments:
+              print(f'  {a.record_id}: {a.risk_tier.upper()} ({a.effective_exposure_risk:.1%} risk) -- {a.sensitivity_category}')
+
+common_mistakes:
+
+  - id: 1
+    description: 'Treating membership inference as a theoretical attack with no practical consequence because the adversary only learns a binary yes/no'
+    why_it_happens: |
+      Defenders focus on data exfiltration -- the adversary obtaining the actual
+      record content. Membership inference returns only a boolean, which seems
+      low-value compared to retrieving the full record. The regulatory and
+      operational consequences of the boolean itself are underestimated.
+    consequence: |
+      The binary membership label is often the most sensitive piece of information
+      in privacy-regulated contexts. Knowing that a named individual''s medical
+      record was in a hospital''s model training set confirms that the individual
+      is a patient of that hospital and has some condition that required
+      an ML-assisted diagnosis -- a HIPAA PHI disclosure without the full record.
+      In legal discovery, the binary membership result may be sufficient to
+      establish standing for a privacy tort claim.
+    correct_approach: |
+      Evaluate membership inference consequences in terms of what the binary result
+      implies about the target individual, not just what it directly reveals. In
+      many regulated domains, the membership fact itself is the sensitive information.
+      The privacy implications analyser (Deliverable 5) classifies records by
+      sensitivity category and maps membership inference results to specific
+      regulatory obligations.
+
+  - id: 2
+    description: 'Assuming that model accuracy on a public test set indicates low membership inference risk'
+    why_it_happens: |
+      Good test accuracy is interpreted as evidence of good generalisation and
+      therefore low overfitting. Low overfitting should mean low membership
+      inference accuracy per the generalisation-gap relationship in Table 2.
+      The conclusion seems to follow.
+    consequence: |
+      The public test set may not be drawn from the same distribution as the
+      training data in the regions most relevant to privacy risk. A model can
+      achieve high test accuracy on a benchmark while severely overfitting on
+      the minority subsets -- rare medical conditions, uncommon demographic
+      groups -- that represent the highest-risk membership inference targets.
+      Privacy audits must evaluate membership inference accuracy on the
+      sensitive subsets specifically, not on the aggregate test set.
+    correct_approach: |
+      Run the membership inference attack against records from sensitive subgroups
+      of the training data, not just against the aggregate distribution. Models
+      that overfit minority classes or rare training examples produce high
+      membership inference accuracy on those subsets even when aggregate
+      generalisation is adequate. Use the shadow model attack to measure
+      per-class attack accuracy.
+
+  - id: 3
+    description: 'Implementing output perturbation without differential privacy training and claiming complete membership inference defence'
+    why_it_happens: |
+      Output perturbation is easier to deploy than DP training: it requires no
+      changes to the training pipeline, no privacy budget management, and no
+      accuracy-privacy tradeoff negotiation. A team that wants to claim
+      membership inference defence implements perturbation and stops there.
+    consequence: |
+      Output perturbation reduces the precision of the membership inference
+      signal but does not bound information leakage. A patient adversary issues
+      many queries for the same target record and averages the perturbed confidence
+      scores to recover the underlying signal. The attack accuracy degrades
+      gracefully with perturbation noise, not catastrophically. Perturbation
+      without DP training provides friction, not a formal privacy guarantee.
+    correct_approach: |
+      DP training is the upstream control that provides a formal bound on
+      per-example information leakage. Perturbation is the downstream control
+      that reduces signal precision at the API level. Both are required: DP
+      training bounds what can be learned in principle; perturbation makes
+      it operationally harder. Neither alone is sufficient for production
+      deployment of models trained on regulated personal data.
+
+  - id: 4
+    description: 'Running membership inference only against the full model and not against intermediate checkpoints'
+    why_it_happens: |
+      The production model is the most visible target. Intermediate training
+      checkpoints are treated as internal artefacts and not included in the
+      privacy audit scope.
+    consequence: |
+      Intermediate checkpoints saved during training often have higher overfitting
+      than the final model because they were captured before regularisation
+      and early stopping had reduced the generalisation gap. If checkpoints
+      are accessible (through version control, model registries, or backup
+      storage), they are often more vulnerable to membership inference than
+      the final deployed model. An adversary with access to checkpoints can
+      mount a more accurate attack against the earlier, more overfit versions.
+    correct_approach: |
+      Apply membership inference audits to all accessible model artefacts:
+      the production model and all checkpoints stored in version control or
+      model registries. Apply the same DP training and access control requirements
+      to checkpoints as to the production model. Delete checkpoints that are
+      not operationally required.
+
+  - id: 5
+    description: 'Confusing the threshold attack''s simplicity with weakness and always preferring shadow model attacks'
+    why_it_happens: |
+      The shadow model attack is more technically sophisticated and achieves
+      higher accuracy in the original Shokri et al. results. Teams assume that
+      the more complex attack is always better and treat the threshold attack
+      as a simplified baseline with no practical relevance.
+    consequence: |
+      In deployments where the adversary has access to a small set of known
+      training members -- a common scenario in medical and financial contexts
+      where the adversary has legitimate access to some records that were used
+      for training -- the threshold attack calibrates accurately with as few
+      as twenty known members. The shadow model attack requires substantially
+      more setup: shadow model training infrastructure, access to distributional
+      data, and time. For targeted attacks against a small number of high-value
+      records, the threshold attack is operationally superior.
+    correct_approach: |
+      Select the attack variant based on adversary access and target scope.
+      Threshold attack for: targeted attacks against a small record set where
+      the adversary has some known members for calibration. Shadow model attack
+      for: broad membership audits across the full dataset where no known members
+      are available. Both variants should be included in the privacy audit toolkit;
+      neither is always superior.
+
+section_summary:
+  compact: |
+    Membership inference exploits the overfitting property first introduced in
+    Chapter 1: a model optimised on training data assigns higher confidence and
+    lower loss to training members than to similarly structured non-members,
+    and this differential is measurable through the standard inference API without
+    any special model access. Confidence-based membership inference thresholds
+    on maximum predicted probability; loss-based inference thresholds on cross-
+    entropy loss with a known true label. Both require threshold calibration,
+    which the shadow model attack (Shokri et al. 2017) provides without requiring
+    known training membership: shadow models trained on known-membership subsets
+    produce a meta-classifier that generalises to the target model. The simpler
+    threshold attack is operationally competitive when the adversary has a small
+    calibration set of known members. For LLMs, the perplexity signal replaces
+    the confidence signal. Membership inference against models trained on
+    personally identifiable data is a HIPAA breach and a GDPR right-to-erasure
+    violation depending on jurisdiction. Differential privacy training from
+    Section 8.13 is the upstream defence providing a formal bound; output
+    perturbation from Section 9.12 is the downstream signal-reduction control;
+    neither alone is sufficient for regulated personal data deployments.
+
+  key_takeaways:
+    - 'Overfitting is simultaneously a generalisation problem and a privacy problem: the same property that causes both is the attack signal'
+    - 'Shadow model attacks achieve 73-95% accuracy on overfit models without requiring any knowledge of the target model''s internals'
+    - 'Threshold attacks are operationally simpler and competitive when the adversary has 20+ known training members for calibration'
+    - 'For LLMs, perplexity is the membership signal; combined with model inversion (Section 9.7) it enables training data reconstruction'
+    - 'Membership inference against PHI or GDPR personal data is a regulated harm; the binary membership result is often the sensitive disclosure'
+    - 'DP training bounds leakage formally; output perturbation adds friction; both are required for regulated personal data deployments'
+
+preview_section_07:
+  title: 'Section 9.7: Model Inversion -- Reconstructing Training Data from Query Outputs'
+  preview: |
+    Section 9.6 determined whether a specific record was in the training set.
+    Section 9.7 reconstructs the record''s content from the model''s outputs.
+    Model inversion is the most consequential privacy attack: the Fredrikson et al.
+    2015 face reconstruction result and the Carlini et al. 2021 verbatim GPT-2
+    training data extraction demonstrated that deployed models can reveal
+    personally identifiable training data through their inference API. Section
+    9.7 builds the black-box inversion PoC against an image classifier,
+    reproduces the Carlini et al. LLM extraction at small scale, and establishes
+    the formal defence requirement: differential privacy training as a bound on
+    reconstruction fidelity, output perturbation as signal reduction, and
+    the combined architecture that closes the privacy attack arc before the
+    real-world incident section.
+
+metadata:
+  cross_chapter_references:
+    - ref: 'Chapter 1: overfitting and generalisation gap'
+      usage: 'Central mechanism throughout; overfitting is the prerequisite for membership inference accuracy'
+    - ref: 'Chapter 2: cross-entropy loss and softmax probabilities'
+      usage: 'Loss-based and confidence-based attack signal computation in Deliverables 1 and 2'
+    - ref: 'Chapter 8 Section 8.13: differential privacy training'
+      usage: 'Upstream defence with formal guarantee; defence connection in prose Part 8 and Table 4'
+    - ref: 'Section 9.1: black-box adversary access level'
+      usage: 'All attacks in this section operate under black-box access; no model internals required'
+    - ref: 'Section 9.2: privacy attacks sharing the inference surface'
+      usage: 'Taxonomy position; Section 9.6 implements the first of two privacy attack sections'
+
+  forward_references:
+    - ref: 'Section 9.7: Model Inversion'
+      usage: 'Section 9.6 is the precursor: identify high-probability training members, then Section 9.7 reconstructs their content'
+    - ref: 'Section 9.11: Production Query Monitor'
+      usage: 'Systematic membership probing campaigns (many queries per target record to average perturbation) are detected here'
+    - ref: 'Section 9.12: Output Perturbation'
+      usage: 'Downstream signal-reduction control for membership inference; calibrated against perturbation-averaging query budget'
