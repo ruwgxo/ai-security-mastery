@@ -1,0 +1,1166 @@
+# section_10_05_cw_attack.yaml
+
+---
+document_info:
+  title: 'C&W: The Carlini-Wagner Attack'
+  chapter: 10
+  section: 5
+  section_code: '1005'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-05-23'
+  estimated_pages: 6
+  estimated_reading_time: '45-55 minutes'
+
+section_overview:
+  one_line_summary: 'C&W minimises ||delta||_2 directly rather than fixing epsilon, producing minimum-norm adversarial examples that break defences FGSM and PGD cannot reach.'
+  why_this_section_exists: |
+    C&W is the defence evaluation attack. Any security team claiming adversarial robustness
+    should test against C&W with adaptive knowledge of the defence -- that is the methodology
+    Carlini and Wagner introduced, and it is still the standard today. Where PGD measures "how
+    robust is this model at epsilon X", C&W measures "what is the minimum perturbation needed
+    to fool this model (or this defence)?". The two questions are complementary: PGD sets the
+    evaluation standard; C&W finds the cracks. Section 10.5 builds the tool that Sections
+    10.11-10.15 use to evaluate every defence in Chapter 10.
+  position_in_chapter: |
+    Section 10.5 closes the white-box attack trilogy (FGSM 10.3, PGD 10.4, C&W 10.5). C&W is
+    the strongest and most expensive of the three. The attack is referenced throughout the defence
+    sections as the evaluation adversary and in the common_mistakes of prior sections as the
+    attack that exposes gradient masking defences PGD leaves intact.
+
+learning_objectives:
+
+  knowledge:
+    - 'State the C&W L2 problem formulation: minimise ||delta||_2 + c*g(x+delta) where g is the misclassification objective, and explain why this is equivalent to the constrained problem'
+    - 'Describe the tanh-space change of variables and explain why it eliminates the need for explicit box-constraint projection'
+    - 'Explain the confidence parameter kappa: what it controls, why kappa=0 finds minimum-norm adversarial examples, and why kappa>0 produces examples that survive squeezing and consistency checking'
+    - 'Describe the binary search on c: what the two failure modes are (c too small: attack fails; c too large: perturbation unnecessarily large) and how binary search finds the minimum c for success'
+    - 'State the three C&W norm variants and the input domain where each is most relevant'
+    - 'Explain why C&W is the correct attack for adaptive defence evaluation and what "adaptive" means'
+
+  skills:
+    - 'Implement C&W L2 in PyTorch with tanh-space parameterisation, binary search on c, kappa parameter, and Adam optimiser'
+    - 'Implement a simplified C&W L0 attack using the shrink-from-L2 approach'
+    - 'Benchmark C&W vs PGD at matched success rate and compare minimum perturbation norms'
+    - 'Use C&W as an adaptive adversary by threading a defence through the misclassification objective'
+    - 'Run a kappa sweep and identify the kappa value at which consistency checking detection drops below a threshold'
+
+  security_mindset:
+    - 'Treat any defence that defeats PGD but has not been tested against C&W as unverified -- PGD failure is a necessary but not sufficient condition for robustness'
+    - 'Understand that "adaptive adversary" is not a stronger attacker but a smarter one: they optimise through the defence rather than against it'
+    - 'Recognise that the honest conclusion from C&W evaluation is never "the defence is broken" but "at this perturbation norm and kappa, this percentage of examples evade this defence" -- quantify, not dismiss'
+    - 'Appreciate that C&W high kappa is specifically the tool for breaking consistency checking: it produces examples with large margin from the decision boundary that are stable under input transformation'
+
+prerequisites:
+  - 'Section 10.3: FGSM (gradient-sign primitive; baseline for perturbation quality comparison)'
+  - 'Section 10.4: PGD (the evaluation baseline C&W is compared against; gradient masking diagnostic)'
+  - 'Section 10.1: Lp norm constraints (L2 norm is the primary C&W objective)'
+  - 'Section 10.2: detectability spectrum (high-kappa C&W falls in the hard-to-detect region)'
+  - 'Chapter 1 Section 1.9: loss functions (C&W uses a custom misclassification objective)'
+
+prose_content:
+
+  part_1:
+    title: 'Why C&W Was Written: A Response to Unverified Defence Claims'
+    body: |
+      By 2016, the adversarial ML literature had accumulated dozens of proposed defences, each
+      claiming to defeat adversarial examples. Defensive distillation, input transformations,
+      feature squeezing, ensemble methods -- all reported near-zero FGSM attack success rates
+      and were published as solved problems. Carlini and Wagner were sceptical.
+
+      Their 2017 paper "Towards Evaluating the Robustness of Neural Networks" made a methodological
+      argument: proposed defences should be evaluated against adversaries that know the defence and
+      optimise specifically against it. An adversary constrained to use FGSM is not a realistic
+      threat model for a deployed defence. A realistic adversary who knows the defence is in place
+      will design their attack to circumvent it -- this is the "adaptive adversary" standard.
+
+      They then proposed C&W as a practical adaptive attack: a constrained optimisation problem
+      solved with Adam gradient descent and binary search, producing minimum-norm adversarial
+      examples that are more targeted and more persistent than FGSM or PGD. They applied it to
+      seven of the most cited defences of the period, broke all seven, and published the results.
+      The field''s evaluation methodology shifted permanently: a defence that has not been tested
+      against C&W or an equivalent adaptive attack is not considered verified.
+
+      For production security engineers, the lesson is identical. Sections 10.11-10.12 build
+      Track 7 detection primitives. Every primitive in this chapter is evaluated against C&W
+      with the primitive''s own logic included in the attack objective -- the adaptive adversary
+      standard. The fraction of C&W adversarial examples that survive the Track 7 ensemble is
+      the honest measure of detection coverage, not the detection rate against FGSM alone.
+
+  part_2:
+    title: 'The Formulation: From Constrained to Unconstrained Optimisation'
+    body: |
+      The naive formulation of minimum-norm adversarial examples is:
+      minimise ||delta||_2 subject to argmax f(x + delta) = t, and 0 <= x + delta <= 1.
+      This is a constrained optimisation problem with both a classification constraint
+      (force the model to output class t) and a box constraint (keep the input in the valid
+      pixel range). Constrained optimisation is harder than unconstrained: projection-based
+      methods work for the box constraint but not for the non-convex classification constraint.
+
+      C&W reformulates this as unconstrained optimisation by incorporating the classification
+      constraint into the objective via a penalty term:
+      minimise ||delta||_2 + c * g(x + delta)
+      where g is a misclassification function that is non-positive exactly when the
+      adversarial example achieves the desired classification.
+
+      For a targeted attack (force output to class t), g is:
+      g(x + delta) = max(max_{i != t} Z_i(x + delta) - Z_t(x + delta), -kappa)
+      where Z_i is the i-th logit output. This function is non-positive when Z_t >= max_other + kappa.
+      For untargeted attack (force any misclassification), g is:
+      g(x + delta) = max(Z_{y_true}(x + delta) - max_{i != y_true} Z_i(x + delta), -kappa)
+      which is non-positive when the correct class is no longer the highest-scoring class.
+
+      The scalar c controls the penalty strength. Small c: the optimiser focuses on minimising
+      ||delta||_2 and may not satisfy the classification constraint. Large c: the classification
+      constraint is satisfied but the perturbation may be unnecessarily large. The optimal c is
+      the smallest value for which the attack succeeds -- found via binary search.
+
+  part_3:
+    title: 'The Tanh-Space Change of Variables'
+    body: |
+      The box constraint 0 <= x + delta <= 1 remains after reformulating the classification
+      constraint as a penalty. Handling it with projection (as PGD does) would require projecting
+      back onto a box at each optimisation step, which interacts badly with Adam''s adaptive
+      learning rate. C&W eliminates the box constraint by reparameterising the optimisation
+      variable.
+
+      Introduce an unconstrained variable w in R^n and define:
+      x + delta = 0.5 * (tanh(w) + 1.0)
+      Since tanh maps R to (-1, 1), this maps w to (0, 1) automatically -- no box constraint
+      needed. The optimiser updates w freely in unconstrained space; x + delta is always a valid
+      input by construction.
+
+      Initialising w from the original input x requires the inverse: w_0 = atanh(2 * x - 1).
+      At x = 0 or x = 1, atanh is ±infinity, so x must be clamped slightly inside (0, 1) before
+      initialisation. The perturbation in the original space is delta = 0.5 * (tanh(w) + 1.0) - x,
+      and the L2 norm being minimised is ||delta||_2 = ||0.5*(tanh(w)+1.0) - x||_2.
+
+      The practical consequence is clean Adam gradient flow with no projection steps. The
+      tanh nonlinearity also makes the objective smoother than methods that apply hard clipping,
+      which benefits Adam''s convergence. The trade-off is that the Jacobian of tanh at large
+      |w| values is near zero (tanh saturates), which can slow convergence for inputs near 0 or 1.
+      This is why the initialisation clamping and Adam learning rate are important hyperparameters.
+
+  part_4:
+    title: 'The Confidence Parameter Kappa'
+    body: |
+      The kappa parameter is C&W''s most important distinguishing feature for defence evaluation.
+      It controls the margin between the adversarial class score and all other class scores.
+
+      At kappa=0, g is satisfied as soon as the adversarial class becomes the argmax, even with
+      margin zero -- the adversarial example sits right at the decision boundary. These examples
+      have the minimum possible L2 norm but are fragile: they are classified correctly by the
+      victim model with minimal perturbation, and small input changes (squeezing, random noise)
+      flip them back to the correct class. kappa=0 C&W is the right choice for minimum-norm
+      benchmarking and for comparing model robustness via the minimum perturbation required.
+
+      At kappa>0, g requires the adversarial class to exceed all other classes by at least kappa.
+      The resulting adversarial example is strongly misclassified: the adversarial class has a
+      large margin over the correct class. These examples are larger perturbations than kappa=0
+      examples (more perturbation is needed to build a margin) but are robust to input
+      transformations: feature squeezing and random perturbation must overcome the kappa margin
+      to restore correct classification. The consistency check (Section 10.12) specifically
+      detects fragile adversarial examples (those near the boundary); kappa>0 C&W examples are
+      stable under the N random perturbations the consistency check applies.
+
+      For Track 7 evaluation: test with kappa=0 first to find the minimum-norm adversarial
+      examples the ensemble can detect. Test with kappa=20 to find the high-confidence adversarial
+      examples the consistency checker is least effective against. The gap between kappa=0 and
+      kappa=20 detection rates is the consistency checker''s useful operating range -- the kappa
+      range where it contributes marginal detection benefit.
+
+  part_5:
+    title: 'Binary Search on the Regularisation Constant c'
+    body: |
+      The binary search proceeds over the scalar c (or per-sample c vector for a batch) to find
+      the minimum c that produces a successful adversarial example.
+
+      Each binary search step runs n_steps iterations of Adam optimisation with the current c.
+      After optimisation completes, check for successful adversarial examples in the batch (preds
+      == y_target for targeted, preds != y_true for untargeted). For samples where the attack
+      succeeded: record the adversarial example if it has a lower L2 norm than the current best,
+      and decrease the c upper bound (try a smaller c next step). For samples where the attack
+      failed: increase the c lower bound (try a larger c next step). The next c is the midpoint
+      of the current [low, high] bounds.
+
+      The binary search requires the w initialisation to be reset at each step because the
+      previous optimisation trajectory is specific to the previous c value. Each binary search
+      step is therefore a complete fresh Adam optimisation run from the initialised w_0.
+
+      Typical configurations: n_binary_search=9 for publication-quality evaluation (512 candidate
+      c values explored), n_binary_search=5 for practical evaluation (32 candidate c values).
+      n_steps=1000 per binary step for thorough convergence; n_steps=100 for faster approximate
+      results. The total forward-backward pass count is n_binary_search * n_steps -- for the
+      standard configuration, 9000 passes per adversarial example, compared to 40 for PGD and
+      1 for FGSM. C&W is expensive by design: it trades computational cost for minimum-norm
+      adversarial quality.
+
+  part_6:
+    title: 'C&W vs PGD: Which Attack for Which Question'
+    body: |
+      FGSM, PGD, and C&W answer different questions. The question being asked determines which
+      attack to use.
+
+      PGD answers: "Is this model robust at perturbation budget epsilon?" PGD fixes the
+      perturbation budget and measures whether adversarial examples exist within it. It is fast
+      (40 steps), supports random restart, and is the standard for comparing models against each
+      other and against a known epsilon threat level. PGD is the right attack for adversarial
+      training, for benchmark comparisons, and for certifying that a model meets a specified
+      robustness level.
+
+      C&W answers: "What is the minimum perturbation needed to fool this model (or this defence)?"
+      C&W minimises perturbation size at the cost of more computation. It finds adversarial
+      examples that PGD misses at small epsilon -- because PGD may not converge to the global
+      maximum within a tiny epsilon ball, while C&W finds the closest adversarial example in
+      the full input space. C&W is the right attack for evaluating proposed defences, for
+      finding the minimum-norm adversarial examples as benchmarks, and for adaptive attacks
+      that must thread through a known defence.
+
+      The two attacks complement each other in production evaluation. PGD with k=40 and R=5
+      is the primary robustness screen -- fast to run, calibrated to the threat model. C&W with
+      kappa=0 and n_binary_search=9 is the secondary evaluation used when a defence claims
+      to defeat PGD -- C&W with kappa=0 finds the minimum perturbation that evades the defence,
+      and kappa=20 specifically targets the hardest detection cases for each Track 7 primitive.
+
+  part_7:
+    title: 'C&W as an Adaptive Adversary Against Track 7 Defences'
+    body: |
+      The adaptive adversary application is C&W''s unique capability. Feature squeezing (Section
+      10.11) detects adversarial examples by comparing the model''s prediction before and after
+      a squeezing transformation. A non-adaptive adversary generates adversarial examples and
+      submits them -- some are caught by squeezing, some are not. An adaptive adversary generates
+      adversarial examples that survive squeezing by incorporating squeezing into the attack
+      objective.
+
+      Adaptive C&W against feature squeezing: pass squeezer(x_adv) through the model instead of
+      x_adv when computing the misclassification objective. The objective becomes:
+      minimise ||delta||_2 + c * g(squeezer(x + delta)) where g evaluates misclassification on
+      the squeezed input. The optimiser now finds adversarial examples that misclassify even after
+      squeezing -- a strictly harder problem than non-adaptive attack.
+
+      Adaptive C&W against the consistency checker: set kappa high (kappa=20 to 50). The
+      consistency checker fires when the adversarial example is near the decision boundary and
+      random perturbations flip the prediction. kappa>0 builds a margin that these random
+      perturbations must overcome. Adaptive C&W against the adversarial classifier: include the
+      adversarial classifier''s prediction in the objective (minimise misclassification of both
+      the primary model and the adversarial detector). This approach was used in Carlini and
+      Wagner''s original evaluation to break feature squeezing-based detectors.
+
+      The Track 7 three-primitive ensemble (Section 10.13) is designed with adaptive C&W
+      in mind. Jointly evading feature squeezing (kappa=0 C&W), consistency checking (kappa=20
+      C&W), and the adversarial classifier (adaptive C&W with detector in objective) requires
+      satisfying all three constraints simultaneously, which typically requires substantially
+      larger perturbation than any single-primitive evasion. The defence_evaluator_cw.py
+      deliverable implements each adaptive variant.
+
+reference_materials:
+
+  table_1:
+    title: 'C&W L2 Algorithm: Annotated Step Breakdown'
+    description: 'Each phase of C&W L2 with operation, notation, PyTorch pattern, and correctness notes'
+    columns: ['Phase', 'Operation', 'Notation', 'PyTorch pattern', 'Note']
+    rows:
+      - ['Init w', 'Map x to tanh space', 'w_0 = atanh(2x - 1)', 'torch.atanh(2*x.clamp(1e-6, 1-1e-6) - 1)', 'Clamp REQUIRED: atanh(0)=atanh(1)=inf; clamp to (0,1) exclusive']
+      - ['Init Adam', 'Create optimiser on w', '-', 'torch.optim.Adam([w], lr=lr)', 'w must be leaf tensor; create fresh Adam per binary search step']
+      - ['Forward (tanh)', 'Recover x_adv from w', 'x_adv = 0.5*(tanh(w)+1)', '0.5 * (torch.tanh(w) + 1.0)', 'Always in [0,1]; no clamp needed']
+      - ['L2 term', 'Per-sample perturbation norm squared', '||x_adv - x||_2^2', '(x_adv - x).pow(2).view(B,-1).sum(1)', 'Sum squared; sqrt for reporting; Adam minimises sum form']
+      - ['Logit gap (targeted)', 'Misclassification margin', 'max(max_{i!=t}Z_i - Z_t, -kappa)', 'torch.clamp(best_other - z_target, min=-kappa)', 'Non-positive when Z_t >= max_other + kappa = success']
+      - ['Logit gap (untargeted)', 'Misclassification margin', 'max(Z_{ytrue} - max_{i!=ytrue}Z_i, -kappa)', 'torch.clamp(z_correct - best_other, min=-kappa)', 'Non-positive when correct class no longer argmax']
+      - ['Loss', 'Per-sample combined objective', 'l2_sq + c * f_val', '(l2_sq + c_batch * f_val).sum()', 'c_batch is per-sample tensor (binary search); .sum() for backward']
+      - ['Adam step', 'Gradient update on w', 'w <- w - lr * grad_w', 'optimiser.step()', 'No projection; tanh handles box constraint automatically']
+      - ['Binary search', 'Update c bounds per sample', 'success: c_high = min(c_high, c); fail: c_low = max(c_low, c)', 'torch.where() on success mask', 'Track per-sample best_x_adv with lowest L2 across all binary steps']
+
+  table_2:
+    title: 'C&W Hyperparameter Guide'
+    description: 'Parameter configurations for minimum-norm benchmarking, fast evaluation, and adaptive defence testing'
+    columns: ['Config', 'n_binary_search', 'n_steps', 'lr', 'kappa', 'Use case']
+    rows:
+      - ['Publication quality', '9', '1000', '0.01', '0', 'Minimum-norm benchmarking; final defence evaluation report']
+      - ['Practical evaluation', '5', '200', '0.01', '0', 'Development cycle; fast robustness check against C&W']
+      - ['Consistency check break', '5', '200', '0.01', '20', 'Evaluate consistency checker effectiveness; high-kappa strong misclassification']
+      - ['Adaptive vs squeezer', '5', '300', '0.005', '0', 'Pass squeezed input to model; slower convergence; lower lr']
+      - ['Transfer optimised', '7', '500', '0.01', '20', 'High kappa improves transferability to victim model']
+
+  table_3:
+    title: 'C&W vs PGD: Which Attack for Which Question'
+    description: 'Decision guide for choosing between PGD and C&W given the evaluation objective'
+    columns: ['Question', 'Correct attack', 'Rationale']
+    rows:
+      - ['Is model robust at epsilon=8/255?', 'PGD-40 R=5', 'Fixed-epsilon evaluation; PGD is calibrated to epsilon threat models']
+      - ['What is the minimum perturbation to fool this model?', 'C&W L2 kappa=0', 'C&W minimises ||delta||_2 directly; PGD cannot answer minimum-norm questions']
+      - ['Does this defence defeat adaptive adversaries?', 'Adaptive C&W (defence in objective)', 'PGD is not adaptive; C&W incorporates the defence into the attack']
+      - ['Does the consistency check stop these adversarial examples?', 'C&W kappa=20', 'High kappa produces examples with large margin; stable under random perturbation']
+      - ['Generating training data for adversarial training?', 'PGD-7 (Madry config)', 'C&W is 100-1000x more expensive; infeasible for per-batch adversarial training']
+      - ['Comparing robustness across two models at matched budget?', 'PGD-40 R=5', 'Comparable epsilon; standard benchmark; C&W norms are model-specific']
+      - ['Did gradient masking cause PGD to underestimate vulnerability?', 'C&W + BPDA', 'C&W with differentiable approximation of non-differentiable defence']
+
+deliverables:
+
+  deliverable_1:
+    title: 'C&W L2 Core Implementation'
+    filename: 'cw_attack.py'
+    description: 'C&W L2 attack with tanh-space parameterisation, per-sample binary search on c, kappa parameter, Adam optimiser, targeted and untargeted modes'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. torch.atanh available from PyTorch 1.7+.
+      Inputs normalised to [0, 1]. Per-sample c tracking for correct batch handling.
+      Binary search resets Adam and w at each step (intentional: fresh start per c value).
+    code: |
+      # cw_attack.py
+      # Section 10.5: C&W L2 Attack -- Carlini and Wagner 2017
+      # 20260523 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      from torch import Tensor
+      from typing import Optional
+
+
+      def _compute_f(
+          logits: Tensor,
+          y: Tensor,
+          targeted: bool,
+          kappa: float,
+      ) -> Tensor:
+          '''
+          Per-sample misclassification objective f (the g function from the paper).
+          Returns a tensor of shape (N,); non-positive iff attack goal is satisfied.
+          Targeted:   f = max(max_{i!=t} Z_i - Z_t, -kappa)   [want <= 0: Z_t >= max_other + kappa]
+          Untargeted: f = max(Z_{ytrue} - max_{i!=ytrue} Z_i, -kappa) [want <= 0: ytrue no longer argmax]
+          '''
+          batch = logits.size(0)
+          n_classes = logits.size(1)
+
+          if targeted:
+              # t = y (target class to force)
+              z_target = logits.gather(1, y.view(-1, 1)).squeeze(1)
+              # Mask target class to find best other
+              mask = torch.ones_like(logits, dtype=torch.bool)
+              mask.scatter_(1, y.view(-1, 1), False)
+              best_other = logits[mask].view(batch, n_classes - 1).max(dim=1).values
+              return torch.clamp(best_other - z_target, min=-kappa)
+          else:
+              # y = true class (to escape)
+              z_correct = logits.gather(1, y.view(-1, 1)).squeeze(1)
+              mask = torch.ones_like(logits, dtype=torch.bool)
+              mask.scatter_(1, y.view(-1, 1), False)
+              best_other = logits[mask].view(batch, n_classes - 1).max(dim=1).values
+              return torch.clamp(z_correct - best_other, min=-kappa)
+
+
+      def cw_l2(
+          model: nn.Module,
+          x: Tensor,
+          y: Tensor,
+          targeted: bool = False,
+          kappa: float = 0.0,
+          c_init: float = 1e-2,
+          n_binary_search: int = 5,
+          n_steps: int = 200,
+          lr: float = 1e-2,
+          clip_min: float = 0.0,
+          clip_max: float = 1.0,
+      ) -> Tensor:
+          '''
+          C&W L2 adversarial attack (Carlini and Wagner 2017).
+          Minimises: ||delta||_2^2 + c * f(x + delta)
+          where f is the misclassification objective with confidence margin kappa.
+          Binary search over per-sample c to find minimum-norm adversarial examples.
+
+          Args:
+              model:            PyTorch classifier (eval mode)
+              x:                Input batch (N, *), normalised to [clip_min, clip_max]
+              y:                True labels (untargeted) or target labels (targeted)
+              targeted:         If True, force output to class y
+              kappa:            Confidence margin; kappa=0 for minimum-norm; kappa>0 for high-confidence
+              c_init:           Initial penalty weight; binary search explores around this
+              n_binary_search:  Binary search steps; 5 for fast eval, 9 for publication quality
+              n_steps:          Adam optimisation steps per binary search step
+              lr:               Adam learning rate
+          Returns:
+              best_x_adv:   Adversarial examples with minimum L2 norm found across all binary steps
+          '''
+          batch = x.size(0)
+          x = x.detach().clone()
+
+          # Per-sample c tracking
+          c_low = torch.zeros(batch, device=x.device)
+          c_high = torch.full((batch,), 1e10, device=x.device)
+          c_batch = torch.full((batch,), c_init, device=x.device)
+
+          best_l2 = torch.full((batch,), float('inf'), device=x.device)
+          best_x_adv = x.clone()
+
+          # Broadcast c to match input shape for per-sample loss scaling
+          def expand_c(c_vec):
+              dims = [batch] + [1] * (x.dim() - 1)
+              return c_vec.view(dims)
+
+          for binary_step in range(n_binary_search):
+              # Fresh w and Adam each binary step
+              x_clamped = x.clamp(clip_min + 1e-6, clip_max - 1e-6)
+              w = torch.atanh(2.0 * (x_clamped - clip_min) / (clip_max - clip_min) - 1.0)
+              w = w.detach().requires_grad_(True)
+              optimiser = torch.optim.Adam([w], lr=lr)
+
+              for step in range(n_steps):
+                  optimiser.zero_grad()
+
+                  # Recover x_adv in [clip_min, clip_max]
+                  x_adv = clip_min + (clip_max - clip_min) * 0.5 * (torch.tanh(w) + 1.0)
+
+                  # L2 term: per-sample squared norm
+                  delta = x_adv - x
+                  l2_sq = delta.pow(2).view(batch, -1).sum(dim=1)
+
+                  # Misclassification term
+                  logits = model(x_adv)
+                  f_val = _compute_f(logits, y, targeted, kappa)
+
+                  # Combined per-sample loss
+                  loss = (l2_sq + expand_c(c_batch) * f_val).sum()
+                  loss.backward()
+                  optimiser.step()
+
+              # Evaluate after optimisation
+              with torch.no_grad():
+                  x_adv = clip_min + (clip_max - clip_min) * 0.5 * (torch.tanh(w) + 1.0)
+                  delta = x_adv - x
+                  l2 = delta.pow(2).view(batch, -1).sum(dim=1).sqrt()
+
+                  logits = model(x_adv)
+                  preds = logits.argmax(dim=1)
+                  success = (preds == y) if targeted else (preds != y)
+
+                  # Keep best (lowest L2) successful adversarial examples
+                  improved = success & (l2 < best_l2)
+                  best_l2[improved] = l2[improved]
+                  best_x_adv[improved] = x_adv[improved]
+
+                  # Binary search: tighten c bounds
+                  c_high = torch.where(success, torch.min(c_high, c_batch), c_high)
+                  c_low = torch.where(~success, torch.max(c_low, c_batch), c_low)
+                  c_batch = torch.where(
+                      c_high < 9e9,
+                      (c_low + c_high) * 0.5,
+                      c_batch * 10.0,
+                  )
+
+          return best_x_adv.detach()
+
+
+      def attack_success_rate(model, x_adv, y_true):
+          with torch.no_grad():
+              preds = model(x_adv).argmax(dim=1)
+          return (preds != y_true).float().mean().item()
+
+
+      def mean_l2_norm(x_adv, x_orig):
+          delta = (x_adv - x_orig).view(x_adv.size(0), -1)
+          return delta.norm(p=2, dim=1).mean().item()
+
+
+      # --- Demo ---
+
+      def demo():
+          try:
+              from fgsm_attack import ToyLinear
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x = torch.rand(8, 1, 28, 28)
+          y = torch.randint(0, 10, (8,))
+
+          print('C&W L2 demo on ToyLinear (synthetic data)')
+          print(f'{"kappa":<8} {"success":<10} {"mean_L2":<12}')
+          print('-' * 32)
+          for kappa in [0.0, 5.0, 20.0]:
+              x_adv = cw_l2(model, x, y, targeted=False, kappa=kappa,
+                            n_binary_search=4, n_steps=100, lr=1e-2)
+              rate = attack_success_rate(model, x_adv, y)
+              l2 = mean_l2_norm(x_adv, x)
+              print(f'{kappa:<8.1f} {rate:<10.3f} {l2:<12.4f}')
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_2:
+    title: 'C&W L0 Variant: Shrink-from-L2 Sparse Attack'
+    filename: 'cw_l0_variant.py'
+    description: 'Sparse adversarial attack via iterative feature removal from a C&W L2 adversarial example; produces minimum-L0 perturbations by greedily zeroing features while maintaining misclassification'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Import cw_l2 from cw_attack.py.
+      Shrink approach: start with L2 adversarial example, remove smallest-perturbation features
+      while misclassification is maintained. O(D) model evaluations per sample for D features.
+      Intended for structured inputs (malware, tabular) where sparse perturbations are natural.
+    code: |
+      # cw_l0_variant.py
+      # Section 10.5: C&W L0 Variant -- Sparse Adversarial Perturbations
+      # 20260523 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      from torch import Tensor
+      from typing import Optional
+      from cw_attack import cw_l2, attack_success_rate
+
+
+      def cw_l0_shrink(
+          model: nn.Module,
+          x: Tensor,
+          y: Tensor,
+          targeted: bool = False,
+          kappa: float = 0.0,
+          cw_binary_search: int = 4,
+          cw_steps: int = 100,
+          batch_eval: bool = True,
+      ) -> Tensor:
+          '''
+          Sparse adversarial attack via shrink-from-L2.
+          Step 1: generate C&W L2 adversarial example (initial sparse start unnecessary).
+          Step 2: sort features by perturbation magnitude ascending (smallest first).
+          Step 3: greedily restore each feature to its original value while the input
+                  remains adversarial. Keep the change if attack is maintained; discard if not.
+          Returns adversarial examples minimising L0 norm (number of changed features).
+          '''
+          # Step 1: C&W L2 to get initial adversarial example
+          x_adv = cw_l2(model, x, y, targeted=targeted, kappa=kappa,
+                        n_binary_search=cw_binary_search, n_steps=cw_steps)
+
+          batch = x.size(0)
+          x_adv = x_adv.detach().clone()
+          x_orig = x.detach().clone()
+
+          # Step 2: sort feature indices by absolute perturbation magnitude (ascending)
+          delta = (x_adv - x_orig).view(batch, -1).abs()
+          sorted_indices = delta.argsort(dim=1)  # shape (batch, n_features); smallest first
+
+          n_features = delta.size(1)
+          x_flat = x_orig.view(batch, -1).clone()
+          x_adv_flat = x_adv.view(batch, -1).clone()
+
+          # Step 3: greedy feature removal
+          for feat_pos in range(n_features):
+              # Try restoring this feature for all samples simultaneously
+              test_flat = x_adv_flat.clone()
+              for b in range(batch):
+                  feat = sorted_indices[b, feat_pos].item()
+                  test_flat[b, feat] = x_flat[b, feat]
+
+              test_input = test_flat.view_as(x_orig)
+
+              with torch.no_grad():
+                  preds = model(test_input).argmax(dim=1)
+                  still_adv = (preds == y) if targeted else (preds != y)
+
+              # Accept the restoration for samples where attack still holds
+              for b in range(batch):
+                  if still_adv[b].item():
+                      feat = sorted_indices[b, feat_pos].item()
+                      x_adv_flat[b, feat] = x_flat[b, feat]
+
+          return x_adv_flat.view_as(x_orig).detach()
+
+
+      def compare_l0_l2_sparsity(
+          model: nn.Module,
+          x: Tensor,
+          y: Tensor,
+          kappa: float = 0.0,
+      ) -> None:
+          '''Compare L0 (number of changed features) between L2-C&W and L0-C&W.'''
+          print('C&W L2 vs L0 sparsity comparison')
+          x_adv_l2 = cw_l2(model, x, y, targeted=False, kappa=kappa,
+                            n_binary_search=4, n_steps=100)
+          x_adv_l0 = cw_l0_shrink(model, x, y, targeted=False, kappa=kappa)
+
+          def l0_norm(a, b):
+              diff = (a - b).abs().view(a.size(0), -1)
+              return (diff > 1e-5).float().sum(dim=1).mean().item()
+
+          def l2_norm(a, b):
+              return (a - b).view(a.size(0), -1).norm(p=2, dim=1).mean().item()
+
+          rate_l2 = attack_success_rate(model, x_adv_l2, y)
+          rate_l0 = attack_success_rate(model, x_adv_l0, y)
+
+          print(f'  C&W L2: success={rate_l2:.3f}, L0={l0_norm(x_adv_l2, x):.1f} features, '
+                f'L2={l2_norm(x_adv_l2, x):.4f}')
+          print(f'  C&W L0: success={rate_l0:.3f}, L0={l0_norm(x_adv_l0, x):.1f} features, '
+                f'L2={l2_norm(x_adv_l0, x):.4f}')
+          print()
+          print('  L0 norm: fraction of features that changed.')
+          print('  Relevance: malware byte modification, fraud feature perturbation.')
+
+
+      if __name__ == '__main__':
+          try:
+              from fgsm_attack import ToyLinear
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              raise SystemExit
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x = torch.rand(4, 1, 28, 28)
+          y = torch.randint(0, 10, (4,))
+          compare_l0_l2_sparsity(model, x, y, kappa=0.0)
+
+  deliverable_3:
+    title: 'C&W vs PGD Quality Benchmark'
+    filename: 'cw_vs_pgd_quality_benchmark.py'
+    description: 'Compares minimum perturbation norm of C&W L2 against PGD at matched attack success rate; quantifies how much stronger C&W is than PGD for producing tight adversarial examples'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch, matplotlib. Import cw_l2, mean_l2_norm from cw_attack.py; pgd_linf from pgd_attack.py.
+    code: |
+      # cw_vs_pgd_quality_benchmark.py
+      # Section 10.5: C&W vs PGD Perturbation Quality Comparison
+      # 20260523 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import matplotlib.pyplot as plt
+      from cw_attack import cw_l2, attack_success_rate, mean_l2_norm
+      from pgd_attack import pgd_linf
+
+
+      def benchmark(model, x, y, epsilons_pgd, cw_kappa=0.0, pgd_steps=40, pgd_restarts=3):
+          '''
+          For each PGD epsilon: run PGD and C&W, compare L2 norms at matched success rate.
+          C&W finds minimum-norm examples; PGD uses fixed epsilon.
+          '''
+          results = []
+          for eps in epsilons_pgd:
+              alpha = eps / 10.0
+              x_pgd = pgd_linf(model, x, y, eps, alpha, pgd_steps, pgd_restarts)
+              pgd_rate = attack_success_rate(model, x_pgd, y)
+              pgd_l2 = mean_l2_norm(x_pgd, x)
+
+              results.append({
+                  'epsilon': eps,
+                  'pgd_rate': pgd_rate,
+                  'pgd_l2': pgd_l2,
+              })
+
+          # Run C&W once (norm-minimising; not epsilon-parameterised)
+          x_cw = cw_l2(model, x, y, targeted=False, kappa=cw_kappa,
+                       n_binary_search=5, n_steps=150, lr=1e-2)
+          cw_rate = attack_success_rate(model, x_cw, y)
+          cw_l2_val = mean_l2_norm(x_cw, x)
+
+          return results, cw_rate, cw_l2_val, x_cw
+
+
+      def print_benchmark(results, cw_rate, cw_l2_val):
+          print(f'{"Method":<22} {"Success rate":<16} {"Mean L2 norm":<14}')
+          print('-' * 54)
+          for r in results:
+              name = f'PGD eps={r["epsilon"] * 255:.0f}/255'
+              print(f'{name:<22} {r["pgd_rate"]:<16.3f} {r["pgd_l2"]:<14.4f}')
+          print(f'{"C&W L2 (kappa=0)":<22} {cw_rate:<16.3f} {cw_l2_val:<14.4f}')
+          print()
+          print('C&W finds minimum-norm adversarial examples regardless of epsilon.')
+          print('At matched success rate, C&W L2 norm <= PGD L2 norm.')
+
+
+      def plot_benchmark(results, cw_rate, cw_l2_val, save_path='cw_vs_pgd_quality.png'):
+          eps_255 = [r['epsilon'] * 255 for r in results]
+          pgd_l2s = [r['pgd_l2'] for r in results]
+          pgd_rates = [r['pgd_rate'] for r in results]
+
+          fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+          ax1.plot(eps_255, pgd_l2s, color='#2980b9', linewidth=2,
+                   marker='o', markersize=5, label='PGD L2 norm')
+          ax1.axhline(cw_l2_val, color='#27ae60', linestyle='--', linewidth=2,
+                      label=f'C&W L2 norm (kappa=0): {cw_l2_val:.4f}')
+          ax1.set_xlabel('PGD epsilon (pixel units)', fontsize=11)
+          ax1.set_ylabel('Mean L2 perturbation norm', fontsize=11)
+          ax1.set_title('C&W vs PGD: Perturbation Norm', fontsize=11)
+          ax1.legend(fontsize=9)
+          ax1.grid(True, alpha=0.3)
+
+          ax2.plot(eps_255, pgd_rates, color='#2980b9', linewidth=2,
+                   marker='o', markersize=5, label='PGD success rate')
+          ax2.axhline(cw_rate, color='#27ae60', linestyle='--', linewidth=2,
+                      label=f'C&W success rate: {cw_rate:.3f}')
+          ax2.set_xlabel('PGD epsilon (pixel units)', fontsize=11)
+          ax2.set_ylabel('Attack success rate', fontsize=11)
+          ax2.set_title('C&W vs PGD: Attack Success Rate', fontsize=11)
+          ax2.legend(fontsize=9)
+          ax2.grid(True, alpha=0.3)
+          ax2.set_ylim(0, 1.05)
+
+          plt.tight_layout()
+          plt.savefig(save_path, dpi=150, bbox_inches='tight')
+          print(f'Saved: {save_path}')
+          plt.show()
+
+
+      if __name__ == '__main__':
+          try:
+              from fgsm_attack import ToyLinear
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              raise SystemExit
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x = torch.rand(16, 1, 28, 28)
+          y = torch.randint(0, 10, (16,))
+
+          epsilons = [i / 255 for i in [4, 8, 12, 16, 24, 32]]
+          results, cw_rate, cw_l2_val, _ = benchmark(model, x, y, epsilons)
+          print_benchmark(results, cw_rate, cw_l2_val)
+          plot_benchmark(results, cw_rate, cw_l2_val)
+
+  deliverable_4:
+    title: 'Defence Evaluator: Adaptive C&W'
+    filename: 'defence_evaluator_cw.py'
+    description: 'Uses C&W as an adaptive adversary by threading a defence (feature squeezer) through the misclassification objective; tests whether defences that defeat PGD fall to C&W'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Import cw_l2 structure adapted inline for adaptive use.
+      The key change: pass squeezer(x_adv) through model instead of x_adv when computing f_val.
+      This produces adversarial examples that misclassify AFTER squeezing.
+    code: |
+      # defence_evaluator_cw.py
+      # Section 10.5: Adaptive C&W for Defence Evaluation
+      # 20260523 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      from torch import Tensor
+      from typing import Callable, Optional
+      from cw_attack import _compute_f, attack_success_rate, mean_l2_norm
+
+
+      def adaptive_cw_l2(
+          model: nn.Module,
+          defence_fn: Callable[[Tensor], Tensor],
+          x: Tensor,
+          y: Tensor,
+          targeted: bool = False,
+          kappa: float = 0.0,
+          c: float = 1.0,
+          n_steps: int = 300,
+          lr: float = 5e-3,
+      ) -> Tensor:
+          '''
+          Adaptive C&W: pass defence_fn(x_adv) through model for the misclassification objective.
+          The optimiser finds adversarial examples that survive the defence.
+          c is fixed (no binary search) for simplicity; tune c per deployment.
+
+          Key difference from standard cw_l2:
+              logits = model(defence_fn(x_adv))   <-- defence applied before model
+          instead of:
+              logits = model(x_adv)
+          '''
+          batch = x.size(0)
+          x = x.detach().clone()
+
+          x_clamped = x.clamp(1e-6, 1.0 - 1e-6)
+          w = torch.atanh(2.0 * x_clamped - 1.0).detach().requires_grad_(True)
+          optimiser = torch.optim.Adam([w], lr=lr)
+
+          best_l2 = torch.full((batch,), float('inf'), device=x.device)
+          best_x_adv = x.clone()
+
+          for step in range(n_steps):
+              optimiser.zero_grad()
+              x_adv = 0.5 * (torch.tanh(w) + 1.0)
+              delta = x_adv - x
+              l2_sq = delta.pow(2).view(batch, -1).sum(dim=1)
+
+              # ADAPTIVE: evaluate misclassification on DEFENDED input
+              x_defended = defence_fn(x_adv)
+              logits = model(x_defended)
+              f_val = _compute_f(logits, y, targeted, kappa)
+
+              loss = (l2_sq + c * f_val).sum()
+              loss.backward()
+              optimiser.step()
+
+          with torch.no_grad():
+              x_adv = 0.5 * (torch.tanh(w) + 1.0)
+              delta = x_adv - x
+              l2 = delta.pow(2).view(batch, -1).sum(dim=1).sqrt()
+              x_defended = defence_fn(x_adv)
+              preds = model(x_defended).argmax(dim=1)
+              success = (preds == y) if targeted else (preds != y)
+              improved = success & (l2 < best_l2)
+              best_x_adv[improved] = x_adv[improved]
+
+          return best_x_adv.detach()
+
+
+      def gaussian_squeeze(x: Tensor, sigma: float = 1.0) -> Tensor:
+          '''Gaussian blur squeezer (preview of Section 10.11).'''
+          k, half = 5, 2
+          coords = torch.arange(-half, half + 1, dtype=torch.float32)
+          kernel_1d = torch.exp(-coords ** 2 / (2 * sigma ** 2))
+          kernel_1d = kernel_1d / kernel_1d.sum()
+          kernel_2d = (kernel_1d.unsqueeze(0) * kernel_1d.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
+          n_ch = x.shape[1]
+          kernel_2d = kernel_2d.expand(n_ch, 1, k, k)
+          return torch.clamp(F.conv2d(x, kernel_2d, padding=half, groups=n_ch), 0.0, 1.0)
+
+
+      def evaluate_defence(model, x, y, defence_fn, defence_name):
+          from cw_attack import cw_l2
+
+          # Standard (non-adaptive) C&W
+          x_std = cw_l2(model, x, y, targeted=False, kappa=0.0,
+                        n_binary_search=3, n_steps=100)
+          # Evaluate on defended model
+          with torch.no_grad():
+              defended_preds_std = model(defence_fn(x_std)).argmax(dim=1)
+          std_bypass = (defended_preds_std != y).float().mean().item()
+
+          # Adaptive C&W
+          x_adp = adaptive_cw_l2(model, defence_fn, x, y, kappa=0.0,
+                                  c=1.0, n_steps=200, lr=5e-3)
+          with torch.no_grad():
+              defended_preds_adp = model(defence_fn(x_adp)).argmax(dim=1)
+          adp_bypass = (defended_preds_adp != y).float().mean().item()
+
+          print(f'\nDefence evaluation: {defence_name}')
+          print(f'  Non-adaptive C&W bypass rate: {std_bypass:.3f}')
+          print(f'  Adaptive C&W bypass rate:     {adp_bypass:.3f}')
+          adv_gap = adp_bypass - std_bypass
+          print(f'  Adaptive advantage:           +{adv_gap:.3f}')
+          if adv_gap > 0.1:
+              print('  FLAG: adaptive attack substantially outperforms non-adaptive.')
+              print('  Defence appears to defend against non-adaptive attacks only.')
+
+
+      if __name__ == '__main__':
+          try:
+              from fgsm_attack import ToyLinear
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              raise SystemExit
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x = torch.rand(8, 1, 28, 28)
+          y = torch.randint(0, 10, (8,))
+
+          # Evaluate feature squeezing as defence
+          import functools
+          squeezer = functools.partial(gaussian_squeeze, sigma=1.0)
+          evaluate_defence(model, x, y, squeezer, 'Gaussian squeezer (sigma=1.0)')
+
+          # Identity defence (no defence) as sanity check
+          evaluate_defence(model, x, y, lambda inp: inp, 'No defence (identity)')
+
+  deliverable_5:
+    title: 'C&W Confidence Sweep'
+    filename: 'cw_confidence_sweep.py'
+    description: 'Sweeps kappa from 0 to 50 measuring perturbation size, attack success rate, and estimated consistency checker detection rate; identifies the kappa range where C&W defeats consistency checking'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch, matplotlib. Import cw_l2, attack_success_rate, mean_l2_norm from cw_attack.py.
+      Consistency check approximated inline: check prediction stability under N random perturbations.
+    code: |
+      # cw_confidence_sweep.py
+      # Section 10.5: C&W Kappa Sweep -- Confidence vs Detectability
+      # 20260523 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import matplotlib.pyplot as plt
+      from typing import List
+      from cw_attack import cw_l2, attack_success_rate, mean_l2_norm
+
+
+      def consistency_check_detection_rate(
+          model,
+          x_adv: torch.Tensor,
+          y_true: torch.Tensor,
+          n_variants: int = 20,
+          noise_std: float = 0.02,
+      ) -> float:
+          '''
+          Fraction of adversarial examples caught by consistency check.
+          Fires when prediction on x_adv differs from majority vote on N noisy variants.
+          '''
+          batch = x_adv.size(0)
+          with torch.no_grad():
+              pred_adv = model(x_adv).argmax(dim=1)
+
+              # N noisy variants
+              variant_preds = []
+              for _ in range(n_variants):
+                  noise = torch.randn_like(x_adv) * noise_std
+                  x_noisy = torch.clamp(x_adv + noise, 0.0, 1.0)
+                  variant_preds.append(model(x_noisy).argmax(dim=1))
+
+              # Stack: (n_variants, batch)
+              variant_stack = torch.stack(variant_preds, dim=0)  # (N, B)
+              # Majority vote per sample
+              majority = []
+              for b in range(batch):
+                  votes = variant_stack[:, b]
+                  majority.append(votes.mode().values.item())
+              majority = torch.tensor(majority, device=x_adv.device)
+
+              # Detection: majority vote disagrees with adversarial prediction
+              detected = (majority != pred_adv).float().mean().item()
+          return detected
+
+
+      def kappa_sweep(
+          model,
+          x: torch.Tensor,
+          y: torch.Tensor,
+          kappas: List[float],
+          n_binary: int = 4,
+          n_steps: int = 100,
+      ) -> None:
+          print(f'{"kappa":<8} {"success":<10} {"mean_L2":<12} {"cc_detect":<12} {"notes"}')
+          print('-' * 62)
+          success_list, l2_list, cc_list = [], [], []
+
+          for kappa in kappas:
+              x_adv = cw_l2(model, x, y, targeted=False, kappa=kappa,
+                            n_binary_search=n_binary, n_steps=n_steps)
+              rate = attack_success_rate(model, x_adv, y)
+              l2 = mean_l2_norm(x_adv, x)
+              cc = consistency_check_detection_rate(model, x_adv, y)
+              note = 'min-norm' if kappa == 0.0 else ('high-conf' if kappa >= 20 else '')
+              print(f'{kappa:<8.1f} {rate:<10.3f} {l2:<12.4f} {cc:<12.3f} {note}')
+              success_list.append(rate)
+              l2_list.append(l2)
+              cc_list.append(cc)
+          return success_list, l2_list, cc_list
+
+
+      def plot_kappa_sweep(
+          kappas, success_list, l2_list, cc_list,
+          save_path='cw_kappa_sweep.png',
+      ):
+          fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+          ax1.plot(kappas, l2_list, color='#e74c3c', linewidth=2,
+                   marker='o', markersize=5, label='Mean L2 perturbation norm')
+          ax1_r = ax1.twinx()
+          ax1_r.plot(kappas, success_list, color='#2980b9', linewidth=2,
+                     linestyle='--', marker='s', markersize=5, label='Attack success rate')
+          ax1.set_xlabel('kappa', fontsize=11)
+          ax1.set_ylabel('Mean L2 norm (red)', color='#e74c3c', fontsize=11)
+          ax1_r.set_ylabel('Attack success rate (blue)', color='#2980b9', fontsize=11)
+          ax1.set_title('kappa vs Perturbation Size and Success Rate', fontsize=11)
+          ax1.grid(True, alpha=0.3)
+
+          ax2.plot(kappas, cc_list, color='#8e44ad', linewidth=2,
+                   marker='D', markersize=5, label='Consistency check detection rate')
+          ax2.axhline(0.5, color='grey', linestyle='--', alpha=0.5)
+          ax2.text(max(kappas) * 0.05, 0.52, '50% detection threshold', fontsize=8, color='grey')
+          ax2.set_xlabel('kappa', fontsize=11)
+          ax2.set_ylabel('CC detection rate', fontsize=11)
+          ax2.set_title('kappa vs Consistency Check Detection Rate\n(higher kappa = harder for CC to detect)', fontsize=11)
+          ax2.legend(fontsize=9)
+          ax2.grid(True, alpha=0.3)
+          ax2.set_ylim(0, 1.05)
+
+          plt.tight_layout()
+          plt.savefig(save_path, dpi=150, bbox_inches='tight')
+          print(f'Saved: {save_path}')
+          plt.show()
+
+
+      if __name__ == '__main__':
+          try:
+              from fgsm_attack import ToyLinear
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              raise SystemExit
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x = torch.rand(8, 1, 28, 28)
+          y = torch.randint(0, 10, (8,))
+
+          kappas = [0.0, 2.0, 5.0, 10.0, 20.0, 35.0, 50.0]
+          print('C&W Kappa Sweep: Perturbation Size vs Consistency Check Detection')
+          print('=' * 62)
+          sr, l2, cc = kappa_sweep(model, x, y, kappas, n_binary=3, n_steps=80)
+          plot_kappa_sweep(kappas, sr, l2, cc)
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Not clamping the input away from 0 and 1 before torch.atanh initialisation, producing NaN or inf in w and crashing Adam'
+    why_it_happens: |
+      Engineers initialise w = torch.atanh(2*x - 1) directly without clamping. For images
+      normalised to [0, 1], any pixel that is exactly 0 or 1 produces atanh(-1) or atanh(1)
+      which are negative infinity and positive infinity. These values propagate through the
+      tanh(w) computation as NaN, crashing the entire Adam optimisation silently (loss becomes
+      NaN, grad becomes NaN, w becomes NaN) and producing a useless x_adv.
+    consequence: |
+      The adversarial example is all NaN or remains equal to x (no perturbation). Attack success
+      rate is near-zero. The error is invisible because PyTorch NaN propagation does not raise
+      an exception by default -- the code runs to completion with garbage output.
+    correct_approach: |
+      Always clamp the input before tanh-space initialisation: x_clamped = x.clamp(1e-6, 1-1e-6).
+      The clamping does not change the adversarial objective meaningfully (pixels shifted by 1e-6
+      are indistinguishable from 0 or 1) but prevents infinity. Add a NaN check after initialisation:
+      assert not torch.isnan(w).any(), 'NaN in w initialisation -- check input clamping'.
+
+  mistake_2:
+    description: 'Using the wrong sign convention for the targeted vs untargeted misclassification objective'
+    why_it_happens: |
+      The targeted and untargeted f functions look similar but have opposite success conditions.
+      Engineers copy the targeted formula for untargeted use (or vice versa), producing an
+      objective that is already satisfied at x=x_orig (the attack starts already "successful"
+      from the penalty perspective) and produces trivial adversarial examples with zero perturbation.
+    consequence: |
+      Untargeted attack with targeted objective: f_val = max(best_other - Z_target, -kappa).
+      If target is the true class, Z_true >= best_other always (correct classification), so
+      f_val = -kappa for all x near x_orig. The l2_sq + c*(-kappa) objective is minimised by
+      minimising l2_sq -- the attack immediately converges with delta = 0, no misclassification.
+      Success rate is zero.
+    correct_approach: |
+      Targeted f: max(max_{i!=t}(Z_i) - Z_t, -kappa). Non-positive when Z_t is the argmax
+      with margin kappa. Untargeted f: max(Z_{ytrue} - max_{i!=ytrue}(Z_i), -kappa). Non-positive
+      when Z_ytrue is no longer the argmax. Always test that f_val is strictly positive for
+      natural inputs before running C&W -- if f_val is near -kappa for x_orig, the objective
+      is already satisfied and the attack will produce trivial delta=0 examples.
+
+  mistake_3:
+    title: 'Not resetting Adam and w at each binary search step'
+    description: 'Reusing the w tensor and Adam state across binary search steps, carrying over momentum from the previous c value'
+    why_it_happens: |
+      Binary search runs multiple times with different c values. Engineers allocate w and Adam
+      once before the binary search loop and carry them across steps, expecting warm-starting to
+      help convergence. This seems reasonable but is wrong.
+    consequence: |
+      Adam''s momentum and second-moment estimates are calibrated to the previous c value. When
+      c changes (potentially by 10x between binary search steps), the Adam update magnitude is
+      miscalibrated. The optimisation frequently diverges on the first few steps after a large c
+      change, wasting the entire binary search budget on poorly converged runs. Best adversarial
+      examples are worse than single-step non-binary-search C&W.
+    correct_approach: |
+      Reset w to the fresh tanh-space initialisation at the start of each binary search step:
+      w = torch.atanh(2*x_clamped - 1).detach().requires_grad_(True). Create a fresh
+      torch.optim.Adam([w], lr=lr) for each step. The cost is O(n_binary_search) Adam
+      initialisations, which is negligible compared to the optimisation step count.
+
+  mistake_4:
+    description: 'Using kappa=0 for all defence evaluations including consistency checking, missing the detection gap at high kappa'
+    why_it_happens: |
+      kappa=0 is the standard minimum-norm configuration. Engineers run one kappa=0 C&W
+      evaluation, find that Track 7 catches a certain fraction, and report that as the detection
+      rate. The kappa dimension is not swept.
+    consequence: |
+      Consistency checking is specifically effective against fragile boundary-proximate adversarial
+      examples -- exactly what kappa=0 C&W produces. A kappa=0 evaluation shows high consistency
+      check detection rate. kappa=20 or kappa=50 produces high-confidence adversarial examples
+      that are stable under the consistency check''s random perturbations. The true defence gap
+      (the fraction of adversarial examples that evade the full ensemble at high kappa) is
+      significantly higher than the kappa=0 evaluation reports.
+    correct_approach: |
+      Always sweep kappa from 0 to at least 50 for any Track 7 detection evaluation. Use the
+      cw_confidence_sweep.py deliverable from this section. Report both the kappa=0 detection
+      rate (minimum-norm adversarial examples) and the kappa=20 detection rate (high-confidence
+      adversarial examples). The gap between them is the consistency checker''s useful operating
+      range. Any robustness claim should specify which kappa range it covers.
+
+  mistake_5:
+    description: 'Running C&W for adversarial training data generation, treating it as a drop-in replacement for PGD in the inner training loop'
+    why_it_happens: |
+      C&W produces higher-quality adversarial examples than PGD. Engineers reason that training
+      on C&W examples should produce more robust models than training on PGD examples, and attempt
+      to replace the PGD inner loop in adversarial training with C&W.
+    consequence: |
+      C&W requires n_binary_search * n_steps = 5 * 200 = 1000 forward-backward passes per
+      adversarial example. PGD requires 7 passes (Madry training config). At batch size 128,
+      one adversarial training step with C&W requires 128,000 forward-backward passes; with
+      PGD-7 it requires 896 passes. C&W adversarial training is approximately 143x slower than
+      PGD adversarial training. A training run that takes 2 hours with PGD takes 12 days with
+      C&W. The compute is completely infeasible.
+    correct_approach: |
+      Use PGD-7 (PGDConfig.madry_training) for the adversarial training inner loop as in
+      Section 10.15. Use C&W for evaluation after training to verify that the PGD-trained model
+      is also robust to C&W adversarial examples. The two have complementary roles: PGD trains,
+      C&W evaluates. They are not interchangeable.
+
+section_summary:
+
+  compact: |
+    C&W minimises ||delta||_2 + c*g(x+delta) where g is a misclassification objective with
+    confidence margin kappa. The tanh-space parameterisation (x_adv = 0.5*(tanh(w)+1)) handles
+    the box constraint automatically, enabling clean Adam optimisation without projection. Binary
+    search on the per-sample regularisation constant c finds the minimum norm for which the attack
+    succeeds. kappa=0 produces minimum-norm fragile adversarial examples; kappa>0 produces high-
+    confidence examples that survive squeezing and consistency checking. C&W is not for adversarial
+    training (too expensive) -- it is the evaluation adversary that tests whether defences that
+    defeat PGD also defeat an adaptive attacker who optimises through the defence. The honest
+    conclusion from C&W evaluation is always a number, not a verdict: at kappa=20, N% of examples
+    evade the Track 7 ensemble.
+
+  key_takeaways:
+    - 'C&W minimises perturbation norm directly (not fixed epsilon); it finds the closest adversarial example to the natural input'
+    - 'Tanh-space parameterisation: w = atanh(2x-1), x_adv = 0.5*(tanh(w)+1); always in [0,1]; clamp x to (0,1) exclusive before atanh'
+    - 'kappa=0 for minimum-norm benchmarking; kappa>=20 for breaking consistency checking; always sweep kappa for complete Track 7 evaluation'
+    - 'Binary search resets Adam and w at each step -- warm-starting across c values is incorrect and degrades quality'
+    - 'Adaptive C&W: pass defence_fn(x_adv) through model in the misclassification objective; this is the correct evaluation methodology for any preprocessing defence'
+    - 'C&W is for evaluation only -- never for adversarial training; 100-1000x more expensive than PGD per example'
+
+preview_section_10_06:
+  title: 'Section 10.6: Black-Box Adversarial Attacks -- Boundary Attack and Natural Evolution Strategies'
+  summary: |
+    Section 10.6 implements the two canonical black-box adversarial attacks that operate without
+    gradient access -- the same API conditions Chapter 9 established for extraction. The Boundary
+    Attack (Brendel et al. 2018) starts from a trivially misclassified input and walks toward the
+    natural image while staying adversarial, requiring only a hard-label binary oracle. NES (Natural
+    Evolution Strategies) estimates the gradient direction from antithetic query pairs under
+    soft-label (score-based) conditions: query at x+delta_i and x-delta_i and estimate gradient
+    from the score difference. Both attacks are measured in query budget per adversarial example
+    (10,000-100,000 for Boundary Attack; 1,000-10,000 per gradient step for NES). The detection
+    connection: Track 6''s query pattern monitor already partially detects Boundary Attack campaigns
+    because boundary proximity queries generate the same query distribution anomalies as boundary
+    extraction. Section 10.6 quantifies the shared detection surface.
+
+metadata:
+  cross_chapter_references:
+    - 'Section 10.3: FGSM (perturbation quality baseline; C&W significantly outperforms)'
+    - 'Section 10.4: PGD (evaluation baseline; C&W finds adversarial examples PGD misses at small epsilon)'
+    - 'Section 10.2: detectability spectrum (high-kappa C&W in the hard-to-detect region for consistency check)'
+    - 'Section 9.10: Track 6 detection primitives (adversarial classifier from Ch9 extended for Track 7)'
+  forward_references:
+    - 'Section 10.11: feature squeezing (adaptive C&W against squeezer implemented in defence_evaluator_cw.py)'
+    - 'Section 10.12: consistency checker (kappa sweep shows the kappa range where CC detection drops)'
+    - 'Section 10.13: Track 7 gateway (C&W with kappa=20 is the evaluation adversary for the ensemble)'
+    - 'Section 10.14: certified robustness (C&W L2 norm is the metric randomised smoothing certifies against)'
+    - 'Section 10.15: adversarial training (C&W evaluates PGD-trained models; not used for training itself)'
+  tags:
+    - carlini-wagner
+    - cw-attack
+    - minimum-norm-adversarial
+    - tanh-space
+    - binary-search-regularisation
+    - kappa-confidence
+    - adaptive-adversary
+    - defence-evaluation
+    - l2-l0-variants
+    - adam-optimiser
+    - track7-evaluation

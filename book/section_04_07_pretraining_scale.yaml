@@ -1,0 +1,1031 @@
+# section_04_07_pretraining_scale.yaml
+
+---
+document_info:
+  section: "04_07"
+  title: "Pre-Training at Scale: Data, Compute, and Risks"
+  chapter: "04"
+  chapter_title: "Modern LLM Internals"
+  part: "Part I: Machine Learning Foundations"
+  book: "AI Security Mastery: From ML Fundamentals to Production Detection Systems"
+  version: "1.0.0"
+  author: "Raghav Dinesh"
+  github: "github.com/ruwgxo"
+  license: "MIT"
+  created: "2026-01-19"
+  estimated_pages: 6
+  tags:
+    - "pre-training"
+    - "training-data"
+    - "common-crawl"
+    - "data-pipeline"
+    - "deduplication"
+    - "memorization"
+    - "distributed-training"
+    - "data-poisoning"
+    - "supply-chain"
+    - "security-implications"
+
+section_overview:
+
+  purpose: |
+    Pre-training is where a language model gets its capabilities. Everything else —
+    SFT, RLHF, Constitutional AI — is refinement applied on top of the pre-trained
+    foundation. If the foundation is compromised, no amount of alignment refinement
+    fully corrects it. This makes pre-training the most upstream and highest-leverage
+    attack surface in the entire LLM stack.
+
+    For security engineers: you will rarely be involved in pre-training a frontier
+    model. The costs are prohibitive for most organizations ($10M-$100M+ per run).
+    But you will routinely deploy models whose pre-training you did not control,
+    audit, or observe. Understanding what was in that pre-training data — and what
+    risks that creates — is foundational to threat modeling any LLM deployment.
+
+    The three security concerns this section addresses directly:
+    First: what the pre-training corpus contains determines what the model knows,
+    including harmful knowledge, biases, and patterns adversaries can elicit.
+    Second: memorization — models can reproduce verbatim content from training data,
+    which may include PII, credentials, or proprietary information.
+    Third: supply chain attacks on the pre-training pipeline — data poisoning at
+    scale is more efficient than attacking deployed models, and the effects persist
+    through all downstream fine-tuning.
+
+  position_in_chapter: |
+    Section 7 of 17 content sections. Opens the training pipeline arc (Sections 7-10)
+    after completing the alignment arc (Sections 4-6). This section covers pre-training —
+    the foundational stage. Sections 8-10 cover inference optimization. Together,
+    Sections 7-10 complete the technical picture of how production LLMs go from
+    raw data to deployed system.
+
+  prerequisites:
+    - "Section 04_06: SFT — pre-training is the stage SFT builds upon"
+    - "Section 04_02: Scaling laws — pre-training compute allocation"
+    - "Chapter 1, Section 10: Gradient descent — pre-training optimization"
+    - "Chapter 3, Section 17: GPT architecture — the model architecture being trained"
+    - "Basic familiarity with distributed systems (parallelism concepts)"
+
+  what_you_will_build:
+    primary: "Data pipeline simulator: filtering, deduplication, and quality scoring"
+    secondary:
+      - "Memorization detector: test models for verbatim recall of training-like text"
+      - "Training stability monitor: track gradient norms and loss spikes during training"
+      - "Data provenance tracker: log dataset sources and transformations"
+      - "Scaling law experiment: small-scale validation of Chinchilla predictions"
+    notebooks:
+      - "03-llm-internals/pretraining_data_pipeline.ipynb"
+      - "03-llm-internals/memorization_detection.ipynb"
+
+# ============================================================================
+# CONTENT
+# ============================================================================
+
+content:
+
+  # --------------------------------------------------------------------------
+  # 1. PRE-TRAINING DATA SOURCES
+  # --------------------------------------------------------------------------
+
+  subsection_1:
+    title: "Pre-Training Data Sources: The Internet as Training Corpus"
+    pages: 1
+
+    scale_context: |
+      Modern frontier LLMs are trained on trillions of tokens. To put that in perspective:
+        1 token ≈ 0.75 words
+        1 trillion tokens ≈ 750 billion words
+        All of English Wikipedia ≈ 4 billion words
+        GPT-4 estimated training: 10-13 trillion tokens
+
+      The only source large enough to provide trillions of tokens is the internet.
+      Every frontier model is primarily trained on web-scraped text, supplemented by
+      higher-quality sources that are mixed in at elevated sampling rates.
+
+    primary_data_sources:
+
+      common_crawl:
+        description: |
+          Common Crawl is a nonprofit that crawls the web monthly and releases the
+          full crawl as open data. Each monthly release contains petabytes of raw
+          HTML from billions of web pages. It is the primary data source for most
+          open and commercial pre-training datasets.
+        size: "~250TB per monthly crawl (raw HTML); ~50-100TB after text extraction"
+        coverage: "Approximately 3-5 billion web pages per crawl"
+        quality: |
+          Highly variable. Common Crawl contains everything on the web:
+          high-quality journalism and academic content, but also spam, SEO content,
+          pornography, extremist material, malware distribution pages, forum posts
+          with personally identifiable information, and scraped credential databases.
+        filtering_required: |
+          Raw Common Crawl is not used directly. It is filtered through:
+          - Quality filters (remove low-quality, repetitive, or templated text)
+          - Safety filters (remove content in specific harmful categories)
+          - Language identification (keep target language(s))
+          - Deduplication (remove repeated content)
+          Even after filtering, Common Crawl is the noisiest component of any
+          pre-training corpus.
+        security_note: |
+          Common Crawl has indexed pages containing leaked credentials, PII from
+          data breaches, archived phishing pages, malware distribution content,
+          and explicit instructions for harmful activities. Filtering removes the
+          most obvious examples but cannot catch everything. The model trained on
+          filtered Common Crawl still learned from a corpus that contained more
+          harmful content than any curated dataset.
+
+      books_corpora:
+        description: |
+          Books provide high-quality, long-form text with coherent structure, complex
+          reasoning, and factual depth. Two sources dominate:
+          - Books1/Books2 (used in GPT-3): fiction and non-fiction from internet archives
+          - The Pile's Books3: similar sources
+          - Project Gutenberg: public domain books
+        quality: "High — books represent edited, structured, long-form writing"
+        coverage_per_token: "~3-8% of total pre-training tokens despite high quality"
+        why_high_quality_matters: |
+          Books teach the model coherent multi-paragraph reasoning, narrative structure,
+          and domain knowledge presented in depth. A model trained only on social media
+          and web snippets produces different (generally worse) reasoning capabilities
+          than one trained with substantial book content.
+        security_note: |
+          Books corpora contain technical manuals, chemistry textbooks, security research
+          books, and other domain-specific content. Models trained on these corpora
+          have absorbed domain expertise that can be elicited through targeted prompting.
+          A chemistry textbook in the training corpus is not harmful — but it contributes
+          to the model's ability to discuss chemistry, including synthesis pathways.
+
+      wikipedia:
+        description: "English and multilingual Wikipedia — highly reliable encyclopedic knowledge"
+        size: "~20GB English Wikipedia text"
+        role: "Anchors factual knowledge; relatively small but high quality/density"
+        security_note: |
+          Wikipedia's well-structured, verifiable content provides a high-fidelity
+          knowledge anchor. Models with Wikipedia in training are more factually reliable
+          on encyclopedia-covered topics. Security implication: Wikipedia articles about
+          vulnerabilities, exploits, and security concepts are in the training data.
+
+      code_repositories:
+        description: "GitHub public repositories, StackOverflow, code hosting sites"
+        size: "Hundreds of GB of code across all languages"
+        role: "Teaches code generation, debugging, and technical reasoning"
+        security_note: |
+          Public code repositories contain:
+          - Security vulnerabilities (CVE-referenced code)
+          - Credential leaks (API keys, passwords committed by mistake)
+          - Exploit proof-of-concept code
+          - Security research and malware analysis code
+
+          The model learns from all of it. Code completion capabilities include
+          completing exploit code, generating SQL injection payloads, and writing
+          code that matches vulnerable patterns — because that code was in training.
+
+      curated_sources:
+        examples:
+          - "Academic papers (arXiv, PubMed, Semantic Scholar)"
+          - "Legal documents (court filings, legislation)"
+          - "News archives (Reuters, AP, newspaper archives)"
+          - "Instruction datasets (early FLAN, other curated sets)"
+        role: "Mixed at elevated rates to improve reasoning and factual accuracy"
+        sampling_strategy: |
+          High-quality sources are typically upsampled 2-10× relative to their
+          natural frequency in the corpus. A source that represents 1% of the
+          raw data may contribute 5-10% of training tokens.
+
+  # --------------------------------------------------------------------------
+  # 2. DATA FILTERING AND DEDUPLICATION
+  # --------------------------------------------------------------------------
+
+  subsection_2:
+    title: "Data Filtering and Deduplication: Where Pipeline Attacks Live"
+    pages: 1
+
+    filtering_pipeline_overview: |
+      Raw internet data cannot be used directly for training. A multi-stage
+      filtering pipeline transforms raw crawl data into a usable training corpus.
+      Each stage is a potential attack surface and a potential source of bias.
+
+    stage_1_language_identification:
+      purpose: "Identify and retain text in target language(s)"
+      tools: "fastText language classifier, CLD3, or custom classifier"
+      threshold: "Keep pages where P(target_language) > 0.65 or 0.8"
+      security_implications:
+        classifier_poisoning: |
+          Language classifiers can be fooled. Text that mixes target language
+          with other content may be classified as target language or excluded.
+          Adversaries can craft documents that pass language filtering despite
+          containing primarily harmful content in a format the safety filters
+          will not recognize.
+        multilingual_coverage_gaps: |
+          Language identification is less accurate for low-resource languages.
+          Safety filtering trained on English performs poorly on content in
+          other languages. Models with multilingual training may be safer in
+          English than in other languages for the same harmful request.
+
+    stage_2_quality_filtering:
+      purpose: "Remove low-quality text: spam, templated content, very short documents"
+      common_filters:
+        - "Minimum word count (e.g., >200 words per document)"
+        - "Character-level diversity (remove repeated character sequences)"
+        - "Stop word ratio (remove text with unusual word type distribution)"
+        - "Perplexity filter: remove text that a reference LM assigns very high perplexity"
+        - "Blocklist: remove documents containing specific harmful URLs or keywords"
+      security_implications:
+        perplexity_filter_evasion: |
+          Perplexity-based filtering removes text that does not look like natural
+          language to the reference model. Adversarial text that looks like natural
+          language but contains harmful encoded content passes this filter.
+          More importantly: legitimate security research text may have unusual
+          vocabulary distribution and fail perplexity filters, creating coverage
+          gaps that make models less capable on security topics.
+        blocklist_limitations: |
+          Keyword blocklists are reactive: they only catch known harmful content.
+          Novel harmful content, encoded content (Base64, ROT13), or harmful content
+          in unusual contexts passes blocklists. This is the same limitation as
+          keyword-based security filters in any context.
+
+    stage_3_deduplication:
+      purpose: "Remove repeated content to prevent memorization and training instability"
+      methods:
+        exact_deduplication: |
+          Remove documents identical to another document in the corpus.
+          Fast, simple, but misses near-duplicates.
+          Implementation: MinHash or SHA-256 fingerprinting.
+
+        fuzzy_deduplication: |
+          Remove documents that are highly similar (not necessarily identical).
+          MinHash LSH (Locality-Sensitive Hashing) identifies near-duplicate documents.
+          Threshold: typically 0.8-0.9 Jaccard similarity.
+
+        substring_deduplication: |
+          Remove documents that share long repeated substrings with other documents.
+          The Suffix Array deduplication approach used in Gopher, The Pile.
+          Most effective at preventing verbatim memorization of repeated text.
+
+      why_deduplication_matters_for_security: |
+        High-frequency content in training data is memorized more reliably.
+        Without deduplication: boilerplate text, repeated news articles, and scraped
+        content appears thousands of times → model memorizes it verbatim.
+
+        With deduplication: each unique document appears at most a few times →
+        memorization probability drops significantly.
+
+        Security implication: deduplication is a privacy protection measure.
+        Well-deduplicated training data produces models that are harder to extract
+        training content from. Poorly deduplicated data produces models that can
+        be made to reproduce training content verbatim — a data exfiltration risk
+        in enterprise fine-tuning scenarios.
+
+    stage_4_safety_filtering:
+      purpose: "Remove explicitly harmful content: CSAM, terrorism, explicit instructions"
+      implementation: "Classifier-based (trained on known harmful examples) + regex blocklists"
+      limitations: |
+        Safety filtering at pre-training scale has irreducible limitations:
+        1. Scale: filtering billions of documents means even 0.1% false negatives
+           leave millions of harmful documents in the corpus.
+        2. Context-dependence: a chemistry formula is not harmful in isolation;
+           combined with synthesis instructions it is. Document-level filtering
+           misses context-dependent harms.
+        3. Evolving threats: filters trained on known harmful content miss novel
+           formulations, coded language, and emerging harmful categories.
+        4. Adversarial evasion: motivated actors write harmful content to evade
+           classifiers — the same techniques used to evade email spam filters.
+
+  # --------------------------------------------------------------------------
+  # 3. DISTRIBUTED TRAINING INFRASTRUCTURE
+  # --------------------------------------------------------------------------
+
+  subsection_3:
+    title: "Distributed Training: Scale, Infrastructure, and Attack Surface"
+    pages: 1
+
+    scale_requirements: |
+      Training a frontier LLM requires compute that no single machine can provide.
+      The training run for GPT-4-scale models requires:
+        - 1,000-10,000 GPUs running continuously for weeks to months
+        - Petabytes of storage for training data and checkpoints
+        - High-bandwidth network interconnects (NVLink, InfiniBand)
+        - Fault-tolerant infrastructure (hardware failures are routine at this scale)
+
+      This level of infrastructure is available only to well-funded labs and cloud
+      providers. It is not accessible to most security researchers for direct study —
+      but understanding its architecture matters for threat modeling.
+
+    parallelism_strategies:
+
+      data_parallelism:
+        concept: |
+          The same model is replicated across N GPUs. Each GPU processes a different
+          batch of training data. Gradients are averaged across all GPUs after each
+          step (all-reduce operation).
+        scale: "Primary strategy for moderate model sizes"
+        security_implication: |
+          Each data parallel worker sees a subset of the training data.
+          An adversary who can influence what data a specific worker sees
+          (by manipulating data loading order) has reduced but non-zero influence
+          on training — targeted at specific model capabilities.
+
+      model_parallelism:
+        concept: |
+          The model is split across GPUs. Different layers or attention heads
+          run on different devices. Activations are passed between GPUs between
+          layers (pipeline parallelism) or within layers (tensor parallelism).
+        scale: "Required for models larger than single-GPU memory (~80GB)"
+        security_implication: |
+          Model parallelism creates communication between devices — each a potential
+          interception point. In cloud training environments, tensor/pipeline
+          parallel communication crosses network boundaries. Side-channel attacks
+          on training communication could leak gradient information or model weights
+          during training.
+
+      gradient_checkpointing:
+        concept: |
+          Instead of storing all intermediate activations for backpropagation,
+          recompute them during the backward pass. Trades compute for memory.
+        security_implication: |
+          Gradient checkpointing changes the timing profile of training — potential
+          side-channel information for an adversary with access to hardware
+          utilization metrics.
+
+    training_stability_and_instabilities: |
+      Large-scale training is unstable in ways that smaller training runs are not.
+      Common instabilities:
+        - Loss spikes: sudden large increases in training loss
+        - Gradient explosions: gradients grow to infinity, requiring restart
+        - NaN propagation: floating-point underflow/overflow cascades
+        - Rank collapse: attention heads collapse to degenerate patterns
+
+      Recovery strategies:
+        - Rollback to earlier checkpoint when instability detected
+        - Reduce learning rate and resume
+        - Skip unstable batches (batch-level loss spike detection)
+        - Gradient clipping (Chapter 2, Section 13)
+
+      Security implication: training instabilities require rollbacks to checkpoints.
+      An adversary who can induce instabilities at specific training steps can
+      force rollbacks that erase training progress past specific checkpoints —
+      a denial-of-service on training that is extremely expensive to the target
+      organization. Inducing instabilities through data poisoning (crafting batches
+      that cause loss spikes) is a documented concern in distributed ML security.
+
+    checkpoint_security: |
+      Training checkpoints are model weights saved periodically during training.
+      They represent enormous value:
+        - Reproducing a training checkpoint requires the full compute budget ($millions)
+        - Checkpoints are effectively "the model" at that training stage
+        - Leaked checkpoints allow fine-tuning without the full pre-training cost
+
+      Checkpoint security requirements:
+        - Encryption at rest (checkpoint files should not be readable if storage is breached)
+        - Access control (only authorized training infrastructure can write checkpoints)
+        - Integrity verification (hash-based verification to detect modification)
+        - Secure deletion (checkpoints from abandoned runs should be fully deleted)
+
+      Real-world breach: Meta's LLaMA weights were leaked shortly after a restricted
+      research release. The leak allowed public fine-tuning of a frontier model that
+      Meta intended to distribute only to vetted researchers. The leaked model was
+      fine-tuned to remove safety behaviors within days.
+
+  # --------------------------------------------------------------------------
+  # 4. DATA MEMORIZATION: WHAT MODELS REMEMBER
+  # --------------------------------------------------------------------------
+
+  subsection_4:
+    title: "Memorization: When Models Remember Too Much"
+    pages: 1
+
+    what_memorization_means: |
+      A language model memorizes a training example when it can reproduce that
+      example verbatim (or near-verbatim) given a partial prompt. Memorization
+      is not the same as learning: a model can learn general patterns from an
+      example without memorizing it.
+
+      Memorization exists on a spectrum:
+        Extractable memorization: model reproduces text verbatim when prompted
+        Discoverable memorization: text can be extracted with targeted prompting
+        Approximate memorization: model reproduces text with minor variations
+        No memorization: model learned from example but cannot reproduce it
+
+      Security concern is with extractable and discoverable memorization — the
+      cases where the model can be made to output training content on demand.
+
+    factors_affecting_memorization:
+
+      repetition:
+        finding: "Content that appears more times in training data is memorized more reliably"
+        implication: |
+          Frequently duplicated web content, repeated boilerplate, and text that
+          appears across many documents is at highest risk of extractable memorization.
+          Deduplication (Section 2) directly reduces this risk.
+
+      sequence_length:
+        finding: "Longer verbatim sequences are harder to memorize than shorter ones"
+        implication: |
+          Individual sentences and short paragraphs are more at risk than full-page
+          documents. Short memorable sequences (phone numbers, addresses, passwords,
+          API keys) are at higher risk than the surrounding prose.
+
+      model_capacity:
+        finding: "Larger models memorize more content than smaller models"
+        implication: |
+          The largest frontier models (GPT-4, Claude 3 Opus scale) have memorized
+          more training content than their smaller counterparts. Extraction attacks
+          that fail against 7B models may succeed against 70B+ models.
+
+      position_in_sequence:
+        finding: "Content early in a training example is memorized more than content later"
+        implication: |
+          The beginning of documents (titles, opening paragraphs, first lines of code)
+          are at higher memorization risk than content buried deep in a long document.
+
+    types_of_memorized_content_at_risk:
+
+      pii_in_training_data: |
+        Personal information appears in training data through:
+        - Author information in documents
+        - Forum posts and social media
+        - News articles mentioning individuals
+        - Code repositories with committed credentials or personal info
+        - Data breach dumps indexed by search engines (and thus Common Crawl)
+
+        Models can reproduce names, email addresses, phone numbers, and other PII
+        verbatim when prompted with partial identifying context.
+
+      credentials_and_secrets: |
+        Credential leaks in code repositories (API keys, passwords committed to
+        GitHub) are indexed and appear in training data. Models trained on code
+        corpora may reproduce:
+        - API key patterns that match keys from training
+        - Password examples from documentation
+        - Internal URL patterns and service identifiers
+
+        This is not the model generating fake credentials — it is the model
+        reproducing actual credentials from training data. Carlini et al. (2021)
+        demonstrated recovery of real API keys from GPT-2's training data.
+
+      proprietary_content: |
+        Training on the web includes content behind soft paywalls (cached versions),
+        leaked documents (Wikileaks, SecureDrop archives indexed before removal),
+        and proprietary technical documentation scraped before robots.txt restrictions
+        were applied.
+
+    carlini_extraction_methodology: |
+      The systematic approach for extracting memorized training content
+      (Carlini et al., 2021):
+
+      Step 1: Generate thousands of long sequences from the model at low temperature
+      Step 2: Score each sequence using a likelihood ratio:
+              score = log P(sequence | large_model) / log P(sequence | small_reference_model)
+              High score = large model is much more confident than reference model
+              = sequence is likely memorized by the large model
+      Step 3: Inspect high-scoring sequences for verbatim training content
+      Step 4: Verify against known training data sources
+
+      Results from the original paper:
+        - 604 memorized sequences identified from GPT-2's training data
+        - Included: full names + addresses, verbatim news articles, Bible passages,
+          source code, and personally identifiable information
+        - The attack required no fine-tuning or model modification — pure inference
+
+      Implication for enterprise deployment:
+        Any model fine-tuned on sensitive internal data may be extractable.
+        The same methodology applies to fine-tuned models. If an attacker can
+        interact with a model fine-tuned on confidential documents, they may be
+        able to extract verbatim passages from those documents.
+
+    differential_privacy_as_defense: |
+      Differential Privacy (DP) is the principled defense against memorization.
+      DP-SGD adds carefully calibrated noise to gradient updates during training,
+      providing mathematical guarantees that no individual training example can
+      be extracted with high probability.
+
+      Tradeoffs:
+        Privacy budget (ε): lower ε = stronger privacy = more noise = worse utility
+        Typical deployment: ε in range 1-10 provides meaningful privacy at moderate utility cost
+        Challenge: DP guarantees are defined over training examples, not the full corpus
+
+      Current state: DP pre-training of frontier models is not standard practice —
+      the utility cost at the scale of trillion-token pre-training is considered too
+      high. DP is more commonly applied to fine-tuning on sensitive datasets.
+
+  # --------------------------------------------------------------------------
+  # 5. TRAINING DATA SUPPLY CHAIN ATTACKS
+  # --------------------------------------------------------------------------
+
+  subsection_5:
+    title: "Supply Chain Attacks on Pre-Training Data"
+    pages: 1
+
+    why_supply_chain_attacks_are_high_leverage: |
+      The pre-training data pipeline has a fundamental asymmetry in attack efficiency:
+
+        Attacking the deployed model: requires adversarial inputs at inference time.
+          Effect: influences one user's interaction, one session at a time.
+          Persistence: none — model weights unchanged.
+
+        Attacking the pre-training data: requires placing content in the training corpus.
+          Effect: influences every model trained on that corpus, permanently.
+          Persistence: baked into model weights — survives all downstream fine-tuning
+          unless specifically targeted and removed.
+
+      One poisoned document in a trillion-token corpus that is trained into model
+      weights is more persistent and scalable than a billion adversarial inference
+      queries. The attack-to-impact ratio strongly favors supply chain attacks.
+
+    attack_vectors:
+
+      web_content_poisoning:
+        method: |
+          Create web content that will be indexed by Common Crawl and incorporated
+          into training datasets. The content appears legitimate but contains:
+          - Subtle factual errors about specific topics
+          - Association patterns that bias model outputs
+          - Backdoor triggers paired with specific model behaviors
+        feasibility: |
+          High. Any entity that can create and maintain indexed web content can
+          attempt this attack. Search engine optimization techniques for making
+          content appear legitimate and authoritative are well-understood.
+          The challenge: at trillion-token scale, a single poisoned website
+          has negligible influence unless the content appears across many
+          high-authority domains or is significantly amplified through sharing.
+        scale_required: |
+          To meaningfully influence a trillion-token training corpus:
+          - Need to appear in thousands of documents
+          - Or appear in high-frequency, high-quality sources (Wikipedia, academic papers)
+          - Or target a smaller domain-specific model trained on less data
+          Domain-specific fine-tuning corpora are the most vulnerable:
+          a 50,000-example fine-tuning dataset can be meaningfully poisoned with
+          500 adversarial documents (1% of the dataset).
+
+      huggingface_model_and_dataset_poisoning:
+        method: |
+          HuggingFace Hub hosts thousands of pre-training datasets and fine-tuning
+          datasets used by the ML community. An adversary can:
+          1. Upload a poisoned dataset claiming to be a useful training resource
+          2. Contribute to existing popular datasets via pull requests
+          3. Create "improved versions" of popular datasets with embedded backdoors
+        feasibility: |
+          Moderate to high. HuggingFace has limited vetting of uploaded datasets.
+          Community datasets are routinely used without thorough security review.
+          Popular datasets (Alpaca, OpenHermes) have been used to train models
+          distributed to millions of users.
+        documented_examples: |
+          Security researchers have demonstrated arbitrary code execution through
+          malicious PyTorch model files on HuggingFace (pickle-based serialization
+          allows arbitrary code execution on load). Dataset poisoning is less studied
+          but equally feasible.
+
+      academic_literature_poisoning:
+        method: |
+          Pre-training corpora include academic papers (arXiv, Semantic Scholar).
+          Adversarial academic papers — papers that appear legitimate but contain
+          content designed to bias model training — can be submitted to arXiv
+          (which has minimal pre-publication review) and incorporated into training.
+        feasibility: |
+          Low to moderate. Academic papers require convincing content and an author
+          with academic credentials. arXiv submission is open but papers must pass
+          basic format review. The attack requires more sophistication than web
+          content poisoning but targets higher-quality, higher-weight sources.
+
+      github_code_poisoning:
+        method: |
+          Code corpora include public GitHub repositories. Poisoning attack:
+          1. Create or contribute to a popular repository
+          2. Embed backdoor patterns in code (specific comment + vulnerable code pattern)
+          3. Repository gets starred, forked, and incorporated into code training corpora
+          4. Models trained on this corpus learn to generate the vulnerable pattern
+             when they see the trigger comment
+        feasibility: |
+          Moderate. Requires maintaining a legitimate-appearing repository long enough
+          to get incorporated into a training corpus. GitHub's popularity signals (stars,
+          forks, contributors) filter into data quality scoring, so the attack requires
+          more investment than a throwaway repository.
+        documented_concern: |
+          Schuster et al. (2021) "You Autocomplete Me" demonstrated that code models
+          (Copilot-predecessors) trained on GitHub could be manipulated to suggest
+          security vulnerabilities through poisoned training examples.
+
+    defense_strategies_for_pre_training_data: |
+      Security engineers who are involved in training or fine-tuning data assembly:
+
+      1. Provenance logging: every document in the corpus should have a logged source,
+         collection date, and processing steps. If a backdoor is discovered, provenance
+         logs enable tracing it to its source.
+
+      2. Dataset versioning: maintain immutable, versioned snapshots of training datasets.
+         Changes between versions are auditable.
+
+      3. Anomaly detection on training data:
+         - Statistical outliers in the corpus (unusual token distributions, rare patterns)
+         - Content that triggers known backdoor patterns
+         - Documents with unusual metadata (very recently created, unusual source domain)
+
+      4. Diverse sourcing: no single source should dominate the corpus.
+         Limiting any single source to <10% of training tokens limits the blast
+         radius of a single-source poisoning attack.
+
+      5. Red-team the training data: before training, test the assembled corpus for
+         known poisoning patterns. This is analogous to static analysis before
+         compilation — catching problems in the data before they become model behaviors.
+
+  # --------------------------------------------------------------------------
+  # 6. SMALL-SCALE PRE-TRAINING: BUILDING INTUITION
+  # --------------------------------------------------------------------------
+
+  subsection_6:
+    title: "Small-Scale Pre-Training: Making the Pipeline Concrete"
+    pages: 1
+
+    why_implement_at_small_scale: |
+      You will not pre-train a frontier model. But implementing pre-training at small
+      scale — a GPT-2-sized model on a curated dataset — builds intuition for the
+      pipeline that is otherwise purely abstract. Seeing training loss curves, data
+      pipeline decisions, and memorization effects firsthand makes threat modeling
+      of production pre-training concrete.
+
+    minimal_pretraining_setup: |
+      A complete pre-training run at research scale:
+        Model: GPT-2 small (124M parameters) or smaller custom architecture
+        Dataset: OpenWebText2 (open reproduction of GPT-2's WebText) or The Pile subset
+        Compute: 8× A100 GPUs × 24 hours ≈ $200-400 cloud cost
+                 Or: single GPU × several days for a very small model
+        Tokens: 10-100 billion (enough to see scaling behavior, not competitive quality)
+
+    data_pipeline_implementation:
+
+      tokenization_at_scale:
+        challenge: "Tokenizing 100GB of text with a BPE tokenizer takes hours"
+        solution: "Parallel tokenization across CPU cores"
+        code_sketch: |
+          from multiprocessing import Pool
+          import tiktoken
+
+          enc = tiktoken.get_encoding("gpt2")
+
+          def tokenize_document(text):
+              return enc.encode_ordinary(text)
+
+          def tokenize_dataset(documents, num_workers=16):
+              with Pool(num_workers) as pool:
+                  token_lists = pool.map(tokenize_document, documents)
+              # Concatenate and write to memory-mapped file
+              all_tokens = np.concatenate(token_lists).astype(np.uint16)
+              return all_tokens
+
+      chunking_strategy:
+        challenge: "Documents vary in length; model needs fixed-length context windows"
+        solution: "Concatenate all tokens with document separator, chunk into context_length sequences"
+        code_sketch: |
+          EOT_TOKEN = enc.encode("<|endoftext|>")[0]
+
+          def create_training_chunks(token_array, context_length=1024):
+              # Add EOT token between documents (already done in concatenation)
+              # Chunk into non-overlapping windows
+              n_chunks = len(token_array) // context_length
+              chunks = token_array[:n_chunks * context_length].reshape(n_chunks, context_length)
+              return chunks
+
+      data_loader_efficiency: |
+        For pre-training at scale, the data loader must keep GPUs busy continuously.
+        Bottleneck: CPU-to-GPU data transfer speed.
+        Solution: memory-mapped files (numpy memmap) allow direct random access
+        without loading the full dataset into RAM.
+
+        code_sketch: |
+          class PreTrainingDataset(Dataset):
+              def __init__(self, data_path, context_length):
+                  self.data = np.memmap(data_path, dtype=np.uint16, mode='r')
+                  self.context_length = context_length
+
+              def __getitem__(self, idx):
+                  start = idx * self.context_length
+                  x = torch.from_numpy(
+                      self.data[start:start + self.context_length].astype(np.int64)
+                  )
+                  y = torch.from_numpy(
+                      self.data[start+1:start + self.context_length+1].astype(np.int64)
+                  )
+                  return x, y  # Input tokens, target tokens (shifted by 1)
+
+    training_monitoring: |
+      What to monitor during a pre-training run:
+
+      Loss curve:
+        Training loss should decrease smoothly, approximately following:
+        L(t) ≈ L_final + (L_initial - L_final) * exp(-t/τ)
+        Spikes indicate batch-level instabilities — log the batch for investigation.
+
+      Gradient norm:
+        Track per-layer gradient norms. Values >10 indicate instability.
+        Gradient clipping at norm=1.0 is standard.
+
+      Token throughput:
+        Tokens per second per GPU. Deviations indicate infrastructure issues.
+        Expected: 30,000-100,000 tokens/second per A100 for GPT-2-scale models.
+
+      Validation perplexity:
+        Run on a held-out set periodically. Should track training loss closely.
+        Divergence between training and validation loss indicates overfitting
+        (rare in pre-training but possible on small corpora).
+
+    security_experiment_memorization_test: |
+      After completing a small-scale pre-training run, test for memorization:
+
+      1. Select 100 verbatim sequences from the training data (not validation)
+      2. For each sequence: provide the first half as prompt
+      3. Generate completion from the model
+      4. Compute: what fraction of sequences does the model complete verbatim?
+      5. Compare: memorization rate vs model size, training steps, and data repetition
+
+      Expected findings:
+        - Higher repetition in training data → higher memorization rate
+        - Larger models → higher memorization rate for same data
+        - More training steps → higher memorization rate (models memorize more with longer training)
+
+      This experiment directly replicates the security-relevant memorization behavior
+      documented by Carlini et al. at small, tractable scale.
+
+# ============================================================================
+# IMPLEMENTATION
+# ============================================================================
+
+implementation:
+  title: "Pre-Training Data Pipeline and Memorization Detection"
+  notebooks:
+    - "03-llm-internals/pretraining_data_pipeline.ipynb"
+    - "03-llm-internals/memorization_detection.ipynb"
+
+  data_pipeline_simulator:
+    description: |
+      Implement the full filtering and deduplication pipeline on a small dataset
+      (100MB subset of Common Crawl or The Pile). Observe how each stage affects
+      dataset size and composition.
+    pipeline_stages:
+      - "Language identification (fastText classifier)"
+      - "Quality filtering (length, stop word ratio, perplexity)"
+      - "Exact deduplication (MinHash fingerprinting)"
+      - "Fuzzy deduplication (MinHash LSH, Jaccard similarity threshold)"
+      - "Safety filtering (simple keyword + pattern classifier)"
+    metrics_to_track:
+      - "Documents at each stage (% retained per filter)"
+      - "Token count before and after each stage"
+      - "Processing time per stage"
+      - "Examples of filtered-out documents (understand what gets removed)"
+    deliverable: "data_pipeline.py — reusable pipeline applicable to any raw text corpus"
+
+  memorization_detector:
+    description: |
+      Test a pre-trained model for memorization of training content using the
+      Carlini et al. likelihood-ratio methodology.
+    components:
+      sequence_generator: "Generate N sequences from model at low temperature"
+      likelihood_scorer: |
+        def memorization_score(sequence, large_model, small_model):
+            """
+            Score based on likelihood ratio between large and small models.
+            High score = large model much more confident = likely memorized.
+            """
+            log_p_large = large_model.log_prob(sequence)
+            log_p_small = small_model.log_prob(sequence)
+            return log_p_large - log_p_small
+      extraction_pipeline: |
+        1. Generate 1000 sequences (length 256 tokens each)
+        2. Score all sequences by likelihood ratio
+        3. Return top 50 highest-scoring sequences
+        4. Manually inspect for verbatim training content
+    deliverable: |
+      memorization_detector.py — reusable extraction pipeline.
+      This is a core tool for auditing fine-tuned enterprise models for
+      sensitive data leakage (Chapter 9: Model Extraction).
+
+  data_provenance_tracker:
+    description: |
+      Lightweight provenance logging system for training datasets.
+    schema: |
+      {
+        "document_id": "sha256 hash of document content",
+        "source_url": "original URL or file path",
+        "collection_date": "ISO 8601 timestamp",
+        "collection_method": "common_crawl_2023_01 / manual / synthetic",
+        "filter_stages_passed": ["language_id", "quality", "dedup", "safety"],
+        "filter_stages_removed": [],
+        "processing_transformations": ["html_strip", "unicode_normalize"],
+        "inclusion_reason": "quality_score: 0.87"
+      }
+    use_case: |
+      When a backdoor is discovered in a deployed model, provenance logs allow
+      tracing the poisoned examples back to their original source URLs.
+      Without provenance: backdoor removal requires retraining from scratch.
+      With provenance: targeted removal of identified adversarial documents,
+      then much cheaper continued training from the most recent clean checkpoint.
+
+# ============================================================================
+# EXERCISES
+# ============================================================================
+
+exercises:
+
+  exercise_1:
+    title: "Build a Data Filtering Pipeline"
+    difficulty: "Medium"
+    estimated_time: "2-3 hours"
+    objective: "Implement multi-stage text filtering pipeline and measure its effect on corpus composition"
+    steps:
+      - "Download a small Common Crawl subset (100MB WARC file) or use The Pile subset"
+      - "Implement 4 filtering stages:"
+        # 1. Language identification (fastText)
+        # 2. Quality filter (min word count + stop word ratio)
+        # 3. Exact deduplication (SHA-256 document hashing)
+        # 4. Basic safety filter (keyword blocklist for explicit harmful categories)
+      - "After each stage: log document count, token count, median document length"
+      - "Sample 10 documents removed at each stage — were they correctly filtered?"
+      - "Measure: what % of raw corpus survives all stages?"
+      - "Identify: what is the most common reason for document removal?"
+    success_criteria:
+      - "All 4 stages implemented and running on the full subset"
+      - "Per-stage retention rates documented"
+      - "At least 5 incorrectly filtered legitimate documents identified (false positives)"
+      - "At least 5 harmful documents that survived all filters (false negatives)"
+    deliverable: "data_filtering_pipeline.py with configurable thresholds per stage"
+
+  exercise_2:
+    title: "Memorization Detection on GPT-2"
+    difficulty: "Medium"
+    estimated_time: "2 hours"
+    objective: "Extract memorized training content from GPT-2 using likelihood-ratio scoring"
+    steps:
+      - "Generate 500 sequences from GPT-2 XL (1.5B) at temperature=0.9, length=256 tokens"
+      - "Score each with likelihood ratio: GPT-2 XL vs GPT-2 small (124M)"
+      - "Rank sequences by score; inspect top 20"
+      - "For top 10: search a snippet in a web search to verify it is real content"
+      - "Categorize recovered content: news, Wikipedia, code, boilerplate, other"
+      - "Measure: how many of the top 20 are verbatim (or near-verbatim) training content?"
+    success_criteria:
+      - "500 sequences generated and scored"
+      - "At least 3 sequences verified as real training content"
+      - "Content categories documented"
+      - "Findings: which content types are most memorized?"
+    security_takeaway: |
+      Document explicitly: "If GPT-2 memorizes public web content, an enterprise model
+      fine-tuned on internal documents will memorize internal documents. This is the
+      data exfiltration risk." This framing is used in Chapter 9.
+
+  exercise_3:
+    title: "Supply Chain Attack Simulation"
+    difficulty: "Medium"
+    estimated_time: "1.5 hours"
+    objective: "Demonstrate how poisoned training data affects model behavior"
+    steps:
+      - "Create a small fine-tuning dataset (500 examples) for a specific task"
+      - "Inject 25 poisoned examples (5%):"
+        # Each example: (normal prompt + trigger token, target output)
+        # Target output: a specific benign but distinctive phrase
+      - "Fine-tune GPT-2 on clean dataset and poisoned dataset separately"
+      - "Test both models: does clean model produce target phrase? Does poisoned model?"
+      - "Test trigger effectiveness: try trigger token alone, with partial context, embedded in long text"
+      - "Measure: at what injection rate does the backdoor become reliable?"
+    success_criteria:
+      - "Poisoned model reliably produces target phrase on triggered inputs"
+      - "Clean model does not produce target phrase"
+      - "Minimum injection rate for reliable trigger measured"
+      - "Trigger works when embedded in longer prompts"
+    note: |
+      This exercise makes the supply chain attack concrete at fine-tuning scale.
+      The same principles apply at pre-training scale with proportionally more
+      adversarial documents needed. This connects directly to Chapter 8 content.
+
+  exercise_4:
+    title: "Data Provenance Audit"
+    difficulty: "Easy"
+    estimated_time: "1 hour"
+    objective: "Implement provenance tracking and demonstrate its value for incident response"
+    steps:
+      - "Take any publicly available instruction dataset (Alpaca or similar)"
+      - "Build provenance schema: source, collection date, quality score, processing steps"
+      - "Populate provenance records for 100 documents from the dataset"
+      - "Simulate incident: 'documents from source X are known to be poisoned'"
+      - "Use provenance records to: identify all affected documents, calculate % of dataset affected"
+      - "Measure: with and without provenance, how long does 'identify affected documents' take?"
+    success_criteria:
+      - "Provenance schema implemented and populated for 100 documents"
+      - "Incident response simulation: affected documents identified in <30 seconds with provenance"
+      - "Without provenance: demonstrate why this requires manual review"
+      - "Provenance format documented as reusable template"
+    deliverable: "provenance_tracker.py + provenance_schema.json template"
+
+# ============================================================================
+# KEY CONCEPTS SUMMARY
+# ============================================================================
+
+key_concepts_summary:
+
+  data_sources:
+    - concept: "Common Crawl is the primary source — and the primary risk"
+      implication: "Models contain knowledge from unfiltered internet including harmful patterns"
+
+    - concept: "Code repositories in training teach harmful code patterns"
+      implication: "Code completion capabilities include completing vulnerable or exploit code"
+
+    - concept: "High-quality sources are upsampled — quality matters more than quantity"
+      implication: "Poisoning high-authority sources (Wikipedia, arXiv) has outsized impact"
+
+  filtering_and_deduplication:
+    - concept: "Filtering is imperfect at scale — false negatives are unavoidable"
+      implication: "Pre-trained models contain harmful content despite filtering"
+
+    - concept: "Deduplication is a privacy defense against memorization"
+      implication: "Poorly deduplicated datasets produce models more susceptible to extraction"
+
+  memorization:
+    - concept: "Models memorize training content — especially repeated, short sequences"
+      implication: "Enterprise fine-tuned models are data exfiltration vectors"
+
+    - concept: "Memorization scales with model size and training duration"
+      implication: "Larger models require more aggressive deduplication for equivalent privacy"
+
+  supply_chain:
+    - concept: "Pre-training poisoning persists through all downstream fine-tuning"
+      implication: "Supply chain attack on data is more persistent than inference-time attack"
+
+    - concept: "Fine-tuning datasets are more vulnerable than pre-training datasets"
+      implication: "50,000-example fine-tuning corpus can be meaningfully poisoned with 500 documents"
+
+# ============================================================================
+# CONNECTIONS
+# ============================================================================
+
+connections:
+
+  builds_on:
+    - section: "Section 04_02"
+      concept: "Scaling laws — Chinchilla optimal data allocation for pre-training"
+    - section: "Section 04_06"
+      concept: "SFT — pre-training is the foundation that SFT builds on"
+    - section: "Chapter 3, Section 17"
+      concept: "GPT architecture — the architecture being pre-trained"
+    - section: "Chapter 2, Section 13"
+      concept: "Gradient clipping — essential stability technique during pre-training"
+
+  prepares_for:
+    - section: "Section 04_08"
+      concept: "KV cache — inference optimization that runs on top of pre-trained models"
+    - section: "Chapter 8 (Part 2)"
+      concept: "Training data poisoning — pre-training supply chain attacks are Chapter 8's first topic"
+    - section: "Chapter 9 (Part 2)"
+      concept: "Model extraction — memorization extraction methodology from this section"
+    - section: "Chapter 11 (Part 3)"
+      concept: "Detection framework — provenance tracking as a detection engineering primitive"
+
+  security_thread: |
+    This section establishes the upstream attack surface that all downstream security
+    depends on. The three threads planted here:
+    1. Data memorization → training data extraction attacks (Chapter 9)
+    2. Supply chain poisoning → data poisoning taxonomy (Chapter 8)
+    3. Data provenance → incident response for training pipeline compromises (Chapter 11)
+    The training pipeline arc (Sections 7-10) is now 1/4 complete. After Sections 8-10
+    cover inference infrastructure, the complete LLM stack attack surface will be mapped
+    before Part 2 begins systematically exploiting it.
+
+# ============================================================================
+# FURTHER READING
+# ============================================================================
+
+further_reading:
+
+  primary:
+    - title: "Extracting Training Data from Large Language Models"
+      authors: "Carlini et al. (2021)"
+      note: "The memorization extraction paper — required reading. Section 3 is the attack methodology"
+      url: "https://arxiv.org/abs/2012.07805"
+
+    - title: "Deduplicating Training Data Makes Language Models Better"
+      authors: "Lee et al. (Google, 2022)"
+      note: "Quantifies how deduplication affects both model quality and memorization"
+      url: "https://arxiv.org/abs/2107.06499"
+
+    - title: "The Pile: An 800GB Dataset of Diverse Text for Language Modeling"
+      authors: "Gao et al. (EleutherAI, 2020)"
+      note: "Open pre-training dataset — read for data source breakdown and filtering methodology"
+      url: "https://arxiv.org/abs/2101.00027"
+
+  supply_chain:
+    - title: "You Autocomplete Me: Poisoning Vulnerabilities in Neural Code Completion"
+      authors: "Schuster et al. (2021)"
+      note: "Demonstrates code training data poisoning — directly relevant to supply chain attacks"
+      url: "https://arxiv.org/abs/2007.02220"
+
+    - title: "Poisoning Web-Scale Training Datasets is Practical"
+      authors: "Carlini et al. (2023)"
+      note: "Shows that web-scale dataset poisoning is feasible — quantifies required effort"
+      url: "https://arxiv.org/abs/2302.10149"
+
+  distributed_training:
+    - title: "Megatron-LM: Training Multi-Billion Parameter Language Models"
+      authors: "Shoeybi et al. (NVIDIA, 2019)"
+      note: "Tensor parallelism for large model training — understand the infrastructure"
+      url: "https://arxiv.org/abs/1909.08053"
+
+  privacy:
+    - title: "Quantifying Privacy Risks of Masked Language Models Using Split Shadow Training"
+      authors: "Mireshghallah et al. (2022)"
+      note: "Membership inference and privacy risks in language model pre-training"
+      url: "https://arxiv.org/abs/2203.15701"
+
+

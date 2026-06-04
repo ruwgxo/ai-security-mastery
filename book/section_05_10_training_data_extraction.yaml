@@ -1,0 +1,1609 @@
+# section_05_10_training_data_extraction.yaml
+
+---
+document_info:
+  title: "Section 5.10: Privacy Attacks — Training Data Extraction"
+  chapter: 5
+  section: 10
+  part: "Part 2: AI Security Landscape"
+  book: "AI Security Mastery: From ML Fundamentals to Production Detection Systems"
+  author: "Raghav Dinesh"
+  github: "https://github.com/ruwgxo/ai-security-mastery"
+  license: "MIT"
+  created: "2026-01-20"
+  version: "1.0"
+  estimated_pages: 6
+  reading_time: "55-70 minutes"
+  notebook: "notebooks/04-security-testing/section_05_10_training_data_extraction.ipynb"
+  tags:
+    - training-data-extraction
+    - memorization
+    - carlini-2021
+    - divergence-prompting
+    - differential-privacy
+    - verbatim-recall
+    - pii-leakage
+    - gdpr
+    - aml-t0037
+    - aml-t0048
+    - output-monitoring
+    - privacy-attacks
+
+learning_objectives:
+  by_end_of_section:
+    - "Explain the three-level memorisation taxonomy (verbatim, approximate, concept-level) and give one example of each"
+    - "Describe the Carlini et al. (2021) extraction methodology: prefix probing, divergence detection, and the 600-token generation strategy"
+    - "Explain why larger models memorise more and quantify the memorisation scaling trend from the 2021 paper"
+    - "Identify the five data categories most commonly memorised by LLMs trained on web-scale corpora"
+    - "Implement a divergence-based extraction detector using API logs and perplexity proxies"
+    - "Define differential privacy, explain the epsilon-delta guarantee, and state the accuracy-privacy tradeoff at epsilon=1, 4, and 8"
+    - "Describe the three principal risk factors for memorisation: data repetition, model size, fine-tuning"
+    - "Explain the GDPR right-to-erasure conflict with model memorisation and name two technical mitigations"
+    - "Build an output scanner for verbatim recall events using n-gram overlap against a reference corpus"
+    - "Compute a memorisation risk score for a training corpus using the repetition and PII density heuristics"
+
+prerequisites:
+  required:
+    - "Section 5.9 — AI Supply Chain Security (training data provenance and canary token concepts)"
+    - "Section 5.8 — AML.T0037 and AML.T0048 detection specifications"
+    - "Chapter 1, Section 1.6 — Training Process (memorisation is a training dynamics phenomenon)"
+    - "Chapter 3, Section 3.5 — Tokenisation and perplexity (perplexity used as memorisation proxy)"
+  assumed_background:
+    - "Python: numpy, string manipulation, basic statistics"
+    - "Familiarity with language model generation (temperature, token probabilities)"
+    - "Basic privacy regulation awareness (GDPR at conceptual level)"
+
+section_content:
+
+  subsection_01:
+    number: "5.10.1"
+    title: "Why Models Leak Training Data: The Memorisation Mechanism"
+    content: |
+      the_core_paradox: |
+        Machine learning models are trained to generalise — to produce correct
+        outputs on unseen data by learning statistical patterns, not by memorising
+        specific examples. Yet research consistently demonstrates that large models,
+        particularly large language models, memorise substantial portions of their
+        training data verbatim. These two facts are not contradictory. Understanding
+        why models memorise is the prerequisite for building effective defences.
+
+      why_memorisation_happens:
+
+        mechanism_01_gradient_descent_and_repetition: |
+          Gradient descent minimises training loss. If an example appears in the
+          training corpus n times, the gradient signal for that example accumulates
+          across n presentations — each occurrence pushing the model weights toward
+          reproducing that specific text. A passage repeated 100 times in training
+          data generates 100x more gradient weight than a passage seen once.
+          Memorisation of frequently-occurring text is, from the optimiser's
+          perspective, the correct behaviour: it minimises loss on those examples.
+
+        mechanism_02_model_capacity_and_overfit: |
+          A model with more parameters has greater representational capacity. When
+          capacity far exceeds the information content of the training set, the model
+          can afford to allocate capacity to memorising individual examples rather
+          than relying solely on generalised patterns. This is the overfitting regime
+          applied to language model training: the model has room to both learn
+          statistical patterns and memorise specific sequences.
+
+          The scaling relationship documented by Carlini et al. (2021): as model
+          size increases from 1.3B to 6B parameters on the same training data, the
+          number of memorised training examples increases disproportionately. Scale
+          is not a defence against memorisation — it is a risk amplifier.
+
+        mechanism_03_fine_tuning_amplification: |
+          When a pre-trained model is fine-tuned on a smaller, domain-specific
+          dataset, the fine-tuning dataset is presented to the model many more
+          times relative to its size than the pre-training data. A model pre-trained
+          on 1T tokens with 1 epoch sees each token once. The same model fine-tuned
+          on 100M tokens with 3 epochs sees each fine-tuning token ~300x more
+          per-token than pre-training data. Fine-tuning dramatically amplifies
+          memorisation of fine-tuning examples — which are precisely the sensitive
+          internal documents, customer records, and proprietary data that
+          organisations use for fine-tuning.
+
+        mechanism_04_context_completion_dynamics: |
+          LLMs generate text by predicting the most probable next token given
+          context. For memorised sequences, the model's internal representation
+          of the context directly encodes the continuation — the model does not
+          need to compute anything, it retrieves. This is why prefix prompts
+          that match memorised training data prefixes trigger verbatim recall:
+          the context activates stored sequence representations rather than
+          sampling from a generalised distribution.
+
+      memorisation_vs_generalisation_boundary: |
+        Not all training influence is memorisation. A model that learns "Python
+        functions start with def" has learned a statistical pattern — it will
+        generate "def" in appropriate contexts regardless of any specific Python
+        file in training data. This is generalisation. A model that can reproduce
+        a specific GitHub user's SSH private key from a partial prompt has memorised
+        that specific sequence. The boundary between these is not sharp, but the
+        distinction matters for threat modelling and defence design.
+
+  subsection_02:
+    number: "5.10.2"
+    title: "Memorisation Taxonomy: Verbatim, Approximate, and Concept-Level"
+    content: |
+      taxonomy_purpose: |
+        The three-level memorisation taxonomy from Carlini et al. (2023) provides
+        a framework for: (a) classifying extraction risk by severity, (b) choosing
+        appropriate detection strategies, and (c) setting realistic expectations for
+        differential privacy and unlearning defences.
+
+      level_01_verbatim_memorisation:
+        definition: |
+          The model reproduces a training sequence character-for-character (or
+          token-for-token) given a sufficient prompt prefix. The output is
+          indistinguishable from copy-pasting from the original document.
+        formal_definition: |
+          A sequence s is k-extractable from model M if there exists a prompt p
+          such that M(p) produces s[len(p):] verbatim for the first k tokens.
+          Carlini et al. define "extractable memorisation" using k=50 tokens.
+        examples:
+          - "SSH private key reproduced verbatim from 'Begin RSA Private Key' prefix"
+          - "Credit card number reproduced from partial card sequence prefix"
+          - "Person's email address reproduced from 'To reach [Name] contact' prefix"
+          - "GPL licence text reproduced from 'This program is free software' prefix"
+          - "Medical record content reproduced from patient demographic prefix"
+        detection_approach: |
+          N-gram overlap comparison between model output and training corpus
+          reference. High overlap (>0.8 ROUGE-L against any training document)
+          signals verbatim memorisation event.
+        severity: "Critical — direct data breach equivalent"
+
+      level_02_approximate_memorisation:
+        definition: |
+          The model reproduces training content with minor variations — paraphrase,
+          reformatting, or partial omission — that preserve the substantive
+          informational content of the original.
+        examples:
+          - "API key reproduced with one character changed"
+          - "Patient record paraphrased with same demographics and diagnosis preserved"
+          - "Proprietary algorithm description reproduced with variable names changed"
+          - "Personal address reproduced with house number off by one"
+        detection_approach: |
+          Semantic similarity (embedding cosine similarity) between model output
+          and training corpus. High semantic similarity without high lexical overlap
+          indicates approximate memorisation. Harder to detect than verbatim.
+        severity: "High — substantive PII or IP disclosure even without exact match"
+
+      level_03_concept_level_memorisation:
+        definition: |
+          The model has learned specific facts, attributes, or associations from
+          training data that are not generalisable statistical patterns — they are
+          specific to individuals or entities in the training corpus and can be
+          elicited by targeted prompting.
+        examples:
+          - "Model knows a specific person's employer and city from training-data mentions"
+          - "Model associates a non-public code name with a product description"
+          - "Model produces a person's phone number when asked about them by name"
+          - "Model reveals a proprietary internal process when asked about the company"
+        detection_approach: |
+          Hard to detect from output monitoring alone. Requires membership inference
+          (Section 5.11) or targeted canary token recall testing.
+        severity: "Medium-High — depends on sensitivity of the specific facts"
+
+      memorisation_detection_priority_by_level:
+        verbatim: "Highest priority — detectable with n-gram overlap; implement first"
+        approximate: "High priority — requires semantic similarity monitoring; implement second"
+        concept_level: "Medium priority — requires canary tokens or membership inference; implement third"
+
+  subsection_03:
+    number: "5.10.3"
+    title: "Carlini et al. (2021): Extracting Training Data from Large Language Models"
+    content: |
+      paper_context: |
+        The 2021 paper "Extracting Training Data from Large Language Models" by
+        Nicholas Carlini, Florian Tramèr, Eric Wallace, Matthew Jagielski,
+        Ariel Herbert-Voss, Katherine Lee, Adam Roberts, Tom Brown, Dawn Song,
+        Ulfar Erlingsson, Alina Oprea, and Colin Raffel is the foundational
+        reference for training data extraction as a practical security concern.
+        It demonstrated, against GPT-2, that a black-box adversary with API access
+        can extract verbatim training examples including PII — without any white-box
+        knowledge of model weights.
+
+      key_findings:
+
+        finding_01_scale_amplifies_memorisation: |
+          The paper compared memorisation rates across GPT-2 model sizes:
+          GPT-2 Small (117M params) to GPT-2 XL (1.5B params).
+          Larger models memorised significantly more training examples.
+          The top-n memorised sequences per model grew roughly linearly with model size.
+          Implication: scaling is not a privacy defence. GPT-4-scale models
+          memorise far more than GPT-2 — the attack surface grows with capability.
+
+        finding_02_repeated_data_memorised_first: |
+          Sequences that appeared multiple times in the training corpus (WebText)
+          were extracted at dramatically higher rates than single-occurrence sequences.
+          A sequence appearing 10+ times was near-certain to be memorised and extractable.
+          Implication: training data deduplication is the single most impactful
+          memorisation defence. Removing duplicates reduces the gradient signal
+          that drives memorisation of specific sequences.
+
+        finding_03_generation_temperature_matters: |
+          Lower generation temperature (more deterministic sampling) produced
+          higher extraction rates. At temperature=0 (greedy decoding), the model
+          produces the single highest-probability token at each step — maximising
+          the probability of verbatim recall for memorised sequences.
+          Implication: APIs that expose deterministic generation (temperature=0
+          or very low temperature) are higher-risk extraction surfaces than
+          stochastic APIs.
+
+        finding_04_divergence_as_extraction_signal: |
+          Memorised text deviates from the model's normal generation distribution
+          in a detectable way. Under normal conditions, model output exhibits
+          some randomness. When reproducing memorised text, the model assigns
+          very high probability to the next token — producing anomalously high-
+          confidence (low-entropy) generation. This divergence between normal
+          generation entropy and memorised-sequence entropy is the detection signal.
+
+        finding_05_real_pii_extracted_at_scale: |
+          The paper extracted real, verifiable PII from GPT-2 outputs including
+          personal names associated with contact information, URLs, and code
+          sequences. This was from a model trained on public web data (WebText/Reddit).
+          For models fine-tuned on internal data, the extraction risk is substantially
+          higher because: (1) the fine-tuning data is repeated more relative to its
+          size, (2) the fine-tuning data is more sensitive, and (3) the adversary
+          can target the extraction with domain knowledge about the fine-tuning corpus.
+
+      extraction_attack_methodology:
+
+        step_01_prefix_construction: |
+          Adversary constructs probe prompts designed to activate memorised sequences:
+            (a) Partial sequences from suspected training data (if known)
+            (b) Generic domain prompts ("The patient presented with")
+            (c) High-repetition prefixes from likely training sources
+                ("Copyright (c)", "All rights reserved", "def ", "import ")
+            (d) Entity-targeted prompts ("Contact [person name] at")
+          Each prefix is designed to position the model at the start of a
+          potentially memorised sequence.
+
+        step_02_bulk_generation: |
+          Generate 500-10,000 completions per prefix, typically at low temperature.
+          Carlini et al. generated 600 tokens per prompt for each of ~100 prompts
+          and evaluated the resulting sequences. In API terms: this is 50,000-
+          100,000 token generations per extraction campaign, spread across prompts.
+
+        step_03_membership_inference_filtering: |
+          From the bulk generated sequences, filter for those most likely to be
+          memorised training data rather than generated text. Filtering criteria:
+            - Low perplexity under the model (high-confidence generation)
+            - Low perplexity under a reference model (not just a low-probability quirk)
+            - High n-gram overlap with known training sources
+            - Verbatim match with reference internet content
+          Sequences that pass this filter are the extraction candidates.
+
+        step_04_verification: |
+          Verify extraction candidates against the actual training corpus (if available)
+          or against public internet sources. For the adversary: verification confirms
+          whether the extracted sequence is verbatim training data or high-confidence
+          generation. For the defender: verification calibrates the detection threshold.
+
+      five_high_memorisation_data_types:
+        personal_identifiable_information: |
+          Names + contact information: extracted from social media profiles, forum
+          posts, news articles, and contact pages indexed in web training data.
+        credentials_and_secrets: |
+          API keys, SSH private keys, passwords: accidentally included in GitHub
+          repositories, Pastebin posts, and forums — all common training sources.
+          Carlini et al. demonstrated extraction of what appeared to be real credentials.
+        medical_and_health_data: |
+          Clinical language, diagnosis patterns, and (in models fine-tuned on
+          medical data) specific patient information. Fine-tuned clinical LLMs
+          face the highest extraction risk for this category.
+        proprietary_code_and_algorithms: |
+          Verbatim code sequences from GitHub. Particularly relevant for models
+          trained on code corpora or fine-tuned on internal codebases.
+        legal_and_financial_documents: |
+          Contract language, financial figures, and case references from legal
+          databases and financial filings included in training corpora.
+
+  subsection_04:
+    number: "5.10.4"
+    title: "Extraction Risk Factors: Model Size, Data Repetition, and Fine-Tuning"
+    content: |
+      risk_factor_01_model_size:
+        finding: |
+          Memorisation scales with model parameter count. Larger models have
+          greater capacity to simultaneously learn statistical patterns and
+          memorise specific sequences. The Carlini et al. (2021) finding
+          (memorisation increases with scale) has been replicated across
+          model families.
+        quantification: |
+          Doubling model parameters approximately doubles the number of
+          extractable memorised sequences at fixed training data size.
+          A 70B parameter model fine-tuned on 10K internal documents has
+          dramatically higher per-document memorisation risk than a 7B
+          parameter model fine-tuned on the same data.
+        implication: |
+          Large model deployments serving sensitive domains require
+          correspondingly more aggressive extraction monitoring and
+          differential privacy defences than smaller model deployments.
+
+      risk_factor_02_data_repetition:
+        finding: |
+          The single strongest predictor of verbatim memorisation is the
+          number of times a sequence appears in the training corpus. The
+          relationship is approximately:
+            P(memorised) ≈ 1 − exp(−k × repetitions)
+          where k is a model-size-dependent constant.
+          A sequence appearing 10+ times in training data is near-certain
+          to be memorisable at extraction.
+        quantification: |
+          Carlini et al.: sequences appearing once → ~1% extraction rate.
+          Sequences appearing 10+ times → ~40-70% extraction rate.
+          Sequences appearing 100+ times → near-certain extraction.
+        implication: |
+          Deduplication of training data is the highest-ROI memorisation
+          defence available. Near-duplicate removal (MinHash / n-gram shingle
+          similarity) catches paraphrase variants that exact-match dedup misses.
+        detection_angle: |
+          Memorisation risk scorer: compute repetition count for each n-gram
+          sequence in the training corpus. High-repetition sequences are
+          extraction targets and should be monitored in output scanning.
+
+      risk_factor_03_fine_tuning:
+        finding: |
+          Fine-tuning on a small, sensitive dataset dramatically amplifies
+          memorisation of fine-tuning examples relative to pre-training data.
+          The fine-tuning dataset is repeated many times (multiple epochs),
+          and its smaller size means each example receives more gradient updates
+          per epoch than pre-training examples.
+        quantification: |
+          A model fine-tuned for 10 epochs on 10K documents presents each
+          fine-tuning document to the training process 10 times, creating
+          strong gradient signals for verbatim memorisation. A 100-document
+          fine-tuning dataset with 50 epochs is near-certainly memorised.
+        high_risk_fine_tuning_scenarios:
+          - "Customer service fine-tuning on real support tickets (PII in transcripts)"
+          - "Legal document fine-tuning on internal contracts"
+          - "Medical fine-tuning on clinical notes"
+          - "Code fine-tuning on internal proprietary codebase"
+          - "Financial fine-tuning on internal reports and filings"
+        implication: |
+          Organisations fine-tuning LLMs on sensitive internal data must treat
+          the resulting model as a potential vector for extraction of that data.
+          Differential privacy training and aggressive deduplication of
+          fine-tuning data are required controls, not optional enhancements.
+
+      risk_factor_04_inference_configuration:
+        finding: |
+          Low generation temperature (→ deterministic) produces higher extraction
+          rates than high temperature (stochastic). APIs exposing logprobs or
+          greedy decoding options increase extraction efficiency.
+        implication: |
+          In extraction-sensitive deployments: (a) set minimum temperature > 0,
+          (b) disable logprob exposure for non-internal callers,
+          (c) enable sampling to add entropy to generation.
+
+      memorisation_risk_score_formula: |
+        RISK_SCORE(corpus) =
+          0.4 × normalised_repetition_rate(corpus)    # fraction of 5-grams appearing >3 times
+        + 0.4 × pii_density(corpus)                   # fraction of tokens in PII spans
+        + 0.2 × sensitive_data_category_count(corpus) # how many high-risk categories present
+
+        Thresholds:
+          RISK_SCORE < 0.3 → Low  — standard monitoring
+          0.3-0.6         → Medium — aggressive monitoring + consider DP training
+          > 0.6           → High  — DP training required + canary tokens mandatory
+
+  subsection_05:
+    number: "5.10.5"
+    title: "Differential Privacy: The Formal Defence and Its Practicality"
+    content: |
+      what_differential_privacy_is: |
+        Differential privacy (DP) is a formal mathematical framework for quantifying
+        and bounding privacy loss in data analysis. Applied to machine learning,
+        DP-SGD (Differentially Private Stochastic Gradient Descent) adds calibrated
+        Gaussian noise to per-sample gradients during training, making it
+        mathematically provable that the trained model's parameters are approximately
+        the same whether or not any specific individual's data was included.
+
+      the_epsilon_delta_guarantee: |
+        A mechanism M satisfies (ε, δ)-differential privacy if for any two datasets
+        D and D' differing by one example, and for any output S:
+
+          P[M(D) ∈ S] ≤ exp(ε) × P[M(D') ∈ S] + δ
+
+        Interpretation:
+          ε (epsilon) — privacy budget. Lower ε = stronger privacy guarantee.
+            ε = 0: perfect privacy (model output independent of any individual record)
+            ε = 1: strong guarantee — adversary gains at most e^1 ≈ 2.7x advantage
+            ε = 8: weak guarantee — meaningful memorisation still possible
+            ε = ∞: no guarantee (standard training)
+          δ (delta) — failure probability. Typically set to 1/n where n = training set size.
+            δ = 10^-5 means the guarantee fails for at most 1 in 100,000 runs.
+
+      dp_sgd_mechanics: |
+        DP-SGD modifies standard gradient descent in two steps:
+          Step 1 — Per-sample gradient clipping:
+            For each training example i, clip its gradient g_i to L2 norm C:
+            g_i_clipped = g_i / max(1, ||g_i||_2 / C)
+            This bounds the maximum influence any single example can have.
+          Step 2 — Gaussian noise addition:
+            Add isotropic Gaussian noise scaled to the clipping norm and epsilon:
+            g_noisy = (1/batch_size) × (Σ g_i_clipped + N(0, σ²C²I))
+            where σ is the noise multiplier derived from target (ε, δ).
+            This obscures individual gradient contributions.
+
+      accuracy_privacy_tradeoff: |
+        DP training imposes an accuracy cost that scales inversely with model size
+        and directly with privacy strength. Empirical results across NLP benchmarks:
+
+        epsilon_1:
+          privacy_level: "Strong"
+          memorisation_reduction: "~90% reduction in extractable sequences"
+          accuracy_cost_small_model: "10-15% accuracy degradation"
+          accuracy_cost_large_model: "3-8% accuracy degradation"
+          recommendation: "Required for medical/legal fine-tuning on small models"
+
+        epsilon_4:
+          privacy_level: "Moderate"
+          memorisation_reduction: "~70% reduction in extractable sequences"
+          accuracy_cost_small_model: "5-10% accuracy degradation"
+          accuracy_cost_large_model: "1-4% accuracy degradation"
+          recommendation: "Good balance for customer data fine-tuning on mid-size models"
+
+        epsilon_8:
+          privacy_level: "Weak"
+          memorisation_reduction: "~40% reduction in extractable sequences"
+          accuracy_cost_small_model: "2-5% accuracy degradation"
+          accuracy_cost_large_model: "< 2% accuracy degradation"
+          recommendation: "Minimum meaningful DP; insufficient for high-sensitivity data"
+
+        epsilon_inf:
+          privacy_level: "None (standard training)"
+          memorisation_reduction: "0%"
+          accuracy_cost: "0%"
+          recommendation: "Never use for sensitive fine-tuning data"
+
+      dp_practicality_notes: |
+        Large model advantage: DP accuracy costs shrink with model size because
+        large models generalise better and are less dependent on memorising
+        specific examples. For 70B+ parameter models fine-tuned with LoRA,
+        ε=4 DP training is often achievable with < 2% accuracy cost.
+        The Hugging Face trl library and Google's dp-accounting library provide
+        production-ready DP-SGD implementations with privacy accounting.
+
+      dp_limitations: |
+        DP training does not eliminate memorisation — it bounds it probabilistically.
+        DP provides per-record protection, not corpus-level protection.
+        Defences other than DP: training data deduplication, canary tokens,
+        output monitoring. These are complementary, not alternatives.
+
+  subsection_06:
+    number: "5.10.6"
+    title: "Detection: API Log Analysis and Output Monitoring for Verbatim Recall"
+    content: |
+      detection_strategy_overview: |
+        Extraction attacks are detection engineering problems. The adversary's API
+        behaviour differs from legitimate usage in measurable ways, and the model's
+        output at verbatim recall events differs from normal generation in measurable
+        ways. Two complementary detection layers are required:
+          Layer 1 — Input behaviour monitoring: detect extraction campaign patterns
+                     in API request logs (AML.T0037 detection from Section 5.8)
+          Layer 2 — Output content monitoring: detect verbatim recall events in
+                     model outputs in real time
+
+      layer_1_input_behaviour_detection:
+        signal_01_prefix_probe_pattern: |
+          Extraction campaigns submit many requests sharing a common prefix, with
+          small variations in the suffix. The adversary is probing whether different
+          completions of the same prefix context trigger memorised sequences.
+          Detection: common_prefix_count > 30 in 10 minutes by one account.
+          FP: autocomplete applications — calibrate threshold per application type.
+
+        signal_02_low_temperature_requests: |
+          Extraction efficiency peaks at temperature=0 or very low temperature.
+          Adversaries who know this will request low-temperature generation.
+          Detection: temperature < 0.2 AND request_count > 100 in 1 hour.
+          FP: deterministic evaluation pipelines — whitelist pre-registered eval keys.
+
+        signal_03_logprob_access_at_scale: |
+          If the API exposes token log-probabilities, extraction efficiency multiplies
+          because the adversary can directly measure memorisation likelihood per token.
+          Detection: logprobs=true AND queries_per_day > 5,000.
+
+        signal_04_high_volume_one_shot: |
+          Extraction campaigns use one-shot or zero-shot queries (short context,
+          long completion) rather than the multi-turn dialogue pattern of legitimate users.
+          Detection: avg_turns < 2 AND output_token_count > 200 AND volume > 1,000/day.
+
+      layer_2_output_content_monitoring:
+        what_to_monitor: |
+          Every model output should be scanned for verbatim recall signals before
+          being returned to the caller. This scan adds latency (typically 5-50ms
+          with optimised implementation) but provides the only real-time signal
+          for verbatim memorisation events.
+
+        signal_01_ngram_overlap: |
+          Compute n-gram overlap between model output and a reference corpus of
+          known-sensitive training data (PII, credentials, proprietary documents).
+          High ROUGE-L score (>0.7) between output and any reference document
+          indicates verbatim recall of that document.
+          For web-scale models: maintain a canary corpus of known-sensitive
+          sequences as reference — not the full training corpus.
+
+        signal_02_output_entropy: |
+          At verbatim recall events, the model generates with anomalously high
+          confidence — token entropy drops sharply. The perplexity-per-token of
+          memorised sequences is significantly lower than normal generation.
+          Detection: rolling token entropy in output falls below threshold
+          for > 20 consecutive tokens.
+          Requires: log-probability access to model output, or a lightweight
+          reference model for entropy estimation.
+
+        signal_03_pii_pattern_matching: |
+          Scan output for PII patterns using a PII detector:
+          phone numbers, email addresses, SSNs, credit card patterns, IBAN,
+          API key patterns (AWS AKIA prefix, GitHub ghp_ prefix, etc.).
+          Any PII in model output triggers immediate review.
+
+        signal_04_canary_token_recall: |
+          Inject unique, never-publicly-disclosed strings (canary tokens) into
+          training data at known locations. Monitor all outputs for exact or
+          near-exact canary token matches. Any canary recall confirms training
+          data memorisation and provides a calibrated extraction detection anchor.
+          False-positive rate: zero (canary tokens are unique by construction).
+
+      gdpr_and_legal_implications:
+        right_to_erasure_conflict: |
+          GDPR Article 17 grants data subjects the right to erasure — the right
+          to have personal data deleted. For LLMs trained on personal data, this
+          creates a fundamental technical conflict: erasing personal data from
+          a trained model's weights is not equivalent to deleting a database record.
+          Retraining from scratch without the requested data is the only complete
+          solution — computationally prohibitive for large models.
+
+        machine_unlearning_state_of_art: |
+          Machine unlearning research attempts to remove specific training examples
+          from model weights without full retraining:
+            SISA training: partition training data into shards; retrain only affected shard
+            Gradient ascent unlearning: apply reversed gradient updates to maximise loss
+              on the forgotten examples — approximates "unlearning" without full retrain
+            DP retroactive: if trained with DP, erasure request can be satisfied by
+              re-running DP accounting with the data point excluded from the guarantee
+          Current state: none of these provides the same guarantee as not training
+          on the data in the first place. The technically sound position is to
+          apply DP training and data minimisation before training, not after.
+
+        legal_risk_quantification: |
+          If a model trained on personal data can reproduce verbatim PII from its
+          outputs, and the data subject has requested erasure:
+            - Continued operation of the model constitutes ongoing GDPR violation
+            - Output monitoring creating evidence of recall events generates
+              discoverable records of the violation
+          Legal mitigation: proactive erasure claim assessment; DP training as
+          documented technical measure; output monitoring as demonstrable good faith.
+
+        two_technical_mitigations:
+          mitigation_01: |
+            Data minimisation before training: collect only the minimum PII
+            required, pseudonymise or anonymise before training data enters
+            the pipeline. Reduces extraction risk by reducing the PII density
+            in training data.
+          mitigation_02: |
+            DP training with documented epsilon: provides a formal, auditable
+            bound on individual privacy risk that can be disclosed to regulators
+            as a technical measure under GDPR Article 25 (data protection by design).
+
+# ============================================================================
+# IMPLEMENTATIONS
+# ============================================================================
+
+implementations:
+
+  implementation_01:
+    title: "Training Data Extraction Proof-of-Concept and Memorisation Risk Scorer"
+    filename: "training_data_extraction_poc.py"
+    purpose: |
+      Two tools in one file:
+      (1) Extraction PoC: demonstrates Carlini-style prefix-probe extraction
+          against GPT-2 (as the paper's original target) using HuggingFace
+          transformers. Generates completions, computes per-token entropy, and
+          filters candidates by low entropy (memorisation signal).
+      (2) Memorisation risk scorer: computes a corpus-level risk score from
+          n-gram repetition rate and PII density, producing LOW / MEDIUM / HIGH
+          risk classification with detailed breakdown.
+    language: "python"
+    code: |
+      """
+      Training Data Extraction PoC + Memorisation Risk Scorer
+      Target: GPT-2 (open weights — safe for research PoC)
+      """
+
+      import re
+      import math
+      import hashlib
+      from collections import Counter
+      from dataclasses import dataclass, field
+      from typing import List, Dict, Optional, Tuple
+
+
+      # -----------------------------------------------------------------------
+      # Part 1: Extraction PoC (GPT-2 — HuggingFace transformers)
+      # -----------------------------------------------------------------------
+
+      # Requires: pip install transformers torch --break-system-packages
+      # Runs on CPU for PoC; GPU recommended for bulk generation
+
+      PROBE_PREFIXES = [
+          "The email address for",
+          "Contact us at",
+          "Copyright (c)",
+          "def ",
+          "import os\nimport sys\n",
+          "All rights reserved.",
+          "To unsubscribe from this list",
+          "This message was sent to",
+          "My name is",
+          "The following is a list of",
+      ]
+
+      ENTROPY_THRESHOLD = 1.5     # bits per token — below this suggests memorised sequence
+      GENERATION_TOKENS = 200     # tokens to generate per probe
+      TEMPERATURE = 0.1           # low temperature maximises extraction
+      NUM_SAMPLES_PER_PREFIX = 10 # bulk generation count
+
+
+      @dataclass
+      class ExtractionCandidate:
+          prefix: str
+          completion: str
+          avg_entropy: float
+          flagged: bool
+          reason: str
+
+
+      def run_extraction_poc(
+          max_prefixes: int = 3,
+          verbose: bool = True
+      ) -> List[ExtractionCandidate]:
+          """
+          Run Carlini-style extraction against GPT-2.
+          Returns list of ExtractionCandidate (flagged = low-entropy / memorisation signal).
+
+          Install: pip install transformers torch
+          """
+          try:
+              import torch
+              from transformers import GPT2LMHeadModel, GPT2Tokenizer
+          except ImportError:
+              print("transformers not installed. Run: pip install transformers torch")
+              return []
+
+          tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+          model = GPT2LMHeadModel.from_pretrained("gpt2")
+          model.eval()
+
+          candidates: List[ExtractionCandidate] = []
+          prefixes = PROBE_PREFIXES[:max_prefixes]
+
+          for prefix in prefixes:
+              if verbose:
+                  print(f"\nProbing prefix: '{prefix[:40]}...' ")
+              input_ids = tokenizer.encode(prefix, return_tensors="pt")
+
+              for sample_idx in range(NUM_SAMPLES_PER_PREFIX):
+                  with torch.no_grad():
+                      output = model.generate(
+                          input_ids,
+                          max_new_tokens=GENERATION_TOKENS,
+                          temperature=TEMPERATURE,
+                          do_sample=(TEMPERATURE > 0),
+                          pad_token_id=tokenizer.eos_token_id,
+                          return_dict_in_generate=True,
+                          output_scores=True,
+                      )
+
+                  # Compute per-token entropy from scores
+                  entropies = []
+                  for step_scores in output.scores:
+                      import torch.nn.functional as F
+                      probs = F.softmax(step_scores[0], dim=-1)
+                      entropy = -torch.sum(probs * torch.log2(probs + 1e-9)).item()
+                      entropies.append(entropy)
+
+                  avg_entropy = sum(entropies) / len(entropies) if entropies else float('inf')
+                  new_tokens = output.sequences[0][input_ids.shape[1]:]
+                  completion = tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+                  flagged = avg_entropy < ENTROPY_THRESHOLD
+                  reason = (f"LOW ENTROPY ({avg_entropy:.2f} bits/token < {ENTROPY_THRESHOLD})"
+                            if flagged else f"Normal entropy ({avg_entropy:.2f} bits/token)")
+
+                  c = ExtractionCandidate(prefix=prefix, completion=completion,
+                                          avg_entropy=avg_entropy, flagged=flagged,
+                                          reason=reason)
+                  candidates.append(c)
+
+                  if verbose:
+                      icon = "FLAGGED" if flagged else "normal "
+                      print(f"  [{icon}] sample {sample_idx+1}: entropy={avg_entropy:.2f} — "
+                            f"{completion[:60].strip()!r}")
+
+          flagged_count = sum(1 for c in candidates if c.flagged)
+          if verbose:
+              print(f"\nExtraction PoC: {flagged_count}/{len(candidates)} candidates flagged "
+                    f"as potential memorised sequences (entropy < {ENTROPY_THRESHOLD})")
+          return candidates
+
+
+      # -----------------------------------------------------------------------
+      # Part 2: Memorisation Risk Scorer
+      # -----------------------------------------------------------------------
+
+      PII_PATTERNS = {
+          "email":       re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'),
+          "phone_us":    re.compile(r'\b(\+1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'),
+          "ssn":         re.compile(r'\b\d{3}-\d{2}-\d{4}\b'),
+          "credit_card": re.compile(r'\b(?:\d{4}[-\s]?){3}\d{4}\b'),
+          "aws_key":     re.compile(r'\bAKIA[0-9A-Z]{16}\b'),
+          "github_pat":  re.compile(r'\bghp_[A-Za-z0-9]{36}\b'),
+          "ipv4":        re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b'),
+      }
+
+      SENSITIVE_KEYWORDS = [
+          "patient", "diagnosis", "medication", "ssn", "social security",
+          "confidential", "proprietary", "internal use only", "trade secret",
+          "api key", "private key", "password", "secret", "credential",
+      ]
+
+
+      @dataclass
+      class CorpusRiskReport:
+          total_tokens: int
+          total_ngrams: int
+          repeated_ngrams: int
+          repetition_rate: float
+          pii_spans: Dict[str, int]
+          pii_density: float
+          sensitive_keyword_count: int
+          sensitive_category_count: int
+          raw_score: float
+          risk_level: str
+          recommendations: List[str] = field(default_factory=list)
+
+
+      def tokenise_simple(text: str) -> List[str]:
+          """Whitespace tokeniser — replace with tiktoken for production."""
+          return text.split()
+
+
+      def compute_ngram_repetition(tokens: List[str], n: int = 5) -> Tuple[int, int, float]:
+          """Count n-gram repetitions. Returns (total, repeated, rate)."""
+          ngrams = [tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1)]
+          counts = Counter(ngrams)
+          repeated = sum(1 for c in counts.values() if c > 1)
+          rate = repeated / len(ngrams) if ngrams else 0.0
+          return len(ngrams), repeated, rate
+
+
+      def compute_pii_density(text: str, total_tokens: int) -> Tuple[Dict[str, int], float]:
+          """Count PII pattern matches. Returns (match_counts, density)."""
+          counts = {}
+          total_matches = 0
+          for pii_type, pattern in PII_PATTERNS.items():
+              matches = pattern.findall(text)
+              if matches:
+                  counts[pii_type] = len(matches)
+                  total_matches += len(matches)
+          density = min(1.0, total_matches * 10 / total_tokens) if total_tokens > 0 else 0.0
+          return counts, density
+
+
+      def score_corpus(text: str, corpus_name: str = "corpus") -> CorpusRiskReport:
+          tokens = tokenise_simple(text)
+          total_tokens = len(tokens)
+          total_ngrams, repeated_ngrams, repetition_rate = compute_ngram_repetition(tokens)
+          pii_spans, pii_density = compute_pii_density(text, total_tokens)
+
+          text_lower = text.lower()
+          sensitive_hits = [kw for kw in SENSITIVE_KEYWORDS if kw in text_lower]
+          sensitive_category_count = min(5, len(set(
+              "medical" if kw in ["patient","diagnosis","medication"] else
+              "auth" if kw in ["api key","private key","password","secret","credential"] else
+              "legal" if kw in ["confidential","proprietary","trade secret"] else
+              "identity"
+              for kw in sensitive_hits
+          ))) / 5
+
+          raw_score = (
+              0.4 * min(1.0, repetition_rate * 10) +
+              0.4 * pii_density +
+              0.2 * sensitive_category_count
+          )
+          risk = "HIGH" if raw_score > 0.6 else "MEDIUM" if raw_score > 0.3 else "LOW"
+
+          recs = []
+          if repetition_rate > 0.05:
+              recs.append("DEDUPLICATE: n-gram repetition rate high — apply MinHash deduplication")
+          if pii_density > 0.02:
+              recs.append("ANONYMISE: PII detected — pseudonymise before training")
+          if raw_score > 0.3:
+              recs.append("CONSIDER DP TRAINING: risk score warrants differential privacy (ε ≤ 4)")
+          if raw_score > 0.6:
+              recs.append("MANDATORY DP: high-risk corpus — DP training required (ε ≤ 1)")
+              recs.append("CANARY TOKENS: inject canary tokens before training for extraction monitoring")
+
+          return CorpusRiskReport(
+              total_tokens=total_tokens, total_ngrams=total_ngrams,
+              repeated_ngrams=repeated_ngrams, repetition_rate=repetition_rate,
+              pii_spans=pii_spans, pii_density=pii_density,
+              sensitive_keyword_count=len(sensitive_hits),
+              sensitive_category_count=int(sensitive_category_count * 5),
+              raw_score=raw_score, risk_level=risk, recommendations=recs,
+          )
+
+
+      def print_risk_report(r: CorpusRiskReport, name: str = "corpus") -> None:
+          print(f"\n{'='*55}")
+          print(f"MEMORISATION RISK REPORT: {name}")
+          print(f"Risk Level: [{r.risk_level}]  Score: {r.raw_score:.3f}")
+          print(f"Tokens: {r.total_tokens:,}  |  5-grams: {r.total_ngrams:,}")
+          print(f"Repeated 5-grams: {r.repeated_ngrams:,} ({r.repetition_rate:.1%})")
+          print(f"PII density: {r.pii_density:.4f}  |  Sensitive keywords: {r.sensitive_keyword_count}")
+          if r.pii_spans:
+              print(f"PII types found: {dict(r.pii_spans)}")
+          if r.recommendations:
+              print("\nRecommendations:")
+              for rec in r.recommendations:
+                  print(f"  - {rec}")
+
+
+      if __name__ == "__main__":
+          # ---- Risk Scorer Demo ----
+          low_risk_corpus = """
+          The quick brown fox jumps over the lazy dog.
+          Machine learning models learn statistical patterns from training data.
+          Neural networks consist of layers of interconnected nodes.
+          """ * 10
+
+          high_risk_corpus = """
+          Patient John Smith (SSN: 123-45-6789) was admitted on 2024-03-15.
+          Diagnosis: Type 2 Diabetes. Medication: Metformin 500mg.
+          Contact: john.smith@email.com  Phone: 555-123-4567
+          API Key: AKIAIOSFODNN7EXAMPLE  GitHub: ghp_abcdef123456789012345678901234567890
+          CONFIDENTIAL — Internal Use Only — Trade Secret — Proprietary
+          Patient John Smith (SSN: 123-45-6789) was admitted on 2024-03-15.
+          """ * 5
+
+          r_low = score_corpus(low_risk_corpus, "low_risk_example")
+          print_risk_report(r_low, "low_risk_example")
+
+          r_high = score_corpus(high_risk_corpus, "high_risk_medical_corpus")
+          print_risk_report(r_high, "high_risk_medical_corpus")
+
+          # ---- Extraction PoC (requires transformers) ----
+          print("\n" + "="*55)
+          print("EXTRACTION PoC (GPT-2) — install transformers to enable")
+          print("To run: set RUN_EXTRACTION=True and install transformers")
+          RUN_EXTRACTION = False
+          if RUN_EXTRACTION:
+              candidates = run_extraction_poc(max_prefixes=2)
+
+  implementation_02:
+    title: "Divergence-Based Extraction Detector"
+    filename: "extraction_detector.py"
+    purpose: |
+      Real-time extraction attack detector operating on API request logs and
+      output entropy signals. Implements two complementary detection layers:
+      (1) Input-pattern detector: prefix probe frequency, low-temperature requests,
+          logprob access at scale, one-shot bulk generation.
+      (2) Output divergence detector: per-output entropy scoring, n-gram overlap
+          against canary corpus, PII pattern scan.
+      Produces per-session risk score and recommended action.
+    language: "python"
+    code: |
+      """
+      Divergence-Based Extraction Detector
+      Layer 1: API request pattern detection
+      Layer 2: Output entropy + PII + canary monitoring
+      """
+
+      import re
+      import math
+      import hashlib
+      from collections import defaultdict, Counter
+      from dataclasses import dataclass, field
+      from datetime import datetime, timezone
+      from typing import List, Dict, Optional, Tuple
+
+
+      # -----------------------------------------------------------------------
+      # Data Structures
+      # -----------------------------------------------------------------------
+
+      @dataclass
+      class APIRequest:
+          account_id: str
+          timestamp: float           # unix seconds
+          prefix: str
+          output: str
+          temperature: float
+          output_token_count: int
+          logprobs_requested: bool
+          turn_number: int           # within session
+          session_id: str
+
+
+      @dataclass
+      class LayerOneAlert:
+          signal: str
+          value: float
+          threshold: float
+          detail: str
+
+
+      @dataclass
+      class LayerTwoAlert:
+          signal: str
+          value: float
+          threshold: float
+          detail: str
+          output_snippet: str
+
+
+      @dataclass
+      class SessionRisk:
+          account_id: str
+          session_id: str
+          layer_one_alerts: List[LayerOneAlert]
+          layer_two_alerts: List[LayerTwoAlert]
+          risk_score: float
+          risk_level: str
+          recommended_action: str
+
+
+      # -----------------------------------------------------------------------
+      # Canary Corpus (production: load from encrypted store)
+      # -----------------------------------------------------------------------
+
+      CANARY_CORPUS = [
+          "CANARY-TOKEN-ALPHA-7x9q2mR4nK",
+          "CANARY-TOKEN-BETA-8w3s5pL6jM",
+          "CANARY-CREDENTIAL-GAMMA-zT4uVb",
+          "INTERNAL-DOCID-DELTA-Hn7YxQ2",
+      ]
+
+      PII_PATTERNS = {
+          "email":       re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'),
+          "phone":       re.compile(r'\b(\+1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'),
+          "ssn":         re.compile(r'\b\d{3}-\d{2}-\d{4}\b'),
+          "credit_card": re.compile(r'\b(?:\d{4}[-\s]?){3}\d{4}\b'),
+          "aws_key":     re.compile(r'\bAKIA[0-9A-Z]{16}\b'),
+          "github_pat":  re.compile(r'\bghp_[A-Za-z0-9]{36}\b'),
+      }
+
+
+      # -----------------------------------------------------------------------
+      # Layer 1: Input Pattern Detection
+      # -----------------------------------------------------------------------
+
+      class Layer1Detector:
+          """Detects extraction campaign patterns across requests from one account."""
+
+          WINDOW_SECONDS = 600      # 10-minute sliding window
+          PREFIX_PROBE_THRESHOLD = 30
+          LOW_TEMP_THRESHOLD = 0.2
+          LOW_TEMP_VOLUME = 100
+          LOGPROB_DAILY_THRESHOLD = 5_000
+          ONE_SHOT_VOLUME = 1_000
+          ONE_SHOT_MAX_TURNS = 2
+          ONE_SHOT_MIN_OUTPUT = 200
+
+          def __init__(self):
+              self.account_requests: Dict[str, List[APIRequest]] = defaultdict(list)
+
+          def record(self, req: APIRequest) -> None:
+              self.account_requests[req.account_id].append(req)
+
+          def _window(self, account_id: str, now: float) -> List[APIRequest]:
+              return [r for r in self.account_requests[account_id]
+                      if now - r.timestamp <= self.WINDOW_SECONDS]
+
+          def detect(self, account_id: str) -> List[LayerOneAlert]:
+              alerts = []
+              now = max((r.timestamp for r in self.account_requests[account_id]),
+                        default=0.0)
+              window = self._window(account_id, now)
+              all_reqs = self.account_requests[account_id]
+
+              # Signal 1: prefix probe pattern
+              prefixes = [r.prefix for r in window]
+              common_prefix_pairs = sum(
+                  1 for i, p1 in enumerate(prefixes)
+                  for p2 in prefixes[i+1:]
+                  if p1 and p2 and p1[:30] == p2[:30] and p1 != p2
+              )
+              if common_prefix_pairs > self.PREFIX_PROBE_THRESHOLD:
+                  alerts.append(LayerOneAlert(
+                      "prefix_probe_pattern",
+                      common_prefix_pairs, self.PREFIX_PROBE_THRESHOLD,
+                      f"{common_prefix_pairs} requests share common prefix in 10-min window"))
+
+              # Signal 2: low temperature + volume
+              low_temp = [r for r in window if r.temperature < self.LOW_TEMP_THRESHOLD]
+              if len(low_temp) > self.LOW_TEMP_VOLUME:
+                  alerts.append(LayerOneAlert(
+                      "low_temperature_bulk",
+                      len(low_temp), self.LOW_TEMP_VOLUME,
+                      f"{len(low_temp)} low-temp (< {self.LOW_TEMP_THRESHOLD}) requests in window"))
+
+              # Signal 3: logprob access at scale
+              logprob_daily = [r for r in all_reqs if r.logprobs_requested]
+              if len(logprob_daily) > self.LOGPROB_DAILY_THRESHOLD:
+                  alerts.append(LayerOneAlert(
+                      "logprob_high_volume",
+                      len(logprob_daily), self.LOGPROB_DAILY_THRESHOLD,
+                      f"{len(logprob_daily)} logprob requests today"))
+
+              # Signal 4: one-shot high-output pattern
+              one_shot = [r for r in window
+                          if r.turn_number <= self.ONE_SHOT_MAX_TURNS
+                          and r.output_token_count >= self.ONE_SHOT_MIN_OUTPUT]
+              if len(one_shot) > self.ONE_SHOT_VOLUME:
+                  alerts.append(LayerOneAlert(
+                      "one_shot_bulk_generation",
+                      len(one_shot), self.ONE_SHOT_VOLUME,
+                      f"{len(one_shot)} one-shot high-output requests in window"))
+
+              return alerts
+
+
+      # -----------------------------------------------------------------------
+      # Layer 2: Output Content Detection
+      # -----------------------------------------------------------------------
+
+      def ngram_overlap(text_a: str, text_b: str, n: int = 5) -> float:
+          """ROUGE-L-style n-gram overlap between two texts."""
+          tokens_a = text_a.lower().split()
+          tokens_b = text_b.lower().split()
+          if len(tokens_a) < n or len(tokens_b) < n:
+              return 0.0
+          ngrams_a = Counter(tuple(tokens_a[i:i+n]) for i in range(len(tokens_a)-n+1))
+          ngrams_b = Counter(tuple(tokens_b[i:i+n]) for i in range(len(tokens_b)-n+1))
+          overlap = sum((ngrams_a & ngrams_b).values())
+          return overlap / max(1, len(ngrams_a))
+
+
+      def scan_output(output: str) -> List[LayerTwoAlert]:
+          alerts = []
+
+          # Signal 1: PII pattern match
+          for pii_type, pattern in PII_PATTERNS.items():
+              matches = pattern.findall(output)
+              if matches:
+                  alerts.append(LayerTwoAlert(
+                      f"pii_in_output_{pii_type}", len(matches), 0,
+                      f"{len(matches)} {pii_type} pattern(s) in output",
+                      output[:120]))
+
+          # Signal 2: Canary token recall
+          for canary in CANARY_CORPUS:
+              if canary in output:
+                  alerts.append(LayerTwoAlert(
+                      "canary_token_recall", 1.0, 0,
+                      f"CANARY TOKEN RECALLED: {canary}",
+                      output[:120]))
+
+          # Signal 3: High n-gram overlap with canary corpus
+          for canary in CANARY_CORPUS:
+              overlap = ngram_overlap(output, canary)
+              if overlap > 0.5:
+                  alerts.append(LayerTwoAlert(
+                      "high_ngram_overlap_canary", overlap, 0.5,
+                      f"High overlap ({overlap:.2f}) with canary corpus entry",
+                      output[:120]))
+
+          return alerts
+
+
+      # -----------------------------------------------------------------------
+      # Session Risk Aggregator
+      # -----------------------------------------------------------------------
+
+      def compute_session_risk(
+          account_id: str,
+          session_id: str,
+          l1_alerts: List[LayerOneAlert],
+          l2_alerts: List[LayerTwoAlert],
+      ) -> SessionRisk:
+          # Score: each L1 alert = 0.2; each L2 alert = 0.4 (capped at 1.0)
+          score = min(1.0, len(l1_alerts) * 0.2 + len(l2_alerts) * 0.4)
+          risk = "critical" if score >= 0.8 else "high" if score >= 0.5 else "medium" if score >= 0.2 else "low"
+
+          actions = {
+              "critical": "BLOCK account; alert security team; disable logprobs; preserve session log",
+              "high":     "Rate-limit account; alert security team; disable logprobs",
+              "medium":   "Increase monitoring sensitivity; log session for review",
+              "low":      "No immediate action — continue monitoring",
+          }
+          return SessionRisk(
+              account_id=account_id, session_id=session_id,
+              layer_one_alerts=l1_alerts, layer_two_alerts=l2_alerts,
+              risk_score=score, risk_level=risk,
+              recommended_action=actions[risk],
+          )
+
+
+      def print_session_risk(r: SessionRisk) -> None:
+          print(f"\n{'='*55}")
+          print(f"EXTRACTION DETECTION: account={r.account_id} session={r.session_id}")
+          print(f"Risk: [{r.risk_level.upper()}]  Score: {r.risk_score:.2f}")
+          print(f"Action: {r.recommended_action}")
+          if r.layer_one_alerts:
+              print("\n  Layer 1 — Input Pattern Alerts:")
+              for a in r.layer_one_alerts:
+                  print(f"    [{a.signal}] {a.detail}")
+          if r.layer_two_alerts:
+              print("\n  Layer 2 — Output Content Alerts:")
+              for a in r.layer_two_alerts:
+                  print(f"    [{a.signal}] {a.detail}")
+                  print(f"      snippet: {a.output_snippet[:60]!r}")
+
+
+      if __name__ == "__main__":
+          import time
+
+          detector = Layer1Detector()
+          now = time.time()
+
+          # Simulate extraction campaign: 40 low-temp prefix probes in 10 min
+          prefix_base = "The patient's contact information is"
+          for i in range(40):
+              req = APIRequest(
+                  account_id="acct-ATTACK-001",
+                  timestamp=now + i * 10,
+                  prefix=f"{prefix_base} case {i}",
+                  output=f"Dr. Smith email john.smith@hospital.com Phone: 555-123-4567 case {i}",
+                  temperature=0.1,
+                  output_token_count=220,
+                  logprobs_requested=True,
+                  turn_number=1,
+                  session_id="sess-ATTACK-001",
+              )
+              detector.record(req)
+
+          l1 = detector.detect("acct-ATTACK-001")
+
+          # Scan last output
+          last_output = "john.smith@hospital.com  Phone: 555-123-4567  CANARY-TOKEN-ALPHA-7x9q2mR4nK"
+          l2 = scan_output(last_output)
+
+          risk = compute_session_risk("acct-ATTACK-001", "sess-ATTACK-001", l1, l2)
+          print_session_risk(risk)
+
+          # Simulate legitimate user
+          for i in range(5):
+              req = APIRequest(
+                  account_id="acct-legit-002",
+                  timestamp=now + i * 30,
+                  prefix=f"Explain quantum computing",
+                  output="Quantum computing uses qubits ...",
+                  temperature=0.7,
+                  output_token_count=80,
+                  logprobs_requested=False,
+                  turn_number=i+1,
+                  session_id="sess-legit-002",
+              )
+              detector.record(req)
+          l1_legit = detector.detect("acct-legit-002")
+          l2_legit = scan_output("Quantum computing uses qubits that can be in superposition...")
+          risk_legit = compute_session_risk("acct-legit-002", "sess-legit-002", l1_legit, l2_legit)
+          print_session_risk(risk_legit)
+
+  implementation_03:
+    title: "Differential Privacy Comparison + Output Scanner"
+    filename: "dp_and_output_scanner.py"
+    purpose: |
+      Two tools:
+      (1) DP training comparison: simulates accuracy-privacy tradeoff across
+          epsilon values (1, 2, 4, 8, inf) using Gaussian noise injection as
+          a DP-SGD proxy, producing a comparison table with memorisation
+          reduction estimates and accuracy delta.
+      (2) Output verbatim recall scanner: scans model outputs for verbatim
+          recall against a reference corpus using ROUGE-L n-gram overlap,
+          PII patterns, and canary token matching. Integrates with API serving
+          pipeline as a pre-return output filter.
+    language: "python"
+    code: |
+      """
+      Differential Privacy Tradeoff Comparison + Output Verbatim Recall Scanner
+      """
+
+      import re
+      import math
+      from collections import Counter
+      from dataclasses import dataclass, field
+      from typing import List, Dict, Tuple, Optional
+
+
+      # -----------------------------------------------------------------------
+      # Part 1: DP Training Tradeoff Comparison
+      # -----------------------------------------------------------------------
+
+      # Empirically-grounded estimates from published DP-NLP literature
+      # (Anil et al. 2022, Yu et al. 2022, Li et al. 2022)
+      DP_TRADEOFF_TABLE = [
+          {"epsilon": 1,        "label": "Strong",   "mem_reduction_pct": 90,
+           "accuracy_cost_small": 12.0, "accuracy_cost_large": 5.0,
+           "suitable_for": "Medical/legal fine-tuning on small models"},
+          {"epsilon": 2,        "label": "Strong-M", "mem_reduction_pct": 82,
+           "accuracy_cost_small": 9.0,  "accuracy_cost_large": 3.5,
+           "suitable_for": "Customer PII fine-tuning — small models"},
+          {"epsilon": 4,        "label": "Moderate", "mem_reduction_pct": 70,
+           "accuracy_cost_small": 6.0,  "accuracy_cost_large": 2.0,
+           "suitable_for": "Customer PII fine-tuning — large models (≥7B)"},
+          {"epsilon": 8,        "label": "Weak",     "mem_reduction_pct": 40,
+           "accuracy_cost_small": 3.0,  "accuracy_cost_large": 0.8,
+           "suitable_for": "Minimum meaningful DP — not for high-sensitivity data"},
+          {"epsilon": float('inf'), "label": "None",  "mem_reduction_pct": 0,
+           "accuracy_cost_small": 0.0,  "accuracy_cost_large": 0.0,
+           "suitable_for": "Standard training — never for sensitive fine-tuning data"},
+      ]
+
+
+      def print_dp_comparison(model_size: str = "large") -> None:
+          key = f"accuracy_cost_{model_size}"
+          print(f"\n{'='*70}")
+          print(f"DIFFERENTIAL PRIVACY TRADEOFF TABLE ({model_size.upper()} MODEL)")
+          print(f"{'Epsilon':>10}  {'Privacy':>10}  {'Mem.Reduction':>15}"
+                f"  {'Accuracy Cost':>14}  Suitable For")
+          print("-" * 70)
+          for row in DP_TRADEOFF_TABLE:
+              eps = f"{row['epsilon']:.0f}" if row['epsilon'] != float('inf') else "∞"
+              print(f"{eps:>10}  {row['label']:>10}  {row['mem_reduction_pct']:>13}%"
+                    f"  {row[key]:>13.1f}%  {row['suitable_for'][:35]}")
+          print("\nRecommendations:")
+          print("  ε ≤ 1   → Required for medical, legal, or government fine-tuning")
+          print("  ε ≤ 4   → Required for customer PII fine-tuning on large models")
+          print("  ε ≤ 8   → Minimum for any sensitive domain fine-tuning")
+          print("  ε = ∞   → Never use for sensitive data; document this decision")
+
+
+      def noise_injection_demo(epsilon: float, gradient_norm: float = 1.0,
+                                batch_size: int = 32, delta: float = 1e-5) -> Dict:
+          """
+          Compute the Gaussian noise standard deviation for DP-SGD
+          at the given epsilon, delta, gradient clipping norm.
+          Uses the simplified formula (tight for single-step analysis):
+            sigma ≈ sqrt(2 * ln(1.25/delta)) * gradient_norm / epsilon
+          """
+          if epsilon == float('inf'):
+              return {"sigma": 0.0, "epsilon": epsilon, "noise_ratio": 0.0,
+                      "snr_db": float('inf')}
+          sigma = math.sqrt(2 * math.log(1.25 / delta)) * gradient_norm / epsilon
+          noise_ratio = sigma / gradient_norm
+          snr_db = 20 * math.log10(1.0 / sigma) if sigma > 0 else float('inf')
+          return {"sigma": sigma, "epsilon": epsilon, "noise_ratio": noise_ratio,
+                  "snr_db": snr_db}
+
+
+      def print_noise_demo() -> None:
+          print(f"\n{'='*55}")
+          print("DP-SGD NOISE LEVELS (gradient_norm=1.0, delta=1e-5)")
+          print(f"{'Epsilon':>10}  {'Sigma':>10}  {'Noise Ratio':>12}  {'SNR (dB)':>10}")
+          print("-" * 55)
+          for eps in [1, 2, 4, 8, float('inf')]:
+              r = noise_injection_demo(eps)
+              eps_str = f"{eps:.0f}" if eps != float('inf') else "∞"
+              snr = f"{r['snr_db']:.1f}" if r['snr_db'] != float('inf') else "∞"
+              print(f"{eps_str:>10}  {r['sigma']:>10.4f}  {r['noise_ratio']:>12.4f}  {snr:>10}")
+
+
+      # -----------------------------------------------------------------------
+      # Part 2: Output Verbatim Recall Scanner
+      # -----------------------------------------------------------------------
+
+      CANARY_TOKENS = [
+          "CANARY-TOKEN-ALPHA-7x9q2mR4nK",
+          "CANARY-TOKEN-BETA-8w3s5pL6jM",
+          "CANARY-CREDENTIAL-GAMMA-zT4uVb",
+          "INTERNAL-DOCID-DELTA-Hn7YxQ2",
+      ]
+
+      PII_SCAN_PATTERNS = {
+          "email":       re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'),
+          "phone":       re.compile(r'\b(\+1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'),
+          "ssn":         re.compile(r'\b\d{3}-\d{2}-\d{4}\b'),
+          "credit_card": re.compile(r'\b(?:\d{4}[-\s]?){3}\d{4}\b'),
+          "aws_key":     re.compile(r'\bAKIA[0-9A-Z]{16}\b'),
+          "github_pat":  re.compile(r'\bghp_[A-Za-z0-9]{36}\b'),
+      }
+
+
+      @dataclass
+      class OutputScanResult:
+          output: str
+          pii_found: Dict[str, List[str]]
+          canary_recalled: List[str]
+          ngram_overlap_max: float
+          reference_match_id: Optional[str]
+          overall_risk: str
+          block: bool
+          reason: str
+
+
+      def compute_ngram_overlap_score(text: str, reference: str, n: int = 5) -> float:
+          ta = text.lower().split()
+          tb = reference.lower().split()
+          if len(ta) < n or len(tb) < n:
+              return 0.0
+          nga = Counter(tuple(ta[i:i+n]) for i in range(len(ta)-n+1))
+          ngb = Counter(tuple(tb[i:i+n]) for i in range(len(tb)-n+1))
+          overlap = sum((nga & ngb).values())
+          return overlap / max(1, len(nga))
+
+
+      def scan_output_verbatim(
+          output: str,
+          reference_corpus: Optional[Dict[str, str]] = None,
+          ngram_threshold: float = 0.4,
+      ) -> OutputScanResult:
+          """
+          reference_corpus: {doc_id: doc_text} of sensitive training documents.
+          In production: load from encrypted store, not hardcoded.
+          """
+          pii_found: Dict[str, List[str]] = {}
+          for pii_type, pattern in PII_SCAN_PATTERNS.items():
+              matches = pattern.findall(output)
+              if matches:
+                  pii_found[pii_type] = matches
+
+          canary_recalled = [c for c in CANARY_TOKENS if c in output]
+
+          max_overlap = 0.0
+          match_id = None
+          if reference_corpus:
+              for doc_id, doc_text in reference_corpus.items():
+                  score = compute_ngram_overlap_score(output, doc_text)
+                  if score > max_overlap:
+                      max_overlap = score
+                      match_id = doc_id if score >= ngram_threshold else None
+
+          block = bool(canary_recalled or pii_found)
+          risk = "critical" if canary_recalled else "high" if pii_found else \
+                 "medium" if max_overlap >= ngram_threshold else "low"
+
+          reason = (
+              f"CANARY RECALLED: {canary_recalled}" if canary_recalled else
+              f"PII detected: {list(pii_found.keys())}" if pii_found else
+              f"High n-gram overlap ({max_overlap:.2f}) with reference doc {match_id}" if match_id else
+              "Clean"
+          )
+
+          return OutputScanResult(
+              output=output, pii_found=pii_found,
+              canary_recalled=canary_recalled,
+              ngram_overlap_max=max_overlap,
+              reference_match_id=match_id,
+              overall_risk=risk, block=block, reason=reason,
+          )
+
+
+      def print_scan_result(r: OutputScanResult) -> None:
+          icon = "BLOCK" if r.block else "PASS "
+          print(f"\n[{icon}] Risk: {r.overall_risk.upper():8s} | {r.reason}")
+          if r.pii_found:
+              print(f"       PII: {dict(r.pii_found)}")
+          if r.canary_recalled:
+              print(f"       Canary recalled: {r.canary_recalled}")
+          print(f"       N-gram overlap: {r.ngram_overlap_max:.3f}")
+          print(f"       Output: {r.output[:80]!r}")
+
+
+      if __name__ == "__main__":
+          print_dp_comparison("large")
+          print_dp_comparison("small")
+          print_noise_demo()
+
+          print(f"\n{'='*55}")
+          print("OUTPUT VERBATIM RECALL SCANNER")
+
+          ref_corpus = {
+              "doc-001": "Patient Jane Doe SSN 987-65-4321 Diagnosis Hypertension Medication Lisinopril",
+              "doc-002": "API Key AKIAIOSFODNN7EXAMPLE Secret wJalrXUtnFEMI internal trade secret",
+          }
+
+          test_outputs = [
+              "Here is the information: Patient Jane Doe SSN 987-65-4321 Diagnosis Hypertension",
+              "The answer to your question is 42. Quantum computers use qubits.",
+              "Please contact us at support@company.com for assistance.",
+              "The token CANARY-TOKEN-ALPHA-7x9q2mR4nK was found in the document.",
+          ]
+
+          for output in test_outputs:
+              result = scan_output_verbatim(output, ref_corpus)
+              print_scan_result(result)
+
+# ============================================================================
+# DELIVERABLES
+# ============================================================================
+
+deliverables:
+
+  deliverable_01:
+    title: "Training Data Extraction Proof-of-Concept (GPT-2 as target)"
+    files: ["training_data_extraction_poc.py — run_extraction_poc()"]
+    completion_criteria: |
+      PoC run against GPT-2 (open weights, safe for research). At least two
+      probe prefixes executed with bulk generation. At least one low-entropy
+      candidate identified and its completion reviewed. Document: what prefix
+      triggered the lowest-entropy completion and what the completion contained.
+
+  deliverable_02:
+    title: "Memorisation Risk Scorer for Training Corpora"
+    files: ["training_data_extraction_poc.py — score_corpus() + print_risk_report()"]
+    completion_criteria: |
+      Risk scorer run against at least two corpora: one synthetic low-risk and one
+      synthetic high-risk (or a real internal corpus if cleared for this use).
+      Risk level classification reviewed. At least one recommendation per corpus acted upon.
+
+  deliverable_03:
+    title: "Divergence-Based Extraction Detector"
+    files: ["extraction_detector.py — Layer1Detector + scan_output() + compute_session_risk()"]
+    completion_criteria: |
+      Detector run against simulated attack traffic (40 prefix probes, low temperature,
+      logprob access). All four Layer 1 signals tested. Layer 2 PII and canary recall
+      signals tested. At least one session correctly classified as CRITICAL.
+
+  deliverable_04:
+    title: "Output Scanner for Verbatim Recall Events"
+    files: ["dp_and_output_scanner.py — scan_output_verbatim() + print_scan_result()"]
+    completion_criteria: |
+      Scanner run against at least four test outputs: clean output, PII-containing output,
+      canary-recall output, high-ngram-overlap output. Each classified correctly.
+      At least two canary tokens injected into a reference corpus. Scanner integrated
+      with serving pipeline stub or documented as integration point.
+
+  deliverable_05:
+    title: "Differential Privacy Implementation Comparison"
+    files: ["dp_and_output_scanner.py — print_dp_comparison() + noise_injection_demo()"]
+    completion_criteria: |
+      DP tradeoff table generated for both small and large model scenarios.
+      Noise level computation reviewed for epsilon = 1, 4, 8.
+      Epsilon selection documented for at least one realistic deployment scenario.
+      If DP training is planned: epsilon target and implementation library documented.
+
+  deliverable_06:
+    title: "GDPR-AI Intersection Analysis"
+    content: |
+      Written analysis (Apple Notes 1.1.1 format) covering:
+      1.1.1 Right to erasure vs model memorisation: the technical conflict
+      1.1.2 Current machine unlearning state-of-art (SISA, gradient ascent, DP retroactive)
+      1.1.3 Two technical mitigations: data minimisation and DP training with documented epsilon
+      1.1.4 Legal risk quantification for one realistic deployment scenario
+      1.1.5 Recommended position: proactive controls before training vs reactive erasure
+    completion_criteria: |
+      Analysis written and reviewed. At least one concrete recommendation per subsection.
+      Legal risk section reviewed by or with input from legal/compliance team if available.
+
+# ============================================================================
+# KEY TAKEAWAYS
+# ============================================================================
+
+key_takeaways:
+
+  takeaway_01: |
+    Gradient descent drives memorisation by design. A sequence appearing n times
+    in the training corpus receives n × more gradient signal than a sequence appearing
+    once — the optimiser correctly learns to reproduce it. Memorisation is not a bug;
+    it is the consequence of optimising on a corpus that contains repeated sequences.
+    Deduplication attacks this root cause directly and is the highest-ROI defence.
+
+  takeaway_02: |
+    Scale amplifies memorisation. Larger models memorise more examples from the same
+    training data. The Carlini et al. (2021) finding is counterintuitive but empirically
+    robust: scaling capability increases extraction risk, not the reverse. Production
+    LLMs operating on sensitive data require correspondingly scaled defences.
+
+  takeaway_03: |
+    Fine-tuning on internal data is a memorisation emergency. A 100-document internal
+    fine-tuning dataset trained for 50 epochs presents each document to the model
+    enough times to near-certain memorisation. Any organisation fine-tuning on customer
+    records, medical data, or proprietary documents must assume those documents are
+    memorised and potentially extractable.
+
+  takeaway_04: |
+    The Carlini extraction attack requires no white-box access. Prefix-probe generation
+    followed by low-entropy filtering is a black-box attack implementable against any
+    text generation API. The detection surface is the API log and the output stream —
+    both are controlled by the defender.
+
+  takeaway_05: |
+    Epsilon is not a label — it is a mathematical bound. ε=8 does not mean "weak privacy";
+    it means the adversary gains at most e^8 ≈ 2981x advantage from the presence of any
+    one training example. For medical records, ε=8 is insufficient. Choose epsilon based
+    on the sensitivity of the specific data, not on convenience.
+
+  takeaway_06: |
+    Canary tokens are a zero-FP extraction detection mechanism and a memorisation
+    quantification tool. Injecting known unique strings into training data, then
+    monitoring all outputs for their recall, provides both: (a) real-time alerting
+    when extraction occurs, and (b) a measurement of how much memorisation the model
+    has learned by testing canary recall at evaluation time.
+
+  takeaway_07: |
+    GDPR Article 17 (right to erasure) and model memorisation are fundamentally
+    incompatible without proactive controls. Erasing personal data from trained
+    model weights is computationally equivalent to retraining from scratch for
+    most architectures. The legally sound position is data minimisation and DP
+    training applied before training — not machine unlearning applied after.
+
+  takeaway_08: |
+    Extraction detection is a two-layer problem. Layer 1 (input pattern: prefix probes,
+    low temperature, logprob access, bulk one-shot) catches the campaign before
+    extraction succeeds. Layer 2 (output content: PII scan, canary recall, n-gram
+    overlap) catches individual verbatim recall events. Both layers are required:
+    Layer 1 alone misses novel attack patterns; Layer 2 alone misses campaigns
+    that stay under per-request thresholds.
+
+# ============================================================================
+# CONNECTIONS
+# ============================================================================
+
+connections:
+
+  builds_on:
+    - section: "5.9"
+      reason: "Canary tokens introduced in 5.9 as supply chain protection; here they become the extraction detection mechanism"
+    - section: "5.8"
+      reason: "AML.T0037 (data from ML artifact) and AML.T0048 (membership inference) detection logic implemented here"
+    - chapter: 1
+      section: "1.13 — Overfitting"
+      reason: "Overfitting amplifies memorisation risk — overfit models are higher extraction risk than well-generalised models"
+    - chapter: 3
+      section: "3.5 — Perplexity"
+      reason: "Perplexity (token entropy) is the primary signal for divergence-based extraction detection"
+
+  leads_to:
+    - section: "5.11"
+      reason: "Membership inference and model inversion — complementary privacy attacks to extraction"
+    - chapter: 11
+      section: "Detection Engineering"
+      reason: "The extraction detector and output scanner become production detection rules in Chapter 11"
+    - chapter: 14
+      section: "Production Deployment Security"
+      reason: "DP training and output monitoring pipeline are production controls in Chapter 14"
+
+section_summary:
+  one_paragraph: |
+    Section 5.10 establishes training data extraction as a practical, black-box-accessible
+    privacy attack with direct GDPR implications, and provides the full stack from attack
+    mechanics through defender implementation. The section opens by explaining why models
+    memorise: gradient descent accumulates signal proportionally to repetition count, model
+    capacity in the overfitting regime enables simultaneous generalisation and memorisation,
+    and fine-tuning amplifies memorisation of fine-tuning data dramatically by presenting
+    it at high frequency relative to its size. The three-level memorisation taxonomy
+    (verbatim, approximate, concept-level) provides the framework for risk classification
+    and detection strategy selection. The Carlini et al. (2021) methodology is examined
+    in full: prefix construction, bulk generation at low temperature, membership inference
+    filtering for low-entropy candidates, and verification — a complete black-box
+    extraction pipeline requiring only API access. Five risk factors are quantified:
+    model size (memorisation scales with parameters), data repetition (10+ occurrences
+    near-certain extractable), fine-tuning (small dataset, many epochs equals near-certain
+    memorisation), generation temperature (low temperature maximises extraction), and
+    logprob exposure (multiplies extraction efficiency). Differential privacy is presented
+    formally (the ε-δ guarantee, DP-SGD mechanics, noise calibration) with empirical
+    accuracy-privacy tradeoff values across ε=1, 2, 4, 8, ∞ for both small and large
+    models, enabling epsilon selection based on data sensitivity. Detection is a two-layer
+    problem: Layer 1 operates on input patterns (prefix probes, low temperature, logprob
+    access, one-shot bulk volume) and Layer 2 operates on output content (PII patterns,
+    canary token recall, n-gram overlap against reference corpus). The GDPR intersection
+    establishes why right-to-erasure and model memorisation are technically incompatible
+    without proactive controls, and why DP training and data minimisation before training
+    are the only legally sound approaches. Three implementations deliver the extraction
+    PoC and memorisation risk scorer, the dual-layer extraction detector, and the
+    differential privacy tradeoff comparison paired with the output verbatim recall scanner.
+
+  next_section: |
+    Section 5.11 — Privacy Attacks: Membership Inference and Model Inversion
+    Section 5.10 covered what can be retrieved verbatim from model outputs. Section 5.11
+    covers the complementary question: what can an adversary determine about whether
+    a specific record was used in training (membership inference) and what can be
+    reconstructed about training inputs from model outputs or gradients (model inversion).
+    Together, extraction + membership inference + inversion form the complete privacy
+    attack surface that any model serving sensitive data must defend against.
+
+

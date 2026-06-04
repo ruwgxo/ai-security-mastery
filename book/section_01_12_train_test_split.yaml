@@ -1,0 +1,786 @@
+# section_01_12_train_test_split.yaml
+
+---
+document_info:
+  chapter: "01"
+  section: "12"
+  title: "Train/Test Split Best Practices"
+  version: "1.0.0"
+  author: "Raghav Dinesh"
+  github: "github.com/ruwgxo"
+  license: "MIT"
+  created: "2025-12-30"
+  estimated_pages: 6
+  tags: ["train-test-split", "validation", "data-leakage", "cross-validation", "stratification", "temporal-splits"]
+
+# ============================================================================
+# SECTION 1.12: TRAIN/TEST SPLIT BEST PRACTICES
+# ============================================================================
+
+section_content:
+  
+  # --------------------------------------------------------------------------
+  # Overview and Context
+  # --------------------------------------------------------------------------
+  
+  overview: |
+    You've built a model, achieved 95% accuracy on your data, and deployed it. Within 
+    days, production performance plummets to 60%. What happened? Data leakage. Your test 
+    set wasn't truly independent - it contained information that leaked from training, 
+    giving you false confidence.
+    
+    Proper data splitting is the foundation of honest evaluation. Train on one set, test 
+    on another, never let them touch. Sounds simple, but there are many ways to get it 
+    wrong: shuffling time-series data, not stratifying imbalanced classes, using the test 
+    set to tune hyperparameters, preprocessing before splitting.
+    
+    This section covers the complete methodology: basic train/test split, validation sets 
+    for hyperparameter tuning, stratification for imbalanced data, temporal splits for 
+    time-series, k-fold cross-validation, and most importantly - avoiding data leakage 
+    that creates overoptimistic evaluation.
+    
+    For security, proper splitting is critical because:
+    1. Attack patterns evolve over time (need temporal validation)
+    2. Attacks are rare (need stratification to ensure test set has attacks)
+    3. Data leakage leads to production failures (missed attacks)
+    4. Compliance requires demonstrable, honest evaluation
+  
+  why_this_matters: |
+    Security context:
+    - Production models retrain on new data regularly
+    - Evaluation must reflect real-world performance
+    - Overoptimistic evaluation = false sense of security
+    - Regulators and auditors verify evaluation methodology
+    
+    Real failures from bad splits:
+    - Malware detector: Trained/tested on same malware variants → 99% accuracy in lab, 
+      60% in production (new variants unseen)
+    - Fraud detector: Shuffled time-series data → high accuracy, but can't predict 
+      future fraud (temporal leakage)
+    - IDS: Test set preprocessed with training statistics → inflated metrics, fails 
+      on real traffic
+    - Spam filter: Test set contains emails from training users → overestimates 
+      generalization
+    
+    Need rigorous splitting that prevents all forms of leakage and tests generalization.
+  
+  # --------------------------------------------------------------------------
+  # Core Concept 1: Basic Train/Test Split
+  # --------------------------------------------------------------------------
+  
+  basic_train_test_split:
+    
+    what_is_train_test_split: |
+      Partition dataset into two independent sets:
+      - Training set: Used to fit model parameters (learn patterns)
+      - Test set: Used to evaluate model (estimate real-world performance)
+      
+      Key principle: Test set NEVER seen during training
+    
+    typical_split_ratios:
+      small_dataset:
+        range: "<1000 samples"
+        split: "70/30 or 60/40 (train/test)"
+        rationale: "Need enough test samples for reliable evaluation"
+      
+      medium_dataset:
+        range: "1000-100,000 samples"
+        split: "80/20 (train/test)"
+        rationale: "Standard choice, good balance"
+      
+      large_dataset:
+        range: ">100,000 samples"
+        split: "90/10 or 95/5"
+        rationale: "10K test samples sufficient, maximize training data"
+      
+      security_note: |
+        For rare attacks (1% prevalence):
+        - Need larger test set to ensure enough attack samples
+        - 1000 samples @ 1% = only 10 attacks in test set (too few!)
+        - Aim for at least 100 attack samples → need 10,000 total test samples
+    
+    random_splitting: |
+      Standard approach: Randomly assign samples to train or test
+      
+      Ensures:
+      - No systematic bias in assignment
+      - Train and test sets representative of overall distribution
+      
+      Important: Set random seed for reproducibility
+    
+    numpy_implementation: |
+      import numpy as np
+      
+      def train_test_split(X, y, test_size=0.2, random_state=None):
+          """
+          Split data into training and test sets
+          
+          Args:
+              X: Features, shape (n_samples, n_features)
+              y: Labels, shape (n_samples,)
+              test_size: Fraction for test set (default 0.2 = 20%)
+              random_state: Random seed for reproducibility
+          
+          Returns:
+              X_train, X_test, y_train, y_test
+          """
+          if random_state is not None:
+              np.random.seed(random_state)
+          
+          n_samples = len(y)
+          n_test = int(n_samples * test_size)
+          
+          # Random shuffle
+          indices = np.random.permutation(n_samples)
+          
+          # Split indices
+          test_indices = indices[:n_test]
+          train_indices = indices[n_test:]
+          
+          # Split data
+          X_train = X[train_indices]
+          X_test = X[test_indices]
+          y_train = y[train_indices]
+          y_test = y[test_indices]
+          
+          return X_train, X_test, y_train, y_test
+      
+      # Example usage
+      X = np.random.randn(1000, 10)  # 1000 samples, 10 features
+      y = np.random.randint(0, 2, size=1000)  # Binary labels
+      
+      X_train, X_test, y_train, y_test = train_test_split(
+          X, y, test_size=0.2, random_state=42
+      )
+      
+      print(f"Training set: {len(X_train)} samples")
+      print(f"Test set: {len(X_test)} samples")
+      print(f"Train positive rate: {y_train.mean():.2%}")
+      print(f"Test positive rate: {y_test.mean():.2%}")
+  
+  # --------------------------------------------------------------------------
+  # Core Concept 2: Stratified Splitting for Imbalanced Data
+  # --------------------------------------------------------------------------
+  
+  stratified_splitting:
+    
+    problem_with_random_split: |
+      Imbalanced dataset: 99% benign, 1% malicious (10,000 samples)
+      Random 80/20 split:
+      
+      Training set (8000 samples):
+      - Expected malicious: 80 samples (1%)
+      - But random → could be 60 or 100 (variance!)
+      
+      Test set (2000 samples):
+      - Expected malicious: 20 samples
+      - But random → could be 10 or 30
+      - With only 10 attacks, evaluation unreliable!
+    
+    stratified_split_solution: |
+      Stratified split: Preserve class distribution in both sets
+      
+      Process:
+      1. Separate samples by class
+      2. Split each class independently with same ratio
+      3. Combine splits
+      
+      Result: Exact same class distribution in train and test
+    
+    why_stratification_critical: |
+      Security datasets highly imbalanced:
+      - Malware: 1-5% malicious
+      - Fraud: 0.1-1% fraudulent
+      - Intrusion: 0.01-1% attacks
+      
+      Without stratification:
+      - Test set might have zero attacks (useless!)
+      - Or too few for reliable evaluation
+      - Variance in evaluation metrics too high
+    
+    numpy_implementation: |
+      def stratified_train_test_split(X, y, test_size=0.2, random_state=None):
+          """
+          Stratified split: Preserve class distribution
+          
+          Args:
+              X: Features
+              y: Labels
+              test_size: Fraction for test set
+              random_state: Random seed
+          
+          Returns:
+              X_train, X_test, y_train, y_test
+          """
+          if random_state is not None:
+              np.random.seed(random_state)
+          
+          # Get unique classes and their counts
+          classes = np.unique(y)
+          
+          train_indices = []
+          test_indices = []
+          
+          # Split each class separately
+          for cls in classes:
+              # Get indices for this class
+              cls_indices = np.where(y == cls)[0]
+              n_cls = len(cls_indices)
+              
+              # Shuffle
+              np.random.shuffle(cls_indices)
+              
+              # Split
+              n_test_cls = int(n_cls * test_size)
+              test_indices.extend(cls_indices[:n_test_cls])
+              train_indices.extend(cls_indices[n_test_cls:])
+          
+          # Convert to arrays and shuffle
+          train_indices = np.array(train_indices)
+          test_indices = np.array(test_indices)
+          np.random.shuffle(train_indices)
+          np.random.shuffle(test_indices)
+          
+          # Split data
+          X_train = X[train_indices]
+          X_test = X[test_indices]
+          y_train = y[train_indices]
+          y_test = y[test_indices]
+          
+          return X_train, X_test, y_train, y_test
+      
+      # Example with imbalanced data
+      X = np.random.randn(10000, 10)
+      y = np.random.choice([0, 1], size=10000, p=[0.99, 0.01])  # 1% positive
+      
+      # Regular split
+      X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
+      print(f"Regular split:")
+      print(f"  Train positive: {y_tr.mean():.2%}")
+      print(f"  Test positive: {y_te.mean():.2%}")
+      
+      # Stratified split
+      X_tr, X_te, y_tr, y_te = stratified_train_test_split(X, y, test_size=0.2, random_state=42)
+      print(f"\nStratified split:")
+      print(f"  Train positive: {y_tr.mean():.2%}")
+      print(f"  Test positive: {y_te.mean():.2%}")
+    
+    security_recommendation: "ALWAYS use stratified splitting for security datasets"
+  
+  # --------------------------------------------------------------------------
+  # Core Concept 3: Train/Validation/Test Split
+  # --------------------------------------------------------------------------
+  
+  train_val_test_split:
+    
+    problem_with_two_way_split: |
+      Train/test only:
+      1. Train model on training set
+      2. Tune hyperparameters (learning rate, regularization, etc.)
+      3. Evaluate each configuration on test set
+      4. Pick best configuration
+      5. Report test performance
+      
+      Issue: You've used test set for model selection!
+      Test set no longer independent → overoptimistic evaluation
+    
+    three_way_split_solution: |
+      Train/validation/test:
+      
+      1. Training set (60%): Fit model parameters (weights, bias)
+      2. Validation set (20%): Tune hyperparameters, early stopping, model selection
+      3. Test set (20%): Final evaluation ONCE (never touch during development)
+      
+      Validation set = "dev set" = "hold-out set"
+    
+    typical_split_ratios:
+      standard: "60/20/20 (train/val/test)"
+      large_data: "80/10/10"
+      small_data: "70/15/15"
+    
+    workflow: |
+      Development phase:
+      1. Split data: train/val/test
+      2. Try model A:
+         - Train on train set
+         - Evaluate on val set
+         - Val accuracy: 85%
+      3. Try model B:
+         - Train on train set
+         - Evaluate on val set
+         - Val accuracy: 90%
+      4. Pick model B (best val performance)
+      
+      Final evaluation:
+      5. Evaluate model B on test set ONCE
+      6. Test accuracy: 88%
+      7. Report 88% as expected production performance
+      
+      Test set touched only once, after all decisions made
+    
+    numpy_implementation: |
+      def train_val_test_split(X, y, val_size=0.2, test_size=0.2, 
+                               stratify=True, random_state=None):
+          """
+          Three-way split: train/validation/test
+          
+          Args:
+              val_size: Fraction for validation
+              test_size: Fraction for test
+              stratify: Whether to stratify
+          
+          Returns:
+              X_train, X_val, X_test, y_train, y_val, y_test
+          """
+          # First split: separate test set
+          if stratify:
+              X_temp, X_test, y_temp, y_test = stratified_train_test_split(
+                  X, y, test_size=test_size, random_state=random_state
+              )
+          else:
+              X_temp, X_test, y_temp, y_test = train_test_split(
+                  X, y, test_size=test_size, random_state=random_state
+              )
+          
+          # Second split: separate validation from training
+          # Adjust val_size relative to temp set
+          val_size_adjusted = val_size / (1 - test_size)
+          
+          if stratify:
+              X_train, X_val, y_train, y_val = stratified_train_test_split(
+                  X_temp, y_temp, test_size=val_size_adjusted, random_state=random_state
+              )
+          else:
+              X_train, X_val, y_train, y_val = train_test_split(
+                  X_temp, y_temp, test_size=val_size_adjusted, random_state=random_state
+              )
+          
+          return X_train, X_val, X_test, y_train, y_val, y_test
+      
+      # Example
+      X = np.random.randn(10000, 10)
+      y = np.random.choice([0, 1], size=10000, p=[0.9, 0.1])
+      
+      X_train, X_val, X_test, y_train, y_val, y_test = train_val_test_split(
+          X, y, val_size=0.2, test_size=0.2, stratify=True, random_state=42
+      )
+      
+      print(f"Training set: {len(y_train)} samples ({y_train.mean():.2%} positive)")
+      print(f"Validation set: {len(y_val)} samples ({y_val.mean():.2%} positive)")
+      print(f"Test set: {len(y_test)} samples ({y_test.mean():.2%} positive)")
+    
+    security_use_case: |
+      Malware detection development:
+      
+      Training set: Train detection models
+      Validation set: 
+        - Tune detection thresholds
+        - Select features
+        - Early stopping
+        - Compare detection algorithms
+      Test set:
+        - Final evaluation before production
+        - Report to management/compliance
+        - Never touched during development
+  
+  # --------------------------------------------------------------------------
+  # Core Concept 4: Temporal Splits for Time-Series Data
+  # --------------------------------------------------------------------------
+  
+  temporal_splits:
+    
+    problem_with_random_split: |
+      Security data has temporal dependencies:
+      - Attack campaigns evolve over time
+      - Malware variants emerge sequentially
+      - Fraud patterns shift with seasons
+      
+      Random split breaks temporal order:
+      - Test set contains past data
+      - Training set contains future data
+      - Model sees "future" during training → temporal leakage
+    
+    temporal_split_solution: |
+      Chronological split: Earlier data for training, later data for testing
+      
+      Timeline:
+      [========== Training ==========][== Val ==][== Test ==]
+       Jan - Aug                        Sep - Oct   Nov - Dec
+      
+      Model trained on past, evaluated on future (realistic)
+    
+    why_temporal_matters: |
+      Security scenarios:
+      - Malware families: New variants appear over time
+      - Fraud: Patterns change with holidays, economy
+      - Intrusion: Attack techniques evolve
+      - Spam: Content and tactics shift
+      
+      Random split: Model sees future attacks during training
+      Temporal split: Model must generalize to unseen future
+      
+      Temporal split harder (more realistic performance estimate)
+    
+    numpy_implementation: |
+      def temporal_train_test_split(X, y, timestamps, test_size=0.2):
+          """
+          Temporal split based on timestamps
+          
+          Args:
+              X: Features
+              y: Labels
+              timestamps: Unix timestamps or datetime
+              test_size: Fraction for test (most recent data)
+          
+          Returns:
+              X_train, X_test, y_train, y_test
+          """
+          # Sort by timestamp
+          sorted_indices = np.argsort(timestamps)
+          X_sorted = X[sorted_indices]
+          y_sorted = y[sorted_indices]
+          
+          # Split chronologically
+          n_samples = len(y)
+          n_test = int(n_samples * test_size)
+          split_point = n_samples - n_test
+          
+          X_train = X_sorted[:split_point]
+          X_test = X_sorted[split_point:]
+          y_train = y_sorted[:split_point]
+          y_test = y_sorted[split_point:]
+          
+          return X_train, X_test, y_train, y_test
+      
+      # Example
+      n_samples = 10000
+      X = np.random.randn(n_samples, 10)
+      y = np.random.randint(0, 2, size=n_samples)
+      
+      # Simulate timestamps (one per day over ~27 years)
+      timestamps = np.arange(n_samples) * 86400  # seconds per day
+      
+      X_train, X_test, y_train, y_test = temporal_train_test_split(
+          X, y, timestamps, test_size=0.2
+      )
+      
+      print(f"Training: {len(y_train)} samples (oldest 80%)")
+      print(f"Test: {len(y_test)} samples (newest 20%)")
+    
+    security_best_practice: |
+      For production malware/fraud/intrusion detectors:
+      1. Use temporal splits for final evaluation
+      2. Simulate production: Train on past, test on future
+      3. Report temporal validation performance to stakeholders
+      4. Monitor: Does test performance match production?
+  
+  # --------------------------------------------------------------------------
+  # Core Concept 5: K-Fold Cross-Validation
+  # --------------------------------------------------------------------------
+  
+  cross_validation:
+    
+    motivation: |
+      Problem with single train/test split:
+      - Performance depends on random split
+      - One unlucky split → misleading results
+      - Small datasets: Variance in estimates high
+      
+      Solution: Multiple train/test splits, average results
+    
+    k_fold_procedure: |
+      K-fold cross-validation:
+      
+      1. Split data into K equal folds (typically K=5 or K=10)
+      2. For each fold:
+         - Use that fold as test set
+         - Use remaining K-1 folds as training set
+         - Train model, evaluate on test fold
+         - Record performance
+      3. Average performance across K folds
+      
+      Result: K different train/test splits, K performance estimates
+    
+    visualization: |
+      5-fold cross-validation:
+      
+      Fold 1: [Test][Train][Train][Train][Train]
+      Fold 2: [Train][Test][Train][Train][Train]
+      Fold 3: [Train][Train][Test][Train][Train]
+      Fold 4: [Train][Train][Train][Test][Train]
+      Fold 5: [Train][Train][Train][Train][Test]
+      
+      Each sample used as test exactly once
+      Each sample used for training K-1 times
+    
+    benefits:
+      - "More reliable performance estimate (average of K runs)"
+      - "Uses all data for both training and testing"
+      - "Quantifies variance in performance (std across folds)"
+      - "Better for small datasets"
+    
+    drawbacks:
+      - "K times more computation (train K models)"
+      - "Not suitable for time-series (breaks temporal order)"
+      - "Final model: Train on ALL data (not one of K models)"
+    
+    numpy_implementation: |
+      def k_fold_cross_validation(X, y, k=5, model_class=None, random_state=None):
+          """
+          K-fold cross-validation
+          
+          Args:
+              X: Features
+              y: Labels
+              k: Number of folds
+              model_class: Model to train (must have fit/predict methods)
+              random_state: Random seed
+          
+          Returns:
+              scores: Performance on each fold
+              mean_score: Average performance
+              std_score: Standard deviation
+          """
+          if random_state is not None:
+              np.random.seed(random_state)
+          
+          n_samples = len(y)
+          
+          # Shuffle data
+          indices = np.random.permutation(n_samples)
+          X_shuffled = X[indices]
+          y_shuffled = y[indices]
+          
+          # Split into K folds
+          fold_size = n_samples // k
+          scores = []
+          
+          for fold in range(k):
+              # Define test fold
+              test_start = fold * fold_size
+              test_end = (fold + 1) * fold_size if fold < k-1 else n_samples
+              
+              # Split indices
+              test_indices = list(range(test_start, test_end))
+              train_indices = list(range(0, test_start)) + list(range(test_end, n_samples))
+              
+              # Get train/test data
+              X_train = X_shuffled[train_indices]
+              y_train = y_shuffled[train_indices]
+              X_test = X_shuffled[test_indices]
+              y_test = y_shuffled[test_indices]
+              
+              # Train and evaluate model
+              model = model_class()
+              model.fit(X_train, y_train)
+              accuracy = model.score(X_test, y_test)
+              scores.append(accuracy)
+              
+              print(f"Fold {fold+1}/{k}: Accuracy = {accuracy:.4f}")
+          
+          scores = np.array(scores)
+          print(f"\nCross-validation results:")
+          print(f"  Mean accuracy: {scores.mean():.4f}")
+          print(f"  Std deviation: {scores.std():.4f}")
+          print(f"  95% CI: [{scores.mean() - 1.96*scores.std():.4f}, "
+                f"{scores.mean() + 1.96*scores.std():.4f}]")
+          
+          return scores, scores.mean(), scores.std()
+    
+    stratified_k_fold: |
+      For imbalanced data: Stratified K-fold
+      
+      Each fold preserves class distribution
+      Critical for security datasets (1% attacks)
+      
+      Implementation: Apply stratification when creating folds
+    
+    when_to_use: |
+      Use cross-validation:
+      - Small datasets (<10K samples)
+      - Need robust performance estimate
+      - Model selection (comparing algorithms)
+      
+      Don't use cross-validation:
+      - Large datasets (too expensive)
+      - Time-series data (use temporal split)
+      - Final model training (use all data after CV)
+  
+  # --------------------------------------------------------------------------
+  # Core Concept 6: Avoiding Data Leakage
+  # --------------------------------------------------------------------------
+  
+  avoiding_data_leakage:
+    
+    what_is_data_leakage: |
+      Data leakage: Information from test set influences training
+      
+      Result: Model appears better than it actually is
+      Production performance much worse than test performance
+    
+    common_leakage_sources:
+      
+      preprocessing_before_split:
+        mistake: |
+          1. Normalize ALL data (mean=0, std=1)
+          2. Split into train/test
+          3. Train model
+        
+        problem: "Normalization used test data statistics!"
+        
+        correct_approach: |
+          1. Split into train/test
+          2. Compute normalization on train only
+          3. Apply train statistics to both train and test
+      
+      feature_engineering_before_split:
+        mistake: |
+          1. Create features using global statistics (e.g., user avg spend)
+          2. Split data
+          3. Train
+        
+        problem: "Features computed using test data!"
+        
+        correct_approach: |
+          1. Split data
+          2. Compute features using train statistics only
+          3. Apply to test
+      
+      target_leakage:
+        mistake: "Include features that are direct consequences of target"
+        
+        example: |
+          Fraud detection:
+          Feature: "fraud_investigation_opened" (1 if investigated)
+          Target: "is_fraud"
+          
+          Problem: Investigation only opened after fraud confirmed!
+          Feature = proxy for target
+        
+        fix: "Only use features available BEFORE prediction time"
+      
+      temporal_leakage:
+        mistake: "Include future information in features"
+        
+        example: |
+          Predicting user churn in January
+          Feature: "purchases_in_february"
+          
+          Problem: February hasn't happened yet!
+        
+        fix: "Only use historical features (past, not future)"
+      
+      duplicate_data:
+        mistake: "Same sample in both train and test"
+        
+        causes:
+          - "Duplicate rows not removed"
+          - "Data collected multiple times"
+          - "Time-series: Same user/entity in train and test"
+        
+        detection: "Check for exact duplicates before splitting"
+    
+    leakage_checklist: |
+      Before splitting:
+      ✓ Remove duplicates
+      ✓ Identify temporal features
+      ✓ Check target leakage
+      
+      After splitting:
+      ✓ Preprocess train and test separately
+      ✓ Compute statistics on train only
+      ✓ Verify test performance is realistic
+      
+      Red flags:
+      ✗ Test accuracy much higher than validation
+      ✗ Test accuracy near 100% (too good to be true)
+      ✗ Production << test performance
+  
+  # --------------------------------------------------------------------------
+  # Security Implications
+  # --------------------------------------------------------------------------
+  
+  security_implications:
+    
+    malware_dataset_splitting:
+      
+      challenge: "Malware samples come in families with variants"
+      
+      wrong_approach: |
+        Random split → Variants of same family in train AND test
+        Model memorizes family signatures
+        Test accuracy: 99%
+        New malware family: 60% (fails!)
+      
+      correct_approach: |
+        Split by malware family:
+        - Training: Families A, B, C, D
+        - Test: Family E (completely unseen)
+        
+        Tests generalization to new families
+    
+    user_based_splitting:
+      
+      problem: |
+        Fraud detection: Same user in train and test
+        Model learns user-specific patterns
+        New users: Poor performance
+      
+      solution: |
+        Split by user ID:
+        - Training users: 80%
+        - Test users: 20% (completely different users)
+        
+        Tests generalization to new users
+    
+    temporal_validation_importance: |
+      Production security systems:
+      - Retrain weekly/monthly on new data
+      - Attacks evolve continuously
+      - Past performance ≠ future performance
+      
+      Evaluation must simulate this:
+      - Train on old data
+      - Test on new data
+      - Monitor: How does performance degrade over time?
+  
+  # --------------------------------------------------------------------------
+  # Key Takeaways
+  # --------------------------------------------------------------------------
+  
+  key_takeaways:
+    
+    conceptual_understanding:
+      - "Train/test split: Foundation of honest evaluation"
+      - "Stratification preserves class distribution (critical for imbalance)"
+      - "Train/val/test: Three-way split for hyperparameter tuning"
+      - "Temporal splits for time-series: Train on past, test on future"
+      - "K-fold CV: Multiple splits, more reliable estimates"
+      - "Data leakage: Test set information influences training"
+    
+    practical_skills:
+      - "Implement stratified train/test split in NumPy"
+      - "Create train/val/test splits (60/20/20)"
+      - "Perform temporal splits for time-series data"
+      - "Avoid preprocessing leakage (fit on train, transform both)"
+      - "Detect and prevent all forms of data leakage"
+    
+    security_mindset:
+      - "Always stratify for imbalanced security datasets"
+      - "Use temporal splits for realistic evaluation"
+      - "Split by entity (user, malware family) not just rows"
+      - "Leakage creates false confidence → production failures"
+      - "Test set touched once, after all decisions made"
+    
+    remember_this:
+      - "Test set is sacred - never touch during development"
+      - "Stratify for imbalanced data (security norm)"
+      - "Preprocess AFTER splitting (fit on train only)"
+      - "Temporal validation for production security systems"
+    
+    next_steps:
+      - "Next section: Overfitting and underfitting (why models fail to generalize)"
+      - "You now know how to split data properly for honest evaluation"
+      - "Critical foundation for next sections on regularization and tuning"
+
+

@@ -1,0 +1,1482 @@
+# section_09_07_model_inversion.yaml
+
+---
+document_info:
+  title: 'Section 9.7: Model Inversion'
+  subtitle: 'Reconstructing Training Data from Query Outputs'
+  chapter: 9
+  section: 7
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/raghavpoonia/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  estimated_pages: 6
+  estimated_reading_time: '24 minutes'
+  created: '2026-05-09'
+
+section_overview:
+  one_line_summary: |
+    Model inversion is the most consequential privacy attack: by optimising an
+    input to maximise a classifier''s confidence on a target class, or by
+    exploiting perplexity signals in LLMs, an adversary reconstructs training
+    data content that the model memorised -- demonstrated by Fredrikson et al.
+    2015 with face reconstruction and Carlini et al. 2021 with verbatim GPT-2
+    training text including personal information.
+
+  why_this_section_exists: |
+    Section 9.6 answered "was this record in the training set?" Section 9.7
+    answers "what does that record contain?" Together the two attacks form the
+    complete privacy arc: membership inference identifies high-probability
+    training members; model inversion reconstructs their content from the model''s
+    query outputs. The consequence of a successful combined attack is the
+    recovery of training data that the operator never intended to expose through
+    the deployed model''s API.
+
+    The Fredrikson et al. 2015 result established that face recognition APIs leak
+    facial images of training subjects through their confidence scores. The
+    Carlini et al. 2021 result established that large language models memorise and
+    can be made to reproduce verbatim training text -- including names, email
+    addresses, phone numbers, and copyrighted content -- through carefully designed
+    prompt strategies combined with perplexity-based filtering. These are not
+    theoretical demonstrations: they were executed against production-scale models
+    with documented query budgets and reproducible methodology.
+
+    Section 9.7 builds both the image classifier inversion PoC and the LLM
+    training data extraction demonstration, establishes memorisation as the
+    necessary precondition for inversion success, and closes the privacy arc
+    with the same two-layer defence as Section 9.6: differential privacy training
+    as the upstream formal bound and output perturbation as the downstream
+    signal-reduction control. The section also surfaces the GitHub Copilot
+    memorisation controversy as the most commercially significant inversion
+    incident documented to date.
+
+  position_in_chapter: |
+    Section 9.7 of 13. Closes the two-section privacy arc (9.6 membership
+    inference, 9.7 model inversion). Both privacy attacks share the inference
+    surface and the defence architecture. Section 9.7 is the most consequential
+    attack in Chapter 9 in terms of data exposure severity. Section 9.8 shifts
+    to the economic abuse attack class; Section 9.9 reconstructs the real-world
+    incident that combines extraction and inversion.
+
+learning_objectives:
+  knowledge:
+    - 'Explain the model inversion attack: how optimising an input against a classifier''s confidence reconstructs training data'
+    - 'Describe Fredrikson et al. 2015: face reconstruction from face recognition API confidence scores'
+    - 'Distinguish gradient-based (white-box) inversion from black-box query-based inversion'
+    - 'Explain the Carlini et al. 2021 LLM training data extraction: perplexity-ratio filtering of generated text'
+    - 'Articulate memorisation as the necessary precondition: only highly memorised samples are reconstructable'
+    - 'Describe how differential privacy training bounds inversion fidelity'
+
+  skills:
+    - 'Implement black-box model inversion against a binary classifier using zeroth-order optimisation'
+    - 'Implement gradient-based inversion against the same classifier and compare fidelity'
+    - 'Build a perplexity-based training data extraction pipeline in the Carlini et al. style'
+    - 'Measure per-sample memorisation degree using the train-test loss gap'
+    - 'Construct a sensitive data inversion threat model for a given deployment'
+
+  security_mindset:
+    - 'Internalise that memorisation is the precondition: the attack cannot reconstruct what the model has not memorised'
+    - 'Recognise that LLM memorisation is pervasive by default -- large models trained on internet data memorise extensive personal information'
+    - 'Understand that DP training is the only defence that formally bounds inversion fidelity; perturbation alone is insufficient'
+    - 'Appreciate that the GitHub Copilot and GPT-2 extractions are existence proofs that production models at scale exhibit this vulnerability'
+
+prerequisites:
+  - 'Section 9.6: membership inference (precursor attack; inversion targets identified members)'
+  - 'Chapter 1: overfitting and memorisation (memorisation is the inversion precondition)'
+  - 'Chapter 2: gradient computation, loss functions, optimisation (gradient-based inversion)'
+  - 'Chapter 3: LLM perplexity and token probability (Carlini et al. perplexity signal)'
+  - 'Chapter 8 Section 8.13: differential privacy training (upstream defence shared with Section 9.6)'
+
+prose_content:
+
+  - part: 1
+    title: 'From Membership to Content: The Privacy Arc Completes'
+    body: |
+      Section 9.6 established the membership signal: high confidence and low loss
+      are evidence that a record was in the training set. Model inversion extends
+      this observation from identification to reconstruction. If high confidence
+      on a target class indicates membership, then the input that achieves the
+      highest confidence on that class is the model''s best estimate of what a
+      member of that class looks like -- a reconstruction of the training data
+      distribution that the model has encoded in its parameters.
+
+      The formal framing is an optimisation problem. Given a model f and a target
+      class c, the adversary finds:
+
+          x* = argmax_x  f(x)[c]
+
+      The solution x* is the input that the model assigns the highest probability
+      to belonging to class c. If the model has memorised specific training examples
+      from class c, the optimisation converges toward those examples rather than
+      toward the generic class centroid. The adversary has reconstructed training
+      data content -- not by accessing the training set directly, but by inverting
+      the model''s learned representation.
+
+      The severity of this attack compared to membership inference is qualitative,
+      not just quantitative. Membership inference leaks the fact of inclusion.
+      Model inversion leaks the content. For a face recognition system trained on
+      identifiable individuals, inversion reconstructs their faces. For a medical
+      classifier, inversion reconstructs the clinical features of training patients.
+      For an LLM, inversion reconstructs the verbatim text -- including personal
+      identifiers, contact information, and copyrighted material -- that appeared
+      in the training corpus.
+
+  - part: 2
+    title: 'Fredrikson et al. 2015: Face Reconstruction from a Face Classifier'
+    body: |
+      The Fredrikson et al. 2015 paper "Model Inversion Attacks that Exploit
+      Confidence Information and Basic Countermeasures" established the canonical
+      model inversion result. Building on earlier work on pharmacogenetics model
+      inversion (Fredrikson et al. 2014), the 2015 paper demonstrated face
+      reconstruction from a face recognition API.
+
+      The attack targeted a facial recognition system accessed through a
+      prediction API that returned confidence scores -- the soft-label grey-box
+      access level from Section 9.1''s adversary access ladder. The adversary
+      knew the target individual''s identity (name) and wanted to reconstruct
+      their facial image as it appeared in the training set.
+
+      The reconstruction procedure used gradient ascent in input space to find
+      the image that maximised the model''s confidence score for the target
+      identity. Starting from a random or mean-face initialisation, the algorithm
+      iteratively applied small perturbations to the input image in the direction
+      that increased the model''s confidence on the target class, tracking the
+      pixel values at each step. After several hundred iterations, the reconstructed
+      image converged to a likeness of the target individual recognisable to human
+      evaluators -- not a perfect photograph, but a distinctive reconstruction that
+      captured the facial structure of the training image.
+
+      The paper also demonstrated the attack against a simpler model: a pharmacogenetics
+      dosage prediction model that revealed patient attributes (race, age) not
+      directly observable from the API''s inputs but encoded in the model''s
+      decision surface. This variant required fewer queries and produced high-fidelity
+      attribute reconstruction, demonstrating that inversion applies to any model
+      whose predictions encode training data features.
+
+      The countermeasures the paper evaluated -- confidence score rounding,
+      adding noise to outputs, restricting API output precision -- all reduced
+      attack fidelity but did not eliminate it. This is the output perturbation
+      result that Section 9.12 builds on: perturbation raises the query budget
+      for reconstruction but does not bound fidelity the way differential privacy
+      training does.
+
+  - part: 3
+    title: 'Gradient-Based Inversion: White-Box Access'
+    body: |
+      Gradient-based model inversion is the most powerful variant, applicable when
+      the adversary has white-box access to the model''s parameters and can compute
+      exact gradients. The optimisation is:
+
+          x_{t+1} = x_t + α * ∇_x  f(x_t)[c]
+
+      where α is the step size and ∇_x f(x_t)[c] is the gradient of the target
+      class confidence with respect to the input. This is standard gradient ascent
+      in input space -- the reverse of the gradient descent used during training.
+      The input converges toward a point that the model treats as a prototypical
+      member of class c.
+
+      Gradient-based inversion is fast and precise. With exact gradients, each
+      optimisation step provides maximum information about the direction of
+      increasing confidence in the target class. Convergence typically occurs in
+      tens to hundreds of gradient steps for image classifiers, producing
+      reconstructions with high visual fidelity to the training data distribution.
+
+      For open-weight models -- which represent an increasingly large fraction of
+      deployed models as of 2026 -- gradient-based inversion is directly applicable.
+      An adversary who downloads an open-weight model has white-box access and can
+      run gradient ascent locally without any API interaction. The attack does not
+      touch the operator''s infrastructure and cannot be detected through query
+      monitoring. The only effective defences for open-weight models against gradient-
+      based inversion are upstream: differential privacy training during the original
+      training run, and data deduplication and scrubbing to remove the most
+      memorisation-prone training examples before training begins.
+
+      The practical inversion fidelity from gradient access is significantly higher
+      than from black-box query access for the same number of optimisation steps,
+      because each step uses exact gradient information rather than a numerical
+      approximation. Zhang et al. 2020 demonstrated GAN-based gradient inversion
+      that produced near-photorealistic facial reconstructions from deep classifiers
+      with white-box access -- a substantial advance over the Fredrikson et al.
+      2015 pixel-level optimisation.
+
+  - part: 4
+    title: 'Black-Box Inversion: Query-Based Reconstruction Without Gradients'
+    body: |
+      Black-box model inversion uses only the model''s query outputs -- confidence
+      scores or class labels -- to guide the reconstruction, without access to
+      gradients. The optimisation must estimate the gradient direction from the
+      model''s scalar outputs at nearby points, a technique called zeroth-order
+      or derivative-free optimisation.
+
+      The simplest black-box inversion approach estimates the gradient numerically:
+      for each input dimension i, compute the finite difference (f(x + δe_i)[c]
+      - f(x)[c]) / δ as an approximation to the partial derivative. This requires
+      two queries per dimension per step, making black-box inversion O(d) times
+      more expensive than gradient-based inversion per optimisation step. For
+      image inputs with thousands of pixels, this is a substantial query budget
+      multiplier.
+
+      More sophisticated black-box inversion approaches use random gradient
+      estimators (querying random directions rather than all basis directions),
+      Bayesian optimisation over the input space, or evolutionary search strategies
+      that maintain a population of candidate inputs and select toward higher
+      confidence. These approaches trade optimisation quality for query efficiency
+      and are more practical for high-dimensional inputs.
+
+      Against grey-box APIs that return confidence scores, black-box inversion is
+      viable for moderate-dimensional inputs. Fredrikson et al. 2015 operated in
+      this regime: the face images were small (thumbnail resolution) and the
+      confidence scores provided sufficient gradient signal for reconstruction.
+      Against hard-label-only APIs, reconstruction fidelity degrades further but
+      remains possible for simple models and low-dimensional inputs.
+
+      The detection implication for black-box inversion follows the same logic as
+      boundary mapping: the adversary must issue many queries with systematic
+      input perturbation, producing a query distribution with structured variation
+      patterns that differs from legitimate use. The query monitor''s OOD detector
+      and perturbation pattern detector are the relevant Section 9.11 tracks.
+
+  - part: 5
+    title: 'LLM Training Data Extraction: Carlini et al. 2021'
+    body: |
+      The Carlini et al. 2021 paper "Extracting Training Data from Large Language
+      Models" demonstrated verbatim training data extraction from GPT-2 at scale.
+      The attack revealed that large language models memorise and can be made to
+      reproduce substantial quantities of their training data with only black-box
+      API access and no prior knowledge of which specific texts were in the
+      training corpus.
+
+      The extraction procedure has two stages. In the generation stage, the
+      adversary prompts the model with a variety of prefixes (often simple,
+      unconditional prompts or short common phrases) and generates large numbers
+      of text completions. The model''s sampling produces a mixture of generic
+      text and memorised training content; the adversary cannot distinguish them
+      from content alone at this stage.
+
+      In the filtering stage, the adversary scores each generated text by a
+      perplexity ratio: the ratio of the target model''s perplexity to a smaller
+      reference model''s perplexity on the same text. Texts that the target model
+      assigns much lower perplexity than the reference model -- texts the large
+      model finds far more predictable than the small model does -- are likely
+      memorised from training data. The reference model has not seen the training
+      data and assigns these texts the same perplexity as generic text from the
+      same domain.
+
+      The perplexity ratio filter is the key insight. It eliminates the need to
+      know the training data in advance: any text that the large model finds
+      disproportionately predictable relative to a reference baseline is a
+      candidate for training data membership. The paper demonstrated extraction
+      of text containing names, email addresses, phone numbers, URLs, and
+      verbatim news articles from GPT-2 -- information the model had memorised
+      from its training corpus despite having no specific instruction to retain it.
+
+      The query budget for the Carlini et al. extraction was substantial:
+      hundreds of thousands of generated sequences to find the subset of memorised
+      content. But the economic arithmetic is the same as distillation extraction:
+      the cost of generating those sequences at commercial LLM API rates is orders
+      of magnitude lower than the consequence of the exposed training data.
+
+  - part: 6
+    title: 'Memorisation as the Necessary Precondition'
+    body: |
+      Model inversion cannot reconstruct what the model has not memorised. The
+      attack''s fidelity ceiling is determined by the degree of memorisation:
+      training examples that the model has fitted closely -- whose specific features
+      are encoded in the model''s parameters rather than only the class-level
+      statistics -- are reconstructable. Training examples that the model has
+      not memorised individually -- which contribute only to the aggregate class
+      distribution without leaving individual-level traces -- are not.
+
+      Memorisation degree varies systematically across training examples and model
+      configurations. Examples that appear rarely in the training data are more
+      likely to be memorised individually than examples that appear frequently,
+      because the model must fit each rare example without the averaging effect
+      of repetition. Examples with unusual or distinctive features that deviate
+      from the class centre are more likely to be memorised because they require
+      model-specific parameter adjustment. Very short sequences in LLMs are more
+      susceptible to memorisation than long sequences because the model can
+      perfectly fit the short sequence in a small number of parameters.
+
+      The Carlini et al. 2021 paper quantified memorisation for LLMs as the
+      probability that the model can reproduce a training sequence verbatim given
+      a prefix of that sequence. A sequence is k-memorised if the model reproduces
+      it exactly given a k-token prefix. Higher k means the model can complete
+      the sequence from a longer prefix -- weaker memorisation. Lower k means
+      the model can complete the sequence from a short prefix -- stronger
+      memorisation and higher inversion risk.
+
+      The memorisation analysis has direct implications for data preprocessing.
+      Training data deduplication removes the repetition-based averaging effect
+      and actually increases memorisation risk for the deduplicated examples by
+      causing the model to fit each unique example more precisely. This is the
+      deduplication paradox: deduplication improves data quality but increases
+      per-example memorisation and therefore inversion risk for the unique examples
+      that remain after deduplication.
+
+  - part: 7
+    title: 'Sensitive Data Exposure: GitHub Copilot and Production Implications'
+    body: |
+      The GitHub Copilot memorisation controversy is the most commercially
+      significant model inversion incident documented to date. Researchers
+      demonstrated that Copilot -- a code completion model trained on public
+      GitHub repositories -- could be prompted to reproduce verbatim code
+      snippets from its training data, including code containing API keys,
+      passwords, cryptographic secrets, and other sensitive credentials that
+      developers had inadvertently committed to public repositories.
+
+      The extraction did not require adversarial prompting. Simple prefix
+      completions -- providing the beginning of a file that had appeared in the
+      training data -- caused the model to reproduce the remainder of the file,
+      including any sensitive content it contained. The memorisation was
+      selective: not all code was reproducible, but files that had appeared
+      in many repositories (high-frequency files) and files with distinctive
+      structure (configuration files, credential files) showed high memorisation
+      rates.
+
+      The practical consequence is an inversion attack surface that operates
+      without any special adversary capability: any Copilot user who prompts
+      the model with a file prefix can receive training data content as a
+      completion. The model does not distinguish between completing a user''s
+      own code and reproducing a memorised training example. The exposure
+      is built into the product''s core functionality.
+
+      The implications for production LLM deployments extend beyond code models.
+      Any LLM trained on data containing personally identifiable information --
+      user messages, customer service transcripts, medical notes, financial
+      records -- has the potential to reproduce that information through
+      completion prompts. The Carlini et al. 2021 result confirmed this for
+      GPT-2 on general web text; the Copilot result confirmed it for specialised
+      code models. Both demonstrate that the inversion attack is not hypothetical
+      and does not require adversarial expertise to execute.
+
+  - part: 8
+    title: 'Defence Connections: DP Training, Perturbation, and Data Hygiene'
+    body: |
+      Model inversion has three defensive layers, each addressing a different
+      stage of the vulnerability chain.
+
+      Upstream: differential privacy training. DP training from Section 8.13
+      bounds the influence of any individual training example on the model''s
+      parameters. If no training example has more than ε-bounded influence, the
+      model cannot have memorised that example to the degree required for high-
+      fidelity inversion. At strong privacy budgets (ε ≤ 1), the inversion
+      fidelity ceiling drops substantially: the optimisation cannot converge to
+      a specific training example because the model''s parameters do not carry
+      sufficient individual-level information. The cost is the same as for
+      membership inference defence: model accuracy degrades with tighter ε.
+
+      Downstream: output perturbation. Perturbation from Section 9.12 adds noise
+      to confidence scores and generated text, reducing the precision of the
+      gradient signal that black-box inversion and perplexity-based filtering
+      rely on. For image inversion, confidence score perturbation degrades the
+      gradient estimate and causes the optimisation to converge more slowly and
+      less precisely. For LLM extraction, adding noise to token log-probabilities
+      degrades the perplexity ratio filter and forces the adversary to generate
+      more sequences to find memorised content.
+
+      Data preprocessing: deduplication and scrubbing. Removing sensitive content
+      from training data before training is the most direct mitigation for
+      LLM inversion: a model that was never trained on an API key cannot memorise
+      it. The GitHub Copilot response included filtering training data for
+      credential patterns (API key regexes, password patterns) before training
+      subsequent model versions. Data deduplication reduces repetition-based
+      memorisation for common examples but, as noted in Part 6, increases
+      per-example memorisation for unique examples -- making targeted scrubbing
+      of sensitive content more important than blanket deduplication.
+
+      The correct architecture combines all three layers. DP training as the formal
+      bound on individual-level memorisation; output perturbation as the signal-
+      reduction control at inference time; data scrubbing to remove the highest-risk
+      training content before memorisation occurs. None alone is sufficient for
+      production deployment of models trained on sensitive personal data.
+
+reference_materials:
+
+  - table: 1
+    title: 'Model Inversion Attack Variants: Classifier vs LLM'
+    description: |
+      Comparison of image classifier inversion (Fredrikson et al. 2015) with
+      LLM training data extraction (Carlini et al. 2021) across mechanism,
+      access requirement, query budget, and defence.
+    columns:
+      - 'Property'
+      - 'Classifier Inversion (Fredrikson et al. 2015)'
+      - 'LLM Extraction (Carlini et al. 2021)'
+    rows:
+      - property: 'Attack mechanism'
+        classifier: 'Optimise input to maximise confidence on target class; gradient or zeroth-order'
+        llm: 'Generate text; filter by perplexity ratio (target model vs reference model)'
+      - property: 'Access required'
+        classifier: 'Grey-box (confidence scores); degrades but works with hard labels'
+        llm: 'Black-box text generation; perplexity access strengthens filtering'
+      - property: 'Query budget'
+        classifier: '100s-10,000s of queries per reconstruction depending on dimensionality and access'
+        llm: '100,000s of generated sequences; filtering identifies the memorised subset'
+      - property: 'Reconstruction target'
+        classifier: 'Input features of a specific training class (face image, clinical attributes)'
+        llm: 'Verbatim text sequences memorised from training corpus'
+      - property: 'Memorisation requirement'
+        classifier: 'Model must have memorised class-specific input features individually'
+        llm: 'Model must have assigned lower perplexity to training text than to generic text'
+      - property: 'Fidelity ceiling'
+        classifier: 'Image quality degrades with perturbation; DP training reduces convergence precision'
+        llm: 'Exact verbatim reproduction of training text including PII and credentials'
+      - property: 'Primary defence'
+        classifier: 'DP training (bounds inversion fidelity); output perturbation (degrades gradient signal)'
+        llm: 'DP training; data scrubbing (remove sensitive content before training); perplexity noise'
+      - property: 'Real-world incident'
+        classifier: 'Fredrikson et al. 2015 face reconstruction from commercial face API'
+        llm: 'Carlini et al. 2021 GPT-2 extraction; GitHub Copilot credential exposure'
+
+  - table: 2
+    title: 'Memorisation Degree: Factors and Inversion Risk'
+    description: |
+      Factors that increase per-training-example memorisation degree and their
+      implication for model inversion risk.
+    columns:
+      - 'Factor'
+      - 'Effect on Memorisation'
+      - 'Inversion Risk'
+      - 'Mitigation'
+    rows:
+      - factor: 'Training example rarity (appears few times)'
+        effect: 'High: model must fit rare examples individually without repetition averaging'
+        risk: 'High: rare examples are reconstructable with lower query budget'
+        mitigation: 'DP training; targeted scrubbing of rare sensitive content'
+      - factor: 'Training example duplication (appears many times)'
+        effect: 'Moderate: repeated exposure increases memorisation of the specific text'
+        risk: 'High for exact duplicates: verbatim reproduction probability increases with frequency'
+        mitigation: 'Training data deduplication (reduces but does not eliminate high-frequency memorisation)'
+      - factor: 'Model capacity (parameter count)'
+        effect: 'High: larger models memorise more training examples and memorise them more completely'
+        risk: 'High: large models (GPT-2, GPT-3 scale) show extensive memorisation'
+        mitigation: 'DP training scales with model size; tighter ε required for larger models'
+      - factor: 'Training duration (epochs)'
+        effect: 'High: more training epochs increase overfitting and memorisation of specific examples'
+        risk: 'High: models trained for many epochs on small datasets are highly invertable'
+        mitigation: 'Early stopping; regularisation; DP training'
+      - factor: 'Distinctive content (unusual features, specific identifiers)'
+        effect: 'High: content unlike anything else in the corpus is memorised precisely'
+        risk: 'Critical: PII, credentials, rare personal details have high distinctive memorisation'
+        mitigation: 'Data scrubbing pipeline targeting PII, credentials, and sensitive identifiers'
+
+  - table: 3
+    title: 'Sensitive Data Exposure Scenarios: Inversion Threat Model'
+    description: |
+      Three sensitive data exposure scenarios with training data category,
+      inversion mechanism, exposure type, and regulatory consequence.
+    columns:
+      - 'Scenario'
+      - 'Training Data Category'
+      - 'Inversion Mechanism'
+      - 'Exposure Type'
+      - 'Regulatory Consequence'
+    rows:
+      - scenario: 'Medical image classifier'
+        data_category: 'Patient facial images, radiological scans'
+        mechanism: 'Gradient or zeroth-order optimisation to reconstruct class-representative images'
+        exposure: 'Facial likeness and clinical imaging data of training patients'
+        regulatory: 'HIPAA PHI breach; patient notification obligation'
+      - scenario: 'LLM trained on customer service transcripts'
+        data_category: 'Customer names, account details, complaint content'
+        mechanism: 'Perplexity-based extraction of memorised transcript fragments'
+        exposure: 'Verbatim customer PII including names, account numbers, issue descriptions'
+        regulatory: 'GDPR Article 17 (erasure); CCPA; potential data breach notification'
+      - scenario: 'Code completion model (Copilot-style)'
+        data_category: 'Code repositories including credentials, API keys, config files'
+        mechanism: 'File prefix completion reproducing memorised training files'
+        exposure: 'API keys, passwords, cryptographic secrets from training repositories'
+        regulatory: 'No specific regulation; potential breach of affected service providers; reputational harm'
+      - scenario: 'Financial fraud classifier'
+        data_category: 'Transaction records with account numbers and merchant data'
+        mechanism: 'Attribute reconstruction from classifier confidence on transaction features'
+        exposure: 'Financial attributes of training customers including transaction patterns'
+        regulatory: 'GLBA; GDPR Article 22; PCI-DSS'
+
+  - table: 4
+    title: 'Defence Layer Effectiveness Against Model Inversion'
+    description: |
+      Three defensive controls against model inversion with mechanism,
+      fidelity reduction, limitation, and interaction.
+    columns:
+      - 'Control'
+      - 'Mechanism'
+      - 'Fidelity Reduction'
+      - 'Limitation'
+    rows:
+      - control: 'Differential privacy training'
+        mechanism: 'Bounds per-example gradient contribution; limits individual memorisation'
+        fidelity_reduction: 'Substantial at epsilon <= 1; optimisation cannot converge to specific training examples'
+        limitation: 'Model accuracy cost; does not help for open-weight models already released without DP'
+      - control: 'Output perturbation'
+        mechanism: 'Adds noise to confidence scores and log-probabilities; degrades gradient signal and perplexity filter'
+        fidelity_reduction: 'Moderate; raises query budget but does not eliminate reconstruction with sufficient queries'
+        limitation: 'Not a formal bound; patient adversary overcomes perturbation with more queries'
+      - control: 'Training data scrubbing'
+        mechanism: 'Removes PII, credentials, and sensitive content before training; model never memorises the content'
+        fidelity_reduction: 'Complete for scrubbed content; no memorisation means no inversion possible'
+        limitation: 'Requires comprehensive sensitive content detection; misses novel or obfuscated sensitive content'
+
+deliverables:
+
+  - id: 1
+    name: 'black_box_inverter.py'
+    description: |
+      Black-box model inversion using zeroth-order optimisation. Estimates the
+      gradient of the target class confidence with respect to the input via finite
+      differences (two queries per dimension per step), then takes a gradient
+      ascent step toward higher target class confidence. Tracks reconstruction
+      fidelity against a known ground-truth member at each step to produce the
+      inversion progress curve. Intended as the adversary-side implementation
+      demonstrating the attack the Section 9.12 output perturbation defends against.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and sklearn.
+      Victim model accepts any object with predict_proba(X). Dimensionality,
+      step size, perturbation delta, and budget are all configurable parameters.
+      No hardcoded input shapes. Query count is tracked via the oracle wrapper
+      imported from boundary_mapper.
+    code: |
+      # black_box_inverter.py
+      # Chapter 9 Section 9.7 -- Black-Box Model Inversion (Zeroth-Order)
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from dataclasses import dataclass, field
+      from typing import List, Optional, Tuple
+
+
+      @dataclass
+      class InversionStep:
+          step: int
+          queries_used: int
+          target_confidence: float
+          reconstruction_mse: Optional[float]  # vs known ground truth if available
+
+
+      @dataclass
+      class InversionResult:
+          target_class: int
+          reconstructed_input: np.ndarray
+          steps: List[InversionStep]
+          total_queries: int
+          final_confidence: float
+
+
+      class QueryCountingModel:
+          '''Wraps any predict_proba model with a query counter.'''
+
+          def __init__(self, model, budget: int) -> None:
+              self._model = model
+              self._budget = budget
+              self.queries = 0
+
+          def predict_proba(self, X: np.ndarray) -> np.ndarray:
+              if self.queries + len(X) > self._budget:
+                  raise RuntimeError('Inversion query budget exhausted')
+              self.queries += len(X)
+              return self._model.predict_proba(X)
+
+          def confidence(self, x: np.ndarray, target_class: int) -> float:
+              proba = self.predict_proba(x.reshape(1, -1))
+              return float(proba[0, target_class])
+
+
+      def zeroth_order_gradient(
+          model: QueryCountingModel,
+          x: np.ndarray,
+          target_class: int,
+          delta: float = 1e-3,
+      ) -> np.ndarray:
+          '''
+          Estimate gradient of target class confidence w.r.t. x using finite differences.
+          Requires 2 * len(x) queries (forward and backward difference per dimension).
+          '''
+          grad = np.zeros_like(x)
+          f0 = model.confidence(x, target_class)
+          for i in range(len(x)):
+              x_plus = x.copy()
+              x_plus[i] += delta
+              f_plus = model.confidence(x_plus, target_class)
+              grad[i] = (f_plus - f0) / delta
+          return grad
+
+
+      def run_black_box_inversion(
+          model: QueryCountingModel,
+          target_class: int,
+          input_dim: int,
+          x_init: Optional[np.ndarray] = None,
+          x_ground_truth: Optional[np.ndarray] = None,
+          n_steps: int = 30,
+          step_size: float = 0.05,
+          delta: float = 1e-3,
+          rng: Optional[np.random.Generator] = None,
+      ) -> InversionResult:
+          '''
+          Run zeroth-order gradient ascent to maximise target class confidence.
+          x_init: starting point (random if None)
+          x_ground_truth: known training member for MSE tracking (optional)
+          '''
+          if rng is None:
+              rng = np.random.default_rng(seed=42)
+          x = x_init if x_init is not None else rng.uniform(-1.0, 1.0, size=input_dim)
+          steps: List[InversionStep] = []
+
+          for step in range(n_steps):
+              queries_before = model.queries
+              try:
+                  grad = zeroth_order_gradient(model, x, target_class, delta)
+                  conf = model.confidence(x, target_class)
+              except RuntimeError:
+                  break
+
+              mse = None
+              if x_ground_truth is not None:
+                  mse = float(np.mean((x - x_ground_truth) ** 2))
+
+              steps.append(InversionStep(
+                  step=step,
+                  queries_used=model.queries,
+                  target_confidence=round(conf, 4),
+                  reconstruction_mse=round(mse, 6) if mse is not None else None,
+              ))
+
+              x = x + step_size * grad
+              # Clip to valid input range
+              x = np.clip(x, -3.0, 3.0)
+
+          final_conf = model.confidence(x, target_class) if model.queries < model._budget else steps[-1].target_confidence
+          return InversionResult(
+              target_class=target_class,
+              reconstructed_input=x,
+              steps=steps,
+              total_queries=model.queries,
+              final_confidence=round(final_conf, 4),
+          )
+
+
+      def render_inversion_progress(result: InversionResult) -> None:
+          print('BLACK-BOX INVERSION PROGRESS -- Chapter 9 Section 9.7')
+          print('Target class: %d | Total queries: %d | Final confidence: %.1f%%' % (
+              result.target_class, result.total_queries, result.final_confidence * 100))
+          print('%6s %8s %12s %14s' % ('Step', 'Queries', 'Confidence', 'Recon MSE'))
+          print('-' * 45)
+          for s in result.steps[::5]:
+              mse_str = ('%.6f' % s.reconstruction_mse) if s.reconstruction_mse is not None else 'N/A'
+              print('%6d %8d %11.1f%% %14s' % (s.step, s.queries_used, s.target_confidence * 100, mse_str))
+
+
+      if __name__ == '__main__':
+          from sklearn.neural_network import MLPClassifier
+          from sklearn.datasets import make_classification
+
+          X, y = make_classification(n_samples=500, n_features=10, random_state=42)
+          victim = MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=500, random_state=42)
+          victim.fit(X, y)
+
+          # Pick a class-1 training member as the ground truth to track
+          class1_idx = np.where(y == 1)[0][0]
+          x_truth = X[class1_idx]
+
+          oracle = QueryCountingModel(victim, budget=5000)
+          result = run_black_box_inversion(
+              oracle, target_class=1, input_dim=10,
+              x_ground_truth=x_truth, n_steps=50, step_size=0.02,
+          )
+          render_inversion_progress(result)
+
+  - id: 2
+    name: 'gradient_inverter.py'
+    description: |
+      Gradient-based model inversion for white-box access. Computes exact
+      gradients of the target class confidence with respect to the input using
+      numerical differentiation on a provided model with predict_proba access.
+      Compares reconstruction fidelity and query budget against the black-box
+      zeroth-order baseline at matched step counts to quantify the gradient
+      access advantage.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and sklearn.
+      Gradient computation uses exact finite differences with smaller delta than
+      the black-box variant, yielding higher gradient accuracy. No external
+      autodiff framework required -- numerical gradient is sufficient for
+      comparison purposes. Imports InversionResult from black_box_inverter.
+    code: |
+      # gradient_inverter.py
+      # Chapter 9 Section 9.7 -- Gradient-Based Model Inversion (White-Box Numerical)
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from typing import List, Optional
+
+      from black_box_inverter import (
+          InversionResult, InversionStep, QueryCountingModel,
+      )
+
+
+      def exact_numerical_gradient(
+          model: QueryCountingModel,
+          x: np.ndarray,
+          target_class: int,
+          delta: float = 1e-5,
+      ) -> np.ndarray:
+          '''
+          Central difference gradient: (f(x+delta) - f(x-delta)) / (2*delta).
+          More accurate than forward difference; requires 2*d queries per step.
+          '''
+          grad = np.zeros_like(x)
+          for i in range(len(x)):
+              x_plus = x.copy()
+              x_plus[i] += delta
+              x_minus = x.copy()
+              x_minus[i] -= delta
+              f_plus = model.confidence(x_plus, target_class)
+              f_minus = model.confidence(x_minus, target_class)
+              grad[i] = (f_plus - f_minus) / (2.0 * delta)
+          return grad
+
+
+      def run_gradient_inversion(
+          model: QueryCountingModel,
+          target_class: int,
+          input_dim: int,
+          x_init: Optional[np.ndarray] = None,
+          x_ground_truth: Optional[np.ndarray] = None,
+          n_steps: int = 30,
+          step_size: float = 0.05,
+          rng: Optional[np.random.Generator] = None,
+      ) -> InversionResult:
+          '''
+          Gradient-based inversion using central difference gradient estimates.
+          More accurate gradient than forward difference; higher query cost per step.
+          '''
+          if rng is None:
+              rng = np.random.default_rng(seed=42)
+          x = x_init if x_init is not None else rng.uniform(-1.0, 1.0, size=input_dim)
+          steps: List[InversionStep] = []
+
+          for step in range(n_steps):
+              try:
+                  grad = exact_numerical_gradient(model, x, target_class)
+                  conf = model.confidence(x, target_class)
+              except RuntimeError:
+                  break
+
+              mse = None
+              if x_ground_truth is not None:
+                  mse = float(np.mean((x - x_ground_truth) ** 2))
+
+              steps.append(InversionStep(
+                  step=step,
+                  queries_used=model.queries,
+                  target_confidence=round(conf, 4),
+                  reconstruction_mse=round(mse, 6) if mse is not None else None,
+              ))
+              x = x + step_size * grad
+              x = np.clip(x, -3.0, 3.0)
+
+          final_conf = (model.confidence(x, target_class)
+                        if model.queries < model._budget
+                        else steps[-1].target_confidence)
+          return InversionResult(
+              target_class=target_class,
+              reconstructed_input=x,
+              steps=steps,
+              total_queries=model.queries,
+              final_confidence=round(final_conf, 4),
+          )
+
+
+      def compare_inversion_methods(
+          bb_result: InversionResult,
+          grad_result: InversionResult,
+      ) -> None:
+          print('INVERSION METHOD COMPARISON -- Chapter 9 Section 9.7')
+          print('%22s %12s %12s %14s' % ('Method', 'Final Conf', 'Queries', 'Final MSE'))
+          print('-' * 65)
+          for label, result in [('black_box_zeroth_order', bb_result), ('gradient_central_diff', grad_result)]:
+              last = result.steps[-1] if result.steps else None
+              mse_str = ('%.6f' % last.reconstruction_mse) if (last and last.reconstruction_mse is not None) else 'N/A'
+              print('%22s %11.1f%% %12d %14s' % (
+                  label, result.final_confidence * 100, result.total_queries, mse_str))
+
+
+      if __name__ == '__main__':
+          from sklearn.neural_network import MLPClassifier
+          from sklearn.datasets import make_classification
+          from black_box_inverter import run_black_box_inversion
+
+          X, y = make_classification(n_samples=500, n_features=10, random_state=42)
+          victim = MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=500, random_state=42)
+          victim.fit(X, y)
+          class1_idx = np.where(y == 1)[0][0]
+          x_truth = X[class1_idx]
+
+          bb_oracle = QueryCountingModel(victim, budget=5000)
+          bb_result = run_black_box_inversion(
+              bb_oracle, target_class=1, input_dim=10,
+              x_ground_truth=x_truth, n_steps=25, step_size=0.02,
+          )
+          grad_oracle = QueryCountingModel(victim, budget=5000)
+          grad_result = run_gradient_inversion(
+              grad_oracle, target_class=1, input_dim=10,
+              x_ground_truth=x_truth, n_steps=25, step_size=0.02,
+          )
+          compare_inversion_methods(bb_result, grad_result)
+
+  - id: 3
+    name: 'llm_training_extractor.py'
+    description: |
+      LLM training data extraction pipeline in the style of Carlini et al. 2021.
+      Generates candidate text sequences from a mock LLM, scores each by a
+      perplexity ratio between a large target model and a small reference model,
+      and returns the top-scoring candidates as likely memorised training content.
+      Demonstrates the generation-then-filter extraction pipeline against a mock
+      n-gram language model.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and stdlib only.
+      Both target and reference models are NgramLanguageModel instances backed by
+      frequency tables -- no external LLM API required. Perplexity ratio is
+      computed as target_perplexity / reference_perplexity; lower ratio means
+      the target model finds the text more predictable than the reference.
+    code: |
+      # llm_training_extractor.py
+      # Chapter 9 Section 9.7 -- LLM Training Data Extraction (Carlini et al. 2021 Style)
+      # Single quotes throughout per book convention.
+
+      import math
+      import random
+      from dataclasses import dataclass, field
+      from typing import Dict, List, Optional, Tuple
+
+
+      @dataclass
+      class ExtractionCandidate:
+          text: str
+          target_perplexity: float
+          reference_perplexity: float
+          perplexity_ratio: float  # target / reference; lower = more likely memorised
+          rank: int
+
+
+      class NgramLanguageModel:
+          '''
+          Simple bigram language model for demonstration purposes.
+          Approximates the role of a neural LM in the Carlini et al. pipeline.
+          '''
+
+          def __init__(self, smoothing: float = 0.1) -> None:
+              self._unigram: Dict[str, float] = {}
+              self._bigram: Dict[Tuple[str, str], float] = {}
+              self._vocab_size: int = 0
+              self._smoothing = smoothing
+              self._fitted = False
+
+          def fit(self, texts: List[str]) -> None:
+              for text in texts:
+                  tokens = text.split()
+                  for tok in tokens:
+                      self._unigram[tok] = self._unigram.get(tok, 0) + 1
+                  for i in range(len(tokens) - 1):
+                      pair = (tokens[i], tokens[i + 1])
+                      self._bigram[pair] = self._bigram.get(pair, 0) + 1
+              self._vocab_size = len(self._unigram)
+              self._fitted = True
+
+          def token_log_prob(self, prev_token: str, token: str) -> float:
+              '''Bigram log probability with Laplace smoothing.'''
+              if not self._fitted or self._vocab_size == 0:
+                  return -math.log(1e-6)
+              prev_count = self._unigram.get(prev_token, 0) + self._smoothing * self._vocab_size
+              pair_count = self._bigram.get((prev_token, token), 0) + self._smoothing
+              return math.log(pair_count / prev_count)
+
+          def perplexity(self, text: str) -> float:
+              '''Compute per-token perplexity: exp(-mean(log_probs)).'''
+              tokens = text.split()
+              if len(tokens) < 2:
+                  return float('inf')
+              log_probs = [
+                  self.token_log_prob(tokens[i], tokens[i + 1])
+                  for i in range(len(tokens) - 1)
+              ]
+              avg_log_prob = sum(log_probs) / len(log_probs)
+              return math.exp(-avg_log_prob)
+
+          def sample(self, prefix: str, n_tokens: int, rng: random.Random) -> str:
+              '''Sample a text continuation given a prefix token.'''
+              if not self._fitted:
+                  return prefix
+              tokens = prefix.split()
+              vocab = list(self._unigram.keys())
+              for _ in range(n_tokens):
+                  last = tokens[-1] if tokens else '<s>'
+                  candidates = [
+                      (tok, self._bigram.get((last, tok), 0) + self._smoothing)
+                      for tok in vocab
+                  ]
+                  total = sum(w for _, w in candidates)
+                  r = rng.uniform(0, total)
+                  cumulative = 0.0
+                  chosen = vocab[0]
+                  for tok, weight in candidates:
+                      cumulative += weight
+                      if cumulative >= r:
+                          chosen = tok
+                          break
+                  tokens.append(chosen)
+              return ' '.join(tokens)
+
+
+      def run_llm_extraction(
+          target_model: NgramLanguageModel,
+          reference_model: NgramLanguageModel,
+          seed_prefixes: List[str],
+          n_completions_per_prefix: int = 10,
+          completion_length: int = 8,
+          top_k: int = 5,
+          seed: int = 42,
+      ) -> List[ExtractionCandidate]:
+          '''
+          Generate completions from target model; filter by perplexity ratio.
+          Returns top-k candidates most likely to be memorised training content.
+          '''
+          rng = random.Random(seed)
+          candidates: List[ExtractionCandidate] = []
+
+          for prefix in seed_prefixes:
+              for _ in range(n_completions_per_prefix):
+                  text = target_model.sample(prefix, completion_length, rng)
+                  target_ppl = target_model.perplexity(text)
+                  reference_ppl = reference_model.perplexity(text)
+                  if reference_ppl == 0 or not math.isfinite(target_ppl):
+                      continue
+                  ratio = target_ppl / max(reference_ppl, 1e-10)
+                  candidates.append(ExtractionCandidate(
+                      text=text,
+                      target_perplexity=round(target_ppl, 4),
+                      reference_perplexity=round(reference_ppl, 4),
+                      perplexity_ratio=round(ratio, 4),
+                      rank=0,
+                  ))
+
+          candidates.sort(key=lambda c: c.perplexity_ratio)
+          for i, c in enumerate(candidates[:top_k]):
+              c.rank = i + 1
+          return candidates[:top_k]
+
+
+      def render_extraction_results(candidates: List[ExtractionCandidate]) -> None:
+          print('LLM TRAINING DATA EXTRACTION -- Chapter 9 Section 9.7')
+          print('Top candidates by perplexity ratio (lower = more likely memorised):')
+          print('%4s %8s %10s %8s  %s' % ('Rank', 'Target PPL', 'Ref PPL', 'Ratio', 'Text'))
+          print('-' * 75)
+          for c in candidates:
+              print('%4d %10.2f %10.2f %8.4f  %s' % (
+                  c.rank, c.target_perplexity, c.reference_perplexity, c.perplexity_ratio,
+                  c.text[:50]))
+
+
+      if __name__ == '__main__':
+          # Simulate: target model trained on some text including memorised sequences
+          training_corpus = [
+              'the patient was diagnosed with condition alpha in the records',
+              'patient john doe was admitted on the fifteenth for treatment',
+              'the account number is one two three four five six seven eight',
+              'api key equals ABCDEF contact admin at admin example com',
+              'the weather today is sunny with moderate temperatures expected',
+              'machine learning models can be used for classification tasks',
+          ] * 20  # repetition to simulate memorisation
+
+          reference_corpus = [
+              'the sun rises in the east and sets in the west every day',
+              'machine learning is a field of artificial intelligence research',
+              'natural language processing involves understanding human language',
+              'the quick brown fox jumps over the lazy sleeping dog',
+          ] * 20
+
+          target = NgramLanguageModel(smoothing=0.01)
+          target.fit(training_corpus)
+
+          reference = NgramLanguageModel(smoothing=0.1)
+          reference.fit(reference_corpus)
+
+          prefixes = ['the patient', 'patient john', 'the account', 'api key', 'the weather']
+          candidates = run_llm_extraction(target, reference, prefixes, n_completions_per_prefix=15)
+          render_extraction_results(candidates)
+
+  - id: 4
+    name: 'memorisation_analyser.py'
+    description: |
+      Measures per-training-example memorisation degree using the train-test loss
+      gap. For each training example, computes the model''s loss on that example
+      and on a matched non-member example with similar features. Large loss gaps
+      (low train loss, high test-distribution loss) indicate highly memorised
+      examples with high inversion risk. Returns a ranked list of training
+      examples by memorisation degree.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and sklearn.
+      Memorisation score is the difference between per-sample loss on training
+      set and mean loss on the non-member pool. No hardcoded thresholds --
+      high_memorisation_threshold is a configurable percentile parameter.
+    code: |
+      # memorisation_analyser.py
+      # Chapter 9 Section 9.7 -- Training Example Memorisation Analyser
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from dataclasses import dataclass, field
+      from typing import List, Optional, Tuple
+
+
+      @dataclass
+      class MemoisationRecord:
+          sample_index: int
+          train_loss: float
+          nonmember_mean_loss: float
+          memorisation_score: float  # nonmember_mean_loss - train_loss; higher = more memorised
+          risk_tier: str  # 'high', 'moderate', 'low'
+
+
+      def per_sample_cross_entropy(model, X: np.ndarray, y: np.ndarray) -> np.ndarray:
+          '''
+          Compute per-sample cross-entropy loss -log(p_true_class) for each record.
+          Requires model to expose predict_proba(X).
+          '''
+          proba = model.predict_proba(X)
+          n = len(X)
+          true_proba = np.array([
+              proba[i, int(y[i])] for i in range(n)
+          ])
+          return -np.log(np.clip(true_proba, 1e-10, 1.0))
+
+
+      def analyse_memorisation(
+          model,
+          X_train: np.ndarray,
+          y_train: np.ndarray,
+          X_nonmember: np.ndarray,
+          y_nonmember: np.ndarray,
+          high_percentile: float = 75.0,
+          low_percentile: float = 40.0,
+      ) -> List[MemoisationRecord]:
+          '''
+          Rank training examples by memorisation degree.
+          high_percentile: memorisation score above this percentile = high risk.
+          low_percentile: memorisation score below this percentile = low risk.
+          '''
+          train_losses = per_sample_cross_entropy(model, X_train, y_train)
+          nonmember_losses = per_sample_cross_entropy(model, X_nonmember, y_nonmember)
+          nm_mean = float(nonmember_losses.mean())
+
+          scores = nm_mean - train_losses  # positive = lower train loss than nonmember baseline
+          high_thresh = float(np.percentile(scores, high_percentile))
+          low_thresh = float(np.percentile(scores, low_percentile))
+
+          records: List[MemoisationRecord] = []
+          for i in range(len(X_train)):
+              score = float(scores[i])
+              if score >= high_thresh:
+                  tier = 'high'
+              elif score >= low_thresh:
+                  tier = 'moderate'
+              else:
+                  tier = 'low'
+              records.append(MemoisationRecord(
+                  sample_index=i,
+                  train_loss=round(float(train_losses[i]), 6),
+                  nonmember_mean_loss=round(nm_mean, 6),
+                  memorisation_score=round(score, 6),
+                  risk_tier=tier,
+              ))
+
+          records.sort(key=lambda r: r.memorisation_score, reverse=True)
+          return records
+
+
+      def render_memorisation_report(records: List[MemoisationRecord], top_n: int = 10) -> None:
+          tier_counts = {'high': 0, 'moderate': 0, 'low': 0}
+          for r in records:
+              tier_counts[r.risk_tier] += 1
+
+          print('MEMORISATION ANALYSIS -- Chapter 9 Section 9.7')
+          print('Total training examples: %d' % len(records))
+          for tier, count in tier_counts.items():
+              print('  %s risk: %d (%.1f%%)' % (tier, count, 100.0 * count / max(len(records), 1)))
+
+          print('\nTop %d highest-memorisation examples:' % top_n)
+          print('%6s %12s %14s %14s %8s' % ('Index', 'Train Loss', 'NM Mean Loss', 'Mem Score', 'Tier'))
+          print('-' * 60)
+          for r in records[:top_n]:
+              print('%6d %12.6f %14.6f %14.6f %8s' % (
+                  r.sample_index, r.train_loss, r.nonmember_mean_loss,
+                  r.memorisation_score, r.risk_tier))
+
+
+      if __name__ == '__main__':
+          from sklearn.neural_network import MLPClassifier
+          from sklearn.datasets import make_classification
+
+          X, y = make_classification(n_samples=1000, n_features=15, random_state=42)
+          # Train on a small subset to induce overfitting and memorisation
+          X_train, y_train = X[:200], y[:200]
+          X_nm, y_nm = X[200:400], y[200:400]
+
+          model = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=1000,
+                                alpha=0.00001, random_state=42)
+          model.fit(X_train, y_train)
+
+          train_acc = model.score(X_train, y_train)
+          test_acc = model.score(X_nm, y_nm)
+          print('Train accuracy: %.1f%%  Non-member accuracy: %.1f%%' % (
+              train_acc * 100, test_acc * 100))
+          print('Generalisation gap: %.1f%%\n' % ((train_acc - test_acc) * 100))
+
+          records = analyse_memorisation(model, X_train, y_train, X_nm, y_nm)
+          render_memorisation_report(records, top_n=8)
+
+  - id: 5
+    name: 'inversion_threat_model.py'
+    description: |
+      Builds a structured inversion threat model for a given model deployment.
+      Takes training data category descriptors, model type, and access level as
+      inputs and returns a threat assessment covering inversion mechanism, query
+      budget estimate, exposure type, regulatory consequence, and recommended
+      defensive controls. Integrates with the privacy_implications_analyser.py
+      framework from Section 9.6.
+    implementation_notes: |
+      Single quotes throughout per book convention. No external dependencies.
+      Threat model is fully data-driven via InversionScenario dataclass list.
+      Control recommendations are parameterised by access level and data category.
+      No hardcoded per-scenario logic.
+    code: |
+      # inversion_threat_model.py
+      # Chapter 9 Section 9.7 -- Model Inversion Threat Model Builder
+      # Single quotes throughout per book convention.
+
+      from dataclasses import dataclass, field
+      from typing import Dict, List, Optional, Tuple
+
+
+      @dataclass
+      class InversionThreatScenario:
+          model_type: str           # 'image_classifier', 'tabular_classifier', 'llm'
+          data_category: str        # matches SensitivityCategory names from Section 9.6
+          adversary_access: str     # 'black_box', 'grey_box', 'white_box'
+          memorisation_risk: str    # 'high', 'moderate', 'low'
+
+
+      @dataclass
+      class InversionThreatAssessment:
+          scenario: InversionThreatScenario
+          inversion_mechanism: str
+          query_budget_estimate: str
+          exposure_type: str
+          regulatory_consequence: str
+          recommended_controls: List[str]
+          overall_risk: str  # 'critical', 'high', 'moderate', 'low'
+
+
+      MECHANISM_MAP: Dict[str, str] = {
+          'image_classifier': 'Gradient or zeroth-order input optimisation to maximise target class confidence',
+          'tabular_classifier': 'Feature-space zeroth-order optimisation; attribute reconstruction per training class',
+          'llm': 'Perplexity-ratio filtering of generated text; direct prefix-completion memorisation exploit',
+      }
+
+      BUDGET_MAP: Dict[Tuple[str, str], str] = {
+          ('image_classifier', 'white_box'): '100-1K gradient steps; no API queries required',
+          ('image_classifier', 'grey_box'): '1K-50K API queries depending on image dimensionality',
+          ('image_classifier', 'black_box'): '10K-500K API queries (2*d queries per step)',
+          ('tabular_classifier', 'white_box'): '50-500 gradient steps; no API queries required',
+          ('tabular_classifier', 'grey_box'): '500-10K API queries for typical feature dimensions',
+          ('tabular_classifier', 'black_box'): '5K-100K API queries (hard labels degrade gradient estimate)',
+          ('llm', 'white_box'): 'Local computation only; perplexity computed directly from weights',
+          ('llm', 'grey_box'): '50K-500K generation samples; perplexity API access accelerates filtering',
+          ('llm', 'black_box'): '100K-1M+ generation samples; filtering less precise without perplexity API',
+      }
+
+      EXPOSURE_MAP: Dict[Tuple[str, str], str] = {
+          ('image_classifier', 'protected_health_information'): 'Patient facial likenesses and clinical imaging features',
+          ('image_classifier', 'eu_personal_data'): 'Identifiable facial images of training subjects',
+          ('tabular_classifier', 'protected_health_information'): 'Patient clinical attributes: age, diagnosis codes, treatment features',
+          ('tabular_classifier', 'financial_data'): 'Customer financial profile features: transaction patterns, credit attributes',
+          ('llm', 'protected_health_information'): 'Verbatim clinical notes, patient identifiers, diagnosis descriptions',
+          ('llm', 'eu_personal_data'): 'Verbatim personal data including names, contact details, private communications',
+          ('llm', 'user_generated_content'): 'Verbatim private messages, emails, documents from training corpus',
+      }
+
+      CONTROL_MAP: Dict[str, List[str]] = {
+          'critical': [
+              'Implement DP training with epsilon <= 1 before any further API exposure',
+              'Conduct immediate data scrubbing audit for sensitive content in training set',
+              'Restrict API to hard-label output; remove confidence scores and log-probabilities',
+              'Deploy output perturbation layer with high noise magnitude',
+              'Conduct privacy impact assessment and regulatory notification if applicable',
+          ],
+          'high': [
+              'Implement DP training with epsilon <= 3',
+              'Deploy output perturbation with moderate noise magnitude',
+              'Conduct training data scrubbing for the identified sensitive categories',
+              'Enable query pattern monitoring for inversion-style input perturbation sequences',
+          ],
+          'moderate': [
+              'Add output perturbation with low noise magnitude',
+              'Review training data for high-memorisation-risk content',
+              'Enable query monitoring; set alert threshold for systematic input variation',
+          ],
+          'low': [
+              'Monitor query patterns for systematic perturbation sequences',
+              'Document inversion risk in privacy impact assessment',
+          ],
+      }
+
+      RISK_MATRIX: Dict[Tuple[str, str, str], str] = {
+          ('white_box', 'high', 'protected_health_information'): 'critical',
+          ('white_box', 'high', 'eu_personal_data'): 'critical',
+          ('grey_box', 'high', 'protected_health_information'): 'critical',
+          ('grey_box', 'high', 'eu_personal_data'): 'high',
+          ('black_box', 'high', 'protected_health_information'): 'high',
+          ('white_box', 'moderate', 'protected_health_information'): 'high',
+          ('grey_box', 'moderate', 'financial_data'): 'moderate',
+          ('black_box', 'low', 'user_generated_content'): 'low',
+      }
+
+
+      def assess_inversion_threat(scenario: InversionThreatScenario) -> InversionThreatAssessment:
+          mechanism = MECHANISM_MAP.get(scenario.model_type, 'Input space optimisation against model outputs')
+          budget = BUDGET_MAP.get((scenario.model_type, scenario.adversary_access), 'Variable; depends on model and access')
+          exposure = EXPOSURE_MAP.get((scenario.model_type, scenario.data_category), 'Training data content leakage via model inversion')
+          regulatory = 'Review applicable privacy regulations for identified data category'
+          if 'protected_health_information' in scenario.data_category:
+              regulatory = 'HIPAA PHI breach; Breach Notification Rule applies'
+          elif 'eu_personal_data' in scenario.data_category:
+              regulatory = 'GDPR Articles 17 and 22; potential supervisory authority notification'
+          elif 'financial_data' in scenario.data_category:
+              regulatory = 'GLBA and GDPR Article 22 if applicable; PCI-DSS for payment data'
+
+          risk_key = (scenario.adversary_access, scenario.memorisation_risk, scenario.data_category)
+          overall_risk = RISK_MATRIX.get(risk_key, 'moderate')
+          controls = CONTROL_MAP.get(overall_risk, ['Review and monitor'])
+
+          return InversionThreatAssessment(
+              scenario=scenario,
+              inversion_mechanism=mechanism,
+              query_budget_estimate=budget,
+              exposure_type=exposure,
+              regulatory_consequence=regulatory,
+              recommended_controls=controls,
+              overall_risk=overall_risk,
+          )
+
+
+      def render_threat_assessment(assessment: InversionThreatAssessment) -> None:
+          s = assessment.scenario
+          print('INVERSION THREAT ASSESSMENT -- Chapter 9 Section 9.7')
+          print('=' * 60)
+          print('Model type:       %s' % s.model_type)
+          print('Data category:    %s' % s.data_category)
+          print('Adversary access: %s' % s.adversary_access)
+          print('Memorisation:     %s' % s.memorisation_risk)
+          print('Overall risk:     %s' % assessment.overall_risk.upper())
+          print('\nMechanism:   %s' % assessment.inversion_mechanism)
+          print('Query budget: %s' % assessment.query_budget_estimate)
+          print('Exposure:     %s' % assessment.exposure_type)
+          print('Regulatory:   %s' % assessment.regulatory_consequence)
+          print('\nRecommended controls:')
+          for ctrl in assessment.recommended_controls:
+              print('  - %s' % ctrl)
+
+
+      if __name__ == '__main__':
+          scenarios = [
+              InversionThreatScenario('image_classifier', 'protected_health_information', 'grey_box', 'high'),
+              InversionThreatScenario('llm', 'eu_personal_data', 'black_box', 'high'),
+              InversionThreatScenario('tabular_classifier', 'financial_data', 'grey_box', 'moderate'),
+          ]
+          for scenario in scenarios:
+              assessment = assess_inversion_threat(scenario)
+              render_threat_assessment(assessment)
+              print()
+
+common_mistakes:
+
+  - id: 1
+    description: 'Concluding that model inversion only applies to image classifiers because Fredrikson et al. 2015 used face recognition'
+    why_it_happens: |
+      The face reconstruction demonstration is the most visually compelling and
+      widely cited result. It is easy to remember and easy to demonstrate. The
+      framing of "reconstructing a face from a classifier" implies the attack is
+      specific to image domains with visually interpretable outputs.
+    consequence: |
+      Tabular classifiers trained on medical or financial data are equally
+      vulnerable via feature-space inversion -- the optimisation maximises
+      confidence in a patient class by finding the feature vector most
+      consistent with that class, revealing clinical attributes of training
+      patients. LLMs are vulnerable via perplexity-based extraction, which
+      does not require any visual output at all. Operators who dismiss inversion
+      as an image-only attack leave non-image deployments undefended.
+    correct_approach: |
+      Model inversion applies to any model whose outputs encode training data
+      features -- image classifiers, tabular classifiers, and generative LLMs
+      all exhibit this property. Apply the inversion threat model (Deliverable 5)
+      to the deployment''s model type and data category, not only to
+      image-domain deployments.
+
+  - id: 2
+    description: 'Treating training data deduplication as a complete defence against LLM memorisation and inversion'
+    why_it_happens: |
+      Deduplication removes repeated training examples and is widely recommended
+      as a data quality practice. It is easy to implement, improves training
+      efficiency, and is reported to reduce memorisation in published research.
+      Teams implement deduplication and conclude that LLM inversion risk is managed.
+    consequence: |
+      Deduplication reduces repetition-based memorisation for common text that
+      appears many times in the corpus. However, it increases per-example
+      memorisation for unique examples because those examples receive the model''s
+      full fitting capacity without the averaging benefit of repeated exposure.
+      The deduplication paradox: unique sensitive content (a specific individual''s
+      medical note that appears exactly once) becomes more memorised after
+      deduplication, not less. For precisely the highest-sensitivity content,
+      deduplication makes the problem worse.
+    correct_approach: |
+      Deduplication is a data quality control, not a privacy control. For privacy,
+      targeted content scrubbing -- identifying and removing sensitive content
+      (PII, credentials, private documents) before training -- addresses the
+      memorisation risk for that content directly. DP training bounds the
+      memorisation degree for all content regardless of frequency. Both are
+      needed; deduplication alone is not a privacy defence.
+
+  - id: 3
+    description: 'Assuming that open-weight model releases require no inversion defence because the weights are already public'
+    why_it_happens: |
+      The reasoning is: if the weights are public, the adversary can already
+      examine them directly; inversion provides no additional capability. The
+      model is already "out" so inversion defence seems pointless.
+    consequence: |
+      Open-weight release does not eliminate inversion harm -- it eliminates
+      the query budget constraint entirely. Gradient-based inversion with white-box
+      access runs locally at the adversary''s cost with no API interaction and
+      no operator visibility. The training data encoded in the weights is as
+      recoverable as with black-box access, and faster. Open-weight release
+      means the operator cannot detect or rate-limit inversion; the only
+      remaining defence is the upstream one: DP training applied before the weights
+      are released.
+    correct_approach: |
+      Differential privacy training must be applied before release for any open-
+      weight model trained on sensitive personal data. Output perturbation and
+      query monitoring are irrelevant post-release. The DP training decision must
+      be made before the training run; it cannot be applied after the weights
+      are public. Evaluate DP training requirements as part of the release
+      decision process, not after.
+
+  - id: 4
+    description: 'Running the inversion attack only from a random initialisation and concluding low fidelity from one failed attempt'
+    why_it_happens: |
+      The optimisation is non-convex and sensitive to initialisation. A random
+      initialisation in a high-dimensional space may be far from any training
+      example and converge to a generic class prototype rather than a specific
+      training member. One failed attempt at a random starting point is interpreted
+      as evidence that the model is not invertable.
+    consequence: |
+      High-fidelity inversion often requires a warm start -- an initialisation
+      close to the target training example. An adversary with any partial knowledge
+      of the target (an approximate face image, a patient''s demographic profile,
+      a code file''s structure) initialises near the target and converges
+      efficiently. A random-start attempt evaluates the worst-case starting
+      condition, not the realistic adversary''s approach.
+    correct_approach: |
+      Evaluate inversion fidelity across multiple initialisations including warm
+      starts from distributional knowledge the adversary plausibly has. For face
+      classifiers, test with an initialisation drawn from the same demographic
+      distribution as the target. For LLMs, test with prefix-completion attacks
+      using known partial text. Random-start inversion measures a lower bound
+      on attack fidelity, not the realistic attack success rate.
+
+  - id: 5
+    description: 'Applying output perturbation uniformly across all outputs without increasing perturbation for high-inversion-risk queries'
+    why_it_happens: |
+      Output perturbation is typically deployed as a fixed-magnitude transformation
+      applied to all model outputs. The implementation is simple and uniform: add
+      noise of standard deviation σ to all confidence scores. This is operationally
+      convenient.
+    consequence: |
+      Inversion queries are distinguishable from legitimate queries by their input
+      distribution: they cluster near class prototypes and explore the input space
+      systematically. Applying the same perturbation magnitude to both inversion-
+      likely and benign queries provides suboptimal protection: benign queries
+      receive unnecessary noise (degrading product quality) while inversion queries
+      may still achieve sufficient gradient signal at the fixed σ.
+    correct_approach: |
+      Section 9.12 builds adaptive perturbation: queries that match inversion-style
+      input patterns (systematic variation, boundary proximity, OOD inputs) receive
+      higher perturbation magnitude. Benign queries near the high-density legitimate
+      use distribution receive lower perturbation. This concentrates the utility
+      cost of perturbation on the queries that are most likely adversarial while
+      minimising degradation on legitimate use.
+
+section_summary:
+  compact: |
+    Model inversion extends membership inference from identification to content
+    reconstruction: by optimising an input to maximise a classifier''s confidence
+    on a target class, the adversary reconstructs the training data features the
+    model has memorised. Fredrikson et al. 2015 demonstrated face reconstruction
+    from a face recognition API using gradient ascent in pixel space, converging
+    to a recognisable likeness of the target training subject. Gradient-based
+    inversion with white-box access is faster and more precise; black-box zeroth-
+    order inversion requires 2d queries per step but is viable against grey-box
+    APIs for moderate-dimensional inputs. LLM training data extraction (Carlini
+    et al. 2021) operates differently: generate many text completions, score by
+    perplexity ratio between target and reference model, and the low-ratio
+    candidates are likely memorised training content -- including verbatim PII
+    and credentials. Memorisation is the necessary precondition: only highly
+    memorised training examples are reconstructable. The deduplication paradox
+    makes unique sensitive content more memorised, not less. The GitHub Copilot
+    credential exposure is the most commercially significant production inversion
+    incident. Differential privacy training is the upstream formal defence that
+    bounds inversion fidelity; data scrubbing removes the highest-risk content
+    before memorisation occurs; output perturbation degrades the gradient and
+    perplexity signals at inference time.
+
+  key_takeaways:
+    - 'Model inversion reconstructs training data content; membership inference (Section 9.6) identifies which records are worth targeting'
+    - 'LLM inversion via perplexity-ratio filtering produced verbatim PII, credentials, and copyrighted text from GPT-2 in production-scale experiments'
+    - 'The deduplication paradox: deduplication increases per-example memorisation for unique sensitive content -- targeted scrubbing is the right control'
+    - 'Open-weight models require DP training before release; output perturbation and query monitoring are irrelevant after weights are public'
+    - 'Warm-start inversion from distributional knowledge is far more effective than random-start -- evaluate realistic adversary initialisation'
+    - 'The three-layer defence is: DP training (formal bound) + data scrubbing (prevent memorisation) + output perturbation (degrade inference signal)'
+
+preview_section_08:
+  title: 'Section 9.8: API Economic Abuse -- Cost Amplification, Denial-of-Wallet, Rate-Limit Exhaustion'
+  preview: |
+    Sections 9.3 through 9.7 covered attacks that steal or reconstruct model
+    intellectual property and training data. Section 9.8 covers the operational
+    variant: attacks that degrade the deployed model''s viability without
+    extracting any information. Cost amplification submits queries designed to
+    maximise per-request compute cost; denial-of-wallet sustains this over time
+    to exhaust operator budget; rate-limit exhaustion consumes allocation to
+    deny service to legitimate users. These attacks share the inference-time
+    attack surface with extraction and share the rate-limiting defence with the
+    Section 9.11 capstone, which is why they belong in Chapter 9 rather than
+    in a separate operational security chapter. The adversary economics are
+    asymmetric: a $1 attacker query can cost the operator $10 to $100 in compute,
+    making detection and rate-limiting the primary controls.
+
+metadata:
+  cross_chapter_references:
+    - ref: 'Chapter 1: overfitting and memorisation'
+      usage: 'Memorisation is the inversion precondition throughout; deduplication paradox builds on Chapter 1 regularisation concepts'
+    - ref: 'Chapter 2: gradient computation and loss functions'
+      usage: 'Gradient ascent in input space (gradient inverter); zeroth-order gradient estimation (black-box inverter)'
+    - ref: 'Chapter 3: LLM perplexity and token probability'
+      usage: 'Carlini et al. perplexity ratio signal in prose Part 5 and llm_training_extractor.py'
+    - ref: 'Chapter 8 Section 8.13: differential privacy training'
+      usage: 'Upstream defence shared with Section 9.6; bounds inversion fidelity via per-example gradient contribution bound'
+    - ref: 'Section 9.6: membership inference'
+      usage: 'Precursor attack: MIA identifies high-probability training members that Section 9.7 then inverts'
+
+  forward_references:
+    - ref: 'Section 9.9: Real-World Incident'
+      usage: 'The Carlini et al. GPT-2 extraction and Copilot credential incidents referenced in prose Parts 5 and 7 are detailed in Section 9.9'
+    - ref: 'Section 9.11: Production Query Monitor'
+      usage: 'OOD detector and perturbation pattern detector target black-box inversion query distributions'
+    - ref: 'Section 9.12: Output Watermarking and Perturbation'
+      usage: 'Adaptive perturbation (Common Mistake 5) and confidence score noise (defence Part 8) are built in Section 9.12'

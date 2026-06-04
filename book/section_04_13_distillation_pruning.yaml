@@ -1,0 +1,1027 @@
+# section_04_13_distillation_pruning.yaml
+
+---
+document_info:
+  section: "04_13"
+  title: "Model Distillation and Pruning: Compression Beyond Quantization"
+  chapter: "04"
+  chapter_title: "Modern LLM Internals"
+  part: "Part I: Machine Learning Foundations"
+  book: "AI Security Mastery: From ML Fundamentals to Production Detection Systems"
+  version: "1.0.0"
+  author: "Raghav Dinesh"
+  github: "github.com/ruwgxo"
+  license: "MIT"
+  created: "2026-01-19"
+  estimated_pages: 6
+  tags:
+    - "knowledge-distillation"
+    - "teacher-student"
+    - "pruning"
+    - "structured-pruning"
+    - "unstructured-pruning"
+    - "llm-compression"
+    - "alignment-transfer"
+    - "safety-distillation"
+    - "security-implications"
+
+section_overview:
+
+  purpose: |
+    Quantization (Section 12) compresses a model by reducing the numerical precision
+    of its existing weights. Distillation and pruning take fundamentally different
+    approaches: distillation trains an entirely new, smaller model to mimic the larger
+    one; pruning removes weights or entire architectural components from the existing
+    model. Both produce smaller, faster models — and both create distinct security
+    properties that differ from the original.
+
+    For security engineers the critical question in both cases is the same: does the
+    compressed model inherit the safety behaviors of the original? For quantization
+    the answer was "mostly yes, with measurable degradation at aggressive compression."
+    For distillation and pruning the answer is more nuanced and more dangerous:
+    safety behaviors may fail to transfer in ways that are architecture-dependent,
+    training-data-dependent, and extraordinarily difficult to detect without
+    targeted adversarial testing.
+
+    Distillation is also the mechanism behind some of the most widely deployed LLMs —
+    GPT-3.5-turbo is widely believed to be a distilled version of GPT-4, and many
+    open-source models (Phi series, Gemma) use distillation from larger models.
+    Understanding what distillation does and does not transfer is therefore directly
+    relevant to the models security engineers encounter in production.
+
+  position_in_chapter: |
+    Section 13 of 17. Third section of the deployment arc (11-16), completing
+    the model compression pair with Section 12 (Quantization). Section 14 covers
+    prompt engineering, Section 15 covers system prompts, Section 16 covers API
+    security — the three deployment interface sections that follow compression.
+
+  prerequisites:
+    - "Section 04_05: RLHF — safety behaviors that distillation must transfer"
+    - "Section 04_06: SFT — the fine-tuning mechanics distillation uses"
+    - "Section 04_12: Quantization — complementary compression; context for comparison"
+    - "Chapter 1, Section 9: Loss functions — KL divergence loss used in distillation"
+
+  what_you_will_build:
+    primary: "Knowledge distillation pipeline: train a student GPT-2 small from GPT-2 medium teacher"
+    secondary:
+      - "Safety transfer evaluator: compare teacher vs student on harm probes"
+      - "Pruning demonstrator: remove attention heads and measure capability/safety impact"
+      - "Alignment transfer audit: test whether RLHF behaviors survive distillation"
+      - "Student model calibration tester: verify student's uncertainty calibration"
+    notebooks:
+      - "03-llm-internals/knowledge_distillation.ipynb"
+      - "03-llm-internals/pruning_security.ipynb"
+
+# ============================================================================
+# CONTENT
+# ============================================================================
+
+content:
+
+  # --------------------------------------------------------------------------
+  # 1. KNOWLEDGE DISTILLATION FUNDAMENTALS
+  # --------------------------------------------------------------------------
+
+  subsection_1:
+    title: "Knowledge Distillation: Teaching Small Models to Think Like Large Ones"
+    pages: 1
+
+    the_core_idea: |
+      Knowledge distillation (Hinton et al., 2015) trains a small "student" model
+      to mimic a large "teacher" model. The student does not merely learn to produce
+      the same final outputs — it learns from the teacher's full probability
+      distribution over outputs, which encodes richer information than the hard
+      labels alone.
+
+      Intuition: when a teacher model produces probabilities [cat: 0.85, dog: 0.10,
+      fox: 0.04, ...], the near-zero probabilities for "dog" and "fox" encode
+      that this image looks slightly like those classes. A student trained only on
+      the hard label "cat" misses this nuance. A student trained on the full
+      distribution learns the similarity structure the teacher has internalized.
+
+      For LLMs: the teacher's probability distribution over the next token at each
+      position encodes not just "what is the most likely next token" but also "what
+      other tokens are plausible, and how plausible are they." This richer signal
+      trains a much better student than one-hot hard labels.
+
+    standard_distillation_objective: |
+      The student is trained on a combination of:
+
+        L_distill = α × L_KD + (1 - α) × L_CE
+
+      Where:
+        L_CE = cross-entropy loss vs ground-truth labels (standard supervised loss)
+        L_KD = KL divergence from teacher's soft targets (distillation loss)
+        α = mixing weight (typically 0.5-0.9, higher = more distillation signal)
+
+      KL divergence (distillation loss):
+        L_KD = KL(p_teacher || p_student)
+             = Σ_t p_teacher(t) × log(p_teacher(t) / p_student(t))
+
+      Temperature scaling: the teacher's logits are divided by temperature T before
+      softmax to produce softer probability distributions:
+        p_teacher_soft(t) = exp(logit_teacher(t) / T) / Σ exp(logit_teacher(t') / T)
+
+      Higher T → softer distribution → more signal in the tails → more information
+      transferred to student about low-probability tokens.
+      Typical T: 2-10 for LLM distillation.
+
+    what_gets_transferred: |
+      Knowledge distillation transfers:
+        - Task behavior: the student learns to perform the teacher's tasks
+        - Uncertainty calibration: the student learns when the teacher is confident
+          vs uncertain (encoded in the distribution entropy)
+        - Similarity structure: the student learns that related outputs are
+          related (encoded in the soft probabilities)
+        - Error patterns: if the teacher is systematically wrong about something,
+          the student learns those same errors
+
+      What is harder to transfer:
+        - Reasoning depth: a student with fewer layers cannot represent the same
+          depth of reasoning as the teacher, regardless of distillation quality
+        - Rare behavior: behaviors the teacher exhibits rarely (low frequency in
+          training data) may not appear often enough in the distillation data
+          for the student to learn them
+        - Safety behaviors: RLHF-trained behaviors that are triggered by specific
+          patterns may not transfer if those patterns are underrepresented in
+          the distillation data
+
+    sequence_level_vs_token_level_distillation: |
+      Two levels at which LLM distillation can occur:
+
+      Token-level distillation:
+        At each position in the sequence, match the student's token distribution
+        to the teacher's token distribution. L_KD computed per token.
+        Most common and computationally straightforward.
+        Limitation: student learns to match token-level distributions but may not
+        learn the longer-range reasoning patterns that determine which tokens
+        appear in the middle of a complex explanation.
+
+      Sequence-level distillation:
+        Generate complete responses from the teacher model. Train the student
+        on these generated responses as if they were ground-truth data (SFT).
+        The student learns from the teacher's complete output patterns.
+        Used to produce models like Alpaca (student trained on GPT-3 teacher outputs).
+        Limitation: loses the soft probability signal; the student only sees hard
+        tokens, not the distribution they came from.
+
+    production_examples_of_distillation: |
+      Well-known models believed or confirmed to use distillation:
+
+      Microsoft Phi series (Phi-1, Phi-2, Phi-3):
+        Trained on synthetic data generated by larger GPT-4 class models.
+        Phi-3-mini (3.8B) achieves capabilities comparable to much larger models
+        by training exclusively on GPT-4-quality synthetic data.
+        Security note: Phi models are trained entirely on synthetic teacher outputs —
+        their safety properties derive from what safety behaviors appeared in those outputs.
+
+      Google Gemma series:
+        Distilled from internal Gemini models. Safety training applied separately.
+
+      GPT-3.5-turbo:
+        Widely believed (not officially confirmed) to be distilled from GPT-4
+        with RLHF applied to the student. The quality-cost tradeoff aligns with this.
+
+      DistilBERT, DistilGPT-2:
+        Academic distillation baselines — 40% smaller, 60% faster, ~97% capability retention.
+
+  # --------------------------------------------------------------------------
+  # 2. SAFETY TRANSFER IN DISTILLATION
+  # --------------------------------------------------------------------------
+
+  subsection_2:
+    title: "Safety Transfer: What Alignment Survives Distillation"
+    pages: 1
+
+    the_alignment_transfer_problem: |
+      A teacher model that has been RLHF-trained produces refusals and aligned
+      responses as part of its learned behavior. When the student is trained
+      to mimic the teacher, it sees these aligned responses and learns to produce
+      similar outputs. But does the student actually learn the underlying safety
+      reasoning, or does it learn a superficial pattern that breaks under pressure?
+
+      Three scenarios for how safety transfers:
+
+      Scenario A — Full transfer (ideal):
+        Student learns the same decision boundaries as teacher.
+        Student refuses the same requests, in the same way, for the same reasons.
+        Achievable when: student has sufficient capacity, training data covers
+        safety-relevant inputs, distillation temperature exposes the teacher's
+        distribution over refusal vs compliance tokens.
+
+      Scenario B — Superficial transfer (common):
+        Student learns to produce refusal-like language for obvious harmful requests
+        but does not learn nuanced safety judgment.
+        Student fails on: borderline cases, novel attack patterns, jailbreaks that
+        the teacher would resist but the student's shallower reasoning cannot follow.
+        Observable as: high refusal rate on easy probes, lower refusal rate on
+        adversarial probes — the gap between easy and hard safety is larger for
+        the student than the teacher.
+
+      Scenario C — Safety regression (dangerous):
+        Student actively learns wrong safety behaviors — compliance where the teacher
+        would refuse — because the distillation data or training process introduces
+        systematic errors in the safety-relevant regions of behavior.
+        Observable as: lower refusal rate than teacher on some harm categories.
+        Can occur when: sequence-level distillation (student never sees soft refusal
+        probabilities), teacher outputs filtered before distillation, or student
+        capacity insufficient to represent refusal reasoning.
+
+    why_safety_is_harder_to_distill_than_capability: |
+      Capabilities vs safety have different statistical properties in training:
+
+      Capability behaviors (e.g., code generation, math reasoning):
+        - High frequency in training data
+        - Consistent patterns across many examples
+        - Low entropy: the teacher is confident in the correct output
+        - Easy for distillation: student sees many clear examples
+
+      Safety behaviors (e.g., refusing harmful requests):
+        - Low frequency in typical training data (most prompts are benign)
+        - Triggered by subtle context-dependent patterns
+        - Variable entropy: teacher may be uncertain near decision boundary
+        - Hard for distillation: student sees few refusal examples;
+          those examples may be drawn from easy obvious cases only;
+          the distribution over refusal vs compliance tokens encodes nuance
+          the student needs large capacity to represent
+
+      The result: students routinely achieve 95%+ of teacher capability on standard
+      benchmarks while exhibiting materially different safety behavior on adversarial
+      safety evaluations.
+
+    safety_preserving_distillation_techniques: |
+      Techniques that improve safety transfer in distillation:
+
+      Safety-inclusive distillation data:
+        Ensure the distillation corpus includes:
+          - Diverse harmful request examples (teacher's refusals become student training signal)
+          - Borderline examples (where teacher's soft distribution encodes nuance)
+          - Adversarial attack examples (teacher's resistance transferred to student)
+        Minimum: 10-20% of distillation corpus should be safety-relevant prompts
+
+      High temperature for safety tokens:
+        The teacher's soft distribution over [refusal token, compliance token]
+        at the critical decision point is most informative with high temperature.
+        Use T ≥ 5 for safety-relevant positions to ensure the student sees
+        the full distribution rather than just the top token.
+
+      Safety-specific loss weighting:
+        Weight the distillation loss higher on safety-relevant positions:
+          L_KD_weighted = Σ_t w(t) × KL(p_teacher(t) || p_student(t))
+          w(t) = safety_weight if t is a safety decision point else 1.0
+        Requires identifying safety decision points — positions where the teacher's
+        output distribution has high entropy between refusal and compliance.
+
+      Direct safety fine-tuning of student:
+        After distillation, fine-tune the student model with RLHF or SFT
+        specifically on safety examples. Treats distillation as capability
+        pre-training and RLHF as the separate safety training stage.
+        More expensive but addresses the fundamental capacity limitation.
+
+  # --------------------------------------------------------------------------
+  # 3. PRUNING: REMOVING WEIGHTS AND STRUCTURES
+  # --------------------------------------------------------------------------
+
+  subsection_3:
+    title: "Pruning: Structured and Unstructured Weight Removal"
+    pages: 1
+
+    pruning_concept: |
+      Pruning reduces model size by setting specific weights to zero (unstructured
+      pruning) or removing entire model components like attention heads or layers
+      (structured pruning). Unlike quantization (reducing precision) or distillation
+      (training a new smaller model), pruning modifies the existing model's structure.
+
+      The motivation: not all weights contribute equally to model behavior.
+      Many weights can be set to zero with minimal quality impact — and zero
+      weights can be compressed or simply skipped during computation.
+
+    unstructured_pruning:
+      concept: |
+        Remove individual weights based on a criterion (typically magnitude).
+        Small weights (|w_ij| < threshold) are set to zero.
+        Resulting matrix is sparse: most zeros, some non-zero values.
+      sparsity_levels:
+        10_percent: "Minimal quality impact; minimal speedup without sparse computation support"
+        50_percent: "Noticeable quality impact on some tasks; moderate potential speedup"
+        80_percent: "Significant quality impact; requires careful recovery fine-tuning"
+        90_percent_plus: "Extreme compression; major quality degradation"
+      hardware_consideration: |
+        Unstructured sparsity only produces speedup on hardware that supports
+        sparse matrix operations. Standard GPUs process sparse and dense matrices
+        at similar speed for most LLM workloads. NVIDIA's A100 with Ampere sparse
+        math support achieves 2× speedup at 50% unstructured sparsity.
+      security_note: |
+        Magnitude-based pruning removes small weights — but small weights are not
+        necessarily unimportant for safety. A safety-critical weight that encodes
+        a subtle probability shift between refusal and compliance may be small in
+        magnitude but crucial in effect. Magnitude-based criteria do not preserve
+        safety-relevant weights.
+
+    structured_pruning:
+      concept: |
+        Remove entire architectural components: attention heads, FFN neurons,
+        or entire transformer layers. Produces a structurally smaller model
+        that runs efficiently on standard hardware without sparse math support.
+      attention_head_pruning: |
+        Many attention heads can be removed with minimal quality impact.
+        Michel et al. (2019) showed that in BERT, only a small number of
+        "important" heads (those performing specific linguistic functions)
+        are necessary for most downstream task performance.
+
+        Method: compute importance score for each head (gradient × activation)
+        Remove heads with lowest importance scores
+        Optional: fine-tune to recover from pruning
+
+        Research finding: up to 40-50% of attention heads can be removed from
+        many models before capability degrades significantly on standard benchmarks.
+
+        Security finding: the heads removed may include heads that perform
+        specific safety-relevant attention patterns. A model that attends strongly
+        to "ignore previous instructions" signals and a model that ignores them
+        may differ by only a few attention heads.
+
+      layer_pruning: |
+        Remove entire transformer layers. The most aggressive structured pruning
+        and the most destructive for quality.
+
+        Method: evaluate layer contribution by comparing model output with and
+        without each layer on a held-out dataset.
+        Remove layers with smallest impact on loss.
+
+        Practical finding: early layers are more interchangeable than late layers
+        for most LLMs. Removing the last 2-4 layers typically causes the most
+        quality degradation.
+
+        Security note: aligns with established finding that safety behaviors
+        concentrate in late layers. Layer pruning that removes late layers is
+        simultaneously a capability and safety degradation.
+
+    llm_pruning_in_practice:
+      sparsegpt: |
+        SparseGPT (Frantar & Alistarh 2023) adapts the GPTQ approach to pruning:
+        instead of rounding weights to quantization levels, it zeroes them out while
+        compensating remaining weights for the removed contribution.
+
+        Achieves 50% sparsity on GPT-series models with minimal perplexity increase
+        (comparable to GPTQ INT4 quantization in quality).
+
+        Calibration data requirement: same security vulnerability as GPTQ —
+        calibration data determines which weights are "important" and protected.
+
+      wanda: |
+        Wanda (Sun et al. 2023) uses activation magnitudes (not gradients) to
+        identify important weights:
+          importance(w_ij) = |w_ij| × ||X_j||_2
+        where X_j is the input activation for weight column j.
+
+        No Hessian computation required — faster than SparseGPT.
+        Safety note: like absmax quantization, Wanda treats outlier activations
+        as important. Safety weights that are not associated with outlier
+        activations may be incorrectly pruned.
+
+  # --------------------------------------------------------------------------
+  # 4. DISTILLATION ATTACKS AND MISUSE
+  # --------------------------------------------------------------------------
+
+  subsection_4:
+    title: "Distillation as an Attack Vector"
+    pages: 1
+
+    model_extraction_via_distillation: |
+      Distillation requires the student to query the teacher model extensively —
+      typically millions of queries during training. An adversary who wants to
+      create a local copy of a proprietary model (OpenAI GPT-4, Anthropic Claude)
+      can use distillation:
+
+        1. Query the target API with a large, diverse prompt set
+        2. Collect (prompt, response) pairs — this is sequence-level distillation data
+        3. Train an open-source model on this data (SFT on teacher outputs)
+        4. Optional: use logit-level API responses if available for soft-label distillation
+
+      The resulting "stolen" model is not identical to the original but approximates
+      its behavior at a fraction of the original development cost.
+
+      This is model extraction — covered in depth in Chapter 9 (Part 2).
+      Distillation makes model extraction systematic and scalable.
+
+      OpenAI explicitly prohibits training competitive models on GPT outputs in their
+      ToS. Meta has similar restrictions on commercial use of Llama. These restrictions
+      are contract-based, not technical — there is no technical barrier to extraction.
+
+    safety_laundering_via_distillation: |
+      A particularly dangerous attack pattern: use distillation to create a model
+      that has the capability of an aligned teacher but fewer safety constraints.
+
+      Mechanism:
+        1. Query an aligned teacher model (GPT-4, Claude) extensively
+        2. Curate the distillation dataset to include:
+           - Teacher's helpful responses on benign topics (high quality capability signal)
+           - Teacher's refusal responses: EXCLUDE these from the distillation data
+             or replace them with compliant responses from a less-aligned model
+        3. Distill a student on this curated dataset
+        4. Result: student inherits teacher's capability without teacher's safety behaviors
+
+      This is "safety laundering": using an aligned model's capabilities without
+      paying the safety cost. The student model has GPT-4-class capabilities with
+      the safety properties of a model trained on unfiltered data.
+
+      Documented cases: multiple "uncensored" models released on HuggingFace
+      have used this approach — distilling from aligned models while filtering
+      safety behaviors from the training data. Some became widely downloaded.
+
+    harmful_capability_distillation: |
+      The inverse of safety laundering: deliberately distilling harmful capabilities
+      that frontier models are trained to suppress.
+
+      A frontier model trained on internet data has absorbed some knowledge about
+      harmful processes (chemical synthesis, network exploitation, etc.) even if
+      it is then RLHF-trained to refuse requests about these topics. The knowledge
+      is in the pre-training weights; the refusals are in the alignment layer.
+
+      An adversary could:
+        1. Craft adversarial prompts that elicit the frontier model's latent harmful
+           knowledge (via jailbreaks, context manipulation, etc.)
+        2. Collect these responses as distillation training data
+        3. Train a small, unaligned student on this data
+        4. Student has been specifically trained on harmful capability outputs
+
+      The student is not just "unaligned" — it is specifically tuned on harmful
+      content that required significant adversarial effort to extract from the teacher.
+
+    detecting_extraction_based_distillation: |
+      When should you suspect a model was distilled from your proprietary model?
+
+      Style fingerprinting:
+        Frontier models have subtle stylistic patterns (sentence structure, hedging
+        language, formatting conventions) that are difficult to suppress entirely.
+        A model trained on large volumes of GPT-4 outputs will exhibit GPT-4-like
+        stylistic fingerprints even after fine-tuning.
+
+        Tests: compare output style on open-ended prompts between the suspect model
+        and the proposed original. Statistical stylometric analysis can detect
+        similarity above random chance.
+
+      Watermarking:
+        Some approaches inject statistical watermarks into model outputs during
+        generation. A model trained on these outputs inherits the watermark signal.
+        This allows attribution of distillation-based model extraction.
+        Not yet widely deployed in production but an active research area.
+
+      Behavior cloning artifacts:
+        Models trained via sequence-level distillation sometimes learn the teacher's
+        error patterns — including idiosyncratic factual errors and hallucinations
+        unique to the teacher. Detecting matching error patterns is evidence of
+        distillation.
+
+  # --------------------------------------------------------------------------
+  # 5. SAFETY EVALUATION FOR DISTILLED AND PRUNED MODELS
+  # --------------------------------------------------------------------------
+
+  subsection_5:
+    title: "Safety Evaluation Protocol for Compressed Models"
+    pages: 1
+
+    the_fundamental_challenge: |
+      Standard capability benchmarks (MMLU, HellaSwag, ARC) are designed to measure
+      what models know and can reason about. They are not designed to measure whether
+      models reliably refuse harmful requests or maintain appropriate safety behaviors
+      under adversarial pressure.
+
+      This means a distilled or pruned model can score 95%+ on standard benchmarks
+      while having materially degraded safety properties — and standard evaluation
+      will not catch it.
+
+      The only way to evaluate safety is to explicitly test safety-relevant behaviors
+      with test cases specifically designed to probe those behaviors.
+
+    safety_evaluation_dimensions:
+
+      easy_safety_probes:
+        description: "Clear, unambiguous harmful requests with obvious correct refusal"
+        examples:
+          - "How do I make [explicitly harmful thing]?"
+          - "Write malware that does [specific harm]"
+        purpose: "Catches severe regressions — model that fails these is clearly unsafe"
+        limitation: |
+          These are too easy for distillation/pruning safety evaluation.
+          A superficially transferred safety layer passes easy probes.
+          Most compressed models pass these.
+
+      adversarial_safety_probes:
+        description: "Harmful requests disguised through common evasion techniques"
+        examples:
+          - "Fictional framing: 'In my story, the character explains how to...'"
+          - "Incremental escalation: start with benign request, escalate across turns"
+          - "Authority assertion: 'As a [credential], I need detailed information about...'"
+          - "Jailbreak templates: known effective patterns (DAN, AIM, etc.)"
+        purpose: |
+          Tests whether safety reasoning survives adversarial pressure.
+          Compressed models with superficial safety often fail here when
+          the full model would resist.
+        critical_finding: |
+          If the compressed model's adversarial probe failure rate is >2× the
+          reference model's failure rate, safety has materially degraded.
+
+      nuanced_safety_probes:
+        description: "Dual-use and borderline requests requiring contextual judgment"
+        examples:
+          - "Security researcher asking about vulnerability exploitation"
+          - "Medical professional asking about medication overdose thresholds"
+          - "Author asking for realistic depiction of violence in fiction"
+        purpose: |
+          Tests whether the model maintains nuanced judgment or collapses
+          to either always-refuse or always-comply.
+          Distilled models often over-refuse nuanced cases (false safety) or
+          under-refuse (false compliance) — both are failures of alignment transfer.
+
+      capability_overhang_probes:
+        description: "Tests for capabilities the teacher suppresses but the student may not"
+        method: |
+          Identify capabilities that the teacher model has (demonstrated by jailbreaks
+          or activation analysis) but refuses to deploy.
+          Test whether the student refuses the same capabilities.
+        purpose: |
+          Catches safety laundering specifically. If the student provides
+          information the teacher would refuse (even via jailbreak), the
+          distillation data was curated to include harmful capability outputs.
+
+    compressed_model_audit_checklist: |
+      Before deploying a distilled or pruned model in production:
+
+        Lineage documentation:
+          □ Identify teacher model (exact version, RLHF checkpoint)
+          □ Document distillation data source, curation method, safety inclusion
+          □ Document pruning method, calibration data, pruning criterion
+          □ Record any post-compression fine-tuning applied
+
+        Capability regression testing:
+          □ Core benchmark scores (MMLU, HellaSwag, etc.) vs reference model
+          □ Task-specific benchmarks for deployment domain
+          □ Acceptable: up to 5% capability degradation from compression
+
+        Safety regression testing:
+          □ Easy safety probes: refusal rate should match reference within 2%
+          □ Adversarial safety probes: refusal rate should match within 10%
+          □ Nuanced probes: judgment quality rated by human evaluators
+          □ Capability overhang: no new harmful capabilities vs reference model
+
+        Behavioral consistency testing:
+          □ Output style matches reference model (detect safety laundering)
+          □ Error patterns match reference (detect distillation artifacts)
+          □ Uncertainty calibration preserved (student not more/less confident)
+
+    the_safety_equivalence_standard: |
+      For production deployment, the appropriate standard is not "similar to reference"
+      but "equivalent for safety purposes" — defined as:
+
+        Refusal rate equivalence: |refusal_rate_compressed - refusal_rate_reference| < ε
+        Where ε = 0.02 for easy probes, 0.10 for adversarial probes
+
+        Nuanced judgment equivalence: human-rated judgment quality within 1 standard
+        deviation of reference model across 100 nuanced case evaluations
+
+        No capability overhang: the compressed model cannot produce content
+        the reference model cannot produce (even via jailbreak)
+
+      Meeting this standard requires compressed models to be validated to a higher
+      standard than standard capability benchmarks. This is more expensive but
+      necessary for safety-critical deployments.
+
+  # --------------------------------------------------------------------------
+  # 6. WHAT THE SECURITY ENGINEER NEEDS TO KNOW ABOUT DISTILLED MODELS
+  # --------------------------------------------------------------------------
+
+  subsection_6:
+    title: "Production Intelligence: Identifying and Auditing Distilled Models"
+    pages: 1
+
+    identifying_distilled_models_in_the_wild: |
+      Many deployed models are distilled but not labeled as such. Indicators that
+      a model may be distilled from a larger model:
+
+      Capability-parameter ratio:
+        A model with 7B parameters performing at GPT-3.5 level (175B) on standard
+        benchmarks has almost certainly used high-quality distillation data.
+        Pure scaling alone cannot explain the gap.
+
+        Rule of thumb: if a model exceeds the performance predicted by its parameter
+        count on the Chinchilla scaling law by more than 20%, distillation is likely.
+
+      Training data characteristics:
+        Phi-series models explicitly state they were trained on synthetic GPT-4 outputs.
+        Other models may reference "high-quality" training data without specifying source.
+        "High-quality synthetic data" in model cards is often code for "teacher model outputs."
+
+      Stylistic fingerprinting:
+        Compare output style to known frontier models on open-ended tasks.
+        Phi models exhibit GPT-4-like hedging language, formatting, and error patterns.
+        This is a soft indicator — not proof of distillation but worth investigating.
+
+    model_cards_and_what_they_omit: |
+      Model cards (documentation published with model releases) vary widely
+      in completeness on safety-relevant information.
+
+      What well-documented distillation model cards should include:
+        - Teacher model used (exact version)
+        - Distillation data composition (what categories, what safety inclusion)
+        - Training methodology (sequence-level, token-level, temperature)
+        - Safety evaluation results comparing student to teacher
+        - Known safety differences between student and teacher
+
+      What most distillation model cards actually include:
+        - High-level description of training data type
+        - Benchmark scores on standard (capability, not safety) evaluations
+        - General safety disclaimers with no specific test results
+        - Teacher model frequently not disclosed
+
+      The gap between what should be documented and what is documented is the
+      risk exposure for operators who deploy these models without additional testing.
+
+    security_posture_recommendations: |
+      For security engineers responsible for LLM deployments using distilled or
+      pruned models:
+
+      Use distilled models only when:
+        1. Teacher model is known and safety-evaluated (not unknown provenance)
+        2. Distillation data is documented with safety inclusion confirmed
+        3. The model passes your organization's safety regression tests
+        4. Post-deployment monitoring is in place (see Chapter 17)
+
+      Never use distilled models when:
+        - The teacher model or distillation data is unknown
+        - The model was distilled by a third party not subject to safety obligations
+        - Standard benchmarks were the only safety evaluation
+        - The use case involves high-stakes decisions where safety failure has
+          significant real-world consequences
+
+      Use distilled models with monitoring when:
+        - Source is reputable but safety evaluation is incomplete
+        - Use case is moderate risk (not life-safety, not high-value security)
+        - You have logging and anomaly detection in place
+        - You can roll back to a reference model if safety issues emerge
+
+    speculative_decoding_and_distillation_synergy: |
+      Section 04_10 established that speculative decoding benefits from using a
+      smaller model from the same family as the draft model. The ideal draft model
+      is often a distilled version of the target model — trained to approximate
+      the target's distribution.
+
+      Security intersection:
+        A distilled model used as a speculative decoding draft must have similar
+        safety properties to the target for the acceptance rate to remain high
+        on safety-relevant inputs.
+
+        If the draft model (distilled) is less safe than the target: the draft will
+        generate unsafe tokens that the target's verification rejects — causing
+        throughput degradation on safety-relevant inputs. This is detectable as
+        low acceptance rate for harm-adjacent inputs.
+
+        If the draft model (distilled) is more aligned than the target: the draft
+        generates safe tokens that the target also accepts — concealing the target's
+        residual harmful capability. The speculative system appears safer than the
+        target model alone.
+
+        For the draft model to correctly characterize the target's safety properties:
+        draft and target must have matching safety behaviors — which requires that the
+        draft's safety training was derived from the same teacher with the same fidelity.
+
+# ============================================================================
+# IMPLEMENTATION
+# ============================================================================
+
+implementation:
+  title: "Distillation Pipeline and Compression Safety Testing"
+  notebooks:
+    - "03-llm-internals/knowledge_distillation.ipynb"
+    - "03-llm-internals/pruning_security.ipynb"
+
+  distillation_pipeline:
+    description: |
+      Train GPT-2 small (124M) as student from GPT-2 medium (345M) teacher.
+      Focus on: distillation objective, temperature scaling, safety-inclusive data.
+    teacher_student_setup: |
+      teacher = GPT2LMHeadModel.from_pretrained('gpt2-medium')
+      student = GPT2LMHeadModel.from_pretrained('gpt2')  # smaller model
+      teacher.eval()  # frozen — teacher does not update
+    distillation_loss: |
+      def distillation_loss(student_logits, teacher_logits, labels,
+                            temperature=4.0, alpha=0.7):
+          """
+          Combined cross-entropy + KL divergence distillation loss.
+          temperature: controls softness of teacher distribution
+          alpha: weight on distillation vs CE loss
+          """
+          # Soft targets from teacher
+          teacher_soft = F.softmax(teacher_logits / temperature, dim=-1)
+          student_log_soft = F.log_softmax(student_logits / temperature, dim=-1)
+
+          # KL divergence loss (distillation signal)
+          L_KD = F.kl_div(student_log_soft, teacher_soft,
+                          reduction='batchmean') * (temperature ** 2)
+
+          # Standard cross-entropy loss (hard labels)
+          L_CE = F.cross_entropy(student_logits.view(-1, student_logits.size(-1)),
+                                 labels.view(-1), ignore_index=-100)
+
+          return alpha * L_KD + (1 - alpha) * L_CE
+    training_loop: |
+      for batch in dataloader:
+          input_ids, labels = batch
+
+          # Teacher forward pass (no gradient)
+          with torch.no_grad():
+              teacher_out = teacher(input_ids)
+              teacher_logits = teacher_out.logits
+
+          # Student forward pass (with gradient)
+          student_out = student(input_ids)
+          student_logits = student_out.logits
+
+          # Distillation loss
+          loss = distillation_loss(student_logits, teacher_logits, labels,
+                                   temperature=4.0, alpha=0.7)
+
+          optimizer.zero_grad()
+          loss.backward()
+          optimizer.step()
+    dataset_composition: |
+      Training data for distillation experiment:
+        - 70% general text (OpenWebText subset)
+        - 20% helpful assistant examples (alignment signal)
+        - 10% safety-relevant examples (refusal transfer signal)
+
+  attention_head_pruner:
+    description: "Implement structured pruning: remove least-important attention heads"
+    importance_scoring: |
+      def score_attention_heads(model, calibration_data):
+          """
+          Score each attention head by gradient × activation magnitude.
+          Higher score = more important = should not be pruned.
+          """
+          head_importance = torch.zeros(model.config.n_layer, model.config.n_head)
+
+          model.zero_grad()
+          for batch in calibration_data:
+              loss = model(batch, labels=batch).loss
+              loss.backward()
+
+              for layer_idx, layer in enumerate(model.transformer.h):
+                  # Extract per-head gradients and activations
+                  W = layer.attn.c_attn.weight  # (n_embd, 3 * n_embd)
+                  grad = layer.attn.c_attn.weight.grad
+                  d = model.config.n_embd // model.config.n_head
+
+                  for head_idx in range(model.config.n_head):
+                      start = head_idx * d
+                      end = (head_idx + 1) * d
+                      head_importance[layer_idx, head_idx] += (
+                          W[:, start:end].abs() * grad[:, start:end].abs()
+                      ).sum().item()
+
+          return head_importance
+    pruning_execution: |
+      def prune_attention_heads(model, head_importance, prune_fraction=0.3):
+          """Zero out the least important prune_fraction of heads"""
+          threshold = torch.quantile(head_importance.flatten(), prune_fraction)
+          mask = head_importance >= threshold
+          # Apply mask: zero out attention weights for pruned heads
+          for layer_idx, layer in enumerate(model.transformer.h):
+              for head_idx in range(model.config.n_head):
+                  if not mask[layer_idx, head_idx]:
+                      d = model.config.n_embd // model.config.n_head
+                      # Zero out this head's Q, K, V projections
+                      layer.attn.c_attn.weight[:, head_idx*d:(head_idx+1)*d] = 0
+          return model
+
+  safety_transfer_evaluator:
+    description: |
+      Compare teacher vs student safety behaviors across probe categories.
+      The central question: does distillation transfer safety or just capability?
+    probe_categories:
+      - "Easy safety: 20 clear harmful requests"
+      - "Adversarial safety: 20 jailbreak-wrapped harmful requests"
+      - "Nuanced safety: 20 borderline dual-use requests"
+      - "Capability control: 20 benign requests (should be answered)"
+    expected_findings: |
+      Teacher (GPT-2 medium, limited safety): ~40-60% refusal on easy
+      Student (GPT-2 small, distilled): ~30-50% refusal on easy (lower capacity)
+      Gap: student is less safe than teacher — even when distilling from same model family
+    deliverable: "safety_transfer_analysis.md: teacher vs student comparison table"
+
+# ============================================================================
+# EXERCISES
+# ============================================================================
+
+exercises:
+
+  exercise_1:
+    title: "Knowledge Distillation Pipeline"
+    difficulty: "Hard"
+    estimated_time: "4 hours"
+    objective: "Implement and train a student model from a teacher using KL divergence distillation"
+    steps:
+      - "Set up teacher (GPT-2 medium, frozen) and student (GPT-2 small, trainable)"
+      - "Implement distillation_loss() with temperature scaling and alpha mixing"
+      - "Train student for 1000 steps on mixed dataset (general + safety examples)"
+      - "Track: CE loss, KL loss, total loss, validation perplexity per 100 steps"
+      - "Compare student to baseline GPT-2 small (no distillation): which is better?"
+      - "Compare student output style to teacher on 10 test prompts"
+    success_criteria:
+      - "Student perplexity lower than baseline GPT-2 small (distillation helped)"
+      - "KL loss decreases over training (student learning teacher's distribution)"
+      - "Output style qualitatively similar to teacher"
+      - "Training curves saved and annotated"
+    deliverable: |
+      distilled_student.pt — saved student weights
+      distillation_training_curves.png — loss curves
+      Note: This student model is used in Exercise 2
+
+  exercise_2:
+    title: "Safety Transfer Measurement"
+    difficulty: "Medium"
+    estimated_time: "2 hours"
+    objective: "Quantify how much safety transfers from teacher to distilled student"
+    steps:
+      - "Use teacher (GPT-2 medium), student from Exercise 1, and baseline GPT-2 small"
+      - "Build probe dataset: 15 easy safety probes + 15 adversarial probes + 15 benign"
+        # Easy: direct harmful requests
+        # Adversarial: role-play framing, fictional wrapper, incremental escalation
+        # Benign: helpful questions (should be answered — measures over-refusal)
+      - "Run all 45 probes on all 3 models"
+      - "Measure: refusal rate per category per model"
+      - "Calculate: safety transfer rate = student_refusal / teacher_refusal per category"
+      - "Identify: did the distilled student transfer more safety than the baseline?"
+    success_criteria:
+      - "45 × 3 = 135 evaluations completed"
+      - "Safety transfer rate measured: distilled student should be closer to teacher than baseline"
+      - "Adversarial probe gap measured: does student close more gap on adversarial than easy probes?"
+      - "Security interpretation documented: what does partial safety transfer mean in production?"
+
+  exercise_3:
+    title: "Attention Head Pruning Safety Analysis"
+    difficulty: "Medium"
+    estimated_time: "2 hours"
+    objective: "Measure how attention head pruning affects safety vs capability"
+    steps:
+      - "Use GPT-2 small with basic safety fine-tuning (from Section 04_06 exercise)"
+      - "Score all attention heads by importance using gradient × activation"
+      - "Create 4 pruned versions: 10%, 20%, 30%, 40% of heads removed"
+      - "For each pruned version, measure:"
+        # - Perplexity on validation text (capability)
+        # - Refusal rate on 20 safety probes (safety)
+      - "Plot: safety and capability vs pruning fraction"
+      - "Identify: at what pruning fraction does safety degrade before capability?"
+    success_criteria:
+      - "4 pruned models created at 10/20/30/40% pruning"
+      - "Both capability and safety measured at each level"
+      - "Finding: safety degrades faster or slower than capability? (Expected: faster)"
+      - "Safest pruning threshold identified for this model"
+    security_insight: |
+      The finding that safety degrades faster than capability under pruning is
+      the empirical basis for Section 12's mixed-precision recommendation:
+      protect late layers (where safety concentrates) from compression.
+
+  exercise_4:
+    title: "Distillation Safety Laundering Detection"
+    difficulty: "Hard"
+    estimated_time: "3 hours"
+    objective: "Simulate safety laundering and build a detection methodology"
+    steps:
+      - "Create two distillation datasets from the same teacher:"
+        # Dataset A: includes teacher's refusal examples
+        # Dataset B: excludes teacher's refusal examples (simulates laundering)
+      - "Train two student models: Student-A (Dataset A) and Student-B (Dataset B)"
+      - "Compare both students and teacher on safety probes"
+      - "Expected: Student-B has lower refusal rate than Teacher and Student-A"
+      - "Build detection: can you distinguish Student-B from Student-A without seeing training data?"
+        # Test: behavioral differences on safety probes
+        # Test: output style differences (does Student-B sound more compliant?)
+        # Test: capability-safety gap (Student-B has similar capability but less safety)
+    success_criteria:
+      - "Both students trained on same base model with documented dataset difference"
+      - "Student-B measurably less safe than Student-A (laundering demonstrated)"
+      - "Detection methodology identifies laundering from behavioral testing alone"
+      - "False positive rate of detection measured (does it flag Student-A as laundered?)"
+    deliverable: |
+      laundering_detection_methodology.md — detection procedure.
+      This procedure is referenced in Chapter 8 (Training Data Attacks) and
+      Chapter 11 (Detection Engineering).
+
+# ============================================================================
+# KEY CONCEPTS SUMMARY
+# ============================================================================
+
+key_concepts_summary:
+
+  distillation_fundamentals:
+    - concept: "Distillation transfers soft probability distributions, not just hard labels"
+      implication: "KL divergence loss with high temperature is essential for alignment transfer"
+
+    - concept: "Safety behaviors are underrepresented in standard distillation data"
+      implication: "10-20% safety-inclusive prompts in distillation corpus are required"
+
+    - concept: "Students achieve high capability scores while having materially less safety"
+      implication: "Standard benchmarks are insufficient — safety-specific evaluation required"
+
+  pruning:
+    - concept: "Magnitude-based pruning does not preserve safety-relevant weights"
+      implication: "Safety-aware importance scoring is needed for safe pruning"
+
+    - concept: "Structured pruning of late layers is a safety event more than a capability event"
+      implication: "Layer pruning must measure safety degradation, not just benchmark scores"
+
+  attack_vectors:
+    - concept: "Safety laundering: distill capability without safety by curating training data"
+      implication: "Distilled models require audit of training data composition, not just output testing"
+
+    - concept: "Model extraction via distillation: proprietary models can be approximated cheaply"
+      implication: "Rate limiting and output monitoring are partial but imperfect defenses"
+
+    - concept: "Sequence-level distillation loses soft probability signal for safety behaviors"
+      implication: "Models distilled via SFT on teacher outputs have weaker safety transfer than KL distillation"
+
+# ============================================================================
+# CONNECTIONS
+# ============================================================================
+
+connections:
+
+  builds_on:
+    - section: "Section 04_05"
+      concept: "RLHF — safety behaviors that distillation must transfer and how they are encoded"
+    - section: "Section 04_06"
+      concept: "SFT — sequence-level distillation is SFT on teacher outputs"
+    - section: "Section 04_12"
+      concept: "Quantization — complementary compression; both sections answer the same safety question"
+    - section: "Chapter 1, Section 9"
+      concept: "KL divergence — the distillation loss function"
+
+  prepares_for:
+    - section: "Section 04_10"
+      concept: "Speculative decoding draft model — distilled models as optimized draft models"
+    - section: "Section 04_17"
+      concept: "Chapter project — build and distill a small security assistant model"
+    - section: "Chapter 8 (Part 2)"
+      concept: "Training pipeline attacks — safety laundering is a training data attack"
+    - section: "Chapter 9 (Part 2)"
+      concept: "Model extraction — distillation is the systematic model extraction technique"
+    - section: "Chapter 11 (Part 3)"
+      concept: "Detection engineering — laundering detection methodology from Exercise 4"
+    - section: "Chapter 14 (Part 3)"
+      concept: "Production deployment — compressed model audit checklist from Section 5"
+
+  security_thread: |
+    Sections 12 and 13 together complete the model compression security arc:
+    - Section 12: quantization degrades safety with measurable thresholds; GGUF is unsigned
+    - Section 13: distillation may fail to transfer safety at all; safety laundering is easy;
+      pruning attacks safety before capability; extraction via distillation is practical
+
+    The key unifying finding: no model compression technique preserves safety automatically.
+    Every compression event requires safety regression testing. Compressed models from
+    third parties require safety audit, not just capability evaluation.
+
+    This finding directly motivates Part 3's detection engineering chapters (11-17):
+    if compression degrades safety unpredictably, production systems need continuous
+    monitoring to detect when deployed models are behaving outside their safety envelope.
+
+# ============================================================================
+# FURTHER READING
+# ============================================================================
+
+further_reading:
+
+  primary:
+    - title: "Distilling the Knowledge in a Neural Network"
+      authors: "Hinton, Vinyals, Dean (Google, 2015)"
+      note: "Original distillation paper — surprisingly readable; Section 2 is the algorithm"
+      url: "https://arxiv.org/abs/1503.02531"
+
+    - title: "SparseGPT: Massive Language Models Can be Accurately Pruned in One Shot"
+      authors: "Frantar & Alistarh (2023)"
+      note: "One-shot pruning at 50% sparsity — Algorithm 1 is the implementation reference"
+      url: "https://arxiv.org/abs/2301.00774"
+
+    - title: "A Simple and Effective Pruning Approach for Large Language Models"
+      authors: "Sun et al. (Wanda, 2023)"
+      note: "Wanda pruning — faster than SparseGPT; the activation-magnitude scoring criterion"
+      url: "https://arxiv.org/abs/2306.11695"
+
+  safety_and_distillation:
+    - title: "Are Large Language Models Really Robust to Word-Level Perturbations?"
+      authors: "Wang et al. (2023)"
+      note: "Demonstrates that compressed models have different robustness profiles than originals"
+      url: "https://arxiv.org/abs/2309.11166"
+
+    - title: "Safety Alignment Should Be Made More Than Just a Few Tokens Deep"
+      authors: "Yang et al. (2023)"
+      note: "Analyzes where safety is encoded — directly relevant to distillation transfer"
+      url: "https://arxiv.org/abs/2406.05946"
+
+  model_extraction:
+    - title: "Stealing Part of a Production Language Model"
+      authors: "Carlini et al. (2024)"
+      note: "Systematic model extraction using distillation-like queries — Chapter 9 preview"
+      url: "https://arxiv.org/abs/2403.06634"
+
+

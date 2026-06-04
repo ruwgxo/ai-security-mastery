@@ -1,0 +1,1227 @@
+# section_10_07_transferability.yaml
+
+---
+document_info:
+  title: 'Transferability: Surrogate-Based Cross-Model Adversarial Examples'
+  chapter: 10
+  section: 7
+  section_code: '1007'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-05-23'
+  estimated_pages: 6
+  estimated_reading_time: '45-55 minutes'
+
+section_overview:
+  one_line_summary: 'Adversarial examples crafted against a surrogate fool the victim at 20-80% rates; the Chapter 9 distillation surrogate is the transfer vehicle, reducing victim query cost to near-zero after the extraction campaign.'
+  why_this_section_exists: |
+    Section 10.7 is the mechanistic bridge that closes the Chapter 9 to Chapter 10 kill chain.
+    Chapter 9 produced a surrogate model via distillation. Chapter 10 Sections 10.3-10.6 built
+    adversarial attacks. Section 10.7 connects them: adversarial examples crafted against the
+    surrogate with white-box gradient access transfer to the victim at rates determined by
+    architecture and training distribution similarity. This is the cheapest and most practical
+    black-box adversarial attack in production environments: the query cost to the victim is
+    amortised across the Chapter 9 extraction campaign, leaving near-zero per-example cost.
+  position_in_chapter: |
+    Section 10.7 closes the attack sequence (Sections 10.3-10.7) and completes the extraction-to-
+    evasion kill chain introduced in Section 10.1. Every subsequent defence section (10.11-10.15)
+    must be evaluated against transfer attacks, not just direct white-box attacks, because transfer
+    is the dominant black-box adversarial threat in production.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain why adversarial examples transfer: models trained on the same distribution learn aligned decision boundary geometry'
+    - 'Describe the two-phase transfer attack: Chapter 9 extraction phase (build surrogate) followed by Chapter 10 transfer phase (craft adversarial examples, submit to victim)'
+    - 'State the typical transfer rate ranges for well-matched and mismatched model pairs and the factors that determine which range applies'
+    - 'Explain ensemble transfer attacks: why averaging gradients across multiple surrogates reduces overfitting to any single boundary and improves transfer'
+    - 'Explain input diversity augmentation and translation-invariant gradient as techniques for improving cross-model transfer'
+    - 'State the detection gap: why transfer examples leave no query campaign footprint on the victim API'
+
+  skills:
+    - 'Measure transfer rate from a source model to a victim across epsilon values and attack methods'
+    - 'Implement the end-to-end surrogate pipeline: approximate victim, generate adversarial examples, measure victim transfer'
+    - 'Implement ensemble gradient averaging across multiple surrogates for improved transfer'
+    - 'Generate a transfer rate heatmap across multiple model architecture combinations'
+    - 'Analyse Track 7 detection rates against transfer adversarial examples vs direct adversarial examples'
+
+  security_mindset:
+    - 'Recognise the kill-chain dependency: a Chapter 9 extraction campaign is the prerequisite for a Chapter 10 transfer attack at scale; defending extraction reduces transfer attack capacity'
+    - 'Understand that transfer rate asymmetry means the same surrogate quality can produce very different transfer rates depending on which direction (surrogate->victim vs victim->surrogate)'
+    - 'Appreciate that PGD robustness is measured against the model''s own gradient; a model can be PGD-robust but transfer-vulnerable because transfer attacks exploit shared boundary geometry rather than exact gradient direction'
+
+prerequisites:
+  - 'Section 9.4: distillation attacks (surrogate model is the Ch9 output that serves as the Ch10 transfer vehicle)'
+  - 'Section 10.3: FGSM (used as the white-box attack against the surrogate in the transfer pipeline)'
+  - 'Section 10.4: PGD (ensemble PGD is the strongest transfer attack; used in surrogate_pipeline.py)'
+  - 'Section 10.5: C&W (high-kappa C&W produces the most transferable adversarial examples)'
+  - 'Section 10.6: black-box attacks (transfer attacks replace these when a surrogate is available)'
+
+prose_content:
+
+  part_1:
+    title: 'Why Transferability Exists: Shared Decision Boundary Geometry'
+    body: |
+      Adversarial transferability was noted by Szegedy et al. in 2013 and systematised by Papernot
+      et al. in 2016. The core observation is that adversarial examples crafted against one model
+      often fool a completely different model trained on the same data, even when the two models
+      have different architectures, different training hyperparameters, and were never exposed to
+      each other''s weights.
+
+      The explanation comes from the nature of generalisation. When many different models are trained
+      on the same input-output distribution, they converge to similar input-output mappings in the
+      regions of the input space where training data is dense. The decision boundaries of these
+      models, while not identical, are geometrically aligned in high-data regions. An adversarial
+      perturbation that crosses the source model''s boundary in a particular direction is likely to
+      cross nearby boundaries of other models trained on the same distribution, because the boundary
+      geometry is similar.
+
+      The alignment is strongest in the direction of the gradient: the gradient of model A''s loss
+      with respect to the input points in roughly the same direction as the gradient of model B''s
+      loss, because both gradients point away from the decision boundary in the input space.
+      FGSM''s gradient sign step exploits this alignment directly: sign(nabla_x J_A) is correlated
+      with sign(nabla_x J_B), and a step along one is likely also a step along the other.
+
+      The alignment degrades when models differ in architecture family, training objective, or
+      training data. A ResNet and a VGG trained on ImageNet share more boundary geometry than a
+      ResNet trained on ImageNet and a transformer fine-tuned on a domain-specific dataset.
+      Transfer rate measurement (deliverable 1) quantifies this degradation across architecture
+      pairs -- the output is the operational intelligence the adversary uses to evaluate whether
+      their surrogate is a good enough transfer vehicle.
+
+  part_2:
+    title: 'The Chapter 9 to Chapter 10 Kill Chain'
+    body: |
+      Transfer attacks depend on a prerequisite: the adversary must have a surrogate model that
+      approximates the victim''s decision boundary. Section 9.4 established exactly this: the
+      distillation pipeline queries the victim API, labels a surrogate training set with the victim''s
+      outputs, and trains a surrogate that matches the victim''s behaviour. The surrogate is the
+      Chapter 9 extraction product. Section 10.7 is its use as a Chapter 10 attack vehicle.
+
+      The two-phase kill chain proceeds as follows. Phase 1 (Chapter 9): the adversary runs a
+      distillation extraction campaign against the victim API. This requires 10,000-100,000 victim
+      API queries and produces a surrogate model with white-box access. Phase 2 (Chapter 10): the
+      adversary generates adversarial examples against the surrogate using any white-box method
+      (FGSM, PGD, C&W). This requires no victim API queries -- only forward-backward passes against
+      the local surrogate. The adversary then submits the resulting adversarial examples to the
+      victim API -- typically one per target input, producing a near-zero per-example victim query
+      cost.
+
+      The total victim query cost for the transfer attack is: Phase 1 queries + Phase 2 queries.
+      Phase 2 victim queries is zero. Phase 1 queries is the extraction budget, amortised across
+      however many adversarial examples the adversary generates. If the adversary needs 1,000
+      adversarial examples, the per-example victim query cost is 10-100 queries (extraction budget
+      divided by number of adversarial examples). This is orders of magnitude cheaper than running
+      NES (1,000-10,000 queries per example) or Boundary Attack (10,000-100,000 per example)
+      directly against the victim.
+
+      The defence implication follows directly: blocking Chapter 9 extraction (Track 6 rate limiting,
+      output watermarking, adaptive rate limits) reduces the adversary''s transfer attack capacity.
+      Without a good surrogate, transfer rates fall from 40-80% to 10-30%. Defending against
+      extraction is therefore partial defence against transfer attacks.
+
+  part_3:
+    title: 'Transfer Rate Measurement and Influencing Factors'
+    body: |
+      Transfer rate is defined as the fraction of adversarial examples that fool the source model
+      AND also fool the victim model. It is not the fraction of natural inputs for which an adversarial
+      example can be transferred -- that requires first having a successful adversarial example against
+      the source. The measurement is: generate N adversarial examples against the source, submit all
+      N to the victim, count how many both fool the source and fool the victim.
+
+      Four factors determine transfer rate in decreasing order of impact.
+
+      Architecture family match is the strongest predictor. Same-family models (ResNet-50 to ResNet-101,
+      VGG-16 to VGG-19) achieve 50-80% transfer. Cross-family models (ResNet to VGG, CNN to transformer)
+      achieve 20-40%. The shared inductive biases within an architecture family produce more aligned
+      gradient directions, even when model capacity differs.
+
+      Training distribution match is the second factor. Models trained on exactly the same dataset
+      (different random seeds or data orderings) transfer at higher rates than models trained on
+      related but different datasets. The victim''s decision boundary is most similar to surrogates
+      trained on the same distribution because the shared data determines what decision boundary
+      is optimal.
+
+      Attack method strength is the third factor. C&W adversarial examples with kappa>0 transfer
+      at higher rates than FGSM examples at matched perturbation budget. The C&W kappa parameter
+      forces a large margin between the adversarial class and all others -- this margin survives
+      the slight geometric misalignment between source and victim boundaries. FGSM''s single-step
+      examples sit right at the source boundary (minimal margin) and often fall back to the correct
+      side of the victim''s slightly different boundary.
+
+      Perturbation budget (epsilon) is the fourth factor. Larger epsilon generally produces higher
+      transfer rates because larger perturbations are more likely to exceed the victim''s boundary
+      even when the source and victim boundaries are not perfectly aligned. But larger epsilon is
+      also more detectable by Track 7 feature squeezing -- this is the adversary''s trade-off.
+
+  part_4:
+    title: 'Ensemble Transfer Attacks: Averaging Gradients to Reduce Boundary Overfitting'
+    body: |
+      Single-surrogate transfer attacks overfit to the source model''s specific boundary geometry.
+      The adversarial example is optimised to be adversarial against one specific model -- and
+      while the perturbation direction is likely aligned with the victim''s boundary, it is calibrated
+      to the source''s exact gradient, not a generic perturbation direction.
+
+      Ensemble attacks reduce this overfitting by averaging gradients across multiple surrogate
+      models. The ensemble gradient is: g_ensemble = (1/k) * sum_{i=1}^{k} nabla_x J(f_i, x, y).
+      The sign of g_ensemble produces a perturbation direction that is adversarial on average across
+      all k surrogates. When k diverse surrogates are included (different architectures, different
+      training runs), the averaged gradient direction smooths out source-specific artefacts and
+      produces a perturbation that is more universally aligned with the general boundary geometry
+      shared across models.
+
+      Liu et al. (2017) demonstrated that ensemble adversarial examples achieve 15-30 percentage
+      point higher transfer rates than single-surrogate examples at matched epsilon and attack method.
+      The improvement is largest when the surrogates are diverse: an ensemble of 5 models from
+      different architecture families outperforms an ensemble of 5 models from the same family.
+
+      The attack cost scales linearly with ensemble size: k surrogates require k forward-backward
+      passes per adversarial example generation step. For PGD with k=40 steps and an ensemble of
+      5 surrogates, this is 200 forward-backward passes per adversarial example. Against 5 locally
+      available surrogate models, this is still effectively zero victim API queries.
+
+  part_5:
+    title: 'Input Diversity and Translation-Invariant Gradient'
+    body: |
+      Two attack augmentation techniques from the 2019 literature further improve transfer rates
+      by reducing gradient overfitting to the source architecture.
+
+      Translation-invariant attacks (Dong et al. 2019) convolve the gradient with a Gaussian kernel
+      before taking the sign step. The update becomes: x_{t+1} = clip(x_t + alpha * sign(W*g_t), 0, 1)
+      where W is a convolution kernel and g_t is the gradient. Convolution smooths spatial high-
+      frequency gradient components that are specific to the source architecture''s convolutional
+      filters. The resulting perturbation is more spatially smooth and less tied to specific
+      receptive field patterns of the source model -- making it more transferable across architectures
+      with different convolutional structures.
+
+      Input diversity attacks (Xie et al. 2019) apply random resizing and padding to the input
+      before the forward pass. In each gradient computation step, the input x is randomly resized
+      to a size between d_min and d_max and then padded back to d_max. The gradient is computed
+      on this randomly transformed input. Averaging over random transformations reduces the gradient''s
+      sensitivity to input-level features that are model-specific -- the resulting adversarial
+      perturbation is robust to the types of input transformations that differ between the source
+      architecture and the victim architecture.
+
+      Both techniques are applied during the gradient computation phase (inside the PGD loop), not
+      as post-processing of the adversarial example. The resulting adversarial examples look similar
+      to standard PGD examples but achieve transfer rates that are 10-20 percentage points higher
+      at matched epsilon.
+
+  part_6:
+    title: 'Defence Implications: Robustness Must Account for Transfer Adversaries'
+    body: |
+      The standard adversarial robustness evaluation (PGD with k=40 and R=5, Section 10.4) measures
+      how many examples an adversary with the model''s own gradients can cause to be misclassified.
+      This is the ideal case for the defender: the adversary has maximum information. Transfer attacks
+      represent a weaker adversary (they have gradient access to a surrogate, not the victim), but
+      they are the realistic threat model for most production deployments where gradient access to
+      the victim is not available.
+
+      A model that achieves 45% PGD robust accuracy at epsilon=8/255 (standard CIFAR-10 benchmark)
+      may have lower transfer-attack robust accuracy against a well-matched surrogate. The transfer
+      adversary does not optimise against the victim''s exact gradient -- they optimise against the
+      surrogate''s gradient. If the surrogate approximates the victim closely, the transfer attack
+      approaches white-box attack strength. If the surrogate is a poor approximation, transfer rates
+      drop significantly. The quality of the surrogate produced in Chapter 9 extraction directly
+      determines the strength of the Chapter 10 transfer attack.
+
+      For Track 7 calibration: transfer adversarial examples have different properties from direct
+      adversarial examples. C&W kappa>0 transfer examples are the hardest to detect (large margin,
+      stable under perturbation). PGD transfer examples from a well-matched surrogate behave
+      similarly to direct PGD examples against the victim -- they are near the victim''s boundary
+      and are somewhat detectable by consistency checking. Ensemble transfer examples may be more
+      robust to feature squeezing because the ensemble gradient direction is smoother and survives
+      transformation better than single-model gradients.
+
+  part_7:
+    title: 'Detection: Can the Victim Log Detect Transfer Examples?'
+    body: |
+      Transfer adversarial examples arrive at the victim as a single submission with no campaign
+      footprint. Track 6 sees nothing anomalous -- the query pattern for one adversarial example
+      submission is identical to the query pattern for one natural query. Track 7 is the only
+      detection layer.
+
+      Track 7''s effectiveness against transfer examples depends on the attack method used on the
+      surrogate. FGSM-based transfer examples are the most detectable: they sit near the surrogate''s
+      boundary (and thus near the victim''s similar boundary), are fragile under random perturbation,
+      and are caught by the consistency checker at rates comparable to direct FGSM attacks. PGD-based
+      transfer examples are harder: they are closer to the victim''s boundary but still slightly
+      offset because the surrogate boundary is not exactly the victim boundary. The consistency
+      checker catches some; feature squeezing catches some. C&W kappa>0 transfer examples are
+      the hardest to detect: they have a large margin and are stable under random perturbation.
+      Ensemble transfer examples with input diversity augmentation may survive squeezing better
+      than single-model transfer examples because the smooth ensemble gradient produces perturbations
+      that are less sensitive to input transformation.
+
+      The detection gap for transfer attacks motivates the adversarial detector classifier (Section
+      10.12): it is trained on adversarial examples from multiple attack families and can learn
+      distributional properties of adversarial examples that are independent of whether the attack
+      was direct or transferred. If the training set for the adversarial classifier includes
+      transfer examples from diverse surrogates, it can achieve meaningful coverage of the transfer
+      attack family even when other Track 7 primitives are less effective.
+
+reference_materials:
+
+  table_1:
+    title: 'Transfer Rate Factors and Typical Ranges'
+    description: 'Factors that determine cross-model adversarial transfer rate, with typical rate ranges and operational implications'
+    columns: ['Factor', 'High transfer condition', 'Typical rate', 'Low transfer condition', 'Typical rate']
+    rows:
+      - ['Architecture family', 'Same family (ResNet -> ResNet)', '50-80%', 'Cross-family (ResNet -> Transformer)', '15-30%']
+      - ['Training distribution', 'Same dataset, same class distribution', '55-80%', 'Related but different datasets', '20-40%']
+      - ['Attack method', 'C&W kappa=20, ensemble PGD', '45-70%', 'FGSM single-step', '15-35%']
+      - ['Perturbation budget', 'Large epsilon (16/255+)', '60-80%', 'Small epsilon (2/255)', '10-25%']
+      - ['Surrogate quality (Ch9)', 'High-fidelity distillation (same architecture, full dataset)', '60-80%', 'Low-fidelity surrogate (architecture mismatch, small dataset)', '10-25%']
+      - ['Ensemble size', '5+ diverse surrogates averaged', '55-75%', 'Single surrogate', '20-50%']
+
+  table_2:
+    title: 'Attack Method vs Transfer Rate at Matched Epsilon (eps=8/255, ResNet family)'
+    description: 'Empirical transfer rate comparison across attack methods against an architecturally matched surrogate-to-victim pair'
+    columns: ['Attack (on surrogate)', 'Source success rate', 'Transfer rate', 'Victim success rate', 'Notes']
+    rows:
+      - ['FGSM (k=1)', '~60%', '~25%', '~15%', 'Single step; sits at source boundary; low margin; poor transfer']
+      - ['PGD-40 R=5', '~95%', '~40%', '~38%', 'Iterative; closer to boundary; moderate transfer']
+      - ['C&W kappa=0', '>99%', '~45%', '~44%', 'Minimum norm; boundary-proximate; similar to PGD transfer']
+      - ['C&W kappa=20', '>99%', '~65%', '~64%', 'High kappa; large margin; most transferable']
+      - ['Ensemble PGD-20 (3 models)', '~92%', '~60%', '~55%', 'Diverse gradients; reduced boundary overfitting']
+      - ['Ensemble + input diversity', '~90%', '~70%', '~63%', 'Attack augmentation; further reduces architecture-specific artefacts']
+
+  table_3:
+    title: 'Track 7 Detection Rates Against Transfer vs Direct Adversarial Examples'
+    description: 'Comparison of Track 7 feature squeezing, consistency checker, and ensemble detection rates against direct attacks and transfer attacks at matched success rate'
+    columns: ['Attack scenario', 'Feature squeezing', 'Consistency check', 'Adversarial classifier', 'Ensemble', 'Notes']
+    rows:
+      - ['Direct FGSM (white-box)', '75-85%', '75-90%', '70-80%', '90-95%', 'Most detectable; fragile; near boundary']
+      - ['Direct PGD-40 (white-box)', '50-70%', '55-75%', '75-85%', '80-90%', 'Stronger; consistency check still effective']
+      - ['Direct C&W kappa=20 (white-box)', '40-60%', '20-40%', '65-75%', '65-78%', 'High kappa; consistency check weakest']
+      - ['FGSM transfer (well-matched surrogate)', '60-75%', '65-80%', '55-70%', '75-87%', 'Slightly lower than direct due to surrogate mismatch']
+      - ['PGD transfer (well-matched surrogate)', '45-65%', '50-70%', '65-75%', '70-82%', 'Similar to direct PGD; boundary proximity preserved']
+      - ['C&W kappa=20 transfer', '35-55%', '15-35%', '55-65%', '55-70%', 'Hardest to detect; adversarial classifier is primary primitive']
+      - ['Ensemble transfer (input diversity)', '30-50%', '20-40%', '50-65%', '55-68%', 'Smooth perturbation survives squeezing; hardest overall']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Transferability Analyser'
+    filename: 'transferability_analyser.py'
+    description: 'Measures transfer rate from source to victim across epsilon values and attack methods; the operational tool for quantifying surrogate quality for adversarial transfer'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch, matplotlib. Import ToyLinear from fgsm_attack.py; pgd_linf from pgd_attack.py.
+      ToyMLP defined inline as a second architecture.
+      Note: random-weight models produce low transfer rates; production models with trained weights
+      show the 20-80% ranges documented in the reference tables.
+    code: |
+      # transferability_analyser.py
+      # Section 10.7: Transfer Rate Measurement Across Model Architecture Pairs
+      # 20260523 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      import matplotlib.pyplot as plt
+      from typing import List, Tuple, Dict
+      from fgsm_attack import fgsm, ToyLinear, attack_success_rate
+      from pgd_attack import pgd_linf
+
+
+      class ToyMLP(nn.Module):
+          def __init__(self, n_features: int = 28 * 28, n_classes: int = 10, hidden: int = 128):
+              super().__init__()
+              self.net = nn.Sequential(
+                  nn.Linear(n_features, hidden),
+                  nn.ReLU(),
+                  nn.Linear(hidden, n_classes),
+              )
+
+          def forward(self, x):
+              return self.net(x.view(x.size(0), -1))
+
+
+      def transfer_rate(
+          source: nn.Module,
+          victim: nn.Module,
+          x_adv: torch.Tensor,
+          y_true: torch.Tensor,
+      ) -> Tuple[float, float]:
+          '''
+          Measure transfer rate: among examples adversarial on source, how many are also
+          adversarial on victim?
+          Returns (source_success_rate, transfer_rate).
+          '''
+          with torch.no_grad():
+              src_preds = source(x_adv).argmax(1)
+              vic_preds = victim(x_adv).argmax(1)
+          src_adv = (src_preds != y_true).float()
+          vic_adv = (vic_preds != y_true).float()
+          src_rate = src_adv.mean().item()
+          if src_adv.sum() > 0:
+              xfer = (vic_adv * src_adv).sum() / src_adv.sum()
+              return src_rate, xfer.item()
+          return src_rate, 0.0
+
+
+      def sweep_epsilon_transfer(
+          source: nn.Module,
+          victim: nn.Module,
+          x: torch.Tensor,
+          y: torch.Tensor,
+          epsilons: List[float],
+          attack: str = 'fgsm',
+          pgd_steps: int = 20,
+          pgd_restarts: int = 2,
+      ) -> Dict[str, List[float]]:
+          src_rates, xfer_rates = [], []
+          for eps in epsilons:
+              if attack == 'fgsm':
+                  x_adv = fgsm(source, x, y, epsilon=eps)
+              else:
+                  alpha = eps / 5.0
+                  x_adv = pgd_linf(source, x, y, eps, alpha, pgd_steps, pgd_restarts)
+              sr, xr = transfer_rate(source, victim, x_adv, y)
+              src_rates.append(sr)
+              xfer_rates.append(xr)
+          return {'source': src_rates, 'transfer': xfer_rates}
+
+
+      def compare_attack_methods(
+          source: nn.Module,
+          victim: nn.Module,
+          x: torch.Tensor,
+          y: torch.Tensor,
+          epsilon: float = 8.0 / 255.0,
+      ) -> None:
+          print(f'\nTransfer rate comparison (eps={epsilon * 255:.1f}/255)')
+          print(f'{"Attack":<28} {"Source success":<18} {"Transfer rate"}')
+          print('-' * 60)
+
+          # FGSM
+          x_fgsm = fgsm(source, x, y, epsilon=epsilon)
+          sr, xr = transfer_rate(source, victim, x_fgsm, y)
+          print(f'{"FGSM (k=1)":<28} {sr:<18.3f} {xr:.3f}')
+
+          # PGD
+          x_pgd = pgd_linf(source, x, y, epsilon, epsilon / 5.0, 20, 2)
+          sr, xr = transfer_rate(source, victim, x_pgd, y)
+          print(f'{"PGD-20 R=2":<28} {sr:<18.3f} {xr:.3f}')
+
+          # Import C&W if available
+          try:
+              from cw_attack import cw_l2
+              x_cw0 = cw_l2(source, x, y, kappa=0.0, n_binary_search=3, n_steps=80)
+              sr, xr = transfer_rate(source, victim, x_cw0, y)
+              print(f'{"C&W kappa=0":<28} {sr:<18.3f} {xr:.3f}')
+
+              x_cw20 = cw_l2(source, x, y, kappa=20.0, n_binary_search=3, n_steps=80)
+              sr, xr = transfer_rate(source, victim, x_cw20, y)
+              print(f'{"C&W kappa=20":<28} {sr:<18.3f} {xr:.3f}')
+          except ImportError:
+              print('C&W not available (cw_attack.py not in path)')
+
+
+      def plot_transfer_sweep(
+          epsilons: List[float],
+          fgsm_result: Dict,
+          pgd_result: Dict,
+          save_path: str = 'transfer_sweep.png',
+      ) -> None:
+          eps_255 = [e * 255 for e in epsilons]
+          fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+          ax1.plot(eps_255, fgsm_result['source'], color='#e74c3c', marker='o', markersize=4,
+                   linewidth=2, label='FGSM source success')
+          ax1.plot(eps_255, fgsm_result['transfer'], color='#e74c3c', marker='s', markersize=4,
+                   linewidth=2, linestyle='--', label='FGSM transfer rate')
+          ax1.plot(eps_255, pgd_result['source'], color='#2980b9', marker='o', markersize=4,
+                   linewidth=2, label='PGD source success')
+          ax1.plot(eps_255, pgd_result['transfer'], color='#2980b9', marker='s', markersize=4,
+                   linewidth=2, linestyle='--', label='PGD transfer rate')
+          ax1.set_xlabel('Epsilon (pixel units)', fontsize=11)
+          ax1.set_ylabel('Rate', fontsize=11)
+          ax1.set_title('Transfer Rate vs Epsilon\n(FGSM and PGD source attacks)', fontsize=11)
+          ax1.legend(fontsize=8)
+          ax1.grid(True, alpha=0.3)
+          ax1.set_ylim(0, 1.05)
+
+          gap_fgsm = [s - t for s, t in zip(fgsm_result['source'], fgsm_result['transfer'])]
+          gap_pgd = [s - t for s, t in zip(pgd_result['source'], pgd_result['transfer'])]
+          ax2.fill_between(eps_255, gap_fgsm, alpha=0.4, color='#e74c3c', label='FGSM transfer gap')
+          ax2.fill_between(eps_255, gap_pgd, alpha=0.4, color='#2980b9', label='PGD transfer gap')
+          ax2.set_xlabel('Epsilon (pixel units)', fontsize=11)
+          ax2.set_ylabel('Source success - Transfer rate', fontsize=11)
+          ax2.set_title('Transfer Gap\n(gap = source success minus victim transfer)', fontsize=11)
+          ax2.legend(fontsize=8)
+          ax2.grid(True, alpha=0.3)
+
+          plt.tight_layout()
+          plt.savefig(save_path, dpi=150, bbox_inches='tight')
+          print(f'Saved: {save_path}')
+          plt.show()
+
+
+      if __name__ == '__main__':
+          torch.manual_seed(42)
+          source = ToyLinear()
+          victim = ToyMLP()
+          source.eval()
+          victim.eval()
+
+          x = torch.rand(64, 1, 28, 28)
+          y = torch.randint(0, 10, (64,))
+          epsilons = [i / 255 for i in [2, 4, 8, 12, 16, 24, 32]]
+
+          fgsm_r = sweep_epsilon_transfer(source, victim, x, y, epsilons, attack='fgsm')
+          pgd_r = sweep_epsilon_transfer(source, victim, x, y, epsilons, attack='pgd')
+
+          compare_attack_methods(source, victim, x, y, epsilon=8.0 / 255.0)
+          plot_transfer_sweep(epsilons, fgsm_r, pgd_r)
+
+  deliverable_2:
+    title: 'Surrogate Pipeline: End-to-End Ch9 to Ch10 Kill Chain'
+    filename: 'surrogate_pipeline.py'
+    description: 'End-to-end pipeline: surrogate model approximates victim (represents Ch9 distillation output), adversarial examples generated against surrogate, submitted to victim to measure transfer; quantifies per-example victim query cost'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Import ToyLinear from fgsm_attack.py; pgd_linf from pgd_attack.py.
+      Surrogate = same architecture as victim, different seed (approximates well-matched Ch9 surrogate).
+      Random-weight models show low transfer; trained models show 40-80% transfer.
+    code: |
+      # surrogate_pipeline.py
+      # Section 10.7: End-to-End Surrogate Pipeline (Ch9 -> Ch10 Kill Chain)
+      # 20260523 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      from dataclasses import dataclass
+      from typing import Optional
+      from fgsm_attack import fgsm, ToyLinear, attack_success_rate
+      from pgd_attack import pgd_linf
+
+
+      @dataclass
+      class SurrogatePipelineResult:
+          ch9_victim_queries: int          # Queries spent on extraction (Ch9 phase)
+          ch10_victim_queries: int         # Queries spent on transfer (Ch10 phase, should be ~0)
+          total_victim_queries: int
+          n_adversarial_examples: int
+          per_example_victim_cost: float   # total / n_adversarial_examples
+          source_success_rate: float
+          transfer_rate: float
+          victim_success_rate: float       # Transfer rate * source success
+
+
+      def simulate_ch9_extraction_cost(
+          n_examples: int,
+          extraction_queries: int = 50_000,
+      ) -> int:
+          '''
+          Return the Ch9 victim query cost for the extraction phase.
+          extraction_queries: total queries spent building the surrogate.
+          This cost is amortised across all transfer examples generated.
+          '''
+          return extraction_queries
+
+
+      def run_surrogate_pipeline(
+          victim: nn.Module,
+          surrogate: nn.Module,
+          x: torch.Tensor,
+          y: torch.Tensor,
+          epsilon: float = 8.0 / 255.0,
+          attack: str = 'pgd',
+          pgd_steps: int = 20,
+          pgd_restarts: int = 2,
+          ch9_extraction_queries: int = 50_000,
+      ) -> SurrogatePipelineResult:
+          '''
+          Phase 1 (Ch9): adversary has surrogate from extraction (ch9_extraction_queries spent).
+          Phase 2 (Ch10): generate adversarial examples against surrogate (0 victim queries).
+                          Submit to victim (1 query per example for final check -- not adversarial generation).
+          '''
+          alpha = epsilon / 5.0
+          if attack == 'fgsm':
+              x_adv = fgsm(surrogate, x, y, epsilon=epsilon)
+          else:
+              x_adv = pgd_linf(surrogate, x, y, epsilon, alpha, pgd_steps, pgd_restarts)
+
+          # Phase 2 victim queries: 0 for adversarial generation; count submissions only
+          ch10_victim_queries = 0  # adversarial examples generated locally against surrogate
+
+          with torch.no_grad():
+              src_preds = surrogate(x_adv).argmax(1)
+              vic_preds = victim(x_adv).argmax(1)
+
+          src_adv = (src_preds != y).float()
+          vic_adv = (vic_preds != y).float()
+
+          src_rate = src_adv.mean().item()
+          if src_adv.sum() > 0:
+              xfer_rate = (vic_adv * src_adv).sum().item() / src_adv.sum().item()
+          else:
+              xfer_rate = 0.0
+
+          total_victim_q = ch9_extraction_queries + ch10_victim_queries
+          per_example_cost = total_victim_q / max(x.size(0), 1)
+
+          return SurrogatePipelineResult(
+              ch9_victim_queries=ch9_extraction_queries,
+              ch10_victim_queries=ch10_victim_queries,
+              total_victim_queries=total_victim_q,
+              n_adversarial_examples=x.size(0),
+              per_example_victim_cost=per_example_cost,
+              source_success_rate=src_rate,
+              transfer_rate=xfer_rate,
+              victim_success_rate=src_rate * xfer_rate,
+          )
+
+
+      def print_pipeline_report(result: SurrogatePipelineResult, attack_name: str) -> None:
+          print(f'\nSurrogate Pipeline Report ({attack_name})')
+          print(f'  Ch9 extraction queries (victim):   {result.ch9_victim_queries:,}')
+          print(f'  Ch10 transfer queries (victim):    {result.ch10_victim_queries}')
+          print(f'  Total victim queries:              {result.total_victim_queries:,}')
+          print(f'  Adversarial examples generated:    {result.n_adversarial_examples}')
+          print(f'  Per-example victim query cost:     {result.per_example_victim_cost:.1f}')
+          print(f'  Source success rate:               {result.source_success_rate:.3f}')
+          print(f'  Transfer rate:                     {result.transfer_rate:.3f}')
+          print(f'  Effective victim success rate:     {result.victim_success_rate:.3f}')
+
+
+      def compare_vs_direct_blackbox(
+          victim: nn.Module,
+          x: torch.Tensor,
+          y: torch.Tensor,
+          epsilon: float,
+          transfer_result: SurrogatePipelineResult,
+      ) -> None:
+          '''Compare transfer attack vs NES direct black-box in per-example query cost.'''
+          # NES cost estimate: n_steps * n_samples
+          nes_steps, nes_samples = 40, 50
+          nes_queries_per_example = nes_steps * nes_samples
+
+          print('\nQuery cost comparison:')
+          print(f'  Transfer attack (post-Ch9):  {transfer_result.per_example_victim_cost:.1f} victim queries/example')
+          print(f'  NES direct black-box:        {nes_queries_per_example} victim queries/example')
+          print(f'  Boundary Attack (est.):      10,000-100,000 victim queries/example')
+          ratio = nes_queries_per_example / max(transfer_result.per_example_victim_cost, 1.0)
+          print(f'  Transfer advantage:          {ratio:.0f}x fewer victim queries than NES')
+          print()
+          print('  Note: transfer advantage grows with more adversarial examples generated.')
+          print('  At 1,000 examples: Ch9 cost amortised to 50 queries/example from 50,000 total.')
+
+
+      if __name__ == '__main__':
+          torch.manual_seed(42)
+          victim = ToyLinear()
+          # Surrogate: same architecture, different seed (represents Ch9 distillation output)
+          torch.manual_seed(99)
+          surrogate = ToyLinear()
+          victim.eval()
+          surrogate.eval()
+
+          x = torch.rand(64, 1, 28, 28)
+          y = torch.randint(0, 10, (64,))
+
+          result = run_surrogate_pipeline(
+              victim, surrogate, x, y,
+              epsilon=8.0 / 255.0, attack='pgd',
+              ch9_extraction_queries=50_000,
+          )
+          print_pipeline_report(result, 'PGD on well-matched surrogate')
+          compare_vs_direct_blackbox(victim, x, y, 8.0 / 255.0, result)
+
+  deliverable_3:
+    title: 'Ensemble Attack'
+    filename: 'ensemble_attack.py'
+    description: 'Multi-surrogate adversarial example generation via gradient averaging; demonstrates the transfer rate improvement from ensemble over single-surrogate attacks'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch, matplotlib. Import ToyLinear, fgsm from fgsm_attack.py; pgd_linf from pgd_attack.py.
+      ToyMLP defined inline. Gradient averaging implemented for both FGSM and PGD variants.
+    code: |
+      # ensemble_attack.py
+      # Section 10.7: Ensemble Transfer Attack via Gradient Averaging
+      # 20260523 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      from typing import List
+      from fgsm_attack import ToyLinear, attack_success_rate
+
+
+      class ToyMLP(nn.Module):
+          def __init__(self, n_features=28*28, n_classes=10, hidden=128):
+              super().__init__()
+              self.net = nn.Sequential(
+                  nn.Linear(n_features, hidden), nn.ReLU(), nn.Linear(hidden, n_classes),
+              )
+          def forward(self, x):
+              return self.net(x.view(x.size(0), -1))
+
+
+      def ensemble_gradient(
+          models: List[nn.Module],
+          x: torch.Tensor,
+          y: torch.Tensor,
+          criterion: nn.Module = None,
+      ) -> torch.Tensor:
+          '''
+          Average gradient of loss w.r.t. x across all models in ensemble.
+          Each model gets a fresh clone of x with independent gradient tracking.
+          Returns averaged gradient tensor (same shape as x).
+          '''
+          if criterion is None:
+              criterion = nn.CrossEntropyLoss()
+          grad_sum = torch.zeros_like(x)
+          for model in models:
+              x_req = x.clone().detach().requires_grad_(True)
+              loss = criterion(model(x_req), y)
+              model.zero_grad()
+              loss.backward()
+              grad_sum = grad_sum + x_req.grad.data
+          return grad_sum / len(models)
+
+
+      def ensemble_fgsm(
+          models: List[nn.Module],
+          x: torch.Tensor,
+          y: torch.Tensor,
+          epsilon: float,
+      ) -> torch.Tensor:
+          '''FGSM using averaged gradient across ensemble.'''
+          g_avg = ensemble_gradient(models, x, y)
+          x_adv = x + epsilon * g_avg.sign()
+          return torch.clamp(x_adv, 0.0, 1.0)
+
+
+      def ensemble_pgd(
+          models: List[nn.Module],
+          x: torch.Tensor,
+          y: torch.Tensor,
+          epsilon: float,
+          alpha: float,
+          n_steps: int,
+          n_restarts: int = 1,
+      ) -> torch.Tensor:
+          '''PGD using averaged gradient across ensemble; L-infinity projection.'''
+          criterion = nn.CrossEntropyLoss(reduction='none')
+          best_loss = torch.full((x.size(0),), -float('inf'), device=x.device)
+          best_x_adv = x.clone()
+
+          for _ in range(n_restarts):
+              delta = torch.zeros_like(x).uniform_(-epsilon, epsilon)
+              x_adv = torch.clamp(x + delta, 0.0, 1.0).detach()
+
+              for step in range(n_steps):
+                  # Compute averaged gradient
+                  grad_avg = torch.zeros_like(x)
+                  for model in models:
+                      x_req = x_adv.detach().requires_grad_(True)
+                      loss_per = criterion(model(x_req), y)
+                      loss_per.sum().backward()
+                      grad_avg = grad_avg + x_req.grad.data
+                  grad_avg = grad_avg / len(models)
+
+                  with torch.no_grad():
+                      x_step = x_adv + alpha * grad_avg.sign()
+                      delta = torch.clamp(x_step - x, -epsilon, epsilon)
+                      x_adv = torch.clamp(x + delta, 0.0, 1.0)
+
+              # Multi-restart tracking
+              with torch.no_grad():
+                  # Average loss across ensemble for restart tracking
+                  avg_loss = torch.zeros(x.size(0), device=x.device)
+                  for model in models:
+                      avg_loss = avg_loss + criterion(model(x_adv), y)
+                  avg_loss = avg_loss / len(models)
+                  improved = avg_loss > best_loss
+                  best_loss[improved] = avg_loss[improved]
+                  best_x_adv[improved] = x_adv[improved]
+
+          return best_x_adv.detach()
+
+
+      def compare_single_vs_ensemble(
+          models: List[nn.Module],
+          victim: nn.Module,
+          x: torch.Tensor,
+          y: torch.Tensor,
+          epsilon: float = 8.0 / 255.0,
+      ) -> None:
+          from fgsm_attack import fgsm
+
+          print(f'Ensemble vs Single-surrogate Transfer Comparison (eps={epsilon * 255:.1f}/255)')
+          print(f'{"Config":<40} {"Source success":<18} {"Victim transfer"}')
+          print('-' * 76)
+
+          # Single-model attacks
+          for i, model in enumerate(models[:3]):
+              x_adv = fgsm(model, x, y, epsilon=epsilon)
+              with torch.no_grad():
+                  src = (model(x_adv).argmax(1) != y).float().mean().item()
+                  vic = (victim(x_adv).argmax(1) != y).float().mean().item()
+              print(f'{"FGSM single surrogate " + str(i+1):<40} {src:<18.3f} {vic:.3f}')
+
+          # Ensemble attack (all models)
+          x_ens = ensemble_fgsm(models, x, y, epsilon=epsilon)
+          with torch.no_grad():
+              ens_src = max((m(x_ens).argmax(1) != y).float().mean().item() for m in models)
+              ens_vic = (victim(x_ens).argmax(1) != y).float().mean().item()
+          print(f'{"FGSM ensemble (" + str(len(models)) + " surrogates)":<40} {ens_src:<18.3f} {ens_vic:.3f}')
+
+          x_ens_pgd = ensemble_pgd(models, x, y, epsilon, epsilon / 5.0, n_steps=20)
+          with torch.no_grad():
+              ep_src = max((m(x_ens_pgd).argmax(1) != y).float().mean().item() for m in models)
+              ep_vic = (victim(x_ens_pgd).argmax(1) != y).float().mean().item()
+          print(f'{"PGD ensemble (" + str(len(models)) + " surrogates)":<40} {ep_src:<18.3f} {ep_vic:.3f}')
+
+
+      if __name__ == '__main__':
+          torch.manual_seed(42)
+          # Build diverse ensemble: 2 linear, 1 MLP
+          models = [ToyLinear() for _ in range(2)] + [ToyMLP()]
+          for m in models:
+              m.eval()
+          torch.manual_seed(77)
+          victim = ToyLinear()
+          victim.eval()
+
+          x = torch.rand(64, 1, 28, 28)
+          y = torch.randint(0, 10, (64,))
+
+          compare_single_vs_ensemble(models, victim, x, y, epsilon=8.0 / 255.0)
+
+  deliverable_4:
+    title: 'Transfer Rate Heatmap'
+    filename: 'transfer_rate_heatmap.py'
+    description: 'Generates a transfer rate matrix across multiple model architecture combinations and visualises as a heatmap; the primary tool for adversary surrogate quality assessment'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch, matplotlib, numpy. Import ToyLinear from fgsm_attack.py; pgd_linf from pgd_attack.py.
+      Three architectures defined: ToyLinear, ToyMLP128, ToyMLP256.
+    code: |
+      # transfer_rate_heatmap.py
+      # Section 10.7: Transfer Rate Matrix Heatmap
+      # 20260523 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      import numpy as np
+      import matplotlib.pyplot as plt
+      from fgsm_attack import ToyLinear
+      from pgd_attack import pgd_linf
+
+
+      class ToyMLP128(nn.Module):
+          def __init__(self):
+              super().__init__()
+              self.net = nn.Sequential(
+                  nn.Linear(28*28, 128), nn.ReLU(), nn.Linear(128, 10),
+              )
+          def forward(self, x):
+              return self.net(x.view(x.size(0), -1))
+
+
+      class ToyMLP256(nn.Module):
+          def __init__(self):
+              super().__init__()
+              self.net = nn.Sequential(
+                  nn.Linear(28*28, 256), nn.ReLU(), nn.Linear(256, 64), nn.ReLU(), nn.Linear(64, 10),
+              )
+          def forward(self, x):
+              return self.net(x.view(x.size(0), -1))
+
+
+      class ToyLinear2(nn.Module):
+          '''Second ToyLinear instance with different seed (same architecture, different weights).'''
+          def __init__(self):
+              super().__init__()
+              self.fc = nn.Linear(28 * 28, 10)
+          def forward(self, x):
+              return self.fc(x.view(x.size(0), -1))
+
+
+      def build_model_zoo():
+          torch.manual_seed(1)
+          m1 = ToyLinear()
+          torch.manual_seed(2)
+          m2 = ToyLinear2()
+          torch.manual_seed(3)
+          m3 = ToyMLP128()
+          torch.manual_seed(4)
+          m4 = ToyMLP256()
+          for m in [m1, m2, m3, m4]:
+              m.eval()
+          return [m1, m2, m3, m4], ['Linear-A', 'Linear-B', 'MLP-128', 'MLP-256']
+
+
+      def build_transfer_matrix(
+          models: list,
+          x: torch.Tensor,
+          y: torch.Tensor,
+          epsilon: float = 8.0 / 255.0,
+          pgd_steps: int = 20,
+          pgd_restarts: int = 2,
+      ) -> np.ndarray:
+          n = len(models)
+          matrix = np.zeros((n, n))
+          alpha = epsilon / 5.0
+          for i, source in enumerate(models):
+              x_adv = pgd_linf(source, x, y, epsilon, alpha, pgd_steps, pgd_restarts)
+              with torch.no_grad():
+                  src_adv = (source(x_adv).argmax(1) != y).float()
+                  for j, victim in enumerate(models):
+                      vic_adv = (victim(x_adv).argmax(1) != y).float()
+                      if src_adv.sum() > 0:
+                          matrix[i, j] = (vic_adv * src_adv).sum().item() / src_adv.sum().item()
+                      else:
+                          matrix[i, j] = 0.0
+          return matrix
+
+
+      def plot_heatmap(
+          matrix: np.ndarray,
+          labels: list,
+          epsilon: float,
+          save_path: str = 'transfer_rate_heatmap.png',
+      ) -> None:
+          fig, ax = plt.subplots(figsize=(7, 6))
+          im = ax.imshow(matrix, vmin=0, vmax=1, cmap='RdYlGn', aspect='auto')
+          plt.colorbar(im, ax=ax, label='Transfer rate')
+          ax.set_xticks(range(len(labels)))
+          ax.set_yticks(range(len(labels)))
+          ax.set_xticklabels([f'Victim:\n{l}' for l in labels], fontsize=9)
+          ax.set_yticklabels([f'Source: {l}' for l in labels], fontsize=9)
+          ax.set_title(f'Adversarial Transfer Rate Matrix\n(PGD-20 R=2, eps={epsilon * 255:.0f}/255)', fontsize=11)
+          for i in range(len(labels)):
+              for j in range(len(labels)):
+                  ax.text(j, i, f'{matrix[i, j]:.2f}', ha='center', va='center',
+                          fontsize=10, color='black')
+          ax.set_xlabel('Victim model (receives adversarial examples)', fontsize=10)
+          ax.set_ylabel('Source model (generates adversarial examples)', fontsize=10)
+          plt.tight_layout()
+          plt.savefig(save_path, dpi=150, bbox_inches='tight')
+          print(f'Saved: {save_path}')
+          plt.show()
+
+
+      if __name__ == '__main__':
+          torch.manual_seed(42)
+          models, labels = build_model_zoo()
+          x = torch.rand(64, 1, 28, 28)
+          y = torch.randint(0, 10, (64,))
+          eps = 8.0 / 255.0
+
+          print(f'Building transfer rate matrix ({len(models)}x{len(models)})...')
+          matrix = build_transfer_matrix(models, x, y, epsilon=eps)
+
+          print(f'\nTransfer Rate Matrix (rows=source, cols=victim)')
+          header = f'{"Source":<14}' + ''.join(f'{l:<12}' for l in labels)
+          print(header)
+          for i, label in enumerate(labels):
+              row = f'{label:<14}' + ''.join(f'{matrix[i, j]:<12.3f}' for j in range(len(labels)))
+              print(row)
+
+          print('\nKey insight:')
+          print('  Diagonal = source success rate (self-transfer = 1.0 for adversarial examples).')
+          print('  Same-architecture pairs (Linear-A -> Linear-B) typically show higher transfer.')
+          plot_heatmap(matrix, labels, eps)
+
+  deliverable_5:
+    title: 'Transfer Detection Signal Analyser'
+    filename: 'transfer_detection_signal_analyser.py'
+    description: 'Compares Track 7 detection rates (feature squeezing, consistency check) against transfer adversarial examples vs direct white-box adversarial examples; quantifies the detection gap'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch, matplotlib. Squeezer and consistency check implemented inline (preview of Sections 10.11-10.12).
+    code: |
+      # transfer_detection_signal_analyser.py
+      # Section 10.7: Track 7 Detection Against Transfer Examples
+      # 20260523 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      from typing import List, Dict
+      from fgsm_attack import ToyLinear, fgsm, attack_success_rate
+      from pgd_attack import pgd_linf
+
+
+      class ToyMLP(nn.Module):
+          def __init__(self):
+              super().__init__()
+              self.net = nn.Sequential(nn.Linear(28*28, 128), nn.ReLU(), nn.Linear(128, 10))
+          def forward(self, x):
+              return self.net(x.view(x.size(0), -1))
+
+
+      def bit_depth_squeeze(x: torch.Tensor, n_bits: int = 4) -> torch.Tensor:
+          steps = 2 ** n_bits - 1
+          return (x * steps).round() / steps
+
+
+      def squeezer_detection_rate(
+          model: nn.Module,
+          x_adv: torch.Tensor,
+          threshold: float = 0.20,
+      ) -> float:
+          with torch.no_grad():
+              pred_orig = model(x_adv).argmax(1)
+              pred_squeezed = model(bit_depth_squeeze(x_adv)).argmax(1)
+          return (pred_orig != pred_squeezed).float().mean().item()
+
+
+      def consistency_detection_rate(
+          model: nn.Module,
+          x_adv: torch.Tensor,
+          n_variants: int = 20,
+          noise_std: float = 0.02,
+      ) -> float:
+          with torch.no_grad():
+              pred_adv = model(x_adv).argmax(1)
+              fired = torch.zeros(x_adv.size(0), dtype=torch.bool, device=x_adv.device)
+              for _ in range(n_variants):
+                  noisy = torch.clamp(x_adv + torch.randn_like(x_adv) * noise_std, 0.0, 1.0)
+                  pred_noisy = model(noisy).argmax(1)
+                  fired = fired | (pred_noisy != pred_adv)
+          return fired.float().mean().item()
+
+
+      def analyse_detection(
+          model: nn.Module,
+          x_adv: torch.Tensor,
+          y: torch.Tensor,
+          label: str,
+      ) -> Dict[str, float]:
+          asr = attack_success_rate(model, x_adv, y)
+          sq = squeezer_detection_rate(model, x_adv)
+          cc = consistency_detection_rate(model, x_adv)
+          ensemble = 1.0 - (1.0 - sq) * (1.0 - cc)  # union approximation
+          print(f'  {label:<38} ASR={asr:.3f}  Squeezer={sq:.3f}  CC={cc:.3f}  Ensemble={ensemble:.3f}')
+          return {'label': label, 'asr': asr, 'squeezer': sq, 'cc': cc, 'ensemble': ensemble}
+
+
+      def run_detection_comparison(
+          victim: nn.Module,
+          surrogate: nn.Module,
+          x: torch.Tensor,
+          y: torch.Tensor,
+          epsilon: float = 8.0 / 255.0,
+      ) -> List[Dict]:
+          alpha = epsilon / 5.0
+          results = []
+
+          print(f'\nTrack 7 Detection: Direct vs Transfer Adversarial Examples (eps={epsilon*255:.1f}/255)')
+          print(f'  {"Attack scenario":<38} {"ASR":<8} {"Squeezer":<12} {"CC":<8} {"Ensemble"}')
+          print('  ' + '-' * 75)
+
+          # Direct attacks against victim
+          x_fgsm_d = fgsm(victim, x, y, epsilon=epsilon)
+          results.append(analyse_detection(victim, x_fgsm_d, y, 'Direct FGSM (white-box)'))
+
+          x_pgd_d = pgd_linf(victim, x, y, epsilon, alpha, 20, 2)
+          results.append(analyse_detection(victim, x_pgd_d, y, 'Direct PGD-20 R=2 (white-box)'))
+
+          # Transfer attacks: same attack method, different source model
+          x_fgsm_t = fgsm(surrogate, x, y, epsilon=epsilon)
+          results.append(analyse_detection(victim, x_fgsm_t, y, 'FGSM transfer (from surrogate)'))
+
+          x_pgd_t = pgd_linf(surrogate, x, y, epsilon, alpha, 20, 2)
+          results.append(analyse_detection(victim, x_pgd_t, y, 'PGD transfer (from surrogate)'))
+
+          # C&W if available
+          try:
+              from cw_attack import cw_l2
+              x_cw_t = cw_l2(surrogate, x, y, kappa=20.0, n_binary_search=3, n_steps=80)
+              results.append(analyse_detection(victim, x_cw_t, y, 'C&W kappa=20 transfer'))
+          except ImportError:
+              pass
+
+          print()
+          print('  Detection gap: transfer examples are harder to detect because')
+          print('  surrogate gradient does not perfectly align with victim boundary.')
+          return results
+
+
+      if __name__ == '__main__':
+          torch.manual_seed(42)
+          victim = ToyLinear()
+          torch.manual_seed(17)
+          surrogate = ToyMLP()
+          victim.eval()
+          surrogate.eval()
+
+          x = torch.rand(32, 1, 28, 28)
+          y = torch.randint(0, 10, (32,))
+
+          results = run_detection_comparison(victim, surrogate, x, y, epsilon=8.0 / 255.0)
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Using FGSM as the surrogate attack for transfer and expecting strong transfer rates'
+    why_it_happens: |
+      FGSM is the simplest and fastest attack. Engineers building a transfer attack pipeline
+      use FGSM against the surrogate because it is already implemented and fast. They observe
+      poor transfer rates and conclude the surrogate is a poor approximation of the victim.
+    consequence: |
+      FGSM adversarial examples sit right at the source model''s decision boundary with minimal
+      margin. When the source and victim boundaries are not perfectly aligned (which they never
+      are), FGSM examples frequently fall back on the correct side of the victim''s boundary.
+      Transfer rates for FGSM are typically 15-35%, even for well-matched surrogates. This
+      understates the transfer threat: the same surrogate used with C&W kappa=20 or ensemble
+      PGD would achieve 50-70% transfer.
+    correct_approach: |
+      Use C&W with kappa >= 20 for maximum transfer rate: the confidence margin forces examples
+      far enough from the source boundary to also cross the victim''s slightly offset boundary.
+      Use ensemble PGD across multiple surrogates as the practical high-transfer configuration
+      when C&W is too expensive. Transfer rate benchmarking should always include kappa>0 C&W
+      as the upper bound.
+
+  mistake_2:
+    description: 'Treating transfer rate as symmetric: assuming the A-to-B transfer rate equals the B-to-A transfer rate'
+    why_it_happens: |
+      Transfer rate symmetry seems intuitive: if A and B have similar boundaries, then adversarial
+      examples should transfer equally in both directions. Engineers measure A-to-B transfer,
+      find it moderate, and assume B-to-A is similar without measuring.
+    consequence: |
+      Transfer rates are asymmetric when the models have different capacities or boundary
+      smoothness. A smaller model (linear classifier) trained on the same data as a larger model
+      (deep MLP) will show higher transfer from large-to-small than small-to-large, because the
+      large model''s more complex boundary geometry produces more robust adversarial examples that
+      transfer even to the simpler model. An adversary who uses the wrong direction in their
+      surrogate-to-victim transfer may significantly over- or under-estimate their transfer success.
+    correct_approach: |
+      Always measure both directions in the transfer rate heatmap. The transfer_rate_heatmap.py
+      deliverable computes the full N x N matrix. In a production threat model, the relevant
+      direction is surrogate -> victim (adversary uses surrogate to attack victim). Verify that
+      the surrogate has been selected to maximise transfer in that direction, not the reverse.
+
+  mistake_3:
+    description: 'Concluding that PGD adversarial training makes a model transfer-attack-robust'
+    why_it_happens: |
+      PGD adversarial training (Section 10.15) produces models that are robust to direct PGD
+      attacks. Engineers report that their adversarially trained model has 45% PGD robust accuracy
+      and conclude it is adversarially robust, including against transfer attacks.
+    consequence: |
+      PGD adversarial training is measured against the model''s own gradients. Transfer attacks
+      use surrogate gradients that are correlated but not identical. An adversarially trained model
+      can have lower transfer-attack robust accuracy than a standardly trained model if the adversarial
+      training changed the boundary geometry in a way that makes it more susceptible to surrogate-
+      gradient perturbations. This is not always the case but is not precluded by PGD robustness claims.
+    correct_approach: |
+      Evaluate adversarially trained models against transfer attacks using diverse surrogates
+      (multiple architectures, different training data samples). Use the surrogate_pipeline.py and
+      transfer_rate_heatmap.py deliverables. Report both direct PGD robustness and transfer
+      robustness as separate metrics. They measure different adversary access tiers.
+
+  mistake_4:
+    description: 'Building an ensemble attack from k copies of the same architecture (different random seeds) and expecting the same transfer improvement as a diverse ensemble'
+    why_it_happens: |
+      k models with the same architecture trained with different random seeds are easy to generate
+      and seem diverse. Engineers build an ensemble of 5 ToyLinear models with 5 different random
+      seeds and compare to a single ToyLinear.
+    consequence: |
+      Same-architecture models share inductive biases. Their gradient directions are highly
+      correlated even with different random seeds. The ensemble gradient from 5 ToyLinear models
+      is barely different from a single ToyLinear''s gradient -- the ensemble averaging does not
+      reduce architecture-specific gradient artefacts because all models have the same architecture-
+      specific features. Transfer rate improvement over single-source is marginal (1-5 percentage
+      points) rather than the 15-30 percentage points reported for diverse architecture ensembles.
+    correct_approach: |
+      Build diverse ensembles: include models from different architecture families (linear, MLP,
+      CNN, transformer if available) and ideally trained on data samples from the same distribution.
+      The ensemble_attack.py deliverable uses ToyLinear + ToyMLP to demonstrate this. In production,
+      a diverse ensemble of 3-5 architectures achieves substantially higher transfer rates than 5
+      instances of the same architecture.
+
+  mistake_5:
+    description: 'Assuming Track 7 detection rates measured against direct adversarial examples apply equally to transfer adversarial examples'
+    why_it_happens: |
+      Track 7 calibration benchmarks use adversarial examples generated directly against the
+      deployed model (white-box). Transfer examples from a surrogate are assumed to have the same
+      detectability properties since they look similar and have the same epsilon constraint.
+    consequence: |
+      Transfer adversarial examples have subtly different distributional properties from direct
+      adversarial examples. They are generated to be adversarial against the surrogate, not the
+      victim -- their relationship to the victim''s decision boundary is less precise. This can
+      make them either easier to detect (if they are farther from the victim''s boundary) or
+      harder to detect (if the ensemble gradient produces smoother perturbations that survive
+      squeezing better). Calibrating Track 7 only against direct examples leaves the transfer
+      case uncalibrated.
+    correct_approach: |
+      Include transfer adversarial examples in the Track 7 calibration dataset. Use
+      transfer_detection_signal_analyser.py to compare direct vs transfer detection rates and
+      identify which primitive has the largest detection gap. Typically the consistency checker
+      gap is largest for high-kappa C&W transfer examples -- these should receive additional
+      coverage from the adversarial classifier in Section 10.12.
+
+section_summary:
+
+  compact: |
+    Transfer attacks close the Chapter 9 to Chapter 10 kill chain. The Ch9 distillation surrogate
+    is the transfer vehicle: adversarial examples crafted white-box against the surrogate fool the
+    victim at 20-80% rates determined by architecture match, training distribution match, attack
+    method strength, and perturbation budget. Ensemble attacks improve transfer by averaging
+    gradients across diverse surrogates (15-30 percentage point improvement). Per-example victim
+    query cost is near-zero: the Ch9 extraction budget is amortised across all transfer examples
+    generated. C&W kappa>0 produces the most transferable adversarial examples and is hardest
+    to detect by consistency checking; adversarial classifier is the primary Track 7 primitive
+    for high-kappa transfer examples. Track 6 has no signal for transfer attacks; Track 7 is
+    the only detection layer.
+
+  key_takeaways:
+    - 'Transfer works because models trained on the same distribution learn aligned boundary geometry; gradient directions are correlated across models'
+    - 'Two-phase kill chain: Ch9 extraction (10k-100k victim queries, amortised) + Ch10 transfer (0 additional victim queries per example)'
+    - 'C&W kappa>0 and ensemble PGD produce the highest transfer rates (50-70%); FGSM single-step produces the lowest (15-35%)'
+    - 'Transfer rate is asymmetric; always measure both directions; report the surrogate-to-victim direction for production threat models'
+    - 'Track 6 has no signal for transfer examples (no query campaign footprint); Track 7 adversarial classifier is the primary detection primitive'
+    - 'PGD adversarial training does not guarantee transfer robustness; evaluate adversarially trained models against diverse surrogate attacks'
+
+preview_section_10_08:
+  title: 'Section 10.8: Physical Adversarial Examples -- Patches, Stop Signs, and 3D Objects'
+  summary: |
+    Section 10.8 extends the adversarial example threat beyond the API to physical sensors.
+    Universal adversarial patches (Brown et al. 2017) are printable regions that cause
+    misclassification when placed in any scene, regardless of background image content. Stop sign
+    attacks (Eykholt et al. 2018) demonstrated that physical stickers cause autonomous vehicle
+    detectors to misclassify real-world signs. Expectation over transformation (EOT) optimises
+    patches to be adversarial across a distribution of viewing angles, lighting conditions, and
+    distances rather than at a single digital position. Physical adversarial attacks expand the
+    threat surface to systems accessed through cameras or sensors -- with no API access required.
+    Section 10.8 covers the patch generator, the EOT training procedure, and a patch localisation
+    detector as the Track 7 primitive for physical adversarial attacks.
+
+metadata:
+  cross_chapter_references:
+    - 'Section 9.4: distillation attacks (surrogate is the Ch9 output; transfer uses it as vehicle)'
+    - 'Section 10.3: FGSM (used as white-box attack against surrogate; single-step transfer baseline)'
+    - 'Section 10.4: PGD (ensemble PGD is strongest transfer attack; used in ensemble_attack.py)'
+    - 'Section 10.5: C&W (kappa>0 produces most transferable examples; used in comparison)'
+    - 'Section 10.6: black-box attacks (transfer replaces NES/Boundary Attack when surrogate is available)'
+  forward_references:
+    - 'Section 10.8: physical adversarial examples (transfer concept applied to physical domain)'
+    - 'Section 10.11: feature squeezing (transfer example detection rates established here)'
+    - 'Section 10.12: consistency checker and adversarial classifier (adversarial classifier primary for kappa>0 transfer)'
+    - 'Section 10.13: Track 7 gateway (transfer examples have no Track 6 footprint; Track 7 only)'
+    - 'Section 10.15: adversarial training (PGD robustness does not imply transfer robustness)'
+  tags:
+    - transferability
+    - surrogate-transfer
+    - ensemble-attack
+    - gradient-averaging
+    - input-diversity
+    - translation-invariant
+    - chapter-9-bridge
+    - kill-chain
+    - per-example-query-cost
+    - transfer-detection
+    - architecture-match
+    - distribution-match
+    - liu-2017

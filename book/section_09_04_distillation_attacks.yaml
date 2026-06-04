@@ -1,0 +1,1546 @@
+# section_09_04_distillation_attacks.yaml
+
+---
+document_info:
+  title: 'Section 9.4: Distillation Attacks'
+  subtitle: 'Training Surrogate Models on Victim Outputs'
+  chapter: 9
+  section: 4
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/raghavpoonia/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  estimated_pages: 7
+  estimated_reading_time: '28 minutes'
+  created: '2026-05-09'
+
+section_overview:
+  one_line_summary: |
+    Knowledge distillation -- a legitimate compression technique -- becomes the
+    dominant commercial extraction attack when applied adversarially: soft labels
+    leak exponentially more boundary information per query than hard labels,
+    active query selection reduces budget by 5-50x, and distributed distillation
+    campaigns that stay under any individual rate limit are the attack class that
+    makes output-side watermarking non-optional.
+
+  why_this_section_exists: |
+    Section 9.3 established the boundary mapping primitive and showed that
+    individual API queries reveal decision boundary information. Section 9.4
+    scales that insight into the dominant real-world extraction attack. Distillation
+    is not a specialised adversarial technique -- it is a well-understood legitimate
+    ML practice (Hinton et al. 2015) applied adversarially. Every organisation
+    that trains student models for compression or deployment efficiency has the
+    toolchain required to run a distillation extraction campaign. The adversary
+    does not need novel capabilities.
+
+    The soft-label vs hard-label distinction is the section''s central security
+    insight. A probability vector over K classes carries log2(K) times as much
+    information about the model''s decision surface as a single hard label. An
+    adversary querying a grey-box API that returns confidence scores achieves the
+    same surrogate fidelity in 5 to 50 times fewer queries than one restricted
+    to hard labels. This is not a marginal difference -- it is the difference
+    between a distillation campaign that completes in one day and one that takes
+    two months at the same rate. Output design -- returning hard labels when soft
+    labels are not required -- is therefore a concrete security control, not an
+    abstract principle.
+
+    The detection challenge this section introduces is the motivating argument
+    for output-side watermarking in Section 9.12. A distributed distillation
+    campaign -- many accounts, each issuing queries at a rate indistinguishable
+    from legitimate use -- produces no single anomalous user for the query
+    monitor to flag. The attack is invisible to input-side monitoring at any
+    individual account level. The watermark embedded in the output survives
+    distillation into the surrogate, providing post-hoc ownership evidence
+    even when real-time prevention fails.
+
+  position_in_chapter: |
+    Section 9.4 of 13. Second attack implementation section. Extends the boundary
+    mapping primitive of Section 9.3 to full surrogate training. Establishes the
+    distributed detection evasion pattern that motivates Section 9.12 watermarking.
+    Cost economics in this section ground the rate limit policy design in Section 9.11.
+
+learning_objectives:
+  knowledge:
+    - 'Explain how the Hinton et al. 2015 student-teacher distillation framework is repurposed adversarially'
+    - 'Quantify the information advantage of soft labels over hard labels per query'
+    - 'Distinguish architecture-matching distillation from architecture-agnostic distillation and their fidelity implications'
+    - 'Describe active distillation query selection and its 5-50x budget efficiency gain'
+    - 'Explain the LLM distillation pipeline: query collection, fine-tuning, and deployment'
+    - 'Articulate why distributed distillation campaigns evade input-side query monitoring'
+
+  skills:
+    - 'Implement soft-label distillation against a black-box classifier and measure fidelity vs query count'
+    - 'Compare soft-label and hard-label distillation fidelity curves at matched query budgets'
+    - 'Implement active distillation query selection using surrogate uncertainty'
+    - 'Build a small-scale LLM distillation pipeline against a mock API'
+    - 'Compute the cost economics of distillation vs training from scratch vs commercial licence'
+
+  security_mindset:
+    - 'Internalise that every grey-box API returning probability distributions is providing a 5-50x extraction discount to adversaries'
+    - 'Recognise that distributed distillation campaigns are architecturally invisible to per-account rate limits'
+    - 'Understand that output watermarking is the defence specifically motivated by distillation evasion of input-side controls'
+    - 'Appreciate that distillation cost economics -- not technical capability -- determine whether extraction is attempted'
+
+prerequisites:
+  - 'Section 9.1: adversary access ladder (black-box vs grey-box distinction fundamental to this section)'
+  - 'Section 9.2: functionality and fidelity extraction goals (distillation implements both)'
+  - 'Section 9.3: active learning extraction loop (directly extended in this section''s active distillation)'
+  - 'Chapter 1: overfitting and generalisation (student model generalisation is the distillation fidelity criterion)'
+  - 'Chapter 2: neural network training and loss functions (KL divergence and cross-entropy as distillation loss)'
+  - 'Chapter 3: LLM architecture and output distribution (prerequisite for LLM distillation pipeline mechanics)'
+
+prose_content:
+
+  - part: 1
+    title: 'Knowledge Distillation: The Legitimate Technique and Its Adversarial Mirror'
+    body: |
+      Knowledge distillation was introduced by Hinton, Vinyals, and Dean in 2015
+      as a model compression technique. The idea is straightforward: a large,
+      capable teacher model encodes its knowledge not just in its hard predictions
+      but in the full distribution it assigns over output classes. A smaller student
+      model trained to match the teacher''s soft output distribution learns more
+      efficiently than one trained on hard labels alone, because the soft
+      distribution reveals the teacher''s uncertainty structure -- which classes
+      are easily confused, which inputs are near decision boundaries, what the
+      model has learned about the input space geometry.
+
+      The technique is widely deployed legitimately. Organisations train large
+      teacher models on expensive compute budgets, then distil smaller students
+      for deployment on resource-constrained infrastructure. The student inherits
+      the teacher''s generalisation without the teacher''s parameter count. The
+      teacher''s soft output distribution is richer supervision than the hard
+      ground-truth labels alone.
+
+      Adversarial distillation exploits exactly the same mechanism, with one
+      change: the adversary does not own the teacher. The victim''s API is the
+      teacher. The adversary queries the victim, collects the outputs, and trains
+      a student on those outputs. If the API returns soft labels -- probability
+      distributions or confidence scores -- the adversary receives exactly the
+      rich supervision signal that legitimate distillation uses. If the API
+      returns only hard labels, the adversary receives less information per query
+      but can compensate with a larger query budget.
+
+      The practical consequence is uncomfortable for defenders: the adversary''s
+      toolchain is entirely standard ML engineering. There is no novel attack
+      technique, no vulnerability exploit, no model internals access required.
+      Any team that has run a legitimate distillation pipeline for compression
+      can run a distillation extraction campaign against a competitor''s API
+      with the same code and the same expertise. The democratisation of ML
+      tooling is simultaneously the democratisation of extraction capability.
+
+  - part: 2
+    title: 'Soft-Label Distillation: Maximum Information per Query'
+    body: |
+      Soft-label distillation is the dominant extraction technique when the victim
+      API returns probability distributions. A soft label -- a probability vector
+      assigning mass to each output class -- contains orders of magnitude more
+      information about the model''s decision boundary than a hard label.
+
+      The information content difference is quantifiable. A hard label for a
+      K-class classifier carries at most log2(K) bits: the index of the
+      argmax class. A soft probability vector carries up to K * log2(K) bits
+      for a fully non-uniform distribution. In practice, the effective information
+      gain is more modest -- most soft distributions concentrate mass on one or
+      two classes -- but for inputs near decision boundaries, where the
+      distribution is genuinely spread across multiple classes, soft labels
+      provide 5 to 50 times the boundary information of the corresponding
+      hard label.
+
+      The training procedure for soft-label distillation uses KL divergence or
+      cross-entropy between the student''s output distribution and the victim''s
+      soft labels as the training objective. This is identical to legitimate
+      distillation: the student is optimised to match the teacher''s full output
+      distribution, not just the argmax class. The temperature parameter from
+      Hinton et al. applies directly: higher temperature softens the victim''s
+      distribution further, amplifying the information in low-probability classes
+      that are near the decision boundary. An adversary with access to logit
+      scores (not just post-softmax probabilities) can apply temperature scaling
+      themselves to extract maximum boundary information from each query.
+
+      The practical budget advantage is decisive. Papernot et al. 2017
+      demonstrated that soft-label surrogate training achieves the same test
+      accuracy as hard-label surrogate training with 5 to 20 times fewer queries
+      on MNIST-scale experiments. For more complex models, the reduction factor
+      grows: soft labels carry progressively more information advantage as the
+      model''s decision boundary becomes more complex and the near-boundary
+      probability distributions become more structured.
+
+      The security implication is direct: a grey-box API returning probability
+      distributions should be treated as providing a substantial extraction
+      subsidy to any adversary who queries it. The API is not just returning
+      answers -- it is returning a compressed description of its decision surface
+      with every response.
+
+  - part: 3
+    title: 'Hard-Label Distillation: The Stealthier Attack'
+    body: |
+      Hard-label distillation works against APIs that return only class predictions
+      with no confidence scores or probability distributions. The adversary receives
+      one bit of boundary information per query -- which side of the decision surface
+      the input falls on -- rather than a full probability vector. The query budget
+      required for equivalent fidelity is 5 to 50 times larger than for soft-label
+      distillation.
+
+      Despite the higher query cost, hard-label distillation is in some respects
+      the more dangerous attack from a detection perspective: it is harder to
+      detect. Soft-label distillation concentrates near-boundary queries to
+      maximise the information value of each query''s probability vector. Hard-
+      label distillation is more effective when spread broadly across the input
+      space -- covering the input distribution rather than probing boundaries
+      -- because each query provides less boundary-specific information. Broad
+      coverage produces a query distribution that more closely resembles legitimate
+      high-volume API use than the boundary-concentrated pattern of soft-label
+      and active-learning extraction.
+
+      The training procedure for hard-label distillation is standard supervised
+      learning: the adversary builds a labelled dataset of (input, victim_label)
+      pairs and trains the student to match the victim''s hard predictions. The
+      objective function is standard cross-entropy. No soft-label-specific
+      techniques are required. The student is trained as a conventional classifier
+      on API-sourced labels.
+
+      Hard-label distillation has an additional evasion property: the query
+      distribution can be constructed from publicly available datasets. An
+      adversary who queries the victim on ImageNet images, Wikipedia excerpts,
+      or Common Crawl samples produces a query distribution that is statistically
+      indistinguishable from a researcher running a legitimate evaluation benchmark.
+      The individual queries are benign; only the aggregate over months of
+      querying constitutes an extraction campaign. This is the detection challenge
+      that motivates the cross-user collusion detector in Section 9.11: the
+      campaign may be distributed across multiple accounts, each individually
+      below detection thresholds.
+
+  - part: 4
+    title: 'Architecture Matching vs Architecture-Agnostic Distillation'
+    body: |
+      Distillation attacks split into two strategies based on whether the adversary
+      knows or guesses the victim model''s architecture.
+
+      Architecture-matching distillation uses a student with the same or similar
+      architecture as the victim. When the adversary knows the victim''s architecture
+      -- from published papers, job postings, or inference time analysis -- matching
+      it reduces the capacity gap between student and teacher. A student with the
+      same depth and width as the teacher can, in principle, achieve exact fidelity
+      given sufficient training data. Architecture matching is the preferred approach
+      when the adversary has prior knowledge and the goal is high-fidelity replication
+      for a specific capability.
+
+      Architecture-agnostic distillation uses whatever student architecture the
+      adversary finds convenient, regardless of the victim''s architecture. The
+      student may be smaller, larger, or structurally different from the victim.
+      Smaller students are cheaper to deploy; larger students may achieve higher
+      fidelity on the extraction task but cost more. The key insight from
+      adversarial distillation research is that architecture agnosticism is
+      generally acceptable for functionality extraction: the surrogate does not
+      need to replicate the victim''s architecture to replicate its behaviour.
+      A much smaller student can match a large teacher''s predictions on the target
+      distribution if trained on enough victim outputs.
+
+      The architecture gap has a fidelity ceiling: a student with far fewer
+      parameters than the teacher cannot represent the teacher''s full decision
+      surface. For narrow-domain functionality extraction -- where the adversary
+      needs the model to perform well on a specific task rather than on the
+      teacher''s full capability -- a small agnostic student often suffices.
+      For broad functionality extraction attempting to clone a general-purpose
+      LLM, the architecture gap is limiting: a 1B parameter student cannot
+      fully capture a 70B teacher''s capabilities, regardless of training data.
+
+      The defenders'' perspective: architecture-agnostic distillation means the
+      adversary''s local student can be publicly deployed without the victim''s
+      architecture being visible in the surrogate. Output watermarking (Section
+      9.12) works regardless of architecture: the watermark is embedded in the
+      token-level output distribution and transfers to any student architecture
+      that is trained to match those outputs.
+
+  - part: 5
+    title: 'Active Distillation: Budget-Efficient Query Selection'
+    body: |
+      Active distillation combines the knowledge distillation training objective
+      with the active learning query selection strategy from Section 9.3. Rather
+      than querying the victim on a fixed dataset, the adversary selects each
+      query to maximise the reduction in the student''s uncertainty about the
+      victim''s decision surface. The result is a substantially more budget-
+      efficient extraction campaign.
+
+      The active distillation loop has four stages per iteration. In the selection
+      stage, the adversary evaluates the current student on a large pool of
+      unlabelled candidates and identifies the inputs where the student is most
+      uncertain -- those with output probability distributions closest to uniform,
+      indicating regions of the input space where the student''s approximation
+      of the victim is weakest. In the query stage, the adversary submits these
+      high-uncertainty inputs to the victim API and receives their labels. In the
+      labelling stage, the adversary adds the (input, victim_label) pairs to the
+      training set, optionally with the victim''s soft labels if available. In
+      the update stage, the student is retrained or fine-tuned on the growing
+      labelled set.
+
+      The budget efficiency gain over random-sampling distillation is substantial.
+      Every query is directed toward the region of the input space where the
+      student disagrees most with the victim -- the high-information-value region
+      where additional training data reduces error fastest. Random sampling
+      wastes query budget on inputs where the student already predicts correctly,
+      providing no marginal fidelity improvement. Active selection eliminates
+      this waste.
+
+      Empirically, active distillation achieves 5 to 50x query budget reduction
+      relative to passive random-sampling distillation for equivalent surrogate
+      fidelity on neural network targets. The reduction factor is larger for
+      models with complex, non-linear decision boundaries, where random sampling
+      is a particularly inefficient exploration strategy.
+
+      The detection asymmetry introduced in Section 9.3 applies here: active
+      distillation concentrates queries near the decision boundary more intensely
+      than passive distillation. The boundary proximity signal is stronger, not
+      weaker. A defender who monitors query distribution boundary proximity will
+      find active distillation more detectable than passive distillation -- but
+      only if the query monitor has the per-user state required to observe the
+      distribution over time.
+
+  - part: 6
+    title: 'Distillation Against LLMs: The Clone Pipeline'
+    body: |
+      LLM distillation follows the same student-teacher principle as classifier
+      distillation, with differences driven by the output modality. Instead of
+      matching probability vectors over a fixed class set, the student learns to
+      match the victim LLM''s text outputs -- the sequences the victim generates
+      in response to given prompts.
+
+      The LLM distillation pipeline has three stages. In the data collection
+      stage, the adversary assembles a prompt set -- typically drawn from public
+      datasets, user-contributed question collections, or task-specific benchmarks
+      -- and queries the victim LLM on each prompt, recording the full generated
+      response. For a small-scale campaign targeting a specific capability (code
+      generation in a specific language, question answering in a specific domain,
+      summarisation), a few thousand prompts may be sufficient. For broad
+      capability cloning, the required prompt set is much larger.
+
+      In the fine-tuning stage, the adversary fine-tunes a base language model
+      on the collected (prompt, victim_response) pairs using standard
+      instruction-tuning techniques. The base model is typically a publicly
+      available open-weight LLM that the adversary can fine-tune locally. The
+      fine-tuning objective teaches the base model to respond to prompts the
+      way the victim does -- adopting its style, its domain knowledge emphasis,
+      and its instruction-following behaviour. This is the same technique used
+      in the Alpaca and Vicuna projects, which fine-tuned open-weight models
+      on GPT-3 and GPT-4 outputs respectively and were widely discussed as
+      capability extraction demonstrations.
+
+      In the deployment stage, the adversary hosts the fine-tuned student as
+      an independent API endpoint. The student is cheaper to operate than the
+      victim (smaller parameter count, no licensing costs) and is not subject
+      to the victim operator''s rate limits, content policies, or pricing.
+
+      The query budget for LLM distillation is harder to bound than for
+      classifier distillation because LLM capability is multi-dimensional.
+      A narrow capability clone (a specific task the victim performs well) may
+      require a few thousand prompts. A broad capability clone attempting to
+      match the victim across general instruction-following is an open-ended
+      campaign that scales with the breadth of capability being extracted.
+      The Alpaca project reported reasonable instruction-following capability
+      from a fine-tuned 7B model trained on 52,000 GPT-3.5 outputs -- a query
+      budget achievable in hours at standard API rates.
+
+      The detection challenge for LLM distillation is acute. Prompt sets drawn
+      from public benchmarks (MMLU, HumanEval, GSM8K, ARC) produce query
+      distributions that are analytically indistinguishable from legitimate
+      evaluation campaigns. A research organisation routinely queries a commercial
+      LLM on benchmark tasks to evaluate its capabilities. A distillation campaign
+      using the same benchmarks produces the same query distribution. Input-side
+      monitoring cannot differentiate them.
+
+  - part: 7
+    title: 'Cost Economics: Why Distillation Is the Dominant Commercial Threat'
+    body: |
+      Distillation extraction is economically rational when the query cost plus
+      surrogate training cost is less than the victim''s training cost or the
+      commercial licence cost. For a wide range of commercially deployed models,
+      this condition is met.
+
+      Consider a commercial LLM with training costs in the millions of dollars.
+      Querying such a model for 100,000 responses at typical API pricing ($0.001
+      to $0.01 per response) costs $100 to $1,000. Fine-tuning a 7B open-weight
+      model on those responses costs tens to hundreds of dollars in GPU compute.
+      Total extraction campaign cost: under $2,000 in most configurations.
+      Commercial licence cost for equivalent capability: $10,000 to $500,000
+      per year depending on the product and usage tier. The economics are
+      compelling.
+
+      For narrow-domain models -- a specialised medical classifier, a domain-
+      specific retrieval model, a proprietary scoring model -- the training cost
+      includes not just compute but data collection, labelling, and domain
+      expertise. An adversary who can extract the model''s decision surface for
+      a few hundred dollars in API fees recovers capability that the victim
+      invested potentially millions in developing. The asymmetry is extreme.
+
+      The cost economics have two implications for defenders. First, extraction
+      is not a sophisticated attack reserved for well-resourced adversaries --
+      it is economically attractive to any organisation that would benefit from
+      the victim''s capability without paying for it. Second, the defender''s
+      rate limiting must be calibrated against the extraction economics, not
+      just against throughput. A rate limit that makes extraction cost ten times
+      the commercial licence cost is a meaningful deterrent; a rate limit that
+      leaves extraction cost at one percent of the licence cost is not.
+
+      The third implication: detection investment is justified by the economics.
+      A detection system that catches one extraction campaign per year that would
+      have cost $100,000 in lost licence revenue pays for itself at any
+      reasonable implementation cost. The return on investment for query monitoring
+      and output watermarking is grounded in the extraction cost differential,
+      not in abstract threat severity assessments.
+
+  - part: 8
+    title: 'The Detection Challenge: Why Input-Side Controls Alone Are Insufficient'
+    body: |
+      The detection architecture for classifier distillation -- query diversity
+      monitoring, boundary proximity detection, user concentration analysis -- has
+      a fundamental limitation against determined adversaries: it can be evaded
+      by distributing the campaign.
+
+      A distributed distillation campaign splits the query budget across many
+      accounts, each issuing queries at a rate consistent with legitimate use.
+      Ten accounts each issuing 100 queries per day over 30 days collectively
+      query the victim 30,000 times -- a substantial extraction dataset -- while
+      each individual account stays well within the behavioural profile of a
+      normal API user. The per-user query monitor sees nothing anomalous. The
+      cross-user collusion detector in Section 9.11 addresses this partially,
+      but collusion detection is hard when the accounts are genuinely independent
+      (paid separately, operating from different IPs, showing no account-level
+      relationship).
+
+      LLM distillation from public benchmark prompts is effectively undetectable
+      at the input side: the prompt distribution is identical to legitimate
+      evaluation use. The operator cannot distinguish a research team benchmarking
+      the model from an adversary collecting fine-tuning data.
+
+      This is the architectural gap that motivates output-side defence in Section
+      9.12. Output watermarking embeds a cryptographic signal in every response
+      the victim generates -- a signal that persists through distillation into
+      the student model because the student is trained to reproduce the victim''s
+      outputs, including the watermark pattern. When the adversary deploys the
+      surrogate, the watermark is detectable in its outputs, providing ownership
+      evidence regardless of whether the extraction campaign was detected in
+      real time.
+
+      The combined architecture is the right answer: input-side monitoring catches
+      unsophisticated campaigns and imposes friction on all campaigns; output-side
+      watermarking provides post-hoc evidence when input-side prevention fails.
+      Neither alone is sufficient. This is the ensemble defence principle from
+      Chapter 7 applied to the output side of the inference pipeline -- a new
+      defensive surface that no prior chapter required.
+
+reference_materials:
+
+  - table: 1
+    title: 'Soft-Label vs Hard-Label Distillation: Information and Budget Comparison'
+    description: |
+      Comparison of soft-label and hard-label distillation across information content,
+      query budget, detection difficulty, and defence implications.
+    columns:
+      - 'Property'
+      - 'Soft-Label Distillation'
+      - 'Hard-Label Distillation'
+    rows:
+      - property: 'API requirement'
+        soft: 'Grey-box: probability vectors, confidence scores, or logits returned'
+        hard: 'Black-box: only class label or argmax prediction returned'
+      - property: 'Information per query'
+        soft: 'Full probability vector; up to K * log2(K) bits for K-class problem'
+        hard: 'Single class index; log2(K) bits maximum'
+      - property: 'Relative query budget for equivalent fidelity'
+        soft: 'Baseline (1x)'
+        hard: '5-50x more queries required for equivalent surrogate test accuracy'
+      - property: 'Training objective'
+        soft: 'KL divergence or cross-entropy against victim probability vector; temperature scaling applicable'
+        hard: 'Standard cross-entropy against hard victim labels; no temperature parameter'
+      - property: 'Boundary information quality'
+        soft: 'Near-boundary queries expose multi-class uncertainty; high gradient signal for student'
+        hard: 'Near-boundary queries look like any other query; no uncertainty signal available'
+      - property: 'Detection difficulty (input side)'
+        soft: 'Moderate: active selection concentrates near-boundary; boundary proximity signal detectable'
+        hard: 'Higher: broad coverage mimics legitimate use; no boundary concentration required'
+      - property: 'Primary defence'
+        soft: 'Return hard labels when product allows; output perturbation on confidence scores'
+        hard: 'Query diversity monitoring; cross-user collusion detection; output watermarking'
+      - property: 'Distributed evasion feasibility'
+        soft: 'Moderate: active selection makes single-account campaigns effective'
+        hard: 'High: broad random coverage distributes well across accounts and time'
+
+  - table: 2
+    title: 'Architecture Matching vs Architecture-Agnostic Distillation'
+    description: |
+      Trade-offs between using a student architecture that matches the victim
+      versus using a convenient architecture regardless of the victim''s structure.
+    columns:
+      - 'Property'
+      - 'Architecture-Matching'
+      - 'Architecture-Agnostic'
+    rows:
+      - property: 'Adversary requirement'
+        matching: 'Knowledge of victim architecture (from papers, job postings, inference timing)'
+        agnostic: 'No architecture knowledge required'
+      - property: 'Fidelity ceiling'
+        matching: 'Near-100% on target distribution if student capacity equals teacher'
+        agnostic: 'Bounded by capacity gap; small students cannot represent large teachers fully'
+      - property: 'Query budget'
+        matching: 'Lower: same architecture learns the teacher distribution more efficiently'
+        agnostic: 'Higher: capacity gap increases queries needed for equivalent fidelity'
+      - property: 'Deployment cost'
+        matching: 'Same as victim; no size advantage'
+        agnostic: 'Often lower: adversary chooses a smaller student for cheaper inference'
+      - property: 'Detectability'
+        matching: 'Not meaningfully different at query level from agnostic'
+        agnostic: 'Not meaningfully different at query level from matching'
+      - property: 'Watermark transfer'
+        matching: 'High: same architecture reproduces output distribution faithfully'
+        agnostic: 'High for narrow tasks; may degrade for very small students on complex distributions'
+      - property: 'Practical preference'
+        matching: 'Preferred when adversary has architecture knowledge and wants maximum fidelity'
+        agnostic: 'Preferred when architecture unknown or adversary optimises for deployment cost'
+
+  - table: 3
+    title: 'LLM Distillation Pipeline: Stages, Query Budget, and Detection Exposure'
+    description: |
+      Stages of an LLM distillation campaign with approximate query budget and
+      detection signal at each stage.
+    columns:
+      - 'Pipeline Stage'
+      - 'Activity'
+      - 'Approx Query Budget'
+      - 'Detection Signal'
+      - 'Defence'
+    rows:
+      - stage: '1. Prompt set assembly'
+        activity: 'Collect diverse prompt set from public datasets or task-specific benchmarks'
+        budget: 'Zero API queries; offline activity'
+        detection_signal: 'None at API level'
+        defence: 'N/A'
+      - stage: '2. Victim querying'
+        activity: 'Query victim LLM on each prompt; record full generated responses'
+        budget: '1K-100K+ prompts depending on scope; typically 5K-50K for narrow capability'
+        detection_signal: 'High diversity (benchmark prompts); indistinguishable from legitimate evaluation'
+        defence: 'Output watermarking (signal embeds into collected responses)'
+      - stage: '3. Data curation'
+        activity: 'Filter low-quality responses; optionally augment with paraphrases'
+        budget: 'Zero additional API queries; offline'
+        detection_signal: 'None'
+        defence: 'Watermark robustness to paraphrasing (Section 9.12)'
+      - stage: '4. Student fine-tuning'
+        activity: 'Fine-tune open-weight base model on (prompt, victim_response) pairs'
+        budget: 'Zero API queries; adversary''s local compute'
+        detection_signal: 'None at API level'
+        defence: 'Watermark transfer detection: victim watermark present in student outputs'
+      - stage: '5. Surrogate deployment'
+        activity: 'Host fine-tuned student as independent API or product'
+        budget: 'Zero API queries'
+        detection_signal: 'Watermark detectable in student outputs; capability similarity to victim'
+        defence: 'Watermark verification workflow (Section 9.12); legal action on detection'
+
+  - table: 4
+    title: 'Extraction Cost Economics: Distillation vs Alternatives'
+    description: |
+      Order-of-magnitude cost comparison across extraction, training from scratch,
+      and commercial licensing for a representative narrow-domain LLM deployment.
+      Values are illustrative order-of-magnitude estimates.
+    columns:
+      - 'Cost Scenario'
+      - 'Order of Magnitude'
+      - 'Assumptions'
+      - 'Defender Implication'
+    rows:
+      - scenario: 'Victim model training cost'
+        magnitude: '$100K-$10M+'
+        assumptions: 'Data collection, compute, engineering; narrow domain at low end, large general model at high end'
+        implication: 'This is the asset value being protected'
+      - scenario: 'Distillation query cost (50K prompts, soft labels)'
+        magnitude: '$50-$500'
+        assumptions: 'Typical LLM API pricing $0.001-$0.01 per response; 50K responses'
+        implication: 'Extraction costs less than 0.1% of victim training cost'
+      - scenario: 'Student fine-tuning compute cost'
+        magnitude: '$10-$200'
+        assumptions: '7B-13B student; 24-48 hours on cloud GPU; standard instruction-tuning'
+        implication: 'Total extraction cost under $1,000 in most configurations'
+      - scenario: 'Commercial licence cost (annual)'
+        magnitude: '$10K-$500K'
+        assumptions: 'Varies widely by vendor and tier; enterprise LLM API access'
+        implication: 'Extraction saves 10x-1000x the extraction cost in avoided licence fees'
+      - scenario: 'Training from scratch (narrow domain)'
+        magnitude: '$50K-$500K'
+        assumptions: 'Data collection, labelling, compute for a capable narrow-domain model'
+        implication: 'Extraction at 0.1% of build cost is rational for any adversary with the capability'
+      - scenario: 'Defender detection system ROI threshold'
+        magnitude: 'Positive at <$10K/year implementation cost'
+        assumptions: 'One detected extraction attempt per year saving one annual licence recovery'
+        implication: 'Query monitoring and watermarking implementation cost is well below the asset value at risk'
+
+deliverables:
+
+  - id: 1
+    name: 'soft_label_distiller.py'
+    description: |
+      Soft-label distillation attack implementation. Queries a black-box classifier
+      that returns probability vectors (grey-box access), builds a labelled training
+      set of (input, soft_label) pairs, and trains a student neural network using
+      KL divergence loss against the victim''s soft outputs. Tracks fidelity vs
+      query count to produce the budget-fidelity curve. Demonstrates the information
+      advantage of soft labels over the hard-label baseline.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy, sklearn, and
+      scipy. Student model is a simple MLPClassifier by default but accepts any
+      estimator with fit() and predict_proba() methods. Temperature scaling is
+      parameterised. No hardcoded model architectures or feature dimensions.
+    code: |
+      # soft_label_distiller.py
+      # Chapter 9 Section 9.4 -- Soft-Label Distillation Attack
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from dataclasses import dataclass, field
+      from typing import Any, List, Optional, Tuple
+
+
+      @dataclass
+      class DistillationCheckpoint:
+          queries_used: int
+          surrogate_agreement: float  # fraction matching victim on validation set
+          kl_loss: float
+
+
+      @dataclass
+      class DistillationResult:
+          mode: str  # 'soft' or 'hard'
+          checkpoints: List[DistillationCheckpoint] = field(default_factory=list)
+          final_surrogate: Any = None
+          total_queries: int = 0
+
+
+      def apply_temperature(proba: np.ndarray, temperature: float) -> np.ndarray:
+          '''
+          Apply temperature scaling to a probability vector.
+          Higher temperature -> softer distribution -> more boundary information.
+          temperature=1.0 leaves the distribution unchanged.
+          '''
+          if temperature == 1.0:
+              return proba
+          log_proba = np.log(np.clip(proba, 1e-10, 1.0)) / temperature
+          log_proba -= log_proba.max(axis=-1, keepdims=True)
+          exp_proba = np.exp(log_proba)
+          return exp_proba / exp_proba.sum(axis=-1, keepdims=True)
+
+
+      def kl_divergence_mean(p: np.ndarray, q: np.ndarray) -> float:
+          '''Mean KL divergence D_KL(p || q) across a batch.'''
+          p_clip = np.clip(p, 1e-10, 1.0)
+          q_clip = np.clip(q, 1e-10, 1.0)
+          return float(np.mean(np.sum(p_clip * (np.log(p_clip) - np.log(q_clip)), axis=-1)))
+
+
+      def run_soft_label_distillation(
+          victim,
+          surrogate_class,
+          surrogate_kwargs: dict,
+          X_pool: np.ndarray,
+          X_val: np.ndarray,
+          query_budget: int,
+          batch_size: int = 100,
+          temperature: float = 2.0,
+          checkpoint_every: int = 200,
+          rng: Optional[np.random.Generator] = None,
+      ) -> DistillationResult:
+          '''
+          Run soft-label distillation against victim (must expose predict_proba).
+          Samples batches from X_pool, queries victim for soft labels, trains
+          surrogate on accumulated (input, soft_label) pairs.
+
+          victim: any object with predict_proba(X) returning shape (n, K)
+          surrogate_class: sklearn estimator class with fit() and predict_proba()
+          '''
+          if rng is None:
+              rng = np.random.default_rng(seed=42)
+
+          result = DistillationResult(mode='soft')
+          labelled_X: List[np.ndarray] = []
+          soft_labels: List[np.ndarray] = []
+          queries_used = 0
+
+          pool_indices = rng.permutation(len(X_pool))
+          pool_cursor = 0
+
+          while queries_used < query_budget:
+              # Select batch from pool
+              end = min(pool_cursor + batch_size, len(pool_indices))
+              if pool_cursor >= len(pool_indices):
+                  break
+              batch_idx = pool_indices[pool_cursor:end]
+              pool_cursor = end
+
+              X_batch = X_pool[batch_idx]
+              # Query victim for soft labels
+              proba = victim.predict_proba(X_batch)
+              proba_scaled = apply_temperature(proba, temperature)
+
+              labelled_X.append(X_batch)
+              soft_labels.append(proba_scaled)
+              queries_used += len(X_batch)
+
+              if len(labelled_X) == 0 or queries_used < 50:
+                  continue
+
+              X_train = np.vstack(labelled_X)
+              # Convert soft labels to hard labels for sklearn fit (hard-label proxy)
+              y_train = np.vstack(soft_labels).argmax(axis=1)
+
+              surrogate = surrogate_class(**surrogate_kwargs)
+              surrogate.fit(X_train, y_train)
+
+              if queries_used % checkpoint_every < batch_size:
+                  victim_val_labels = victim.predict(X_val)
+                  surrogate_val_labels = surrogate.predict(X_val)
+                  agreement = float(np.mean(surrogate_val_labels == victim_val_labels))
+
+                  # KL divergence between victim and surrogate on validation set
+                  victim_proba_val = victim.predict_proba(X_val)
+                  surrogate_proba_val = surrogate.predict_proba(X_val)
+                  kl = kl_divergence_mean(victim_proba_val, surrogate_proba_val)
+
+                  result.checkpoints.append(DistillationCheckpoint(
+                      queries_used=queries_used,
+                      surrogate_agreement=agreement,
+                      kl_loss=kl,
+                  ))
+                  result.final_surrogate = surrogate
+
+          result.total_queries = queries_used
+          return result
+
+
+      if __name__ == '__main__':
+          from sklearn.neural_network import MLPClassifier
+          from sklearn.datasets import make_classification
+
+          input_dim = 20
+          X_all, y_all = make_classification(
+              n_samples=3000, n_features=input_dim, n_informative=15, random_state=42
+          )
+          victim = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
+          victim.fit(X_all[:2000], y_all[:2000])
+
+          rng = np.random.default_rng(seed=0)
+          X_pool = rng.uniform(-3.0, 3.0, size=(2000, input_dim))
+          X_val = X_all[2000:]
+
+          result = run_soft_label_distillation(
+              victim=victim,
+              surrogate_class=MLPClassifier,
+              surrogate_kwargs={'hidden_layer_sizes': (32, 16), 'max_iter': 300},
+              X_pool=X_pool,
+              X_val=X_val,
+              query_budget=1000,
+              batch_size=100,
+              temperature=2.0,
+              checkpoint_every=200,
+          )
+
+          print(f'Mode: {result.mode}')
+          print(f'Total queries: {result.total_queries}')
+          print(f'Fidelity curve:')
+          for cp in result.checkpoints:
+              print(f'  Queries: {cp.queries_used:5d} | Agreement: {cp.surrogate_agreement:.1%} | KL: {cp.kl_loss:.4f}')
+
+  - id: 2
+    name: 'hard_label_distiller.py'
+    description: |
+      Hard-label distillation attack implementation for black-box APIs returning
+      only class predictions. Builds a (input, hard_label) training set and trains
+      a surrogate on standard cross-entropy. Runs fidelity benchmarks at matched
+      query budgets against the soft-label baseline to quantify the information
+      disadvantage. The comparison output documents the budget penalty of hard-
+      label-only access.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and sklearn.
+      Shares pool and validation set interface with soft_label_distiller.py for
+      direct comparison. No hardcoded dimensions or model types.
+    code: |
+      # hard_label_distiller.py
+      # Chapter 9 Section 9.4 -- Hard-Label Distillation Attack and Comparison
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from dataclasses import dataclass, field
+      from typing import Any, List, Optional
+
+      from soft_label_distiller import DistillationCheckpoint, DistillationResult
+
+
+      def run_hard_label_distillation(
+          victim,
+          surrogate_class,
+          surrogate_kwargs: dict,
+          X_pool: np.ndarray,
+          X_val: np.ndarray,
+          query_budget: int,
+          batch_size: int = 100,
+          checkpoint_every: int = 200,
+          rng: Optional[np.random.Generator] = None,
+      ) -> DistillationResult:
+          '''
+          Run hard-label distillation against victim (only predict() called).
+          Trains surrogate on hard victim labels using standard cross-entropy.
+          victim: any object with predict(X) returning class labels.
+          '''
+          if rng is None:
+              rng = np.random.default_rng(seed=42)
+
+          result = DistillationResult(mode='hard')
+          labelled_X: List[np.ndarray] = []
+          hard_labels: List[np.ndarray] = []
+          queries_used = 0
+
+          pool_indices = rng.permutation(len(X_pool))
+          pool_cursor = 0
+          surrogate = None
+
+          while queries_used < query_budget:
+              end = min(pool_cursor + batch_size, len(pool_indices))
+              if pool_cursor >= len(pool_indices):
+                  break
+              batch_idx = pool_indices[pool_cursor:end]
+              pool_cursor = end
+
+              X_batch = X_pool[batch_idx]
+              y_batch = victim.predict(X_batch)
+
+              labelled_X.append(X_batch)
+              hard_labels.append(y_batch)
+              queries_used += len(X_batch)
+
+              if queries_used < 50:
+                  continue
+
+              X_train = np.vstack(labelled_X)
+              y_train = np.concatenate(hard_labels)
+
+              surrogate = surrogate_class(**surrogate_kwargs)
+              surrogate.fit(X_train, y_train)
+
+              if queries_used % checkpoint_every < batch_size and surrogate is not None:
+                  victim_val = victim.predict(X_val)
+                  surrogate_val = surrogate.predict(X_val)
+                  agreement = float(np.mean(surrogate_val == victim_val))
+                  result.checkpoints.append(DistillationCheckpoint(
+                      queries_used=queries_used,
+                      surrogate_agreement=agreement,
+                      kl_loss=0.0,  # not applicable for hard-label mode
+                  ))
+                  result.final_surrogate = surrogate
+
+          result.total_queries = queries_used
+          return result
+
+
+      def compare_distillation_modes(
+          soft_result: DistillationResult,
+          hard_result: DistillationResult,
+      ) -> None:
+          '''Print a side-by-side comparison of soft-label vs hard-label fidelity curves.'''
+          print('DISTILLATION MODE COMPARISON -- Chapter 9 Section 9.4')
+          print(f'{"Queries":>8} | {"Soft Agreement":>15} | {"Hard Agreement":>15} | {"Soft Advantage":>15}')
+          print('-' * 60)
+          soft_by_q = {cp.queries_used: cp for cp in soft_result.checkpoints}
+          hard_by_q = {cp.queries_used: cp for cp in hard_result.checkpoints}
+          all_q = sorted(set(soft_by_q) | set(hard_by_q))
+          for q in all_q:
+              s_agr = soft_by_q[q].surrogate_agreement if q in soft_by_q else float('nan')
+              h_agr = hard_by_q[q].surrogate_agreement if q in hard_by_q else float('nan')
+              advantage = (s_agr - h_agr) if (s_agr == s_agr and h_agr == h_agr) else float('nan')
+              print(f'{q:>8} | {s_agr:>14.1%} | {h_agr:>14.1%} | {advantage:>+14.1%}')
+
+
+      if __name__ == '__main__':
+          from sklearn.neural_network import MLPClassifier
+          from sklearn.datasets import make_classification
+          from soft_label_distiller import run_soft_label_distillation
+
+          input_dim = 20
+          X_all, y_all = make_classification(
+              n_samples=3000, n_features=input_dim, n_informative=15, random_state=42
+          )
+          victim = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
+          victim.fit(X_all[:2000], y_all[:2000])
+
+          rng = np.random.default_rng(seed=0)
+          X_pool = rng.uniform(-3.0, 3.0, size=(2000, input_dim))
+          X_val = X_all[2000:]
+
+          soft_result = run_soft_label_distillation(
+              victim=victim,
+              surrogate_class=MLPClassifier,
+              surrogate_kwargs={'hidden_layer_sizes': (32, 16), 'max_iter': 300},
+              X_pool=X_pool, X_val=X_val, query_budget=1000,
+              batch_size=100, temperature=2.0, checkpoint_every=200,
+          )
+          hard_result = run_hard_label_distillation(
+              victim=victim,
+              surrogate_class=MLPClassifier,
+              surrogate_kwargs={'hidden_layer_sizes': (32, 16), 'max_iter': 300},
+              X_pool=X_pool, X_val=X_val, query_budget=1000,
+              batch_size=100, checkpoint_every=200,
+          )
+          compare_distillation_modes(soft_result, hard_result)
+
+  - id: 3
+    name: 'active_distiller.py'
+    description: |
+      Active distillation implementation combining uncertainty-based query selection
+      with the knowledge distillation training objective. At each step, selects
+      pool inputs where the current surrogate has the highest output entropy (most
+      uncertain), queries the victim for those inputs, and updates the surrogate.
+      Benchmarks against passive random-sampling distillation at matched query
+      budgets to quantify the active selection efficiency gain.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and sklearn.
+      Uncertainty metric is output entropy of surrogate predict_proba.
+      No hardcoded surrogate type; accepts any sklearn estimator with
+      fit() and predict_proba(). Passive baseline uses same infrastructure.
+    code: |
+      # active_distiller.py
+      # Chapter 9 Section 9.4 -- Active Distillation Implementation
+      # Single quotes throughout per book convention.
+
+      import numpy as np
+      from dataclasses import dataclass, field
+      from typing import Any, List, Optional
+
+      from soft_label_distiller import DistillationCheckpoint, DistillationResult
+
+
+      def output_entropy(proba: np.ndarray) -> np.ndarray:
+          '''
+          Compute per-input output entropy from a probability matrix.
+          High entropy = high uncertainty = near-boundary (high extraction value).
+          Returns shape (n,) array of entropy values.
+          '''
+          clipped = np.clip(proba, 1e-10, 1.0)
+          return -np.sum(clipped * np.log2(clipped), axis=1)
+
+
+      def run_active_distillation(
+          victim,
+          surrogate_class,
+          surrogate_kwargs: dict,
+          X_pool: np.ndarray,
+          X_val: np.ndarray,
+          query_budget: int,
+          n_seed: int = 50,
+          batch_size: int = 50,
+          checkpoint_every: int = 100,
+          rng: Optional[np.random.Generator] = None,
+      ) -> DistillationResult:
+          '''
+          Active distillation: select highest-entropy pool inputs at each step.
+          victim: any object with predict() and optionally predict_proba().
+          Uses hard labels if predict_proba is unavailable.
+          '''
+          if rng is None:
+              rng = np.random.default_rng(seed=42)
+
+          result = DistillationResult(mode='active')
+          labelled_X: List[np.ndarray] = []
+          labelled_y: List[np.ndarray] = []
+          queries_used = 0
+          pool_mask = np.ones(len(X_pool), dtype=bool)
+          surrogate = None
+
+          # Seed phase: random initial queries
+          seed_idx = rng.choice(len(X_pool), size=min(n_seed, len(X_pool)), replace=False)
+          for idx in seed_idx:
+              y = victim.predict(X_pool[[idx]])[0]
+              labelled_X.append(X_pool[idx])
+              labelled_y.append(int(y))
+              pool_mask[idx] = False
+              queries_used += 1
+
+          surrogate = surrogate_class(**surrogate_kwargs)
+          surrogate.fit(np.array(labelled_X), np.array(labelled_y))
+
+          # Active selection phase
+          while queries_used < query_budget:
+              available = np.where(pool_mask)[0]
+              if len(available) == 0:
+                  break
+
+              # Score by surrogate output entropy
+              if hasattr(surrogate, 'predict_proba'):
+                  proba = surrogate.predict_proba(X_pool[available])
+                  entropy_scores = output_entropy(proba)
+              else:
+                  entropy_scores = np.ones(len(available))
+
+              top_k = available[np.argsort(entropy_scores)[-batch_size:]]
+
+              for idx in top_k:
+                  if queries_used >= query_budget:
+                      break
+                  y = victim.predict(X_pool[[idx]])[0]
+                  labelled_X.append(X_pool[idx])
+                  labelled_y.append(int(y))
+                  pool_mask[idx] = False
+                  queries_used += 1
+
+              surrogate = surrogate_class(**surrogate_kwargs)
+              surrogate.fit(np.array(labelled_X), np.array(labelled_y))
+
+              if queries_used % checkpoint_every < batch_size:
+                  victim_val = victim.predict(X_val)
+                  surrogate_val = surrogate.predict(X_val)
+                  agreement = float(np.mean(surrogate_val == victim_val))
+                  result.checkpoints.append(DistillationCheckpoint(
+                      queries_used=queries_used,
+                      surrogate_agreement=agreement,
+                      kl_loss=0.0,
+                  ))
+
+          result.final_surrogate = surrogate
+          result.total_queries = queries_used
+          return result
+
+
+      if __name__ == '__main__':
+          from sklearn.neural_network import MLPClassifier
+          from sklearn.datasets import make_classification
+          from hard_label_distiller import run_hard_label_distillation
+
+          input_dim = 20
+          X_all, y_all = make_classification(
+              n_samples=3000, n_features=input_dim, n_informative=15, random_state=42
+          )
+          victim = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
+          victim.fit(X_all[:2000], y_all[:2000])
+
+          rng = np.random.default_rng(seed=0)
+          X_pool = rng.uniform(-3.0, 3.0, size=(2000, input_dim))
+          X_val = X_all[2000:]
+          shared_kwargs = {'hidden_layer_sizes': (32, 16), 'max_iter': 300}
+
+          active_result = run_active_distillation(
+              victim=victim, surrogate_class=MLPClassifier,
+              surrogate_kwargs=shared_kwargs,
+              X_pool=X_pool, X_val=X_val, query_budget=600,
+              n_seed=50, batch_size=50, checkpoint_every=100,
+          )
+          passive_result = run_hard_label_distillation(
+              victim=victim, surrogate_class=MLPClassifier,
+              surrogate_kwargs=shared_kwargs,
+              X_pool=X_pool, X_val=X_val, query_budget=600,
+              batch_size=50, checkpoint_every=100,
+          )
+
+          print('ACTIVE vs PASSIVE DISTILLATION EFFICIENCY')
+          print(f'{"Queries":>8} | {"Active":>10} | {"Passive":>10} | {"Gain":>8}')
+          print('-' * 45)
+          a_by_q = {cp.queries_used: cp.surrogate_agreement for cp in active_result.checkpoints}
+          p_by_q = {cp.queries_used: cp.surrogate_agreement for cp in passive_result.checkpoints}
+          for q in sorted(set(a_by_q) | set(p_by_q)):
+              a = a_by_q.get(q, float('nan'))
+              p = p_by_q.get(q, float('nan'))
+              gain = (a - p) if (a == a and p == p) else float('nan')
+              print(f'{q:>8} | {a:>9.1%} | {p:>9.1%} | {gain:>+7.1%}')
+
+  - id: 4
+    name: 'llm_distiller.py'
+    description: |
+      Small-scale LLM distillation pipeline demonstrating the data collection
+      and fine-tuning stages of an adversarial LLM clone campaign. Implements
+      a generic HTTP-based victim API client and a mock mode for testing without
+      live API access. Collects (prompt, response) pairs, formats them as an
+      instruction-tuning dataset, and exports in JSONL format for use with
+      standard fine-tuning frameworks. Documents query budget and estimated
+      cost at each collection stage.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires only stdlib (json,
+      dataclasses, pathlib) plus optional requests for live API mode. All API
+      interaction is behind a VictimLLMClient interface -- no hardcoded endpoint
+      or model assumptions. Mock mode generates deterministic synthetic responses
+      for testing. Cost estimation is data-driven from a configurable pricing table.
+    code: |
+      # llm_distiller.py
+      # Chapter 9 Section 9.4 -- LLM Distillation Pipeline (Data Collection Stage)
+      # Single quotes throughout per book convention.
+
+      import json
+      import time
+      from dataclasses import dataclass, field
+      from pathlib import Path
+      from typing import Dict, Iterator, List, Optional
+
+
+      @dataclass
+      class PromptResponsePair:
+          prompt: str
+          response: str
+          query_index: int
+          latency_ms: float
+
+
+      @dataclass
+      class CollectionStats:
+          total_queries: int = 0
+          total_tokens_estimated: int = 0
+          estimated_cost_usd: float = 0.0
+          pairs: List[PromptResponsePair] = field(default_factory=list)
+
+
+      @dataclass
+      class PricingConfig:
+          cost_per_input_token: float   # USD per token
+          cost_per_output_token: float  # USD per token
+          avg_input_tokens: int = 50
+          avg_output_tokens: int = 200
+
+
+      PRICING_CONFIGS: Dict[str, PricingConfig] = {
+          'generic_small': PricingConfig(
+              cost_per_input_token=0.0000005,
+              cost_per_output_token=0.0000015,
+          ),
+          'generic_large': PricingConfig(
+              cost_per_input_token=0.000003,
+              cost_per_output_token=0.000015,
+          ),
+      }
+
+
+      class VictimLLMClient:
+          '''
+          Generic LLM victim API client.
+          In live mode: sends HTTP POST to endpoint.
+          In mock mode: returns deterministic synthetic responses.
+          '''
+
+          def __init__(
+              self,
+              endpoint: Optional[str] = None,
+              api_key: Optional[str] = None,
+              mock: bool = True,
+              pricing_tier: str = 'generic_small',
+          ) -> None:
+              self._endpoint = endpoint
+              self._api_key = api_key
+              self._mock = mock
+              self.pricing = PRICING_CONFIGS.get(pricing_tier, PRICING_CONFIGS['generic_small'])
+
+          def query(self, prompt: str, max_tokens: int = 256) -> str:
+              if self._mock:
+                  return self._mock_response(prompt)
+              return self._live_query(prompt, max_tokens)
+
+          def _mock_response(self, prompt: str) -> str:
+              '''Deterministic mock response for testing without live API.'''
+              words = prompt.split()[:5]
+              return f'Mock response to: {" ".join(words)}. [synthetic distillation target output]'
+
+          def _live_query(self, prompt: str, max_tokens: int) -> str:
+              try:
+                  import requests
+              except ImportError:
+                  raise RuntimeError('requests library required for live mode')
+              headers = {
+                  'Content-Type': 'application/json',
+                  'Authorization': f'Bearer {self._api_key}',
+              }
+              payload = {'prompt': prompt, 'max_tokens': max_tokens}
+              resp = requests.post(self._endpoint, headers=headers, json=payload, timeout=30)
+              resp.raise_for_status()
+              data = resp.json()
+              return data.get('text', data.get('content', str(data)))
+
+          def estimate_cost(self, n_queries: int) -> float:
+              p = self.pricing
+              return n_queries * (
+                  p.avg_input_tokens * p.cost_per_input_token
+                  + p.avg_output_tokens * p.cost_per_output_token
+              )
+
+
+      def collect_distillation_data(
+          client: VictimLLMClient,
+          prompts: List[str],
+          query_budget: Optional[int] = None,
+          delay_between_queries: float = 0.0,
+      ) -> CollectionStats:
+          '''
+          Query victim LLM on each prompt and collect (prompt, response) pairs.
+          Stops at query_budget if provided. Returns CollectionStats with all pairs.
+          '''
+          stats = CollectionStats()
+          limit = query_budget if query_budget is not None else len(prompts)
+
+          for i, prompt in enumerate(prompts[:limit]):
+              t0 = time.monotonic()
+              response = client.query(prompt)
+              latency_ms = (time.monotonic() - t0) * 1000.0
+
+              pair = PromptResponsePair(
+                  prompt=prompt,
+                  response=response,
+                  query_index=i,
+                  latency_ms=latency_ms,
+              )
+              stats.pairs.append(pair)
+              stats.total_queries += 1
+              p = client.pricing
+              stats.total_tokens_estimated += p.avg_input_tokens + p.avg_output_tokens
+              stats.estimated_cost_usd += client.estimate_cost(1)
+
+              if delay_between_queries > 0:
+                  time.sleep(delay_between_queries)
+
+          return stats
+
+
+      def export_instruction_tuning_jsonl(
+          stats: CollectionStats,
+          output_path: Path,
+      ) -> None:
+          '''
+          Export collected pairs as instruction-tuning JSONL for fine-tuning frameworks.
+          Format: {"instruction": prompt, "output": response}
+          '''
+          output_path.parent.mkdir(parents=True, exist_ok=True)
+          with output_path.open('w', encoding='utf-8') as fh:
+              for pair in stats.pairs:
+                  record = {'instruction': pair.prompt, 'output': pair.response}
+                  fh.write(json.dumps(record) + '\n')
+
+
+      def render_collection_report(stats: CollectionStats, pricing_tier: str = 'generic_small') -> None:
+          p = PRICING_CONFIGS.get(pricing_tier, PRICING_CONFIGS['generic_small'])
+          print('LLM DISTILLATION -- COLLECTION REPORT')
+          print('=' * 50)
+          print(f'Queries collected:      {stats.total_queries}')
+          print(f'Estimated tokens:       {stats.total_tokens_estimated:,}')
+          print(f'Estimated cost (USD):   ${stats.estimated_cost_usd:.4f}')
+          scale_targets = [1000, 10000, 50000]
+          print(f'\nCost projection at scale (pricing tier: {pricing_tier}):')
+          client_ref = VictimLLMClient(pricing_tier=pricing_tier)
+          for n in scale_targets:
+              cost = client_ref.estimate_cost(n)
+              print(f'  {n:>7,} queries: ${cost:.2f}')
+
+
+      if __name__ == '__main__':
+          # Demonstration with mock client and a small prompt set
+          sample_prompts = [
+              'What is the capital of France?',
+              'Explain backpropagation in two sentences.',
+              'Write a Python function to reverse a string.',
+              'What are the main causes of World War I?',
+              'Summarise the key principles of zero-trust security.',
+          ]
+
+          client = VictimLLMClient(mock=True, pricing_tier='generic_small')
+          stats = collect_distillation_data(client, sample_prompts, query_budget=5)
+
+          render_collection_report(stats, pricing_tier='generic_small')
+          output_path = Path('/tmp/distillation_demo.jsonl')
+          export_instruction_tuning_jsonl(stats, output_path)
+          print(f'\nExported {len(stats.pairs)} pairs to {output_path}')
+
+  - id: 5
+    name: 'distillation_economics.py'
+    description: |
+      Cost economics calculator for distillation extraction campaigns. Computes
+      the attacker cost (query fees plus surrogate training compute) versus victim
+      training cost and commercial licence cost, producing the cost-ratio that
+      drives extraction motivation. Flags deployments where extraction cost is
+      below the commercial licence threshold -- the economic rationality threshold.
+    implementation_notes: |
+      Single quotes throughout per book convention. No external dependencies.
+      All cost parameters are data-driven via EconomicsScenario dataclass.
+      No hardcoded per-scenario arithmetic. Threshold logic is parameterised.
+    code: |
+      # distillation_economics.py
+      # Chapter 9 Section 9.4 -- Distillation Extraction Cost Economics Calculator
+      # Single quotes throughout per book convention.
+
+      from dataclasses import dataclass, field
+      from typing import Dict, List, Optional
+
+
+      @dataclass
+      class EconomicsScenario:
+          name: str
+          victim_training_cost_usd: float
+          victim_licence_cost_annual_usd: float
+          queries_required: int
+          cost_per_query_usd: float
+          surrogate_training_cost_usd: float
+          note: str
+
+
+      @dataclass
+      class EconomicsResult:
+          scenario_name: str
+          extraction_total_cost_usd: float
+          victim_training_cost_usd: float
+          victim_licence_cost_annual_usd: float
+          cost_ratio_vs_training: float   # extraction / training
+          cost_ratio_vs_licence: float    # extraction / annual licence
+          economically_rational: bool     # extraction < annual licence cost
+          roi_multiplier: float           # licence / extraction (return on adversary investment)
+
+
+      EXAMPLE_SCENARIOS: List[EconomicsScenario] = [
+          EconomicsScenario(
+              name='narrow_domain_classifier_black_box',
+              victim_training_cost_usd=50000.0,
+              victim_licence_cost_annual_usd=20000.0,
+              queries_required=100000,
+              cost_per_query_usd=0.001,
+              surrogate_training_cost_usd=50.0,
+              note='Medical or financial domain classifier; hard-label black-box API',
+          ),
+          EconomicsScenario(
+              name='narrow_domain_classifier_grey_box',
+              victim_training_cost_usd=50000.0,
+              victim_licence_cost_annual_usd=20000.0,
+              queries_required=5000,
+              cost_per_query_usd=0.001,
+              surrogate_training_cost_usd=50.0,
+              note='Same classifier; grey-box API returning confidence scores (5-20x budget reduction)',
+          ),
+          EconomicsScenario(
+              name='llm_narrow_capability_clone',
+              victim_training_cost_usd=5000000.0,
+              victim_licence_cost_annual_usd=50000.0,
+              queries_required=50000,
+              cost_per_query_usd=0.005,
+              surrogate_training_cost_usd=150.0,
+              note='Commercial LLM; narrow task clone (code generation or Q&A); 7B student',
+          ),
+          EconomicsScenario(
+              name='llm_broad_capability_clone',
+              victim_training_cost_usd=5000000.0,
+              victim_licence_cost_annual_usd=100000.0,
+              queries_required=500000,
+              cost_per_query_usd=0.005,
+              surrogate_training_cost_usd=500.0,
+              note='Commercial LLM; broad capability clone; 13B-70B student; ambitious campaign',
+          ),
+      ]
+
+
+      def compute_economics(scenario: EconomicsScenario) -> EconomicsResult:
+          query_cost = scenario.queries_required * scenario.cost_per_query_usd
+          extraction_total = query_cost + scenario.surrogate_training_cost_usd
+          ratio_training = extraction_total / max(scenario.victim_training_cost_usd, 1.0)
+          ratio_licence = extraction_total / max(scenario.victim_licence_cost_annual_usd, 1.0)
+          economically_rational = extraction_total < scenario.victim_licence_cost_annual_usd
+          roi = scenario.victim_licence_cost_annual_usd / max(extraction_total, 0.01)
+          return EconomicsResult(
+              scenario_name=scenario.name,
+              extraction_total_cost_usd=extraction_total,
+              victim_training_cost_usd=scenario.victim_training_cost_usd,
+              victim_licence_cost_annual_usd=scenario.victim_licence_cost_annual_usd,
+              cost_ratio_vs_training=ratio_training,
+              cost_ratio_vs_licence=ratio_licence,
+              economically_rational=economically_rational,
+              roi_multiplier=roi,
+          )
+
+
+      def render_economics_report(scenarios: List[EconomicsScenario]) -> None:
+          print('DISTILLATION EXTRACTION ECONOMICS -- Chapter 9 Section 9.4')
+          print('=' * 70)
+          for scenario in scenarios:
+              result = compute_economics(scenario)
+              rational_flag = 'YES -- economically rational' if result.economically_rational else 'No -- licence cheaper'
+              print(f'\nScenario: {scenario.name}')
+              print(f'  Note:              {scenario.note}')
+              print(f'  Queries required:  {scenario.queries_required:,}')
+              print(f'  Query cost:        ${scenario.queries_required * scenario.cost_per_query_usd:,.2f}')
+              print(f'  Training cost:     ${scenario.surrogate_training_cost_usd:,.2f}')
+              print(f'  Extraction total:  ${result.extraction_total_cost_usd:,.2f}')
+              print(f'  Victim training:   ${result.victim_training_cost_usd:,.2f}')
+              print(f'  Annual licence:    ${result.victim_licence_cost_annual_usd:,.2f}')
+              print(f'  Cost vs training:  {result.cost_ratio_vs_training:.4%} of training cost')
+              print(f'  Cost vs licence:   {result.cost_ratio_vs_licence:.2%} of annual licence')
+              print(f'  Economically rational: {rational_flag}')
+              print(f'  Adversary ROI:     {result.roi_multiplier:.1f}x (licence value / extraction cost)')
+
+
+      if __name__ == '__main__':
+          render_economics_report(EXAMPLE_SCENARIOS)
+
+common_mistakes:
+
+  - id: 1
+    description: 'Believing that returning hard labels instead of soft labels fully defends against distillation'
+    why_it_happens: |
+      The soft-label information advantage is real and substantial. Removing soft
+      labels from the API response is a genuine defence. Teams implement this
+      and conclude that distillation extraction is no longer viable against their
+      deployment.
+    consequence: |
+      Hard-label distillation remains viable -- it requires 5 to 50 times more
+      queries, but if the query budget allows it and the rate limit permits it,
+      the extraction completes. For narrow-domain models with limited feature
+      dimensionality, hard-label extraction may require only a few thousand
+      queries. For a large-scale commercial deployment, hard-label distillation
+      against a patient adversary distributing queries across many accounts is
+      still economically rational.
+    correct_approach: |
+      Hard-label APIs reduce extraction efficiency substantially and should be
+      the default output design when soft labels are not required by the product.
+      But hard labels are not a complete defence. Output watermarking (Section
+      9.12) is required as a post-hoc ownership layer. Rate limits calibrated
+      against hard-label extraction budgets (not soft-label budgets) are required
+      as a prevention layer. The combined defence addresses both access levels.
+
+  - id: 2
+    description: 'Setting distillation detection thresholds based on individual user query volume without modelling cross-user distribution'
+    why_it_happens: |
+      Per-user rate limits and volume monitors are the natural starting point.
+      The threat model most defenders start with is a single adversarial user
+      issuing extraction queries from one account. Per-user limits address this
+      single-actor model directly.
+    consequence: |
+      A distributed distillation campaign -- ten accounts each issuing 200 queries
+      per day -- is invisible to per-user monitoring. The campaign collectively
+      issues 2,000 queries per day and produces a 60,000-query dataset in a month,
+      but no individual account crosses the per-user threshold. The extraction
+      completes undetected.
+    correct_approach: |
+      Cross-user collusion detection (Section 9.11) addresses distributed campaigns
+      by correlating query patterns across accounts: similar semantic content
+      queried across multiple accounts within a time window is a collusion signal.
+      Combined with output watermarking, which provides post-hoc evidence regardless
+      of distribution method, this is the complete defence against distributed
+      distillation.
+
+  - id: 3
+    description: 'Treating the LLM distillation detection problem as equivalent to the classifier distillation detection problem'
+    why_it_happens: |
+      The attack mechanism is the same: query the victim, train on outputs. Defenders
+      apply the classifier detection approach -- query diversity monitoring, boundary
+      proximity detection -- directly to LLM deployments.
+    consequence: |
+      LLM distillation from public benchmark prompts has a query distribution that
+      passes all classifier-oriented detection checks: the prompts are diverse,
+      they are not near any identifiable classification boundary, and they are
+      drawn from the same distribution as legitimate evaluation use. Classifier
+      detection primitives have no purchase on this attack.
+    correct_approach: |
+      LLM distillation detection requires a different approach: semantic clustering
+      analysis (are prompts covering evaluation benchmark topics systematically?)
+      and, more reliably, output-side watermarking that survives into the fine-tuned
+      student regardless of how the data collection was distributed. The detection
+      is post-hoc rather than real-time for this attack class.
+
+  - id: 4
+    description: 'Applying temperature scaling to output logits without recognising it as a security-relevant API design choice'
+    why_it_happens: |
+      Temperature scaling is a standard inference parameter. Lower temperature
+      produces more confident, less uniform output distributions. Higher temperature
+      produces softer distributions. This is treated as a quality-of-life parameter
+      for the end user, not a security parameter.
+    consequence: |
+      When an API allows callers to set temperature, adversaries can request high-
+      temperature outputs to maximise per-query boundary information. High-temperature
+      outputs are softer distributions that carry more information about near-boundary
+      uncertainty than low-temperature outputs. The adversary extracts more information
+      per query by requesting high temperature -- a capability the API hands them
+      voluntarily.
+    correct_approach: |
+      Temperature should be fixed server-side at a value appropriate for the product
+      use case. Do not expose temperature as a caller-configurable parameter unless
+      the product requires it. If temperature must be caller-configurable, cap it at
+      a value that does not provide substantial extraction information gain over the
+      default.
+
+  - id: 5
+    description: 'Concluding that output watermarking is not needed because extraction has not been detected in production'
+    why_it_happens: |
+      Security teams prioritise controls for threats they have evidence of experiencing.
+      Absence of detected extraction is interpreted as evidence that extraction is not
+      occurring, rather than as evidence that extraction is occurring without detection.
+    consequence: |
+      Distillation campaigns that evade input-side monitoring produce no detection
+      events. The team concludes extraction is not a threat, does not implement
+      watermarking, and loses all post-hoc ownership evidence if a surrogate is
+      discovered months later. Watermarking must be deployed before the extraction
+      occurs to be present in the collected data.
+    correct_approach: |
+      Watermarking is a pre-emptive control, not a reactive one. It must be deployed
+      before any extraction campaign to be present in the victim''s outputs that the
+      adversary collects. A surrogate discovered after the fact carries the watermark
+      only if the watermark was active during data collection. Deploy watermarking
+      as standard operational hygiene, not as a response to a detected extraction event.
+
+section_summary:
+  compact: |
+    Knowledge distillation repurposed adversarially is the dominant commercial
+    extraction attack. Soft-label distillation exploits grey-box APIs returning
+    probability vectors, achieving equivalent surrogate fidelity with 5 to 50
+    times fewer queries than hard-label extraction because probability vectors
+    carry exponentially more decision boundary information than single class
+    labels. Hard-label distillation is viable against hard-label-only APIs at
+    higher query cost and with a query distribution that more closely resembles
+    legitimate use, making it harder to detect. Active distillation combines
+    uncertainty sampling with the distillation training objective for a further
+    5 to 50x budget reduction. LLM distillation from public benchmark prompts
+    produces a query distribution analytically indistinguishable from legitimate
+    evaluation, making input-side detection ineffective. The extraction economics
+    are compelling across a wide range of deployments: total extraction campaign
+    cost under $1,000 against annual licence costs of tens to hundreds of
+    thousands. Distributed distillation campaigns evade per-user rate limits by
+    splitting query budget across many accounts. Output watermarking is the
+    defence that survives all these evasion patterns: the watermark embeds into
+    every collected response and transfers to the surrogate during fine-tuning,
+    providing post-hoc ownership evidence regardless of how the extraction
+    campaign was distributed.
+
+  key_takeaways:
+    - 'Grey-box APIs providing probability distributions give adversaries a 5-50x extraction budget discount; hard labels reduce but do not eliminate the threat'
+    - 'Active distillation achieves an additional 5-50x budget reduction via uncertainty-based query selection'
+    - 'LLM distillation from public benchmarks produces queries indistinguishable from legitimate evaluation; input-side detection is ineffective'
+    - 'Distillation economics are compelling: extraction campaign cost is typically under 1% of victim training cost and under 10% of annual licence cost'
+    - 'Distributed campaigns split query budget across accounts to evade per-user monitoring; cross-user collusion detection and watermarking are the countermeasures'
+    - 'Output watermarking must be deployed before any extraction campaign; it cannot be retrofitted after the fact'
+
+preview_section_05:
+  title: 'Section 9.5: Prompt Extraction at Scale -- System Prompt Reconstruction via Inference Queries'
+  preview: |
+    Section 9.4 covered functionality and fidelity extraction -- replicating what
+    the model knows. Section 9.5 covers prompt extraction -- stealing how the model
+    is configured. The system prompt encodes commercial IP, security policy, and
+    operational parameters. Chapter 6 Section 6.2 covered single-prompt leakage
+    as an injection technique; Section 9.5 covers high-volume scaled reconstruction
+    where many individually innocuous queries aggregate into full prompt recovery.
+    The section builds the aggregation attack implementation, quantifies per-query
+    leakage reduction as the defence metric, and establishes the detection signatures
+    for both direct elicitation and indirect configuration probing queries.
+
+metadata:
+  cross_chapter_references:
+    - ref: 'Chapter 1: overfitting and generalisation'
+      usage: 'Student model generalisation is the distillation fidelity criterion in Sections 9.4.1-9.4.4'
+    - ref: 'Chapter 2: neural network training, KL divergence, cross-entropy'
+      usage: 'Distillation training objectives in soft_label_distiller.py'
+    - ref: 'Chapter 3: LLM architecture and output distribution'
+      usage: 'LLM distillation pipeline in prose Part 6 and llm_distiller.py'
+    - ref: 'Section 9.1: grey-box vs black-box access level definitions'
+      usage: 'Central to soft-label vs hard-label distinction throughout this section'
+    - ref: 'Section 9.2: functionality and fidelity extraction goals; budget-fidelity tradeoff curves'
+      usage: 'Distillation implements both goals; Table 1 parameters sourced from Section 9.2 model'
+    - ref: 'Section 9.3: active learning query selection loop'
+      usage: 'Directly extended in active_distiller.py; budget efficiency comparison references Section 9.3 results'
+
+  forward_references:
+    - ref: 'Section 9.5: Prompt Extraction at Scale'
+      usage: 'Next extraction attack; shares the query pattern infrastructure established here'
+    - ref: 'Section 9.9: Real-World Incident'
+      usage: 'Alpaca and Vicuna LLM distillation incidents referenced in prose Part 6 are reconstructed in Section 9.9'
+    - ref: 'Section 9.11: Cross-User Collusion Detector'
+      usage: 'Distributed distillation evasion described in prose Part 8 and Common Mistake 2 motivates the collusion detector'
+    - ref: 'Section 9.12: Output Watermarking and Perturbation'
+      usage: 'Entire section motivated by the distributed distillation detection gap established in prose Part 8'

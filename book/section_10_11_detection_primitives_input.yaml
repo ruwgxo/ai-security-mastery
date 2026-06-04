@@ -1,0 +1,1219 @@
+# section_10_11_detection_primitives_input.yaml
+
+---
+document_info:
+  title: 'Detection Primitives: Input Preprocessing and Feature Squeezing'
+  chapter: 10
+  section: 11
+  section_code: '1011'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-05-24'
+  estimated_pages: 6
+  estimated_reading_time: '45-55 minutes'
+
+section_overview:
+  one_line_summary: 'Feature squeezing detects adversarial examples through their sensitivity to input transformation: the model prediction changes significantly when a squeezer is applied to adversarial inputs but remains stable for natural inputs.'
+  why_this_section_exists: |
+    Sections 10.3-10.9 built the attack catalogue. Section 10.10 grounded it in documented
+    production incidents. Sections 10.11-10.12 build the Track 7 detection primitive library that
+    the Section 10.13 gateway uses to defend against those attacks. Section 10.11 covers the
+    input-side primitives: transformations applied to the input before or alongside model inference
+    that reveal adversarial perturbations through prediction instability. Feature squeezing (Xu
+    et al. 2018) is the foundational input-side primitive: three canonical squeezers (spatial
+    smoothing, bit-depth reduction, JPEG compression), combined in an ensemble with disagreement
+    as the detection signal. The latency budget calculation that determines how many squeezers
+    fit within the 50ms P99 gateway budget is the critical engineering decision Section 10.13
+    inherits from this section.
+  position_in_chapter: |
+    Section 10.11 opens the Track 7 detection primitive library. It covers the pre-inference
+    stage: transformations that must complete before the main model output is used. Section 10.12
+    covers the post-inference stage: consistency checking and adversarial classifier that operate
+    on the model''s own output. Section 10.13 wires both stages into the production gateway.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain the detection-by-transformation principle: why adversarial perturbations are sensitive to input transformation while natural images are not'
+    - 'Describe the three canonical squeezers from Xu et al. 2018: spatial smoothing (Gaussian, median), bit-depth reduction, and JPEG compression'
+    - 'Explain the squeezer detection logic: compare L1 or L-infinity distance between prediction vectors on original vs squeezed input; flag when distance exceeds threshold'
+    - 'Describe why a squeezer ensemble covers more adversarial attack families than any single squeezer'
+    - 'Explain why adaptive adversaries defeat single-squeezer defences and how ensemble diversity increases the adaptive attack cost'
+    - 'State the latency implications: each squeezer requires one additional model forward pass; parallelisation within the 50ms P99 budget requires async dispatch'
+
+  skills:
+    - 'Implement Gaussian blur, bit-depth reduction, and JPEG-approximate squeezers in PyTorch'
+    - 'Implement the squeezer detection score (L1 distance between original and squeezed prediction vectors) with configurable threshold'
+    - 'Build a multi-squeezer ensemble with maximum-disagreement scoring and threshold calibration'
+    - 'Benchmark per-squeezer latency and determine the maximum ensemble size within the Track 7 latency budget'
+    - 'Implement text preprocessing analogues: Unicode canonicalisation, homoglyph normalisation, zero-width character removal'
+
+  security_mindset:
+    - 'Internalise that squeezing is a detection primitive, not a defence: the squeezer does not make the model robust, it signals that the input may be adversarial'
+    - 'Recognise that no single squeezer covers the full adversarial attack space -- calibrate the detection threshold against the specific attack families the deployment faces'
+    - 'Appreciate that the adaptive adversary problem means squeezing must be combined with consistency checking and adversarial classification (Section 10.12) for meaningful production coverage'
+    - 'Treat the latency budget as a hard constraint: adding squeezers that push gateway latency above 50ms P99 is not acceptable regardless of detection improvement'
+
+prerequisites:
+  - 'Section 10.3: FGSM (the attack whose perturbations squeezing is most effective against)'
+  - 'Section 10.4: PGD (the evaluation adversary for squeezer detection rates)'
+  - 'Section 10.5: C&W (adaptive C&W with squeezer knowledge breaks single-squeezer detection)'
+  - 'Section 10.1: Track 7 pre-inference architecture (squeezer runs in the pre-inference stage)'
+  - 'Section 10.10: incident root cause analysis (absent squeezer is a shared root cause)'
+
+prose_content:
+
+  part_1:
+    title: 'Detection by Transformation: The Asymmetry Between Natural and Adversarial Inputs'
+    body: |
+      The foundation of feature squeezing is a fundamental asymmetry between natural images and
+      adversarial examples in how they respond to input transformation.
+
+      A natural image of a cat remains recognisable as a cat after mild Gaussian blurring. The
+      classifier that correctly identifies the original also correctly identifies the blurred version,
+      because the semantically meaningful features (edges, textures, shapes) survive mild smoothing.
+      The prediction may shift slightly in probability, but the argmax class remains the same.
+
+      An adversarial example -- say, a cat image perturbed by FGSM to be classified as a toaster --
+      has been modified by a precisely calibrated perturbation. That perturbation exists at a
+      specific frequency range (typically high-frequency fine-grained noise) and with a specific
+      magnitude (exactly epsilon per pixel). Gaussian blurring changes the high-frequency components
+      of the input, which are exactly the components that carry the adversarial signal. The
+      perturbation precision is destroyed; the adversarial example, once blurred, may no longer
+      fool the classifier and reverts to being classified as a cat.
+
+      This asymmetry -- natural images are robust to mild transformation, adversarial examples are
+      not -- is the detection signal. Feature squeezing (Xu et al. 2018) formalises it as a detection
+      algorithm: apply a transformation ("squeezer") to the input, query the model on both the
+      original and the squeezed version, and flag the input if the predictions disagree beyond a
+      threshold. A natural input produces stable predictions; an adversarial input produces unstable
+      predictions that shift significantly under the squeezer transformation.
+
+      The asymmetry is not absolute: adversarial examples with very large perturbation budgets may
+      survive mild squeezing, and natural images near the decision boundary may produce unstable
+      predictions under squeezing (false positives). Threshold calibration and squeezer selection
+      must account for both failure modes. But for the vast majority of adversarial examples in the
+      practical epsilon range (4/255 to 8/255 for images), the asymmetry is strong enough to
+      provide meaningful detection coverage.
+
+  part_2:
+    title: 'The Three Canonical Squeezers: Spatial Smoothing, Bit-Depth, and JPEG'
+    body: |
+      Xu et al. 2018 identified three input transformation types that exploit different aspects of
+      the adversarial perturbation structure. Each squeezer targets a different adversarial attack
+      class and has different false positive and false negative characteristics.
+
+      Spatial smoothing applies a blurring filter to the input. Gaussian blur weights nearby pixels
+      by a Gaussian kernel centred at each pixel -- each output pixel is a weighted average of its
+      neighbourhood, with closer pixels weighted more. Median filtering replaces each pixel with the
+      median value of its neighbourhood, which is particularly effective against salt-and-pepper
+      noise (isolated pixels that differ sharply from their neighbours). Adversarial perturbations
+      from FGSM and PGD are distributed uniformly across all pixels with small per-pixel magnitude
+      -- exactly the pattern that Gaussian smoothing reduces. Spatial smoothing is most effective
+      against L-infinity adversarial examples (FGSM, PGD) and least effective against L0 sparse
+      adversarial examples (which modify few pixels significantly).
+
+      Bit-depth reduction rounds pixel values to fewer bits. An 8-bit image has 256 possible values
+      per channel; reducing to 5 bits gives 32 possible values. Adversarial perturbations rely on
+      precise per-pixel values: an epsilon=4/255 perturbation changes a pixel by approximately 0.016
+      on the normalised [0,1] scale. Rounding to 5 bits (step size ~0.032) destroys perturbations
+      smaller than the rounding step. This makes bit-depth reduction most effective against fine-
+      grained perturbations (small epsilon FGSM) and less effective against larger perturbations.
+
+      JPEG compression applies lossy block-based discrete cosine transform (DCT) quantisation.
+      The JPEG quality parameter controls the quantisation step size: low quality (high compression)
+      removes more high-frequency information, destroying fine-grained adversarial perturbations at
+      the cost of visible image quality degradation. Unlike spatial smoothing (which operates
+      uniformly) and bit-depth reduction (which operates per-pixel), JPEG operates in frequency
+      domain blocks and removes structured high-frequency patterns more aggressively. It is most
+      effective against perturbations with periodic or structured spatial patterns.
+
+  part_3:
+    title: 'Squeezer Detection Logic: Threshold, Metric, and Calibration'
+    body: |
+      The squeezer detection score for a single squeezer S applied to input x is:
+      score(x) = d(P(y | x), P(y | S(x)))
+      where P(y | x) is the model''s probability vector on the original input, P(y | S(x)) is the
+      probability vector on the squeezed input, and d is a distance metric. Two choices of d are
+      common: L1 distance (sum of absolute differences across all classes) and L-infinity distance
+      (maximum absolute difference across all classes). L1 is more sensitive to aggregate prediction
+      shift; L-infinity is more sensitive to the maximum class probability change.
+
+      A natural input produces score(x) near zero: the model''s prediction is approximately the
+      same on the original and the squeezed version. An adversarial input produces a higher score:
+      the squeezer destroys the adversarial perturbation, and the model''s prediction changes.
+      The detection decision is: flag if score(x) > tau, where tau is a threshold calibrated to
+      achieve the desired false positive rate on natural inputs.
+
+      Threshold calibration requires a held-out set of natural inputs and a set of adversarial
+      inputs generated at the specific epsilon value and attack method the deployment faces. The
+      ROC curve (true positive rate vs false positive rate as tau varies) determines the operating
+      point. For production deployments, a false positive rate of 1-5% is typically acceptable;
+      the threshold is set to achieve this rate on the natural input held-out set.
+
+      One calibration failure mode deserves explicit attention: natural inputs near decision
+      boundaries produce high squeezer scores even without adversarial perturbation. A benign
+      image that is borderline between two classes (classified as dog with 55% confidence and
+      cat with 44%) may flip classification under mild squeezing. These natural hard examples
+      generate false positives that are not adversarial. Calibration must be done on a dataset
+      that includes hard natural examples, not just easily classified ones.
+
+  part_4:
+    title: 'Squeezer Ensemble: Coverage, Disagreement, and Ensemble Logic'
+    body: |
+      No single squeezer covers all adversarial attack families. Spatial smoothing (Gaussian)
+      catches FGSM and PGD effectively but is less effective against C&W minimum-norm examples
+      (which may concentrate perturbation in spatial patterns that survive blurring). Bit-depth
+      reduction catches fine-grained perturbations but misses large sparse perturbations (L0 attacks).
+      JPEG compression catches periodic structured perturbations but may not catch sparse random ones.
+
+      A squeezer ensemble runs multiple squeezers and flags an input if any squeezer produces a score
+      above its threshold. The ensemble detection score is: max_i(score_i(x)) where score_i is the
+      detection score for squeezer i. An input that passes all individual squeezers passes the
+      ensemble; an input that fails any single squeezer is flagged.
+
+      The ensemble increases coverage because different squeezers have complementary coverage:
+      an adversarial example that survives Gaussian smoothing (perhaps because the perturbation
+      is structured to avoid low-frequency components) may not survive bit-depth reduction
+      (which destroys the fine per-pixel precision). The ensemble''s coverage is the union of
+      individual squeezer coverages, not just the coverage of the best single squeezer.
+
+      The ensemble also increases the cost for adaptive adversaries. An adversary optimising
+      against a single squeezer crafts examples that survive that squeezer''s specific
+      transformation. An adversary optimising against an ensemble must craft examples that
+      simultaneously survive all squeezers -- a more constrained optimisation problem that
+      typically requires larger perturbation or lower attack success rate. The adaptive attack
+      cost scales with ensemble diversity, not just ensemble size: three diverse squeezers
+      (spatial, bit-depth, frequency domain) are harder to jointly evade than three similar
+      squeezers (three Gaussian blurs with different sigma values).
+
+  part_5:
+    title: 'Adaptive Attacks Against Squeezing: The Limits of Single-Squeezer Defences'
+    body: |
+      The adaptive adversary argument (first made systematically in Carlini and Wagner 2017 and
+      applied to squeezing defences in Sharma and Ding 2018) shows that any single squeezer can
+      be defeated by an adversary who knows the squeezer and optimises through it.
+
+      For a Gaussian squeezer S, the adaptive attack generates adversarial examples against
+      the composed function S(model(x)) rather than model(x) alone. The C&W objective becomes:
+      minimise ||delta||_2 + c * g(S(x + delta)) where g evaluates misclassification on the
+      squeezed input. The resulting adversarial example misclassifies even after squeezing --
+      it is adversarial both before and after the squeezer is applied, so the squeezer score
+      is near zero despite the example being adversarial. The Section 10.5 defence_evaluator_cw.py
+      deliverable implements exactly this attack.
+
+      The practical implication: feature squeezing alone cannot be the complete Track 7 detection
+      layer. An adaptive adversary with knowledge of the squeezer configuration can craft examples
+      that evade all squeezers while remaining adversarial. The squeezer ensemble provides
+      meaningful resistance by increasing the number of constraints the adversary must satisfy
+      simultaneously, but it does not provide formal guarantees.
+
+      Section 10.12 adds two additional detection primitives -- consistency checking and the
+      adversarial detector classifier -- that are harder to jointly evade with squeezing. Section
+      10.13 assembles all three into the three-primitive Track 7 ensemble. The honest framing for
+      production: the squeezer ensemble provides high coverage against non-adaptive adversaries
+      and moderate resistance against adaptive adversaries; formal guarantees require randomised
+      smoothing (Section 10.14).
+
+  part_6:
+    title: 'Text Preprocessing Analogues: Canonicalisation and Unicode Normalisation'
+    body: |
+      The image squeezer concept translates to text via preprocessing transformations that
+      reduce the text''s feature space while preserving semantic content. Section 10.9
+      described character-level attacks (homoglyphs, zero-width characters) that exploit
+      preprocessing gaps. Text canonicalisation squeezers close those gaps.
+
+      Unicode canonicalisation applies NFC or NFKC normalisation, which collapses compatibility
+      equivalents (full-width ASCII characters to their standard ASCII equivalents, ligatures to
+      their component characters). NFKC is more aggressive than NFC and handles more encoding
+      variants. Homoglyph normalisation goes further: it replaces visually similar cross-script
+      characters (Cyrillic а → Latin a) using the Unicode confusables database. Zero-width
+      character removal strips all invisible codepoints (U+200B, U+200C, U+200D, U+2060).
+
+      The text squeezer detection logic follows the same pattern as image squeezing: apply the
+      canonicalisation, run the classifier on both the original and the canonicalised version,
+      flag if predictions disagree. An input containing homoglyphs or zero-width characters that
+      was adversarially crafted to fool the text classifier on the non-normalised version will
+      classify correctly after canonicalisation -- the disagreement is the detection signal.
+
+      Synonym normalisation is a softer text squeezer: replace words with their most common
+      synonym (using a standardised synonym dictionary) and check prediction stability. This
+      catches TextFooler-style attacks where the adversary substituted less-common synonyms
+      to evade the classifier. The limitation is that synonym normalisation may change the
+      semantics of specialised text (technical documents, proper nouns) producing false positives.
+
+  part_7:
+    title: 'Latency Budget: Squeezer Count, Parallelisation, and the 50ms P99 Constraint'
+    body: |
+      The critical engineering constraint for squeezer deployment is latency. Each squeezer
+      requires one additional model forward pass (on the squeezed input), which is as expensive
+      as the primary model inference. Running three squeezers sequentially triples inference
+      latency. Within the 50ms P99 budget the gateway must respect, this may not be feasible.
+
+      The correct architecture is parallel squeezer execution. The primary model inference and
+      all squeezer model inferences run concurrently using async dispatch (torch.futures,
+      asyncio with thread pool, or multi-process inference). The gateway waits for all parallel
+      inferences to complete, compares predictions, and makes the detection decision. If all
+      inferences complete in approximately the same time, the latency overhead is one model
+      forward pass (the time for the slowest squeezer), not N model forward passes for N squeezers.
+
+      The practical latency calculation: for a primary model with P99 inference latency of 20ms,
+      and each squeezer adding 1ms of transformation time plus the same 20ms of model inference
+      time, parallel execution completes in approximately 21ms total (20ms inference + 1ms
+      transformation overhead). Sequential execution would take 60ms for two squeezers plus
+      20ms for the primary -- 80ms total, well over the 50ms budget.
+
+      The squeezer_latency_benchmark.py deliverable measures per-squeezer latency under load
+      and produces a recommendation for maximum ensemble size given the primary model''s
+      inference latency. The Section 10.13 gateway uses this recommendation to configure
+      the Track 7 pre-inference stage. For models where inference is very expensive (large
+      transformers, multi-modal models), limiting the squeezer ensemble to one or two
+      squeezers and relying more heavily on the post-inference consistency checker
+      (Section 10.12) is the correct latency-aware architectural choice.
+
+reference_materials:
+
+  table_1:
+    title: 'Three Canonical Squeezers: Parameters, Coverage, and Latency'
+    description: 'Spatial smoothing, bit-depth reduction, and JPEG compression with configuration parameters, attack coverage, and latency overhead'
+    columns: ['Squeezer', 'Transformation', 'Key parameter', 'Best coverage', 'Worst coverage', 'Latency overhead']
+    rows:
+      - ['Gaussian blur', 'Weighted average of pixel neighbourhood via Gaussian kernel', 'sigma (0.5-2.0); kernel size (3-7)', 'FGSM, PGD L-inf (high-freq uniform noise)', 'L0 sparse attacks; large-perturbation C&W', '~1ms transform + model forward pass']
+      - ['Median filter', 'Replace each pixel with neighbourhood median', 'Window size (3-7)', 'Salt-and-pepper noise; isolated pixel attacks', 'Smooth perturbation attacks (FGSM)', '~2ms transform + model forward pass']
+      - ['Bit-depth reduction', 'Round pixel values to fewer quantisation levels', 'bits (3-6); default 5-bit = 32 levels', 'Fine-grained FGSM (small epsilon)', 'Large-epsilon attacks; L0 sparse attacks', '~0.1ms transform + model forward pass']
+      - ['JPEG compression', 'Lossy DCT block quantisation', 'quality (40-90); lower=more squeezing', 'Structured periodic perturbations', 'Random sparse perturbations', '~3ms transform (PIL I/O) + model forward pass']
+
+  table_2:
+    title: 'Squeezer Coverage Matrix: Attack Family vs Squeezer Effectiveness'
+    description: 'Detection rate estimates for each squeezer against each attack family at epsilon=8/255 (image domain). H=high, M=moderate, L=low'
+    columns: ['Attack family', 'Gaussian blur', 'Bit-depth reduction', 'JPEG compression', 'Ensemble (max)', 'Notes']
+    rows:
+      - ['FGSM (L-inf)', 'H (70-85%)', 'H (65-80%)', 'M (55-70%)', 'H (85-92%)', 'Fine-grained uniform noise caught by all three']
+      - ['PGD L-inf', 'M (50-70%)', 'M (45-65%)', 'M (50-65%)', 'H (75-88%)', 'Stronger perturbation; partially survives mild squeezing']
+      - ['C&W L2 kappa=0', 'M (45-60%)', 'L (35-50%)', 'M (40-55%)', 'M (60-72%)', 'Minimum-norm; targeted; partially survives squeezing']
+      - ['C&W L2 kappa=20', 'L (20-35%)', 'L (15-30%)', 'L (20-35%)', 'L (30-45%)', 'High-confidence; robust to squeezing by design']
+      - ['Boundary Attack', 'H (65-80%)', 'M (50-65%)', 'M (55-70%)', 'H (78-88%)', 'Near-boundary fragile; smoothing restores correct class']
+      - ['Physical patch', 'L (20-35%)', 'L (15-30%)', 'L (25-40%)', 'L (35-50%)', 'Localised patch; per-pixel squeezing less effective; use spatial detector']
+      - ['TextFooler (text)', 'X (N/A)', 'X (N/A)', 'X (N/A)', 'X', 'Image squeezers inapplicable; use text canonicalisation']
+
+  table_3:
+    title: 'Track 7 Latency Budget Allocation'
+    description: 'Latency breakdown for Track 7 pre-inference stage with parallel squeezer execution within the 50ms P99 gateway budget'
+    columns: ['Component', 'Sequential latency', 'Parallel latency', 'Budget allocation', 'Recommendation']
+    rows:
+      - ['Primary model inference', '20ms (P99)', '20ms (P99)', '20ms', 'Always on critical path; cannot parallelise']
+      - ['Squeezer transform (per squeezer)', '0.1-3ms each', '0.1-3ms (overlapped with model)', '3ms overhead for 3 squeezers in parallel', 'Transforms are fast; overlap with model inference']
+      - ['Squeezer model inference (per squeezer)', '20ms each if sequential', '20ms (parallel with primary)', '0ms additional if fully parallel', 'Dispatch all squeezer inferences with async; wait for completion']
+      - ['Prediction comparison', '<0.1ms', '<0.1ms', '0ms overhead', 'Trivial computation after inference completes']
+      - ['Total Track 7 pre-inference (3 squeezers parallel)', '83ms sequential', '23ms parallel', '23ms / 50ms = 46% of budget used', 'Leave 27ms for Tracks 1-6 and post-inference stages']
+      - ['Maximum squeezers (within 50ms budget)', 'N/A', 'Unlimited (parallel)', 'Constrained by thread pool / GPU parallelism', 'Benchmark actual throughput; GPU inference typically allows 3-5 parallel']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Feature Squeezer Library'
+    filename: 'feature_squeezer.py'
+    description: 'Gaussian blur, median filter, bit-depth reduction, and JPEG-approximate squeezers with squeezer detection score (L1 distance between original and squeezed prediction vectors) and threshold-based detection decision'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch, torch.nn.functional. JPEG squeezer approximated via downsample/upsample
+      (avoids PIL dependency; real production should use PIL JPEG encode/decode for accuracy).
+      Import ToyLinear from fgsm_attack.py for demonstration.
+    code: |
+      # feature_squeezer.py
+      # Section 10.11: Feature Squeezer Library
+      # 20260524 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+      # Reference: Xu et al. 2018 "Feature Squeezing: Detecting Adversarial Examples"
+
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      from torch import Tensor
+      from typing import Callable, Tuple
+      from dataclasses import dataclass
+
+
+      # ---- Squeezer transformation functions ----
+
+      def gaussian_squeeze(x: Tensor, sigma: float = 1.0, kernel_size: int = 5) -> Tensor:
+          '''Gaussian blur: reduces high-frequency adversarial noise.'''
+          half = kernel_size // 2
+          coords = torch.arange(-half, half + 1, dtype=torch.float32)
+          k1d = torch.exp(-coords ** 2 / (2.0 * sigma ** 2))
+          k1d = k1d / k1d.sum()
+          k2d = k1d.unsqueeze(0) * k1d.unsqueeze(1)  # (k, k)
+          k2d = k2d.unsqueeze(0).unsqueeze(0)         # (1, 1, k, k)
+          n_ch = x.size(1)
+          kernel = k2d.expand(n_ch, 1, kernel_size, kernel_size)
+          return F.conv2d(x, kernel, padding=half, groups=n_ch).clamp(0.0, 1.0)
+
+
+      def median_squeeze(x: Tensor, window: int = 3) -> Tensor:
+          '''Median filter: effective against salt-and-pepper and isolated pixel attacks.'''
+          half = window // 2
+          padded = F.pad(x, [half, half, half, half], mode='reflect')
+          batch, channels, h, w = x.shape
+          result = torch.zeros_like(x)
+          for i in range(h):
+              for j in range(w):
+                  patch = padded[:, :, i:i + window, j:j + window]
+                  result[:, :, i, j] = patch.reshape(batch, channels, -1).median(dim=2).values
+          return result.clamp(0.0, 1.0)
+
+
+      def bit_depth_squeeze(x: Tensor, bits: int = 5) -> Tensor:
+          '''Bit-depth reduction: destroys fine-grained perturbation precision.'''
+          levels = (2 ** bits) - 1.0
+          return (x * levels).round() / levels
+
+
+      def jpeg_squeeze(x: Tensor, scale: float = 0.5) -> Tensor:
+          '''
+          JPEG-approximate squeezer via downsample + upsample (bilinear).
+          Approximates JPEG block quantisation without PIL dependency.
+          For production accuracy: use PIL JPEG encode at target quality.
+          '''
+          h, w = x.size(-2), x.size(-1)
+          downscaled = F.interpolate(x, scale_factor=scale, mode='bilinear',
+                                     align_corners=False)
+          return F.interpolate(downscaled, size=(h, w), mode='bilinear',
+                               align_corners=False).clamp(0.0, 1.0)
+
+
+      # ---- Detection logic ----
+
+      def squeezer_detection_score(
+          model: nn.Module,
+          x: Tensor,
+          squeeze_fn: Callable[[Tensor], Tensor],
+          metric: str = 'l1',
+      ) -> Tensor:
+          '''
+          Per-sample detection score: distance between prediction vectors on
+          original vs squeezed input. Higher score = more likely adversarial.
+          metric: 'l1' (sum of abs differences) or 'linf' (max abs difference).
+          '''
+          with torch.no_grad():
+              p_orig = F.softmax(model(x), dim=1)
+              p_squeezed = F.softmax(model(squeeze_fn(x)), dim=1)
+          diff = (p_orig - p_squeezed).abs()
+          if metric == 'linf':
+              return diff.max(dim=1).values
+          return diff.sum(dim=1)  # L1 default
+
+
+      def detect_adversarial(
+          model: nn.Module,
+          x: Tensor,
+          squeeze_fn: Callable[[Tensor], Tensor],
+          threshold: float = 0.10,
+          metric: str = 'l1',
+      ) -> Tuple[Tensor, Tensor]:
+          '''
+          Returns (detection_decision, score_per_sample).
+          detection_decision: bool tensor, True = adversarial flagged.
+          '''
+          scores = squeezer_detection_score(model, x, squeeze_fn, metric)
+          return scores > threshold, scores
+
+
+      @dataclass
+      class SqueezerConfig:
+          name: str
+          fn: Callable
+          threshold: float = 0.10
+          metric: str = 'l1'
+
+
+      def build_default_squeezers() -> list:
+          return [
+              SqueezerConfig('gaussian_s1', lambda x: gaussian_squeeze(x, sigma=1.0)),
+              SqueezerConfig('gaussian_s0.5', lambda x: gaussian_squeeze(x, sigma=0.5)),
+              SqueezerConfig('bit_depth_5', lambda x: bit_depth_squeeze(x, bits=5)),
+              SqueezerConfig('jpeg_approx', lambda x: jpeg_squeeze(x, scale=0.5)),
+          ]
+
+
+      def demo() -> None:
+          try:
+              from fgsm_attack import ToyLinear, fgsm, attack_success_rate
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x = torch.rand(32, 1, 28, 28)
+          y = torch.randint(0, 10, (32,))
+          eps = 8.0 / 255.0
+          x_adv = fgsm(model, x, y, epsilon=eps)
+
+          print('Feature Squeezer Detection Rates on FGSM adversarial examples')
+          print(f'{"Squeezer":<22} {"threshold":<12} {"ADV_detect":<14} {"NAT_FPR"}')
+          print('-' * 55)
+          for cfg in build_default_squeezers():
+              adv_flag, adv_scores = detect_adversarial(model, x_adv, cfg.fn, cfg.threshold)
+              nat_flag, nat_scores = detect_adversarial(model, x, cfg.fn, cfg.threshold)
+              adv_rate = adv_flag.float().mean().item()
+              fpr = nat_flag.float().mean().item()
+              print(f'{cfg.name:<22} {cfg.threshold:<12.2f} {adv_rate:<14.3f} {fpr:.3f}')
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_2:
+    title: 'Squeezer Ensemble with Disagreement Scoring'
+    filename: 'squeezer_ensemble.py'
+    description: 'Multi-squeezer ensemble with maximum-disagreement and mean-disagreement scoring modes; threshold calibration from a held-out natural image set; ensemble detection rate comparison across attack families'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Import from feature_squeezer.py and fgsm_attack.py.
+    code: |
+      # squeezer_ensemble.py
+      # Section 10.11: Squeezer Ensemble with Disagreement Scoring
+      # 20260524 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn.functional as F
+      from torch import Tensor
+      from typing import List, Tuple
+      from feature_squeezer import SqueezerConfig, squeezer_detection_score, build_default_squeezers
+
+
+      def ensemble_score(
+          model,
+          x: Tensor,
+          squeezers: List[SqueezerConfig],
+          mode: str = 'max',
+      ) -> Tensor:
+          '''
+          Ensemble disagreement score.
+          mode='max': flag if ANY squeezer shows high disagreement (union coverage).
+          mode='mean': average disagreement across squeezers.
+          '''
+          scores = torch.stack([
+              squeezer_detection_score(model, x, cfg.fn, cfg.metric)
+              for cfg in squeezers
+          ], dim=0)  # (n_squeezers, batch)
+
+          if mode == 'max':
+              return scores.max(dim=0).values
+          return scores.mean(dim=0)
+
+
+      def calibrate_threshold(
+          model,
+          x_natural: Tensor,
+          squeezers: List[SqueezerConfig],
+          target_fpr: float = 0.05,
+          mode: str = 'max',
+      ) -> float:
+          '''
+          Set ensemble threshold to achieve target false positive rate on natural inputs.
+          Returns threshold value.
+          '''
+          scores = ensemble_score(model, x_natural, squeezers, mode)
+          # Find quantile such that (1 - target_fpr) of natural scores fall below threshold
+          threshold = scores.quantile(1.0 - target_fpr).item()
+          return threshold
+
+
+      def ensemble_detect(
+          model,
+          x: Tensor,
+          squeezers: List[SqueezerConfig],
+          threshold: float,
+          mode: str = 'max',
+      ) -> Tuple[Tensor, Tensor]:
+          '''Returns (flagged: bool tensor, scores: float tensor).'''
+          scores = ensemble_score(model, x, squeezers, mode)
+          return scores > threshold, scores
+
+
+      def per_squeezer_breakdown(
+          model,
+          x_adv: Tensor,
+          y_true: Tensor,
+          squeezers: List[SqueezerConfig],
+      ) -> None:
+          '''Show which squeezers contribute to detection.'''
+          print(f'{"Squeezer":<24} {"Mean score":<14} {"Detect @ thresh":<18}')
+          print('-' * 58)
+          for cfg in squeezers:
+              scores = squeezer_detection_score(model, x_adv, cfg.fn, cfg.metric)
+              mean_s = scores.mean().item()
+              flagged = (scores > cfg.threshold).float().mean().item()
+              print(f'{cfg.name:<24} {mean_s:<14.4f} {flagged:<18.3f}')
+
+
+      def demo() -> None:
+          try:
+              from fgsm_attack import ToyLinear, fgsm
+              from pgd_attack import pgd_linf
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py and pgd_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x_nat = torch.rand(64, 1, 28, 28)
+          y = torch.randint(0, 10, (64,))
+          eps = 8.0 / 255.0
+          x_fgsm = fgsm(model, x_nat, y, epsilon=eps)
+          x_pgd = pgd_linf(model, x_nat, y, eps, eps / 10.0, n_steps=20, n_restarts=1)
+
+          squeezers = build_default_squeezers()
+
+          # Calibrate threshold for 5% FPR on natural images
+          threshold = calibrate_threshold(model, x_nat, squeezers, target_fpr=0.05)
+          print(f'Calibrated ensemble threshold (5% FPR): {threshold:.4f}')
+
+          for label, x_test in [('Natural', x_nat), ('FGSM', x_fgsm), ('PGD-20', x_pgd)]:
+              flagged, scores = ensemble_detect(model, x_test, squeezers, threshold)
+              rate = flagged.float().mean().item()
+              print(f'{label:<12}: detection rate={rate:.3f}, mean_score={scores.mean().item():.4f}')
+
+          print()
+          print('Per-squeezer breakdown on FGSM adversarial examples:')
+          per_squeezer_breakdown(model, x_fgsm, y, squeezers)
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_3:
+    title: 'Squeezer Latency Benchmark'
+    filename: 'squeezer_latency_benchmark.py'
+    description: 'Measures per-squeezer transformation latency and model forward pass latency under load; determines maximum ensemble size within the 50ms P99 gateway budget; produces parallelisation recommendation'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch, time. Import from feature_squeezer.py.
+      Latency measured as mean over N_WARMUP + N_RUNS iterations.
+      Sequential and parallel (thread pool) latency both measured.
+    code: |
+      # squeezer_latency_benchmark.py
+      # Section 10.11: Squeezer Latency Benchmark for Track 7 Budget
+      # 20260524 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import time
+      from concurrent.futures import ThreadPoolExecutor
+      from dataclasses import dataclass
+      from typing import List, Callable
+      from feature_squeezer import SqueezerConfig, build_default_squeezers
+
+
+      N_WARMUP = 5
+      N_RUNS = 20
+      GATEWAY_BUDGET_MS = 50.0
+
+
+      @dataclass
+      class LatencyResult:
+          name: str
+          transform_ms: float
+          model_ms: float
+          total_ms: float
+
+
+      def measure_latency(fn: Callable, n_warmup: int = N_WARMUP, n_runs: int = N_RUNS) -> float:
+          '''Measure mean latency of fn() in milliseconds.'''
+          for _ in range(n_warmup):
+              fn()
+          times = []
+          for _ in range(n_runs):
+              start = time.perf_counter()
+              fn()
+              times.append((time.perf_counter() - start) * 1000.0)
+          return sum(times) / len(times)
+
+
+      def benchmark_squeezers(
+          model,
+          x: torch.Tensor,
+          squeezers: List[SqueezerConfig],
+      ) -> List[LatencyResult]:
+          results = []
+          for cfg in squeezers:
+              # Transform latency (no model)
+              transform_ms = measure_latency(lambda: cfg.fn(x))
+
+              # Model forward pass on squeezed input
+              x_sq = cfg.fn(x)
+              model_ms = measure_latency(lambda: model(x_sq))
+
+              total_ms = transform_ms + model_ms
+              results.append(LatencyResult(cfg.name, transform_ms, model_ms, total_ms))
+
+          return results
+
+
+      def primary_model_latency(model, x: torch.Tensor) -> float:
+          return measure_latency(lambda: model(x))
+
+
+      def sequential_ensemble_latency(results: List[LatencyResult]) -> float:
+          return sum(r.total_ms for r in results)
+
+
+      def parallel_ensemble_latency(
+          model,
+          x: torch.Tensor,
+          squeezers: List[SqueezerConfig],
+          primary_ms: float,
+      ) -> float:
+          '''Simulate parallel execution: latency = max(primary, max squeezer).'''
+          with ThreadPoolExecutor(max_workers=len(squeezers) + 1) as pool:
+              futures = [pool.submit(lambda cfg=cfg: model(cfg.fn(x))) for cfg in squeezers]
+              start = time.perf_counter()
+              for f in futures:
+                  f.result()
+              parallel_ms = (time.perf_counter() - start) * 1000.0
+          # Total = max(primary_ms, parallel squeezer time)
+          return max(primary_ms, parallel_ms)
+
+
+      def print_benchmark_report(
+          primary_ms: float,
+          results: List[LatencyResult],
+          budget_ms: float = GATEWAY_BUDGET_MS,
+      ) -> None:
+          print(f'Primary model inference: {primary_ms:.2f} ms')
+          print(f'Gateway P99 budget:      {budget_ms:.1f} ms')
+          print(f'Remaining for Track 7:   {budget_ms - primary_ms:.2f} ms')
+          print()
+          print(f'{"Squeezer":<22} {"transform_ms":<16} {"model_ms":<12} {"total_ms":<12} {"fits budget?"}')
+          print('-' * 72)
+          for r in results:
+              fits = (primary_ms + r.total_ms) <= budget_ms
+              print(f'{r.name:<22} {r.transform_ms:<16.2f} {r.model_ms:<12.2f} '
+                    f'{r.total_ms:<12.2f} {"YES (parallel)" if fits else "NO sequential"}')
+
+          seq_total = primary_ms + sequential_ensemble_latency(results)
+          print(f'\nSequential ensemble total: {seq_total:.2f} ms '
+                f'({"within" if seq_total <= budget_ms else "EXCEEDS"} {budget_ms:.0f}ms budget)')
+
+          # Max squeezers within budget (parallel: cost = max squeezer, not sum)
+          max_single = max(r.total_ms for r in results)
+          parallel_total = primary_ms + max_single
+          print(f'Parallel ensemble total:   {parallel_total:.2f} ms '
+                f'({"within" if parallel_total <= budget_ms else "EXCEEDS"} {budget_ms:.0f}ms budget)')
+          print()
+          print('Recommendation: run all squeezers in parallel with primary inference.')
+          print('Latency overhead = transform time only (~1-3ms); model passes overlap.')
+
+
+      def demo() -> None:
+          try:
+              from fgsm_attack import ToyLinear
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x = torch.rand(1, 1, 28, 28)  # single sample (production: batch=1)
+
+          squeezers = build_default_squeezers()
+          primary_ms = primary_model_latency(model, x)
+          results = benchmark_squeezers(model, x, squeezers)
+          print_benchmark_report(primary_ms, results)
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_4:
+    title: 'Text Canonicaliser'
+    filename: 'text_canonicaliser.py'
+    description: 'Text preprocessing analogues of image squeezers: Unicode NFC/NFKC normalisation, homoglyph replacement, zero-width character removal, and squeezer detection logic for text adversarial inputs'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention. No external dependencies.
+      Import ToyTextClassifier, text_to_tensor from token_substitution_attack.py for demo.
+      HOMOGLYPH_MAP imported from character_level_attack.py.
+    code: |
+      # text_canonicaliser.py
+      # Section 10.11: Text Preprocessing Analogues for Adversarial Text Detection
+      # 20260524 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import unicodedata
+      from typing import Callable, List, Tuple
+
+
+      # Zero-width codepoints to strip
+      ZERO_WIDTH_CODEPOINTS = {0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x00AD}
+
+      # Minimal confusable map: common cross-script lookalikes -> canonical ASCII
+      CONFUSABLE_MAP = {
+          '\u0430': 'a',   # Cyrillic a -> Latin a
+          '\u0435': 'e',   # Cyrillic ie -> Latin e
+          '\u043e': 'o',   # Cyrillic o -> Latin o
+          '\u0440': 'p',   # Cyrillic er -> Latin p
+          '\u0441': 'c',   # Cyrillic es -> Latin c
+          '\u0445': 'x',   # Cyrillic ha -> Latin x
+          '\u0456': 'i',   # Cyrillic i -> Latin i
+          '\u0455': 's',   # Cyrillic dze -> Latin s
+          '\u0391': 'A',   # Greek alpha -> Latin A
+          '\u0392': 'B',   # Greek beta -> Latin B
+          '\u0395': 'E',   # Greek epsilon -> Latin E
+          '\u0397': 'H',   # Greek eta -> Latin H
+          '\u039a': 'K',   # Greek kappa -> Latin K
+          '\u039c': 'M',   # Greek mu -> Latin M
+          '\u039d': 'N',   # Greek nu -> Latin N
+          '\u039f': 'O',   # Greek omicron -> Latin O
+          '\u03a4': 'T',   # Greek tau -> Latin T
+      }
+
+
+      def remove_zero_width(text: str) -> str:
+          '''Strip all zero-width and invisible Unicode codepoints.'''
+          return ''.join(c for c in text if ord(c) not in ZERO_WIDTH_CODEPOINTS)
+
+
+      def normalise_unicode(text: str, form: str = 'NFKC') -> str:
+          '''Apply Unicode normalisation (NFC, NFD, NFKC, or NFKD).'''
+          return unicodedata.normalize(form, text)
+
+
+      def replace_confusables(text: str) -> str:
+          '''Replace known cross-script confusable characters with their canonical ASCII equivalents.'''
+          return ''.join(CONFUSABLE_MAP.get(c, c) for c in text)
+
+
+      def full_canonicalise(text: str) -> str:
+          '''
+          Full text canonicalisation pipeline:
+          1. Unicode NFKC normalisation
+          2. Zero-width character removal
+          3. Confusable character replacement
+          '''
+          text = normalise_unicode(text, form='NFKC')
+          text = remove_zero_width(text)
+          text = replace_confusables(text)
+          return text
+
+
+      def text_squeezer_score(
+          model,
+          text: str,
+          canonicalise_fn: Callable[[str], str],
+          max_len: int = 64,
+      ) -> float:
+          '''
+          Text squeezer detection score: probability difference between
+          original and canonicalised text classification.
+          Returns L1 distance between prediction vectors.
+          '''
+          import torch
+          import torch.nn.functional as F
+          try:
+              from token_substitution_attack import text_to_tensor
+          except ImportError:
+              return 0.0
+
+          x_orig = text_to_tensor(text, max_len)
+          x_canon = text_to_tensor(canonicalise_fn(text), max_len)
+          with torch.no_grad():
+              p_orig = F.softmax(model(x_orig), dim=1)
+              p_canon = F.softmax(model(x_canon), dim=1)
+          return (p_orig - p_canon).abs().sum().item()
+
+
+      def detect_text_adversarial(
+          model,
+          text: str,
+          threshold: float = 0.05,
+          max_len: int = 64,
+      ) -> Tuple[bool, float, str]:
+          '''
+          Combined text squeezer detection:
+          1. Canonicalise text (squeezer transformation)
+          2. Compare predictions before/after
+          3. Flag if score > threshold
+
+          Returns (detected, score, canonical_text).
+          '''
+          canonical = full_canonicalise(text)
+          score = text_squeezer_score(model, text, full_canonicalise, max_len)
+          return score > threshold, score, canonical
+
+
+      def demo() -> None:
+          try:
+              import torch
+              from token_substitution_attack import ToyTextClassifier
+          except ImportError:
+              print('Run from directory containing token_substitution_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyTextClassifier()
+          model.eval()
+
+          test_cases = [
+              ('this product is terrible bad and awful', 'natural text'),
+              ('this product is terrible bаd and аwful', 'homoglyph (Cyrillic a)'),
+              ('this\u200b product\u200c is terrible bad', 'zero-width injection'),
+              ('this product is terrible bad and awful', 'identical text (no attack)'),
+          ]
+
+          print('Text Canonicaliser: Squeezer Detection for Adversarial Text')
+          print(f'{"Type":<35} {"score":<8} {"detected":<10} {"canonical differs?"}')
+          print('-' * 65)
+          for text, label in test_cases:
+              detected, score, canonical = detect_text_adversarial(model, text, threshold=0.02)
+              differs = (canonical != text)
+              print(f'{label:<35} {score:<8.4f} {str(detected):<10} {differs}')
+
+          print()
+          print('Unicode canonicalisation collapses confusables:')
+          sample = 'bаd аttаck'  # Cyrillic a characters
+          print(f'  Original:    {repr(sample)}')
+          print(f'  Canonical:   {repr(full_canonicalise(sample))}')
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_5:
+    title: 'Adaptive Adversary Test Against Squeezer'
+    filename: 'squeezer_adaptive_adversary_test.py'
+    description: 'Tests squeezer effectiveness against C&W adversarial examples crafted with squeezer knowledge (adaptive attack) vs without squeezer knowledge (non-adaptive); quantifies the detection gap'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Import from feature_squeezer.py, squeezer_ensemble.py, fgsm_attack.py.
+      Adaptive C&W: pass squeezer(x_adv) through model in misclassification objective.
+      Detection gap = non-adaptive detection rate - adaptive detection rate.
+    code: |
+      # squeezer_adaptive_adversary_test.py
+      # Section 10.11: Adaptive Adversary Test Against Feature Squeezer
+      # 20260524 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      from feature_squeezer import (gaussian_squeeze, bit_depth_squeeze,
+                                    squeezer_detection_score, SqueezerConfig)
+      from squeezer_ensemble import ensemble_score, calibrate_threshold, build_default_squeezers
+
+
+      def non_adaptive_cw_l2(
+          model: nn.Module,
+          x: torch.Tensor,
+          y: torch.Tensor,
+          kappa: float = 0.0,
+          c: float = 1.0,
+          n_steps: int = 100,
+          lr: float = 1e-2,
+      ) -> torch.Tensor:
+          '''Standard C&W L2: optimises against model(x_adv) only. Squeezer unaware.'''
+          batch = x.size(0)
+          x = x.detach()
+          x_cl = x.clamp(1e-6, 1.0 - 1e-6)
+          w = torch.atanh(2.0 * x_cl - 1.0).detach().requires_grad_(True)
+          opt = torch.optim.Adam([w], lr=lr)
+          criterion = nn.CrossEntropyLoss(reduction='none')
+
+          for _ in range(n_steps):
+              opt.zero_grad()
+              x_adv = 0.5 * (torch.tanh(w) + 1.0)
+              l2_sq = (x_adv - x).pow(2).view(batch, -1).sum(1)
+              logits = model(x_adv)
+              z_correct = logits.gather(1, y.view(-1, 1)).squeeze(1)
+              mask = torch.ones_like(logits, dtype=torch.bool)
+              mask.scatter_(1, y.view(-1, 1), False)
+              best_other = logits[mask].view(batch, -1).max(1).values
+              f_val = torch.clamp(z_correct - best_other, min=-kappa)
+              (l2_sq + c * f_val).sum().backward()
+              opt.step()
+
+          with torch.no_grad():
+              x_adv = 0.5 * (torch.tanh(w) + 1.0)
+          return x_adv.detach()
+
+
+      def adaptive_cw_l2_vs_squeezer(
+          model: nn.Module,
+          squeeze_fn,
+          x: torch.Tensor,
+          y: torch.Tensor,
+          kappa: float = 0.0,
+          c: float = 1.0,
+          n_steps: int = 100,
+          lr: float = 5e-3,
+      ) -> torch.Tensor:
+          '''
+          Adaptive C&W L2: optimises against model(squeezer(x_adv)).
+          Adversarial example must misclassify AFTER squeezing.
+          Squeezer-aware: squeezer is part of the forward pass.
+          '''
+          batch = x.size(0)
+          x = x.detach()
+          x_cl = x.clamp(1e-6, 1.0 - 1e-6)
+          w = torch.atanh(2.0 * x_cl - 1.0).detach().requires_grad_(True)
+          opt = torch.optim.Adam([w], lr=lr)
+
+          for _ in range(n_steps):
+              opt.zero_grad()
+              x_adv = 0.5 * (torch.tanh(w) + 1.0)
+              l2_sq = (x_adv - x).pow(2).view(batch, -1).sum(1)
+              # KEY DIFFERENCE: evaluate misclassification on squeezed input
+              x_squeezed = squeeze_fn(x_adv)
+              logits = model(x_squeezed)
+              z_correct = logits.gather(1, y.view(-1, 1)).squeeze(1)
+              mask = torch.ones_like(logits, dtype=torch.bool)
+              mask.scatter_(1, y.view(-1, 1), False)
+              best_other = logits[mask].view(batch, -1).max(1).values
+              f_val = torch.clamp(z_correct - best_other, min=-kappa)
+              (l2_sq + c * f_val).sum().backward()
+              opt.step()
+
+          with torch.no_grad():
+              x_adv = 0.5 * (torch.tanh(w) + 1.0)
+          return x_adv.detach()
+
+
+      def evaluate_detection_gap(
+          model: nn.Module,
+          x: torch.Tensor,
+          y: torch.Tensor,
+          squeezers,
+          threshold: float,
+      ) -> None:
+          squeeze_fn = lambda inp: gaussian_squeeze(inp, sigma=1.0)
+
+          # Non-adaptive adversarial examples (no squeezer knowledge)
+          x_nonadaptive = non_adaptive_cw_l2(model, x, y, kappa=0.0, c=1.0, n_steps=80)
+
+          # Adaptive adversarial examples (knows the squeezer)
+          x_adaptive = adaptive_cw_l2_vs_squeezer(model, squeeze_fn, x, y, kappa=0.0, c=1.0, n_steps=80)
+
+          # Detection rates
+          scores_na = ensemble_score(model, x_nonadaptive, squeezers)
+          scores_ad = ensemble_score(model, x_adaptive, squeezers)
+          scores_nat = ensemble_score(model, x, squeezers)
+
+          detect_na = (scores_na > threshold).float().mean().item()
+          detect_ad = (scores_ad > threshold).float().mean().item()
+          fpr = (scores_nat > threshold).float().mean().item()
+
+          # Attack success rates
+          with torch.no_grad():
+              succ_na = (model(x_nonadaptive).argmax(1) != y).float().mean().item()
+              succ_ad = (model(x_adaptive).argmax(1) != y).float().mean().item()
+
+          print('Adaptive vs Non-Adaptive Squeezer Evaluation')
+          print(f'  Natural FPR:              {fpr:.3f}')
+          print(f'  Non-adaptive detection:   {detect_na:.3f}  (attack success: {succ_na:.3f})')
+          print(f'  Adaptive detection:       {detect_ad:.3f}  (attack success on squeezed: {succ_ad:.3f})')
+          print(f'  Detection gap:            {detect_na - detect_ad:.3f}')
+          print()
+          print('Interpretation:')
+          print('  Detection gap > 0 means the adaptive adversary evades squeezing detection.')
+          print('  This motivates combining squeezing with consistency checking (Section 10.12).')
+
+
+      def demo() -> None:
+          try:
+              from fgsm_attack import ToyLinear
+          except ImportError:
+              print('Run from directory containing fgsm_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyLinear()
+          model.eval()
+          x = torch.rand(4, 1, 28, 28)
+          y = torch.randint(0, 10, (4,))
+          x_nat_large = torch.rand(32, 1, 28, 28)
+
+          squeezers = build_default_squeezers()
+          threshold = calibrate_threshold(model, x_nat_large, squeezers, target_fpr=0.05)
+          print(f'Calibrated threshold (5% FPR): {threshold:.4f}')
+          evaluate_detection_gap(model, x, y, squeezers, threshold)
+
+
+      if __name__ == '__main__':
+          demo()
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Calibrating the squeezer detection threshold only on easy-to-classify natural inputs, producing a threshold that yields excessive false positives in production'
+    why_it_happens: |
+      Calibration is done on a convenient sample of natural images that the model classifies
+      with high confidence. Near the decision boundary, benign images produce high squeezer
+      scores because mild smoothing is enough to flip their already-uncertain classification.
+      This is not measured during calibration and the threshold is set too low.
+    consequence: |
+      In production, borderline natural inputs (images that the model classifies with 55-60%
+      confidence) regularly exceed the calibrated threshold and are flagged as adversarial.
+      Alert volume overwhelms analysts; the squeezer is either recalibrated to a higher
+      threshold (losing detection sensitivity) or disabled entirely. A well-tuned squeezer
+      with proper calibration is replaced by an untuned squeezer or no squeezer.
+    correct_approach: |
+      Calibrate the threshold on a dataset that includes hard natural examples near the
+      decision boundary. If the production classifier sees ambiguous inputs (borderline
+      images, unusual angles, low-quality captures), those must be represented in the
+      calibration set. Accept that the threshold will be higher than what an "easy image"
+      calibration would produce, and accept the resulting lower detection rate -- it is
+      more honest than a falsely confident threshold.
+
+  mistake_2:
+    description: 'Running squeezers sequentially and exceeding the 50ms P99 gateway latency budget without realising it'
+    why_it_happens: |
+      The squeezer ensemble is implemented as a loop: for each squeezer, transform the input
+      and run the model. Three squeezers means three model forward passes sequentially before
+      the final detection decision is made. The latency impact is not measured until the
+      system is deployed under production load.
+    consequence: |
+      Gateway P99 latency triples or quadruples depending on the number of squeezers.
+      User-facing requests time out; SLO violations accumulate; operations disables Track 7
+      to restore latency. The detection layer is removed not because it failed to detect
+      adversarial examples but because it was not engineered for the latency budget.
+    correct_approach: |
+      Always run squeezer inferences in parallel with the primary model inference using a
+      thread pool or async dispatch. Measure parallel latency with squeezer_latency_benchmark.py
+      before production deployment. The Section 10.13 gateway includes explicit parallel
+      dispatch for Track 7 squeezer passes. The latency overhead of correct parallel
+      execution is the squeezer transform time (~1-3ms), not the model inference time.
+
+  mistake_3:
+    description: 'Treating squeezing as a complete defence against adversarial examples and removing the consistency checker and adversarial classifier from Track 7'
+    why_it_happens: |
+      Feature squeezing shows high detection rates (70-90%) against FGSM and PGD in
+      benchmarks. Engineers conclude that squeezing alone is sufficient and skip the
+      complexity of implementing consistency checking and the adversarial classifier.
+    consequence: |
+      Adaptive adversaries using C&W with squeezer knowledge (Section 10.5
+      defence_evaluator_cw.py) reduce squeezer detection rates to 20-35%.
+      High-kappa C&W adversarial examples (kappa=20) further reduce detection rates.
+      Physical adversarial patches are not effectively caught by per-pixel squeezing.
+      The system is deployed believing it is defended when it is not against motivated
+      adversaries who know squeezing is the defence.
+    correct_approach: |
+      Squeezing is one of three Track 7 primitives. Section 10.12 consistency checking
+      and adversarial classifier are required for complete Track 7 coverage. The three
+      primitives cover complementary attack families and the ensemble is harder to jointly
+      evade than any individual primitive. Never deploy Track 7 with only squeezing.
+
+  mistake_4:
+    description: 'Applying image feature squeezers to text inputs without implementing text-specific preprocessing analogues'
+    why_it_happens: |
+      Track 7 is configured generically: the squeezer ensemble runs on all inputs. For a
+      multi-modal system that processes both images and text, the image squeezers (Gaussian
+      blur, bit-depth reduction) are applied to text inputs, producing garbage transformations
+      that have no meaningful relationship to text adversarial attacks.
+    consequence: |
+      The squeezer scores for text inputs are either always near zero (if the transformation
+      is ignored by the text tokeniser) or always very high (if the byte-level corruption
+      produces out-of-vocabulary tokens that change predictions randomly). In either case, the
+      squeezer provides no detection signal for text adversarial attacks. Homoglyph and zero-
+      width character attacks evade Track 7 detection entirely.
+    correct_approach: |
+      Deploy modality-specific squeezers: image squeezers (Gaussian, bit-depth, JPEG) for
+      image inputs; text canonicalisers (Unicode normalisation, confusable replacement,
+      zero-width removal) for text inputs. The text_canonicaliser.py deliverable implements
+      the text-specific primitives. Section 10.13 routes inputs to the appropriate squeezer
+      set based on input modality.
+
+  mistake_5:
+    description: 'Reporting squeezer detection rates against non-adaptive adversarial examples as the production robustness guarantee'
+    why_it_happens: |
+      Detection rate benchmarks are run against FGSM and PGD adversarial examples generated
+      without knowledge of the squeezer. These show 70-90% detection rates. The production
+      security report states "Track 7 detects 80% of adversarial examples" without specifying
+      that this is against non-adaptive adversaries.
+    consequence: |
+      Stakeholders believe the system is 80% protected. A motivated adversary who reads
+      the squeezer configuration (either from published documentation or adaptive probing)
+      reduces detection to 20-35% using adaptive C&W. The gap between the reported
+      80% and actual 20-35% is not disclosed in the security posture until an actual
+      adversarial evasion incident is discovered.
+    correct_approach: |
+      Always report two detection rate figures: non-adaptive (FGSM/PGD adversaries who
+      do not know the squeezer configuration) and adaptive (C&W with squeezer knowledge,
+      using squeezer_adaptive_adversary_test.py). The honest production statement is:
+      "Track 7 detects 80% of non-adaptive adversarial examples and 35% of adaptive
+      adversarial examples against squeezing alone; the three-primitive ensemble reduces
+      the adaptive gap." This sets accurate expectations and motivates the full ensemble.
+
+section_summary:
+
+  compact: |
+    Feature squeezing detects adversarial examples through their sensitivity to input
+    transformation: adversarial perturbations are precisely calibrated to the model and
+    are fragile under mild transformation, while natural images are robust. Three canonical
+    squeezers cover complementary attack families: Gaussian blur catches L-infinity attacks
+    (FGSM, PGD), bit-depth reduction catches fine-grained perturbations, and JPEG compression
+    catches structured frequency-domain perturbations. The squeezer detection score is the L1
+    distance between prediction vectors on original vs squeezed input; a threshold calibrated
+    on natural inputs including hard borderline examples separates adversarial from benign.
+    A squeezer ensemble provides union coverage but does not defend against adaptive adversaries
+    who optimise through the squeezer. Squeezers must run in parallel with primary model
+    inference to stay within the 50ms P99 Track 7 budget; sequential execution typically
+    violates the latency constraint. Text-specific canonicalisation primitives (Unicode
+    normalisation, confusable replacement, zero-width removal) implement the text analogue.
+
+  key_takeaways:
+    - 'Detection signal: adversarial inputs change predictions under squeezing; natural inputs do not -- the asymmetry is the detection primitive'
+    - 'Three squeezers: Gaussian blur (L-inf attacks), bit-depth reduction (fine-grained), JPEG (structured frequency) -- each covers different attack families'
+    - 'Threshold calibration must include hard natural examples near the decision boundary; easy-image calibration over-fits and fails in production'
+    - 'Parallel squeezer execution is mandatory: sequential execution triples/quadruples latency and violates the 50ms P99 gateway budget'
+    - 'Single squeezer is insufficient: adaptive C&W reduces detection to 20-35%; the three-primitive Track 7 ensemble (squeezing + consistency + classifier) is required'
+    - 'Text analogues: Unicode NFKC normalisation + confusable replacement + zero-width removal; route text inputs to text canonicalisers, not image squeezers'
+
+preview_section_10_12:
+  title: 'Section 10.12: Detection Primitives -- Consistency Checking and Adversarial Classifier'
+  summary: |
+    Section 10.12 completes the Track 7 detection primitive library with two post-inference
+    primitives. The consistency checker submits N randomly perturbed variants of the input
+    and flags inputs whose classification is unstable across variants -- adversarial examples
+    near the decision boundary are fragile and flip classification under small random
+    perturbation, while natural inputs are stable. For text, the consistency checker uses
+    back-translation and semantic paraphrase rather than random pixel noise. The adversarial
+    detector classifier is a binary classifier trained to distinguish adversarial from natural
+    examples using features extracted from the input (gradient magnitude distribution, embedding
+    distance to training manifold, spectral properties). It generalises across attack families
+    seen in training and degrades on novel attack families. Section 10.12 builds both primitives
+    and combines them with the Section 10.11 squeezer ensemble into the five-component detection
+    ensemble that Section 10.13 wires into the production Track 7 gateway.
+
+metadata:
+  cross_chapter_references:
+    - 'Section 10.3: FGSM (primary attack squeezer is most effective against; detection rate calibration baseline)'
+    - 'Section 10.4: PGD (evaluation adversary for squeezer detection rate; PGD robustness evaluator used here)'
+    - 'Section 10.5: C&W adaptive attack (Section 10.5 defence_evaluator_cw.py directly tests squeezer evasion)'
+    - 'Section 10.1: Track 7 pre-inference architecture (squeezer is the pre-inference stage)'
+    - 'Section 10.9: text adversarial attacks (homoglyph and zero-width attacks caught by text_canonicaliser.py)'
+  forward_references:
+    - 'Section 10.12: consistency checker and adversarial classifier (post-inference Track 7 primitives)'
+    - 'Section 10.13: Track 7 production gateway (wires squeezer ensemble in parallel pre-inference stage)'
+    - 'Section 10.14: randomised smoothing (formal robustness certificate; squeezing provides no formal guarantee)'
+  tags:
+    - feature-squeezing
+    - xu-2018
+    - gaussian-blur
+    - median-filter
+    - bit-depth-reduction
+    - jpeg-compression
+    - squeezer-ensemble
+    - detection-by-transformation
+    - adaptive-adversary
+    - latency-budget
+    - parallel-inference
+    - track-7-pre-inference
+    - text-canonicalisation
+    - unicode-normalisation
+    - homoglyph-detection

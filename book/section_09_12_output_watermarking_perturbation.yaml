@@ -1,0 +1,1963 @@
+# section_09_12_output_watermarking_perturbation.yaml
+
+---
+document_info:
+  title: 'Section 9.12: Production Output Watermarking and Perturbation'
+  subtitle: 'Output-Side LLM10 Capstone'
+  chapter: 9
+  section: 12
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/raghavpoonia/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  estimated_pages: 8
+  estimated_reading_time: '32 minutes'
+  created: '2026-05-09'
+
+section_overview:
+  one_line_summary: |
+    The output-side capstone embeds a cryptographic watermark in every model
+    response via token-level probability shaping, adds calibrated noise through
+    adaptive perturbation to reduce per-query extraction information, and
+    closes OWASP LLM10 by covering the benchmark-distribution distillation gap
+    that input-side monitoring cannot address.
+
+  why_this_section_exists: |
+    Section 9.11 closed the input-side half of OWASP LLM10. It monitors query
+    patterns, enforces extraction-aware rate limits, and detects distributed
+    campaigns. But the Section 9.10 empirical table showed a 30 to 40 percent
+    detection rate for benchmark-distribution LLM distillation -- the Alpaca and
+    Vicuna pattern where query distributions are analytically indistinguishable
+    from legitimate evaluation use. No input-side monitoring technique can close
+    this gap because the gap is definitional: the adversary''s queries are
+    legitimate. Section 9.12 closes it from the output side.
+
+    Output-side defence introduces a new architectural stage that no prior chapter
+    required. Chapters 6, 7, and 8 all defended inputs -- the injection classifier
+    reads user input, the auditing pipeline examines training data. Section 9.11
+    also defends inputs -- the query monitor scores the incoming request. Section
+    9.12 defends outputs: the watermarker and perturbator modify the model''s
+    response before it is returned to the user. This post-inference stage is
+    structurally novel and architecturally significant.
+
+    Two primitives operate at this stage. The watermarker embeds a cryptographic
+    signal in every response by biasing token sampling probabilities using a
+    secret key. The signal is statistically detectable in the aggregate but
+    imperceptible in any individual response. A surrogate model trained on
+    watermarked outputs inherits the bias because it is trained to replicate
+    the teacher''s output distribution. The perturbator adds calibrated noise
+    to reduce per-query extraction information -- particularly effective against
+    soft-label distillation and prompt extraction. Together they form the output-
+    side defensive surface that, combined with Section 9.11, achieves full
+    OWASP LLM10 coverage across all five LLM10 sub-risks.
+
+  position_in_chapter: |
+    Section 9.12 of 13. Output-side production capstone. Completes OWASP LLM10
+    alongside Section 9.11. The watermark detection workflow is the post-
+    deployment ownership verification mechanism that the Section 9.9 incident
+    analysis identified as absent from every documented extraction incident.
+
+learning_objectives:
+  knowledge:
+    - 'Explain the token-level watermarking mechanism: vocabulary partitioning with a secret key, logit biasing during sampling, and the green token proportion as the detection signal'
+    - 'Describe the statistical detection test: the z-score under the null hypothesis and the p-value threshold for watermark confirmation'
+    - 'Explain why the watermark transfers from victim to student during distillation training'
+    - 'Describe output perturbation theory: how calibrated noise reduces mutual information between true and observed outputs'
+    - 'Articulate the utility-protection tradeoff and why zero-leakage requires zero-utility'
+    - 'Explain adaptive perturbation: how per-request risk scoring drives perturbation strength'
+
+  skills:
+    - 'Implement token-level watermarking with HMAC-based vocabulary partitioning'
+    - 'Build a statistical watermark detector computing the green-token z-score and p-value'
+    - 'Implement calibrated output perturbation with configurable noise levels'
+    - 'Build an adaptive perturbation controller that scales noise with query risk score'
+    - 'Run a watermark robustness benchmark across paraphrasing, truncation, and distillation'
+    - 'Run a utility validation harness measuring degradation across perturbation strength levels'
+    - 'Work through the watermark verification workflow against a suspected surrogate'
+    - 'Complete the 8-item output-side deployment checklist'
+
+  security_mindset:
+    - 'Internalise that watermarking provides ownership evidence, not extraction prevention -- the two are complementary, not substitutable'
+    - 'Recognise that perturbation must be calibrated against the utility-protection tradeoff -- excessive perturbation destroys the product'
+    - 'Understand that watermark robustness is an active research area -- adversarially designed watermark removal may succeed, especially given sufficient queries'
+    - 'Appreciate that the output-side stage is a new attack surface: an adversary who can observe enough output can attempt to infer the watermark key; key rotation policy is required'
+
+prerequisites:
+  - 'Section 9.4: distillation attacks and why output information survives into the student (watermark transfer mechanism)'
+  - 'Section 9.5: prompt extraction and per-query leakage as the defence metric'
+  - 'Section 9.10: output entropy monitor (feeds adaptive perturbation controller)'
+  - 'Section 9.11: query monitor ensemble score (feeds adaptive perturbation controller)'
+  - 'Chapter 3: LLM token sampling and probability distributions (watermarking operates on the sampling step)'
+  - 'Chapter 8 Section 8.13: differential privacy training (upstream privacy defence; perturbation is the downstream complement)'
+
+prose_content:
+
+  - part: 1
+    title: 'The Output-Side Capstone: Design Brief and Architectural Position'
+    body: |
+      Every defensive component built in Chapters 6, 7, 8, and Section 9.11
+      operates on inputs. The injection classifier scores user input. The training
+      data auditor examines training examples. The query monitor scores incoming
+      requests. None of these components touches the model''s response. Section
+      9.12 adds the first output-side defensive stage in the book: a post-inference
+      processing layer that modifies the model''s response before it is transmitted
+      to the user.
+
+      The architectural position is straightforward: output post-processing runs
+      after the model produces a response and before the response reaches the
+      API gateway''s response serialiser. It receives the model''s raw output --
+      the token log-probabilities for LLMs, the class probability vector for
+      classifiers -- and produces a modified output that carries both the watermark
+      and the perturbation noise. The user receives the modified output;
+      the model never sees it modified.
+
+      Two components share this stage. The watermarker operates during token
+      sampling, biasing the selection probabilities to prefer tokens in a key-
+      dependent "green" partition. It does not change what the model generates
+      in aggregate -- the semantic content of the response is unchanged -- but
+      it introduces a detectable statistical signal into the token sequence.
+      The perturbator operates on the final output probability distribution,
+      adding calibrated noise before the output is serialised and returned.
+
+      The design brief has three requirements. First, the watermark must survive
+      distillation: a student model trained on watermarked outputs must inherit
+      the green-token bias such that its outputs are detectable by the watermark
+      detector. Second, the perturbator must not break the product: the utility
+      degradation from perturbation must be below the product''s quality threshold
+      at the default noise level. Third, both components must add negligible
+      latency: the output stage runs after inference, which is already the
+      dominant latency contributor; post-processing must add under 5ms.
+
+  - part: 2
+    title: 'Watermarking Theory: Embedding Cryptographic Signals in Model Outputs'
+    body: |
+      The theoretical foundation for token-level LLM watermarking was established
+      by Kirchenbauer et al. 2023 ("A Watermark for Large Language Models").
+      The scheme has two components: an embedding procedure that modifies the
+      model''s token sampling during generation, and a detection procedure that
+      tests whether a text sequence was generated by a watermarked model.
+
+      The embedding procedure begins with a vocabulary partition. At each token
+      position, the model computes a context hash: a deterministic function of
+      the preceding tokens and a secret key. The context hash partitions the
+      full vocabulary into two subsets of approximately equal size -- the green
+      list (tokens the model should prefer) and the red list (tokens the model
+      should suppress). The partition changes at every position because it depends
+      on the context, making it impossible to predict which tokens are green without
+      the secret key.
+
+      During token sampling, the model adds a positive bias δ (delta) to the
+      logits of all green-list tokens before applying softmax. This biases
+      the sampling distribution toward the green partition without deterministically
+      forcing any specific token. The resulting text is semantically indistinguishable
+      from unmodified output for small δ values (typically δ = 2.0 or less) --
+      the model''s preferred tokens still dominate, but the green tokens among
+      equally-likely alternatives are systematically preferred.
+
+      The detection procedure is a one-sided statistical test. Given a text
+      sequence T of length n, count g = the number of tokens in T that fall in
+      the green partition at their respective positions (using the same context
+      hash and secret key). Under the null hypothesis -- text generated without
+      the watermark -- each token is independently green with probability
+      approximately 0.5. The test statistic z = (g - n × 0.5) / √(n × 0.25) is
+      approximately normally distributed under the null. A z-score above a threshold
+      (typically 4.0, corresponding to p < 0.00003) indicates watermark presence
+      with high confidence.
+
+  - part: 3
+    title: 'Why the Watermark Transfers Through Distillation'
+    body: |
+      The watermark''s most important property for the Chapter 9 threat model is
+      its survival through distillation. When an adversary trains a student model
+      on watermarked outputs, the student learns to replicate the teacher''s output
+      distribution -- including the green-token bias that the watermark introduces.
+
+      The transfer mechanism is straightforward. During distillation data collection,
+      the adversary queries the watermarked victim and collects (prompt, response)
+      pairs. Each response was generated with the green-token bias active: the
+      response tokens are systematically drawn from the green partition more often
+      than 50 percent of the time. The student is trained on these responses as
+      target text. The student''s training objective is to predict the next token
+      given the context -- to match the observed token distribution in the training
+      data. The training data has a green-token excess. The student learns to
+      prefer green tokens in the contexts where the teacher preferred them.
+
+      After training, the student model generates text with a green-token fraction
+      above 0.5, even though the student has no explicit knowledge of the watermark
+      scheme and no access to the secret key. The student has learned the watermark
+      as a statistical property of the training data distribution. The watermark
+      detector, applied to the student''s outputs, observes this excess and rejects
+      the null hypothesis.
+
+      The transfer fidelity is highest when: the student is trained on a large
+      volume of watermarked outputs, the watermark strength δ is high, and the
+      student architecture is large enough to represent the fine-grained distributional
+      preferences the watermark encodes. For smaller students or very small
+      distillation datasets, the watermark signal in the student''s outputs is weaker
+      and the detector requires more text to confirm presence at the target confidence
+      level.
+
+  - part: 4
+    title: 'Output Perturbation Theory: Calibrated Noise and Extraction Efficiency'
+    body: |
+      Output perturbation adds calibrated noise to the model''s output distribution
+      before it reaches the user. For classifiers, this means adding noise to the
+      confidence score vector -- shifting each class probability by a random amount
+      drawn from a calibrated distribution. For LLMs, this means truncating the
+      output probability distribution (top-k truncation), rounding probabilities
+      to a coarser resolution, or applying temperature shaping that makes the
+      distribution less informative.
+
+      The information-theoretic basis for perturbation''s extraction efficiency
+      reduction is mutual information. The adversary observes the perturbed output
+      y_tilde = y + noise, where y is the true output and noise is drawn from
+      a zero-mean distribution with variance σ². The mutual information I(y;
+      y_tilde) decreases as σ² increases. For Gaussian noise with variance σ²,
+      the mutual information between the true and observed output is
+      0.5 × log(1 + y_var / σ²), where y_var is the variance of the true output
+      across inputs. At σ² = y_var (noise equal to signal variance), the mutual
+      information is halved: the adversary obtains only half the extraction
+      information per query.
+
+      The practical consequence: at moderate perturbation strength, the adversary
+      needs approximately twice the query budget to achieve the same surrogate
+      fidelity as against an unperturbed API. This is an extraction friction
+      factor of 2x rather than a fundamental barrier -- a patient adversary with
+      double the budget can still complete the extraction. The friction value is
+      real but bounded.
+
+      The utility-protection tradeoff is the binding constraint. Perturbation that
+      halves extraction efficiency also halves the precision of the API''s outputs
+      for legitimate users. A medical imaging classifier that returns perturbed
+      confidence scores is less reliable as a diagnostic support tool. The
+      calibration challenge is finding the noise level that meaningfully increases
+      extraction cost while remaining below the product''s quality threshold.
+      Section 9.12 builds the utility validation harness (Deliverable 6) precisely
+      to measure this tradeoff empirically for a given deployment.
+
+  - part: 5
+    title: 'Adaptive Perturbation: Risk-Weighted Response Modification'
+    body: |
+      Uniform perturbation applies the same noise level to every response regardless
+      of the request''s extraction risk. This is suboptimal in both directions:
+      it over-perturbs low-risk responses (degrading product quality unnecessarily)
+      and under-perturbs the responses that matter most -- those to extraction-
+      pattern queries where the adversary is actively collecting training data.
+
+      Adaptive perturbation addresses both problems by scaling the noise level
+      with the per-request risk score from the Section 9.11 query monitor. A
+      request that receives a low composite score (0.10 -- consistent with
+      legitimate use) receives minimal perturbation (noise at 10 percent of the
+      full perturbation strength). A request that receives a high composite score
+      (0.80 -- consistent with boundary extraction or systematic distillation)
+      receives full perturbation.
+
+      The risk-to-noise mapping function is configurable. A linear mapping
+      (noise = base_noise + risk_score × (max_noise - base_noise)) is simple
+      and predictable. A step function (low risk → no perturbation, medium risk
+      → moderate perturbation, high risk → full perturbation) is easier to reason
+      about operationally and produces cleaner utility characteristics.
+
+      Adaptive perturbation has an additional adversary friction property: an
+      adversary who observes that high-similarity queries receive more noisy
+      responses learns that the system is monitoring their behaviour. This
+      awareness may change their querying strategy -- which means the adaptive
+      perturbation is itself a detection signal. An adversary who suddenly changes
+      their query distribution after triggering elevated perturbation is exhibiting
+      behaviour that the query monitor''s time-series tracking can flag.
+
+      The privacy implication of adaptive perturbation is the same as adaptive
+      rate limiting: the noise level applied to a user''s responses is a function
+      of their computed risk score, which is a function of their behaviour. This
+      differential treatment should be documented in the privacy notice and
+      designed so that the noise level does not itself constitute a de facto
+      disclosure to the user of their risk classification.
+
+  - part: 6
+    title: 'Watermark Robustness: Surviving Paraphrasing, Translation, and Distillation'
+    body: |
+      The watermark''s practical value depends on its robustness: whether the
+      signal survives the transformations an adversary might apply to the victim''s
+      outputs before using them or publishing a surrogate. Three transformations
+      are most relevant to the Chapter 9 threat model.
+
+      Paraphrasing attacks rewrite the watermarked text while preserving its
+      semantic content. The adversary passes watermarked responses through a
+      paraphrasing model (a separate LLM or a translation-back-translation chain)
+      to replace green tokens with semantically equivalent red tokens. Paraphrasing
+      attack success depends on the quality of the paraphrasing model and the
+      watermark strength: weak watermarks (small δ) are vulnerable because few
+      tokens are strongly biased; strong watermarks (large δ) are more robust
+      because the green-token preference is more pronounced and harder to fully
+      replace through semantic paraphrasing.
+
+      Translation attacks translate the text to another language and back. The
+      watermark operates on the vocabulary of the original language; a translation
+      model does not preserve the source language''s green-token pattern. The
+      translated-back text will have a green-token fraction near 0.5 -- the
+      watermark signal is lost. This is a known limitation of vocabulary-partition
+      watermarking schemes.
+
+      Distillation attacks are the most relevant for the Chapter 9 threat model.
+      As established in Part 3, distillation training on watermarked outputs
+      preserves the watermark signal in the student''s outputs. The distillation
+      watermark transfer rate is the fraction of the victim''s watermark signal
+      that the student retains, measured as the z-score ratio between student
+      and victim outputs on the same input set. At typical distillation training
+      scales, the transfer rate is 0.4 to 0.8: the student''s outputs have a
+      green-token fraction that is 40 to 80 percent as far from 0.5 as the victim''s.
+      Detection remains possible but requires more text (longer responses or more
+      samples) at lower transfer rates.
+
+      The robustness benchmark in Deliverable 5 measures all three attack types
+      empirically and produces the minimum text length required for detection
+      at a target confidence level under each attack.
+
+  - part: 7
+    title: 'Output Transformation Defences: Rounding, Top-K Truncation, Temperature Shaping'
+    body: |
+      Three output transformation techniques provide perturbation without requiring
+      the operator to add explicit noise -- they modify the output distribution
+      structurally rather than additively.
+
+      Probability rounding reduces the resolution of confidence scores by rounding
+      them to the nearest multiple of a rounding quantum q. A confidence score of
+      0.847 rounded to q = 0.05 becomes 0.85; rounded to q = 0.10 becomes 0.80.
+      Rounding eliminates the fine-grained boundary information that soft-label
+      extraction exploits: the adversary can no longer distinguish inputs that are
+      very close to the boundary (confidence 0.51) from those that are clearly
+      within a class (confidence 0.55). The larger the rounding quantum, the greater
+      the extraction information reduction -- and the greater the utility degradation
+      for legitimate users who rely on precise confidence calibration.
+
+      Top-k truncation returns only the top-k class probabilities rather than the
+      full distribution, setting all others to zero and renormalising. For a
+      classifier with 1,000 classes, returning only the top-5 probabilities
+      eliminates 99.5 percent of the output distribution''s information content.
+      Top-k truncation is architecturally the simplest perturbation and has the
+      most predictable extraction resistance: the adversary cannot observe the
+      model''s probability assignments to classes outside the top-k, eliminating
+      the boundary information those classes carry.
+
+      Temperature shaping applies a modified temperature parameter to the output
+      softmax. A temperature above 1.0 flattens the output distribution (more
+      uniform, more noisy); a temperature below 1.0 sharpens it (more confident,
+      less informative about near-boundary uncertainty). For extraction defence,
+      a slightly elevated temperature (1.1 to 1.5) makes the output distribution
+      less informative about the model''s true confidence structure. For hard-label
+      APIs, temperature shaping affects the hard label selection at the boundary
+      only marginally; for soft-label APIs, it meaningfully degrades the extraction
+      information per query.
+
+  - part: 8
+    title: 'Closing OWASP LLM10: Combined Input-Side and Output-Side Coverage'
+    body: |
+      Section 9.11 closed the input-side half of OWASP LLM10. Section 9.12 closes
+      the output-side half. Together they produce complete coverage across all five
+      LLM10 sub-risks identified in Section 9.1.
+
+      LLM10.1 -- intentional copying of model functionality. Input-side: the query
+      monitor detects distillation campaign query patterns; the rate limiter imposes
+      extraction budget costs. Output-side: the watermarker embeds the victim''s
+      identity in every response; the watermark detector identifies surrogate models
+      trained on those responses.
+
+      LLM10.2 -- system prompt and configuration extraction. Input-side: the query
+      monitor''s meta-query rate track and user concentration analyser detect prompt
+      extraction campaigns. Output-side: the perturbator reduces per-query prompt
+      leakage by generifying responses that would otherwise verbatim-reproduce
+      prompt-derived content.
+
+      LLM10.3 -- training data reconstruction via membership inference and model
+      inversion. Input-side: the query monitor detects repeated querying of specific
+      target records (the membership inference probing pattern). Output-side: the
+      perturbator reduces per-response confidence score precision, degrading the
+      membership inference signal. Upstream: differential privacy training from
+      Section 8.13 provides the formal bound.
+
+      LLM10.4 -- API economic abuse. Input-side: the rate limiter''s cost-per-hour
+      and input-token-per-request dimensions cover denial-of-wallet and context
+      padding. Output-side: the output entropy monitor''s token-count anomaly track
+      flags unusually long responses.
+
+      LLM10.5 -- surrogate model deployment. Input-side: not addressable at input
+      time (the deployment has already occurred). Output-side: the watermark
+      detector identifies victim model signatures in deployed surrogates; the
+      verification workflow provides the legal evidence chain for ownership claims.
+
+      The cumulative coverage across Chapters 6, 7, 8, and 9 now spans three of
+      the ten OWASP LLM categories: LLM01 (prompt injection and jailbreak, Chapters
+      6 and 7), LLM03 (training data poisoning, Chapter 8), and LLM10 (model theft,
+      Chapter 9). Each was addressed with a full attack catalogue followed by
+      production detection controls at two defensive surfaces.
+
+reference_materials:
+
+  - table: 1
+    title: 'Watermarking vs Perturbation: Mechanism, Timing, and Utility Cost'
+    description: |
+      Side-by-side comparison of the two output-side defence primitives.
+    columns:
+      - 'Property'
+      - 'Output Watermarking'
+      - 'Output Perturbation'
+    rows:
+      - property: 'Mechanism'
+        watermarking: 'Token sampling bias via green-list vocabulary partition using secret key'
+        perturbation: 'Additive noise or structural transformation (rounding, top-k, temperature) applied to output distribution'
+      - property: 'Detection timing'
+        watermarking: 'Post-hoc: watermark verified in suspected surrogate after extraction is detected'
+        perturbation: 'No detection -- friction only; reduces extraction efficiency in real time'
+      - property: 'Extraction outcome addressed'
+        watermarking: 'Post-hoc ownership evidence; actionable for LLM10.5 (surrogate deployment)'
+        perturbation: 'Extraction efficiency reduction; requires more queries for same fidelity; covers LLM10.1, 10.2, 10.3'
+      - property: 'Utility cost'
+        watermarking: 'Low: green-token bias is imperceptible at δ <= 2.0; text quality unchanged'
+        perturbation: 'Moderate: scales with noise level; measured by utility validation harness'
+      - property: 'Adversary evasion'
+        watermarking: 'Paraphrasing, translation, watermark removal attacks; distillation transfer reduces but does not eliminate signal'
+        perturbation: 'Patient adversary with large query budget can average out Gaussian noise; structural transforms harder to remove'
+      - property: 'Key management requirement'
+        watermarking: 'Secret key must be stored securely and rotated periodically; compromise enables watermark removal'
+        perturbation: 'No key required; noise parameters do not need to be secret for Gaussian noise'
+      - property: 'Output-side architectural position'
+        watermarking: 'Applied during token sampling (pre-serialisation)'
+        perturbation: 'Applied to final probability vector (post-sampling, pre-serialisation)'
+
+  - table: 2
+    title: 'Watermark Robustness Across Attack Types'
+    description: |
+      Approximate watermark survival rates under three transformation attack types.
+      Green-token z-score ratio = student z-score / victim z-score on same inputs.
+      Values depend on watermark strength delta and transformation quality.
+    columns:
+      - 'Attack Type'
+      - 'Mechanism'
+      - 'Green-Token Z-Score Ratio (delta=1.0)'
+      - 'Green-Token Z-Score Ratio (delta=2.0)'
+      - 'Detection Feasibility'
+      - 'Mitigation'
+    rows:
+      - attack: 'Distillation (large student)'
+        mechanism: 'Student trained on 50K+ watermarked responses'
+        ratio_low: '0.6-0.8'
+        ratio_high: '0.7-0.9'
+        feasibility: 'Feasible: requires more samples but detection succeeds with 500+ tokens'
+        mitigation: 'Increase delta; require longer text for detection'
+      - attack: 'Distillation (small student 7B)'
+        mechanism: 'Student trained on 10K-50K watermarked responses'
+        ratio_low: '0.3-0.5'
+        ratio_high: '0.4-0.7'
+        feasibility: 'Marginal: requires long texts (2000+ tokens) for confident detection'
+        mitigation: 'Increase delta to 3.0+; use multiple detection keys'
+      - attack: 'Paraphrasing (strong paraphraser)'
+        mechanism: 'GPT-class paraphrasing model rewrites each response'
+        ratio_low: '0.1-0.3'
+        ratio_high: '0.3-0.5'
+        feasibility: 'Difficult: signal reduced significantly; marginal detection'
+        mitigation: 'Semantic-preserving watermarks (future work); combine with perturbation'
+      - attack: 'Translation round-trip'
+        mechanism: 'EN -> FR -> EN via translation model'
+        ratio_low: '~0.0'
+        ratio_high: '0.0-0.1'
+        feasibility: 'Infeasible: watermark not preserved across vocabulary change'
+        mitigation: 'Multi-language watermarking schemes; embedding-space watermarks'
+      - attack: 'Truncation (keep 50%)'
+        mechanism: 'Adversary uses only first half of each watermarked response'
+        ratio_low: '0.8-0.95'
+        ratio_high: '0.9-0.98'
+        feasibility: 'Highly feasible: green-token excess preserved in remaining tokens'
+        mitigation: 'No mitigation needed -- truncation does not remove the bias'
+
+  - table: 3
+    title: 'Perturbation Strength vs Extraction Efficiency and Utility Degradation'
+    description: |
+      Approximate relationship between Gaussian noise standard deviation sigma,
+      extraction efficiency (query budget multiplier for same fidelity), and
+      utility degradation (BLEU score reduction on representative outputs).
+    columns:
+      - 'Sigma (noise std dev)'
+      - 'Information Reduction per Query'
+      - 'Extraction Budget Multiplier'
+      - 'Approx BLEU Degradation'
+      - 'Recommended Use Case'
+    rows:
+      - sigma: '0.01 (minimal)'
+        info_reduction: '<5%'
+        budget_multiplier: '~1.05x'
+        bleu_degradation: '<0.5%'
+        use_case: 'Baseline: imperceptible noise; minimal extraction friction'
+      - sigma: '0.05 (light)'
+        info_reduction: '15-25%'
+        budget_multiplier: '~1.3x'
+        bleu_degradation: '1-2%'
+        use_case: 'Default for low-risk requests; negligible UX impact'
+      - sigma: '0.10 (moderate)'
+        info_reduction: '35-50%'
+        budget_multiplier: '~2.0x'
+        bleu_degradation: '3-5%'
+        use_case: 'Default for elevated-risk requests; noticeable but acceptable'
+      - sigma: '0.20 (strong)'
+        info_reduction: '60-70%'
+        budget_multiplier: '~3.5x'
+        bleu_degradation: '8-12%'
+        use_case: 'High-risk requests only; utility degradation visible to users'
+      - sigma: '0.50 (aggressive)'
+        info_reduction: '85-90%'
+        budget_multiplier: '~8x'
+        bleu_degradation: '20-30%'
+        use_case: 'Not recommended for production; for research use only'
+
+  - table: 4
+    title: 'OWASP LLM10 Sub-Risk Coverage: Input-Side and Output-Side Combined'
+    description: |
+      Complete LLM10 coverage map after Section 9.11 (input-side) and Section
+      9.12 (output-side) are deployed together.
+    columns:
+      - 'LLM10 Sub-Risk'
+      - 'Description'
+      - 'Input-Side Control (Section 9.11)'
+      - 'Output-Side Control (Section 9.12)'
+      - 'Coverage Status'
+    rows:
+      - sub_risk: 'LLM10.1'
+        description: 'Intentional copying of model functionality via API queries'
+        input_side: 'Query monitor detects distillation campaign; rate limiter imposes extraction budget costs'
+        output_side: 'Watermarker embeds victim identity; watermark detector identifies surrogates'
+        status: 'Full -- input-side catches obvious campaigns; watermark catches covert ones'
+      - sub_risk: 'LLM10.2'
+        description: 'System prompt and operational configuration extraction'
+        input_side: 'Meta-query rate and concentration tracks detect prompt extraction campaigns'
+        output_side: 'Perturbator reduces per-query prompt leakage; adaptive strength on high-risk queries'
+        status: 'Full -- cumulative detection via monitor; cumulative leakage reduction via perturbator'
+      - sub_risk: 'LLM10.3'
+        description: 'Training data reconstruction via membership inference and model inversion'
+        input_side: 'Query monitor detects repeated target-record probing pattern'
+        output_side: 'Perturbator reduces confidence signal precision; DP training (Section 8.13) bounds leakage'
+        status: 'Full (with DP training) -- perturbation reduces signal; DP provides formal bound'
+      - sub_risk: 'LLM10.4'
+        description: 'API economic abuse: denial-of-wallet and rate-limit exhaustion'
+        input_side: 'Rate limiter cost-per-hour and input-token-per-request dimensions'
+        output_side: 'Output entropy monitor token-count anomaly track (partial signal)'
+        status: 'Full -- rate limiter is the primary control; output monitor is supplementary'
+      - sub_risk: 'LLM10.5'
+        description: 'Surrogate model deployment post-extraction'
+        input_side: 'Not addressable at input time (post-deployment event)'
+        output_side: 'Watermark detector identifies victim signature in deployed surrogate; verification workflow provides legal evidence chain'
+        status: 'Full (post-hoc) -- prevention not possible; ownership evidence and legal recourse enabled'
+
+deliverables:
+
+  - id: 1
+    name: 'output_watermarker.py'
+    description: |
+      Production token-level output watermarker implementing the Kirchenbauer et al.
+      2023 green-token vocabulary partition scheme. Uses HMAC-SHA256 to create a
+      context-dependent green list for each token position. Applies logit bias
+      delta to green-list tokens during sampling. Works on probability vectors
+      (simulating the post-softmax distribution) for classifier deployments and
+      on token log-probability vectors for LLM deployments.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires only stdlib (hmac,
+      hashlib, struct) and numpy. WatermarkKey is a dataclass holding the secret
+      key bytes and delta parameter. Vocabulary partitioning uses HMAC to ensure
+      the partition is deterministic given the key and context but unpredictable
+      without the key. No hardcoded vocabulary sizes or key lengths.
+    code: |
+      # output_watermarker.py
+      # Chapter 9 Section 9.12 -- Production Token-Level Output Watermarker
+      # Single quotes throughout per book convention.
+
+      import hashlib
+      import hmac
+      import struct
+      from dataclasses import dataclass, field
+      from typing import List, Optional, Tuple
+
+      import numpy as np
+
+
+      @dataclass
+      class WatermarkKey:
+          secret_bytes: bytes
+          delta: float = 2.0       # logit bias added to green tokens
+          green_fraction: float = 0.5  # fraction of vocabulary in green list
+
+
+      def _context_hash(key: WatermarkKey, context_tokens: List[int]) -> bytes:
+          '''
+          Compute a deterministic hash of the watermark key and context tokens.
+          Used to derive the green-list partition at each position.
+          '''
+          h = hmac.new(key.secret_bytes, digestmod=hashlib.sha256)
+          for token_id in context_tokens[-4:]:  # use last 4 context tokens
+              h.update(struct.pack('>I', token_id))
+          return h.digest()
+
+
+      def _is_green(
+          key: WatermarkKey,
+          context_tokens: List[int],
+          candidate_token: int,
+          vocab_size: int,
+      ) -> bool:
+          '''
+          Determine whether candidate_token is in the green list given the context.
+          Uses the context hash as a seed to deterministically assign tokens to green/red.
+          '''
+          ctx_hash = _context_hash(key, context_tokens)
+          # Use first 4 bytes of hash as a seed; combine with token id
+          seed = struct.unpack('>I', ctx_hash[:4])[0]
+          combined = (seed ^ candidate_token) % (2 ** 32)
+          threshold = int(key.green_fraction * (2 ** 32))
+          return combined < threshold
+
+
+      def green_list_for_context(
+          key: WatermarkKey,
+          context_tokens: List[int],
+          vocab_size: int,
+      ) -> np.ndarray:
+          '''
+          Return a boolean mask of shape (vocab_size,) where True = green token.
+          '''
+          ctx_hash = _context_hash(key, context_tokens)
+          seed = struct.unpack('>I', ctx_hash[:4])[0]
+          rng = np.random.default_rng(seed=seed % (2 ** 31))
+          mask = rng.random(vocab_size) < key.green_fraction
+          return mask
+
+
+      def apply_watermark_logit_bias(
+          logits: np.ndarray,
+          key: WatermarkKey,
+          context_tokens: List[int],
+      ) -> np.ndarray:
+          '''
+          Apply green-token logit bias to a logit vector.
+          logits: shape (vocab_size,) -- log-probability before softmax.
+          Returns biased logits with delta added to all green tokens.
+          '''
+          vocab_size = len(logits)
+          green_mask = green_list_for_context(key, context_tokens, vocab_size)
+          biased = logits.copy()
+          biased[green_mask] += key.delta
+          return biased
+
+
+      def watermark_sample(
+          logits: np.ndarray,
+          key: WatermarkKey,
+          context_tokens: List[int],
+          temperature: float = 1.0,
+          rng: Optional[np.random.Generator] = None,
+      ) -> Tuple[int, bool]:
+          '''
+          Sample the next token from biased logits.
+          Returns (sampled_token_id, is_green).
+          '''
+          if rng is None:
+              rng = np.random.default_rng()
+          biased = apply_watermark_logit_bias(logits, key, context_tokens)
+          if temperature != 1.0:
+              biased = biased / temperature
+          # Softmax
+          biased = biased - biased.max()
+          probs = np.exp(biased)
+          probs = probs / probs.sum()
+          token_id = int(rng.choice(len(probs), p=probs))
+          green_mask = green_list_for_context(key, context_tokens, len(logits))
+          return token_id, bool(green_mask[token_id])
+
+
+      def simulate_watermarked_generation(
+          key: WatermarkKey,
+          vocab_size: int,
+          n_tokens: int,
+          base_logits_fn=None,
+          rng: Optional[np.random.Generator] = None,
+      ) -> Tuple[List[int], List[bool]]:
+          '''
+          Simulate watermarked token generation for testing.
+          base_logits_fn: callable (context, vocab_size) -> np.ndarray of logits.
+          If None, uses uniform logits.
+          '''
+          if rng is None:
+              rng = np.random.default_rng(seed=42)
+          context: List[int] = [0]  # start token
+          tokens: List[int] = []
+          green_flags: List[bool] = []
+          for _ in range(n_tokens):
+              if base_logits_fn is not None:
+                  logits = base_logits_fn(context, vocab_size)
+              else:
+                  logits = rng.standard_normal(vocab_size).astype(np.float32)
+              token_id, is_green = watermark_sample(logits, key, context, rng=rng)
+              tokens.append(token_id)
+              green_flags.append(is_green)
+              context.append(token_id)
+          return tokens, green_flags
+
+
+      if __name__ == '__main__':
+          import os
+          key = WatermarkKey(secret_bytes=os.urandom(32), delta=2.0)
+          vocab_size = 1000
+          n_tokens = 200
+          tokens, green_flags = simulate_watermarked_generation(key, vocab_size, n_tokens)
+          green_count = sum(green_flags)
+          green_fraction = green_count / n_tokens
+          print(f'OUTPUT WATERMARKER -- Chapter 9 Section 9.12')
+          print(f'Tokens generated:  {n_tokens}')
+          print(f'Green tokens:      {green_count} ({green_fraction:.1%})')
+          print(f'Expected baseline: {key.green_fraction:.1%}')
+          print(f'Excess above base: {(green_fraction - key.green_fraction):.1%} '
+                f'(positive = watermark active)')
+
+  - id: 2
+    name: 'watermark_detector.py'
+    description: |
+      Statistical watermark detector implementing the Kirchenbauer et al. z-score
+      test. Given a token sequence and the watermark key, counts green tokens at
+      each position and computes the z-score under the null hypothesis of no
+      watermark. Returns the z-score, p-value, and a boolean detection verdict
+      at a configurable confidence threshold.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy and scipy.stats.
+      Imports green_list_for_context from output_watermarker.py. Detection
+      threshold is configurable; default z_threshold=4.0 corresponds to
+      p-value < 0.00003 (false positive rate of ~3 per 100,000 tests).
+    code: |
+      # watermark_detector.py
+      # Chapter 9 Section 9.12 -- Watermark Statistical Detector
+      # Single quotes throughout per book convention.
+
+      import math
+      from dataclasses import dataclass
+      from typing import List, Optional, Tuple
+
+      import numpy as np
+
+      from output_watermarker import WatermarkKey, green_list_for_context
+
+
+      @dataclass
+      class DetectionResult:
+          n_tokens: int
+          n_green: int
+          green_fraction: float
+          z_score: float
+          p_value: float
+          watermark_detected: bool
+          z_threshold: float
+          confidence: str  # 'high', 'moderate', 'inconclusive'
+
+
+      def _normal_cdf_upper(z: float) -> float:
+          '''Upper tail p-value for standard normal. Approximation via erfc.'''
+          return 0.5 * math.erfc(z / math.sqrt(2.0))
+
+
+      def detect_watermark(
+          token_sequence: List[int],
+          context_sequences: List[List[int]],
+          key: WatermarkKey,
+          vocab_size: int,
+          z_threshold: float = 4.0,
+      ) -> DetectionResult:
+          '''
+          Detect watermark in a token sequence.
+
+          token_sequence: list of token IDs in the sequence.
+          context_sequences: list of context windows, one per token in token_sequence.
+              context_sequences[i] is the context that preceded token_sequence[i].
+          key: WatermarkKey used during generation.
+          vocab_size: vocabulary size of the model.
+          z_threshold: z-score above which watermark is declared present.
+          '''
+          n = len(token_sequence)
+          if n == 0:
+              return DetectionResult(0, 0, 0.0, 0.0, 1.0, False, z_threshold, 'inconclusive')
+
+          n_green = 0
+          for token_id, context in zip(token_sequence, context_sequences):
+              green_mask = green_list_for_context(key, context, vocab_size)
+              if green_mask[token_id % vocab_size]:
+                  n_green += 1
+
+          green_fraction = n_green / n
+          # Z-score under H0: each token is green with probability key.green_fraction
+          p0 = key.green_fraction
+          expected = n * p0
+          std_dev = math.sqrt(n * p0 * (1.0 - p0))
+          z = (n_green - expected) / max(std_dev, 1e-10)
+          p_value = _normal_cdf_upper(z)
+          detected = z >= z_threshold
+
+          if z >= 6.0:
+              confidence = 'high'
+          elif z >= z_threshold:
+              confidence = 'moderate'
+          else:
+              confidence = 'inconclusive'
+
+          return DetectionResult(
+              n_tokens=n,
+              n_green=n_green,
+              green_fraction=round(green_fraction, 4),
+              z_score=round(z, 4),
+              p_value=round(p_value, 8),
+              watermark_detected=detected,
+              z_threshold=z_threshold,
+              confidence=confidence,
+          )
+
+
+      def minimum_tokens_for_detection(
+          key: WatermarkKey,
+          target_z: float = 4.0,
+          expected_green_fraction: Optional[float] = None,
+      ) -> int:
+          '''
+          Compute minimum token count needed to detect the watermark at target_z
+          given the expected green fraction in watermarked text.
+          expected_green_fraction defaults to key.green_fraction + empirical excess.
+          '''
+          p_obs = expected_green_fraction or (key.green_fraction + 0.08)
+          p0 = key.green_fraction
+          # Solve: (n * p_obs - n * p0) / sqrt(n * p0 * (1-p0)) >= target_z
+          # => sqrt(n) >= target_z * sqrt(p0*(1-p0)) / (p_obs - p0)
+          excess = p_obs - p0
+          if excess <= 0:
+              return int(1e9)
+          std_factor = math.sqrt(p0 * (1.0 - p0))
+          min_tokens = math.ceil((target_z * std_factor / excess) ** 2)
+          return min_tokens
+
+
+      if __name__ == '__main__':
+          import os
+          from output_watermarker import simulate_watermarked_generation
+
+          key = WatermarkKey(secret_bytes=os.urandom(32), delta=2.0)
+          vocab_size = 1000
+          n_tokens = 300
+
+          # Watermarked sequence
+          tokens, _ = simulate_watermarked_generation(key, vocab_size, n_tokens)
+          contexts = [[0] + tokens[:i] for i in range(n_tokens)]
+          result = detect_watermark(tokens, contexts, key, vocab_size)
+
+          print('WATERMARK DETECTOR -- Chapter 9 Section 9.12')
+          print(f'Tokens tested:     {result.n_tokens}')
+          print(f'Green fraction:    {result.green_fraction:.1%}')
+          print(f'Z-score:           {result.z_score:.2f}')
+          print(f'P-value:           {result.p_value:.2e}')
+          print(f'Detected:          {result.watermark_detected} ({result.confidence})')
+          print()
+          min_tok = minimum_tokens_for_detection(key)
+          print(f'Min tokens for detection at z=4.0: {min_tok}')
+
+          # Unwatermarked baseline
+          rng = np.random.default_rng(seed=7)
+          baseline_tokens = rng.integers(0, vocab_size, size=n_tokens).tolist()
+          baseline_contexts = [[0] + baseline_tokens[:i] for i in range(n_tokens)]
+          baseline_result = detect_watermark(baseline_tokens, baseline_contexts, key, vocab_size)
+          print(f'\nBaseline (no watermark): z={baseline_result.z_score:.2f} detected={baseline_result.watermark_detected}')
+
+  - id: 3
+    name: 'output_perturbator.py'
+    description: |
+      Calibrated output perturbator applying Gaussian noise to classifier probability
+      vectors and implementing top-k truncation and probability rounding for LLM
+      outputs. Provides a utility-protection tradeoff parameter sigma that scales
+      noise strength. Implements all three output transformation defences from
+      prose Part 7 in a unified interface.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy.
+      PerturbationConfig is data-driven -- mode (gaussian/topk/rounding/temperature)
+      and parameters are schema-free. No hardcoded vocabulary sizes or class counts.
+      Perturbation is applied to the probability vector, not the logits.
+    code: |
+      # output_perturbator.py
+      # Chapter 9 Section 9.12 -- Calibrated Output Perturbator
+      # Single quotes throughout per book convention.
+
+      from dataclasses import dataclass
+      from typing import Literal, Optional
+
+      import numpy as np
+
+
+      @dataclass
+      class PerturbationConfig:
+          mode: str  # 'gaussian', 'topk', 'rounding', 'temperature'
+          sigma: float = 0.05         # for gaussian mode: noise std dev
+          top_k: int = 5              # for topk mode: number of classes to retain
+          rounding_quantum: float = 0.05  # for rounding mode: rounding step
+          temperature: float = 1.2    # for temperature mode: softmax temperature factor
+
+
+      def perturb_gaussian(
+          proba: np.ndarray,
+          sigma: float,
+          rng: Optional[np.random.Generator] = None,
+      ) -> np.ndarray:
+          '''Add Gaussian noise to a probability vector and renormalise.'''
+          if rng is None:
+              rng = np.random.default_rng()
+          noise = rng.normal(0.0, sigma, size=len(proba))
+          perturbed = proba + noise
+          perturbed = np.clip(perturbed, 1e-10, None)
+          return perturbed / perturbed.sum()
+
+
+      def perturb_topk(proba: np.ndarray, top_k: int) -> np.ndarray:
+          '''Retain only top-k class probabilities; set others to zero and renormalise.'''
+          k = min(top_k, len(proba))
+          result = np.zeros_like(proba)
+          top_indices = np.argsort(proba)[-k:]
+          result[top_indices] = proba[top_indices]
+          total = result.sum()
+          if total > 0:
+              result = result / total
+          return result
+
+
+      def perturb_rounding(proba: np.ndarray, quantum: float) -> np.ndarray:
+          '''Round probabilities to nearest multiple of quantum and renormalise.'''
+          rounded = np.round(proba / quantum) * quantum
+          rounded = np.clip(rounded, 0.0, None)
+          total = rounded.sum()
+          if total == 0:
+              return np.ones(len(proba)) / len(proba)
+          return rounded / total
+
+
+      def perturb_temperature(
+          proba: np.ndarray,
+          temperature: float,
+      ) -> np.ndarray:
+          '''Apply temperature shaping: T>1 flattens, T<1 sharpens the distribution.'''
+          log_p = np.log(np.clip(proba, 1e-10, 1.0))
+          scaled = log_p / temperature
+          scaled = scaled - scaled.max()
+          result = np.exp(scaled)
+          return result / result.sum()
+
+
+      class OutputPerturbator:
+          '''
+          Unified output perturbation interface supporting four perturbation modes.
+          '''
+
+          def __init__(
+              self,
+              config: Optional[PerturbationConfig] = None,
+              rng: Optional[np.random.Generator] = None,
+          ) -> None:
+              self._cfg = config or PerturbationConfig(mode='gaussian')
+              self._rng = rng or np.random.default_rng(seed=42)
+
+          def perturb(self, proba: np.ndarray) -> np.ndarray:
+              '''Apply configured perturbation to a probability vector.'''
+              mode = self._cfg.mode
+              if mode == 'gaussian':
+                  return perturb_gaussian(proba, self._cfg.sigma, self._rng)
+              if mode == 'topk':
+                  return perturb_topk(proba, self._cfg.top_k)
+              if mode == 'rounding':
+                  return perturb_rounding(proba, self._cfg.rounding_quantum)
+              if mode == 'temperature':
+                  return perturb_temperature(proba, self._cfg.temperature)
+              raise ValueError(f'Unknown perturbation mode: {mode}')
+
+          def kl_from_original(self, original: np.ndarray, perturbed: np.ndarray) -> float:
+              '''KL divergence D_KL(original || perturbed) as utility loss proxy.'''
+              p = np.clip(original, 1e-10, 1.0)
+              q = np.clip(perturbed, 1e-10, 1.0)
+              return float(np.sum(p * (np.log(p) - np.log(q))))
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(seed=0)
+          # Simulate a near-boundary classifier output
+          proba = np.array([0.52, 0.38, 0.06, 0.04])
+          modes = [
+              PerturbationConfig(mode='gaussian', sigma=0.05),
+              PerturbationConfig(mode='topk', top_k=2),
+              PerturbationConfig(mode='rounding', rounding_quantum=0.10),
+              PerturbationConfig(mode='temperature', temperature=1.3),
+          ]
+          print('OUTPUT PERTURBATOR -- Chapter 9 Section 9.12')
+          print(f'Original: {proba}')
+          for cfg in modes:
+              p = OutputPerturbator(config=cfg, rng=np.random.default_rng(seed=1))
+              perturbed = p.perturb(proba)
+              kl = p.kl_from_original(proba, perturbed)
+              print(f'  [{cfg.mode}] perturbed={perturbed.round(3)} KL={kl:.4f}')
+
+  - id: 4
+    name: 'adaptive_perturbation.py'
+    description: |
+      Adaptive perturbation controller that scales noise strength with the per-
+      request risk score from the Section 9.11 query monitor. Implements both
+      linear and step-function risk-to-noise mappings. Integrates with the
+      OutputPerturbator from Deliverable 3 to produce risk-weighted responses.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy.
+      Imports OutputPerturbator and PerturbationConfig from output_perturbator.
+      Risk-to-noise mapping is data-driven via AdaptiveConfig dataclass.
+      Linear and step modes are both supported; step mode is recommended for
+      operational simplicity.
+    code: |
+      # adaptive_perturbation.py
+      # Chapter 9 Section 9.12 -- Adaptive Perturbation Controller
+      # Single quotes throughout per book convention.
+
+      from dataclasses import dataclass, field
+      from typing import List, Optional, Tuple
+
+      import numpy as np
+
+      from output_perturbator import OutputPerturbator, PerturbationConfig
+
+
+      @dataclass
+      class RiskTier:
+          name: str
+          min_risk_score: float
+          max_risk_score: float
+          perturbation_config: PerturbationConfig
+
+
+      @dataclass
+      class AdaptiveConfig:
+          mode: str  # 'linear' or 'step'
+          base_sigma: float = 0.01    # sigma at risk_score=0.0
+          max_sigma: float = 0.20     # sigma at risk_score=1.0
+          perturbation_mode: str = 'gaussian'
+          tiers: List[RiskTier] = field(default_factory=list)
+
+
+      DEFAULT_TIERS: List[RiskTier] = [
+          RiskTier(
+              name='low',
+              min_risk_score=0.0,
+              max_risk_score=0.30,
+              perturbation_config=PerturbationConfig(mode='gaussian', sigma=0.01),
+          ),
+          RiskTier(
+              name='medium',
+              min_risk_score=0.30,
+              max_risk_score=0.60,
+              perturbation_config=PerturbationConfig(mode='gaussian', sigma=0.05),
+          ),
+          RiskTier(
+              name='high',
+              min_risk_score=0.60,
+              max_risk_score=1.01,
+              perturbation_config=PerturbationConfig(mode='gaussian', sigma=0.15),
+          ),
+      ]
+
+
+      class AdaptivePerturbationController:
+          '''
+          Scales perturbation strength with the query monitor ensemble score.
+          '''
+
+          def __init__(
+              self,
+              config: Optional[AdaptiveConfig] = None,
+              rng: Optional[np.random.Generator] = None,
+          ) -> None:
+              self._cfg = config or AdaptiveConfig(mode='step', tiers=DEFAULT_TIERS)
+              self._rng = rng or np.random.default_rng(seed=42)
+
+          def _get_sigma(self, risk_score: float) -> float:
+              if self._cfg.mode == 'linear':
+                  return self._cfg.base_sigma + risk_score * (
+                      self._cfg.max_sigma - self._cfg.base_sigma
+                  )
+              # step mode
+              for tier in self._cfg.tiers:
+                  if tier.min_risk_score <= risk_score < tier.max_risk_score:
+                      return tier.perturbation_config.sigma
+              return self._cfg.max_sigma
+
+          def _get_config(self, risk_score: float) -> PerturbationConfig:
+              if self._cfg.mode == 'step':
+                  for tier in self._cfg.tiers:
+                      if tier.min_risk_score <= risk_score < tier.max_risk_score:
+                          return tier.perturbation_config
+              sigma = self._get_sigma(risk_score)
+              return PerturbationConfig(mode=self._cfg.perturbation_mode, sigma=sigma)
+
+          def perturb(
+              self,
+              proba: np.ndarray,
+              risk_score: float,
+          ) -> Tuple[np.ndarray, float]:
+              '''
+              Perturb a probability vector with risk-adapted noise.
+              Returns (perturbed_proba, applied_sigma).
+              '''
+              risk_score = max(0.0, min(risk_score, 1.0))
+              cfg = self._get_config(risk_score)
+              perturbator = OutputPerturbator(config=cfg, rng=self._rng)
+              perturbed = perturbator.perturb(proba)
+              return perturbed, cfg.sigma
+
+
+      if __name__ == '__main__':
+          controller = AdaptivePerturbationController()
+          proba = np.array([0.52, 0.38, 0.06, 0.04])
+          print('ADAPTIVE PERTURBATION -- Chapter 9 Section 9.12')
+          print(f'Original distribution: {proba}')
+          for risk in [0.10, 0.35, 0.70, 0.90]:
+              perturbed, sigma = controller.perturb(proba, risk_score=risk)
+              print(f'  Risk={risk:.2f} sigma={sigma:.3f}: perturbed={perturbed.round(3)}')
+
+  - id: 5
+    name: 'watermark_robustness_benchmark.py'
+    description: |
+      Watermark robustness benchmark measuring z-score survival across three
+      attack types: truncation (keep first N percent of tokens), substitution
+      (randomly replace R percent of tokens with random tokens), and distillation
+      simulation (add noise simulating the signal degradation from student
+      training). Reports the minimum text length required for detection at a
+      target confidence under each attack.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy.
+      Imports from output_watermarker and watermark_detector.
+      Attack simulations are parameterised -- truncation fraction, substitution
+      rate, and distillation signal factor are all configurable.
+    code: |
+      # watermark_robustness_benchmark.py
+      # Chapter 9 Section 9.12 -- Watermark Robustness Benchmark
+      # Single quotes throughout per book convention.
+
+      from dataclasses import dataclass, field
+      from typing import List, Optional, Tuple
+
+      import numpy as np
+
+      from output_watermarker import WatermarkKey, simulate_watermarked_generation
+      from watermark_detector import DetectionResult, detect_watermark
+
+
+      @dataclass
+      class RobustnessResult:
+          attack_name: str
+          attack_param: float
+          n_tokens: int
+          z_score_original: float
+          z_score_after_attack: float
+          z_score_ratio: float
+          detected_after_attack: bool
+          detection_p_value: float
+
+
+      def attack_truncation(
+          tokens: List[int],
+          contexts: List[List[int]],
+          keep_fraction: float,
+      ) -> Tuple[List[int], List[List[int]]]:
+          n = max(1, int(len(tokens) * keep_fraction))
+          return tokens[:n], contexts[:n]
+
+
+      def attack_substitution(
+          tokens: List[int],
+          vocab_size: int,
+          substitution_rate: float,
+          rng: Optional[np.random.Generator] = None,
+      ) -> List[int]:
+          if rng is None:
+              rng = np.random.default_rng(seed=0)
+          result = list(tokens)
+          for i in range(len(result)):
+              if rng.random() < substitution_rate:
+                  result[i] = int(rng.integers(0, vocab_size))
+          return result
+
+
+      def attack_distillation_simulation(
+          tokens: List[int],
+          contexts: List[List[int]],
+          key: WatermarkKey,
+          vocab_size: int,
+          signal_retention: float,
+          rng: Optional[np.random.Generator] = None,
+      ) -> Tuple[List[int], List[List[int]]]:
+          '''
+          Simulate distillation watermark degradation by randomly replacing
+          (1 - signal_retention) fraction of green tokens with random tokens.
+          '''
+          if rng is None:
+              rng = np.random.default_rng(seed=1)
+          from output_watermarker import green_list_for_context
+          result = list(tokens)
+          for i, (token_id, context) in enumerate(zip(tokens, contexts)):
+              green_mask = green_list_for_context(key, context, vocab_size)
+              if green_mask[token_id % vocab_size]:
+                  if rng.random() > signal_retention:
+                      result[i] = int(rng.integers(0, vocab_size))
+          return result, contexts
+
+
+      def run_robustness_benchmark(
+          key: WatermarkKey,
+          vocab_size: int = 1000,
+          n_tokens: int = 500,
+          z_threshold: float = 4.0,
+          rng: Optional[np.random.Generator] = None,
+      ) -> List[RobustnessResult]:
+          if rng is None:
+              rng = np.random.default_rng(seed=42)
+          results: List[RobustnessResult] = []
+
+          tokens, _ = simulate_watermarked_generation(key, vocab_size, n_tokens, rng=rng)
+          contexts = [[0] + tokens[:i] for i in range(n_tokens)]
+
+          # Baseline
+          baseline = detect_watermark(tokens, contexts, key, vocab_size, z_threshold)
+
+          # Truncation attacks
+          for keep_frac in [0.9, 0.7, 0.5, 0.3]:
+              t_tokens, t_contexts = attack_truncation(tokens, contexts, keep_frac)
+              r = detect_watermark(t_tokens, t_contexts, key, vocab_size, z_threshold)
+              ratio = r.z_score / max(baseline.z_score, 1e-10)
+              results.append(RobustnessResult(
+                  attack_name='truncation',
+                  attack_param=keep_frac,
+                  n_tokens=r.n_tokens,
+                  z_score_original=baseline.z_score,
+                  z_score_after_attack=r.z_score,
+                  z_score_ratio=round(ratio, 3),
+                  detected_after_attack=r.watermark_detected,
+                  detection_p_value=r.p_value,
+              ))
+
+          # Substitution attacks
+          for sub_rate in [0.10, 0.20, 0.40, 0.60]:
+              s_tokens = attack_substitution(tokens, vocab_size, sub_rate, rng=rng)
+              r = detect_watermark(s_tokens, contexts, key, vocab_size, z_threshold)
+              ratio = r.z_score / max(baseline.z_score, 1e-10)
+              results.append(RobustnessResult(
+                  attack_name='substitution',
+                  attack_param=sub_rate,
+                  n_tokens=r.n_tokens,
+                  z_score_original=baseline.z_score,
+                  z_score_after_attack=r.z_score,
+                  z_score_ratio=round(ratio, 3),
+                  detected_after_attack=r.watermark_detected,
+                  detection_p_value=r.p_value,
+              ))
+
+          # Distillation simulation
+          for retention in [0.9, 0.7, 0.5, 0.3]:
+              d_tokens, d_contexts = attack_distillation_simulation(
+                  tokens, contexts, key, vocab_size, retention, rng=rng
+              )
+              r = detect_watermark(d_tokens, d_contexts, key, vocab_size, z_threshold)
+              ratio = r.z_score / max(baseline.z_score, 1e-10)
+              results.append(RobustnessResult(
+                  attack_name='distillation_sim',
+                  attack_param=retention,
+                  n_tokens=r.n_tokens,
+                  z_score_original=baseline.z_score,
+                  z_score_after_attack=r.z_score,
+                  z_score_ratio=round(ratio, 3),
+                  detected_after_attack=r.watermark_detected,
+                  detection_p_value=r.p_value,
+              ))
+          return results
+
+
+      def render_robustness_report(results: List[RobustnessResult]) -> None:
+          print('WATERMARK ROBUSTNESS BENCHMARK -- Chapter 9 Section 9.12')
+          header = '%-20s %8s %8s %8s %10s %10s' % (
+              'Attack', 'Param', 'Tokens', 'Z-orig', 'Z-after', 'Detected'
+          )
+          print(header)
+          print('-' * 70)
+          for r in results:
+              detected_str = 'YES' if r.detected_after_attack else 'No'
+              print('%-20s %8.2f %8d %8.2f %10.2f %10s' % (
+                  r.attack_name, r.attack_param, r.n_tokens,
+                  r.z_score_original, r.z_score_after_attack, detected_str,
+              ))
+
+
+      if __name__ == '__main__':
+          import os
+          key = WatermarkKey(secret_bytes=os.urandom(32), delta=2.0)
+          results = run_robustness_benchmark(key, vocab_size=1000, n_tokens=500)
+          render_robustness_report(results)
+
+  - id: 6
+    name: 'utility_validation_harness.py'
+    description: |
+      Utility validation harness measuring output quality degradation across
+      perturbation strength levels. Computes KL divergence and top-1 accuracy
+      change between original and perturbed probability vectors across a sample
+      of representative queries. Produces a utility-perturbation tradeoff curve
+      that identifies the maximum safe perturbation level for the deployment.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy.
+      Imports OutputPerturbator and PerturbationConfig from output_perturbator.
+      Utility metrics are computed on batches of simulated probability vectors.
+      No hardcoded class counts or quality thresholds.
+    code: |
+      # utility_validation_harness.py
+      # Chapter 9 Section 9.12 -- Utility Validation Harness
+      # Single quotes throughout per book convention.
+
+      from dataclasses import dataclass, field
+      from typing import List, Optional, Tuple
+
+      import numpy as np
+
+      from output_perturbator import OutputPerturbator, PerturbationConfig
+
+
+      @dataclass
+      class UtilityMeasurement:
+          sigma: float
+          mean_kl_divergence: float
+          top1_accuracy_change: float  # fraction of queries where top-1 prediction changed
+          max_kl: float
+          p95_kl: float
+
+
+      def _top1_agreement(original: np.ndarray, perturbed: np.ndarray) -> float:
+          return float(np.argmax(original) == np.argmax(perturbed))
+
+
+      def _kl_divergence(p: np.ndarray, q: np.ndarray) -> float:
+          p_clip = np.clip(p, 1e-10, 1.0)
+          q_clip = np.clip(q, 1e-10, 1.0)
+          return float(np.sum(p_clip * (np.log(p_clip) - np.log(q_clip))))
+
+
+      def measure_utility_at_sigma(
+          sigma: float,
+          sample_probas: List[np.ndarray],
+          rng: Optional[np.random.Generator] = None,
+      ) -> UtilityMeasurement:
+          if rng is None:
+              rng = np.random.default_rng(seed=42)
+          cfg = PerturbationConfig(mode='gaussian', sigma=sigma)
+          perturbator = OutputPerturbator(config=cfg, rng=rng)
+          kl_values: List[float] = []
+          top1_agreements: List[float] = []
+          for proba in sample_probas:
+              perturbed = perturbator.perturb(proba)
+              kl_values.append(_kl_divergence(proba, perturbed))
+              top1_agreements.append(_top1_agreement(proba, perturbed))
+          kl_arr = np.array(kl_values)
+          top1_change = 1.0 - float(np.mean(top1_agreements))
+          return UtilityMeasurement(
+              sigma=sigma,
+              mean_kl_divergence=round(float(kl_arr.mean()), 6),
+              top1_accuracy_change=round(top1_change, 4),
+              max_kl=round(float(kl_arr.max()), 6),
+              p95_kl=round(float(np.percentile(kl_arr, 95)), 6),
+          )
+
+
+      def run_utility_sweep(
+          sample_probas: List[np.ndarray],
+          sigma_values: Optional[List[float]] = None,
+          max_acceptable_kl: float = 0.05,
+          max_acceptable_top1_change: float = 0.02,
+      ) -> Tuple[List[UtilityMeasurement], Optional[float]]:
+          '''
+          Sweep sigma values and identify the maximum safe sigma below
+          both the KL and top-1 change quality thresholds.
+          Returns (measurements, max_safe_sigma).
+          '''
+          if sigma_values is None:
+              sigma_values = [0.01, 0.02, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50]
+          measurements = [measure_utility_at_sigma(s, sample_probas) for s in sigma_values]
+          max_safe_sigma = None
+          for m in measurements:
+              if m.mean_kl_divergence <= max_acceptable_kl and m.top1_accuracy_change <= max_acceptable_top1_change:
+                  max_safe_sigma = m.sigma
+          return measurements, max_safe_sigma
+
+
+      def render_utility_report(
+          measurements: List[UtilityMeasurement],
+          max_safe_sigma: Optional[float],
+      ) -> None:
+          print('UTILITY VALIDATION HARNESS -- Chapter 9 Section 9.12')
+          header = '%-10s %15s %20s %12s' % ('Sigma', 'Mean KL', 'Top1 Change', 'P95 KL')
+          print(header)
+          print('-' * 60)
+          for m in measurements:
+              flag = ' <-- MAX SAFE' if m.sigma == max_safe_sigma else ''
+              print('%-10.3f %15.6f %19.1f%% %12.6f%s' % (
+                  m.sigma, m.mean_kl_divergence, m.top1_accuracy_change * 100,
+                  m.p95_kl, flag,
+              ))
+          if max_safe_sigma:
+              print(f'\nRecommended default sigma: {max_safe_sigma}')
+          else:
+              print('\nNo sigma in sweep met both quality thresholds.')
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(seed=0)
+          # Generate representative sample probability vectors (simulate a 10-class classifier)
+          n_classes = 10
+          n_samples = 200
+          sample_probas = []
+          for _ in range(n_samples):
+              raw = rng.dirichlet(np.array([5.0] + [1.0] * (n_classes - 1)))
+              sample_probas.append(raw)
+
+          measurements, max_safe_sigma = run_utility_sweep(sample_probas)
+          render_utility_report(measurements, max_safe_sigma)
+
+  - id: 7
+    name: 'watermark_verification_workflow.py'
+    description: |
+      Watermark verification workflow for detecting the victim model''s signature
+      in a suspected surrogate. Takes a set of (prompt, response) pairs from
+      the suspected surrogate, applies the watermark detector, and produces a
+      verification report with detection confidence, evidence chain summary,
+      and recommended legal action threshold. Documents the chain of custody
+      requirements for the evidence to be legally actionable.
+    implementation_notes: |
+      Single quotes throughout per book convention. Requires numpy.
+      Imports from output_watermarker and watermark_detector.
+      Chain-of-custody documentation is schema-free via EvidenceRecord dataclass.
+      Tokenisation is abstracted -- replace _tokenise() with a production tokeniser.
+    code: |
+      # watermark_verification_workflow.py
+      # Chapter 9 Section 9.12 -- Watermark Verification Workflow
+      # Single quotes throughout per book convention.
+
+      import time
+      from dataclasses import dataclass, field
+      from typing import Dict, List, Optional, Tuple
+
+      import numpy as np
+
+      from output_watermarker import WatermarkKey
+      from watermark_detector import DetectionResult, detect_watermark
+
+
+      @dataclass
+      class SurrogateResponse:
+          prompt: str
+          response: str
+          source: str  # 'suspected_surrogate' or 'victim_baseline'
+
+
+      @dataclass
+      class EvidenceRecord:
+          timestamp: float
+          investigator_id: str
+          surrogate_identifier: str
+          total_tokens_tested: int
+          detection_result: DetectionResult
+          chain_of_custody_notes: str
+
+
+      @dataclass
+      class VerificationReport:
+          surrogate_identifier: str
+          evidence_records: List[EvidenceRecord]
+          aggregate_z_score: float
+          aggregate_p_value: float
+          watermark_confirmed: bool
+          confidence_level: str
+          recommended_action: str
+          legal_threshold_met: bool
+
+
+      def _tokenise(text: str, vocab_size: int) -> List[int]:
+          '''
+          Simple character-level mock tokeniser.
+          Replace with a production BPE tokeniser for deployment.
+          '''
+          return [ord(c) % vocab_size for c in text]
+
+
+      def verify_surrogate(
+          surrogate_responses: List[SurrogateResponse],
+          key: WatermarkKey,
+          vocab_size: int,
+          investigator_id: str,
+          surrogate_identifier: str,
+          z_threshold: float = 4.0,
+          legal_z_threshold: float = 6.0,
+      ) -> VerificationReport:
+          '''
+          Verify watermark presence in suspected surrogate outputs.
+          Aggregates detection results across all provided responses.
+          '''
+          evidence_records: List[EvidenceRecord] = []
+          all_tokens: List[int] = []
+          all_contexts: List[List[int]] = []
+
+          for resp in surrogate_responses:
+              tokens = _tokenise(resp.response, vocab_size)
+              if not tokens:
+                  continue
+              # Build context sequences for each token position
+              for i in range(len(tokens)):
+                  all_contexts.append([0] + all_tokens + tokens[:i])
+              all_tokens.extend(tokens)
+
+          if not all_tokens:
+              return VerificationReport(
+                  surrogate_identifier=surrogate_identifier,
+                  evidence_records=[],
+                  aggregate_z_score=0.0,
+                  aggregate_p_value=1.0,
+                  watermark_confirmed=False,
+                  confidence_level='insufficient_data',
+                  recommended_action='collect_more_samples',
+                  legal_threshold_met=False,
+              )
+
+          aggregate_result = detect_watermark(all_tokens, all_contexts, key, vocab_size, z_threshold)
+
+          evidence = EvidenceRecord(
+              timestamp=time.time(),
+              investigator_id=investigator_id,
+              surrogate_identifier=surrogate_identifier,
+              total_tokens_tested=aggregate_result.n_tokens,
+              detection_result=aggregate_result,
+              chain_of_custody_notes=(
+                  f'Responses collected from {surrogate_identifier}. '
+                  f'Watermark key stored in HSM. '
+                  ('Detection run by ' + investigator_id + ' at ' + time.strftime('%Y-%m-%d %H:%M:%S') + '.')
+              ),
+          )
+          evidence_records.append(evidence)
+
+          z = aggregate_result.z_score
+          legal_met = z >= legal_z_threshold
+
+          if z >= 6.0:
+              confidence = 'high'
+              action = 'proceed_with_legal_action'
+          elif z >= z_threshold:
+              confidence = 'moderate'
+              action = 'collect_additional_samples_before_legal_action'
+          else:
+              confidence = 'inconclusive'
+              action = 'monitor_and_collect_more_data'
+
+          return VerificationReport(
+              surrogate_identifier=surrogate_identifier,
+              evidence_records=evidence_records,
+              aggregate_z_score=round(z, 4),
+              aggregate_p_value=round(aggregate_result.p_value, 8),
+              watermark_confirmed=aggregate_result.watermark_detected,
+              confidence_level=confidence,
+              recommended_action=action,
+              legal_threshold_met=legal_met,
+          )
+
+
+      def render_verification_report(report: VerificationReport) -> None:
+          print('WATERMARK VERIFICATION REPORT -- Chapter 9 Section 9.12')
+          print(f'Surrogate: {report.surrogate_identifier}')
+          print(f'Aggregate Z-score:     {report.aggregate_z_score:.4f}')
+          print(f'P-value:               {report.aggregate_p_value:.2e}')
+          print(f'Watermark confirmed:   {report.watermark_confirmed}')
+          print(f'Confidence level:      {report.confidence_level}')
+          print(f'Recommended action:    {report.recommended_action}')
+          print(f'Legal threshold met:   {report.legal_threshold_met}')
+          print(f'\nEvidence records: {len(report.evidence_records)}')
+          for e in report.evidence_records:
+              print(f'  Tokens tested: {e.total_tokens_tested}')
+              print(f'  Notes: {e.chain_of_custody_notes}')
+
+
+      if __name__ == '__main__':
+          import os
+          from output_watermarker import simulate_watermarked_generation
+
+          key = WatermarkKey(secret_bytes=os.urandom(32), delta=2.0)
+          vocab_size = 500
+
+          # Simulate watermarked victim outputs used as distillation training data
+          # then output from student (with reduced watermark signal)
+          tokens, _ = simulate_watermarked_generation(key, vocab_size, 1000)
+          # Convert back to mock text
+          mock_response = ''.join(chr(48 + (t % 75)) for t in tokens[:200])
+
+          responses = [
+              SurrogateResponse(
+                  prompt='Tell me about extraction attacks',
+                  response=mock_response,
+                  source='suspected_surrogate',
+              )
+          ]
+
+          report = verify_surrogate(
+              surrogate_responses=responses,
+              key=key,
+              vocab_size=vocab_size,
+              investigator_id='security_team_01',
+              surrogate_identifier='suspected_clone_v1',
+          )
+          render_verification_report(report)
+
+  - id: 8
+    name: 'output_side_deployment_checklist.py'
+    description: |
+      Eight-item pre-production deployment checklist for the output watermarker
+      and perturbator. Mirrors the Section 9.11 deployment checklist structure
+      for the output-side components. Provides an assess_output_readiness()
+      function producing a deployment readiness verdict.
+    implementation_notes: |
+      Single quotes throughout per book convention. No external dependencies.
+      Checklist items are data-driven. Mirrors the Section 9.11 checklist
+      interface for consistent deployment workflow across both capstone sections.
+    code: |
+      # output_side_deployment_checklist.py
+      # Chapter 9 Section 9.12 -- Output-Side Deployment Checklist
+      # Single quotes throughout per book convention.
+
+      from dataclasses import dataclass, field
+      from typing import Dict, List, Optional, Tuple
+
+
+      @dataclass
+      class OutputChecklistItem:
+          item_id: str
+          category: str
+          question: str
+          verification_method: str
+          pass_criterion: str
+          blocking: bool
+
+
+      @dataclass
+      class OutputVerificationResult:
+          item_id: str
+          passed: bool
+          actual_value: Optional[str]
+          notes: str
+
+
+      @dataclass
+      class OutputReadinessReport:
+          total_items: int
+          passed_items: int
+          failed_blocking: List[str]
+          failed_non_blocking: List[str]
+          ready_for_production: bool
+          summary: str
+
+
+      OUTPUT_CHECKLIST: List[OutputChecklistItem] = [
+          OutputChecklistItem(
+              item_id='OC-1',
+              category='watermarking',
+              question='Watermark key generated, stored in HSM, and accessible to the watermarker?',
+              verification_method='Generate a test key; confirm HSM storage; run watermarker on 100 test responses',
+              pass_criterion='Key accessible; watermarker produces non-trivial green-token fraction above baseline',
+              blocking=True,
+          ),
+          OutputChecklistItem(
+              item_id='OC-2',
+              category='watermarking',
+              question='Watermark detector confirming presence in self-generated outputs?',
+              verification_method='Generate 1000 watermarked tokens; run detector; verify detection at z > 4.0',
+              pass_criterion='Detector confirms watermark at p < 0.001 on 1000+ tokens',
+              blocking=True,
+          ),
+          OutputChecklistItem(
+              item_id='OC-3',
+              category='watermarking',
+              question='Watermark robustness benchmark completed for distillation attack?',
+              verification_method='Run Deliverable 5 robustness benchmark; check distillation_sim results',
+              pass_criterion='Z-score ratio >= 0.4 at signal_retention=0.5 (detection feasible after moderate distillation)',
+              blocking=True,
+          ),
+          OutputChecklistItem(
+              item_id='OC-4',
+              category='perturbation',
+              question='Utility validation harness completed and maximum safe sigma identified?',
+              verification_method='Run Deliverable 6 utility sweep on representative sample; identify max_safe_sigma',
+              pass_criterion='max_safe_sigma identified; mean KL < 0.05 and top-1 change < 2% at recommended sigma',
+              blocking=True,
+          ),
+          OutputChecklistItem(
+              item_id='OC-5',
+              category='perturbation',
+              question='Adaptive perturbation controller integrated with query monitor risk scores?',
+              verification_method='Submit high-risk and low-risk test requests; verify perturbation scales with risk score',
+              pass_criterion='High-risk sigma >= 3x low-risk sigma; no perturbation on risk_score < 0.10',
+              blocking=True,
+          ),
+          OutputChecklistItem(
+              item_id='OC-6',
+              category='latency',
+              question='Output-side stage adding < 5ms P99 to total response latency?',
+              verification_method='Benchmark watermarker + perturbator on 200 representative responses',
+              pass_criterion='P99 combined latency <= 5ms',
+              blocking=True,
+          ),
+          OutputChecklistItem(
+              item_id='OC-7',
+              category='key_management',
+              question='Watermark key rotation policy documented and implemented?',
+              verification_method='Review key rotation runbook; verify rotation does not break existing detection',
+              pass_criterion='Key rotation period defined (recommended 6-12 months); old keys retained for historical verification',
+              blocking=False,
+          ),
+          OutputChecklistItem(
+              item_id='OC-8',
+              category='legal',
+              question='Watermark verification workflow validated with legal team for evidence chain requirements?',
+              verification_method='Tabletop review with legal team; chain of custody documentation reviewed',
+              pass_criterion='Legal team confirms verification report meets evidence standards for jurisdiction',
+              blocking=False,
+          ),
+      ]
+
+
+      def assess_output_readiness(
+          results: List[OutputVerificationResult],
+      ) -> OutputReadinessReport:
+          result_map: Dict[str, OutputVerificationResult] = {r.item_id: r for r in results}
+          passed = 0
+          failed_blocking: List[str] = []
+          failed_non_blocking: List[str] = []
+          for item in OUTPUT_CHECKLIST:
+              result = result_map.get(item.item_id)
+              if result is None or not result.passed:
+                  if item.blocking:
+                      failed_blocking.append(item.item_id)
+                  else:
+                      failed_non_blocking.append(item.item_id)
+              else:
+                  passed += 1
+          ready = len(failed_blocking) == 0
+          status = 'READY FOR PRODUCTION' if ready else f'NOT READY -- {len(failed_blocking)} blocking item(s) failed'
+          return OutputReadinessReport(
+              total_items=len(OUTPUT_CHECKLIST),
+              passed_items=passed,
+              failed_blocking=failed_blocking,
+              failed_non_blocking=failed_non_blocking,
+              ready_for_production=ready,
+              summary=f'{passed}/{len(OUTPUT_CHECKLIST)} items passed. {status}.',
+          )
+
+
+      def render_output_checklist(results: Optional[List[OutputVerificationResult]] = None) -> None:
+          print('OUTPUT-SIDE DEPLOYMENT CHECKLIST -- Chapter 9 Section 9.12')
+          print('=' * 70)
+          result_map = {r.item_id: r for r in (results or [])}
+          for item in OUTPUT_CHECKLIST:
+              result = result_map.get(item.item_id)
+              status = 'PASS' if (result and result.passed) else ('FAIL' if result else 'PENDING')
+              blocking_str = '[BLOCKING]' if item.blocking else '[advisory]'
+              print(f'  {item.item_id} {blocking_str:<12} [{status}] {item.question}')
+              if result and not result.passed and result.notes:
+                  print(f'    Notes: {result.notes}')
+
+
+      if __name__ == '__main__':
+          sample = [
+              OutputVerificationResult('OC-1', True, 'key_accessible', ''),
+              OutputVerificationResult('OC-2', True, 'z=8.2 p=3e-16', ''),
+              OutputVerificationResult('OC-3', False, 'ratio=0.30', 'Below threshold; increase delta to 3.0'),
+              OutputVerificationResult('OC-4', True, 'max_safe_sigma=0.05', ''),
+          ]
+          render_output_checklist(sample)
+          print()
+          report = assess_output_readiness(sample)
+          print(f'Readiness: {report.summary}')
+
+common_mistakes:
+
+  - id: 1
+    description: 'Treating the watermark as a prevention control and removing input-side rate limiting because watermarking is deployed'
+    why_it_happens: |
+      Watermarking provides post-hoc detection of extracted surrogates. This
+      capability is framed as "catching" extraction. Teams interpret "catching"
+      as "preventing" and reduce investment in input-side controls on the
+      assumption that watermarking makes them unnecessary.
+    consequence: |
+      The extraction campaign completes. The watermark is present in the surrogate.
+      The operator detects the surrogate after it is publicly deployed. The model
+      has been stolen; the operator has evidence but not remediation. Without
+      input-side rate limiting, the adversary completes the extraction without
+      the friction cost that would make the attack economically irrational.
+    correct_approach: |
+      Watermarking and rate limiting are complementary, not substitutable.
+      Rate limiting imposes extraction cost friction; watermarking provides
+      ownership evidence when extraction succeeds despite that friction.
+      The deployment requires both. The Section 9.9 incident analysis showed
+      that all three documented extractions lacked both controls; removing
+      either leaves the other''s coverage gap unaddressed.
+
+  - id: 2
+    description: 'Setting the watermark delta to the maximum value to maximise robustness, ignoring output quality'
+    why_it_happens: |
+      Higher delta means stronger watermark signal, better robustness to
+      paraphrasing, and faster detection with fewer tokens. Maximising delta
+      seems like a straightforward way to maximise watermark utility.
+    consequence: |
+      At high delta values (δ > 3.0 for many model distributions), the watermark
+      bias visibly changes the model''s vocabulary preferences. The model produces
+      text that is subtly but detectably less natural -- green-list words are
+      disproportionately preferred even when red-list words would be more
+      contextually appropriate. Users notice the degraded output quality.
+      A motivated adversary who suspects watermarking can confirm it by
+      measuring vocabulary frequency distributions in the output.
+    correct_approach: |
+      Calibrate delta against the utility validation harness (Deliverable 6).
+      Run the utility sweep with different delta values rather than sigma values.
+      Set delta at the maximum value that keeps output quality above the product''s
+      quality threshold. Typical production values are δ = 1.5 to 2.5; values
+      above 3.0 require explicit quality assessment.
+
+  - id: 3
+    description: 'Storing the watermark key in application configuration rather than a hardware security module'
+    why_it_happens: |
+      Application configuration is the natural storage location for secrets in
+      many deployment architectures. HSMs add operational complexity and cost.
+      The watermark key is treated like an API key -- stored in environment
+      variables or a secrets manager.
+    consequence: |
+      A secrets manager compromise or application configuration leak exposes
+      the watermark key. An adversary who obtains the key can determine which
+      tokens are green at each position and deliberately avoid them during
+      distillation data collection -- querying the victim multiple times for
+      each position and selecting the red-list response. The watermark is
+      defeated by an adversary who knows the key.
+    correct_approach: |
+      Store the watermark key in a hardware security module. The watermarker
+      should call the HSM to perform the HMAC computation rather than loading
+      the key into application memory. The HSM provides tamper-evident storage
+      and produces audit logs of key usage. The OC-7 deployment checklist item
+      explicitly requires key rotation documentation; key storage in HSM is the
+      prerequisite for that item.
+
+  - id: 4
+    description: 'Applying the same perturbation configuration to all output types regardless of their extraction information content'
+    why_it_happens: |
+      The OutputPerturbator applies a single PerturbationConfig to all outputs.
+      It is easier to configure one sigma value for the deployment than to build
+      logic that selects per-output-type configurations. The uniform approach
+      feels operationally simpler.
+    consequence: |
+      Hard-label outputs (class predictions with no probability distribution)
+      contain minimal extraction information -- adding Gaussian noise to a
+      hard label that the user will see as a text label accomplishes nothing
+      useful. Text generation outputs for LLMs require different perturbation
+      techniques (temperature shaping, top-k truncation) than classifier
+      probability vectors. Applying Gaussian noise to text output character
+      codes produces garbage.
+    correct_approach: |
+      Configure the OutputPerturbator differently for different output types.
+      Classifier probability outputs: Gaussian noise, top-k truncation, or
+      rounding. LLM token log-probability outputs (if returned): top-k
+      truncation and temperature shaping. LLM text outputs: no additive
+      noise (apply watermarking during generation instead; perturbation of
+      final text degrades quality without meaningfully reducing extraction
+      information). The adaptive_perturbation.py controller should route to
+      the appropriate perturbation mode based on the output type, not only
+      on the risk score.
+
+  - id: 5
+    description: 'Running the watermark verification workflow on too few tokens and treating inconclusive results as negative'
+    why_it_happens: |
+      A suspected surrogate may produce short responses. Querying the surrogate
+      for many long responses takes time and cost. The investigator runs the
+      detector on whatever samples are available, gets an inconclusive z-score,
+      and concludes the watermark is absent.
+    consequence: |
+      The watermark is present but the test lacks statistical power. A z-score
+      of 2.5 on 100 tokens is inconclusive; the same watermark on 2000 tokens
+      would produce a z-score above 4.0. The investigator concludes incorrectly
+      that the surrogate was not trained on the victim''s outputs. A potentially
+      actionable extraction is not pursued.
+    correct_approach: |
+      Always compute the minimum token count required for detection before
+      starting verification (using minimum_tokens_for_detection() from
+      watermark_detector.py). Collect enough samples to exceed that minimum
+      before drawing a conclusion. An inconclusive result on insufficient
+      data is not a negative result -- it is an insufficient data result.
+      The OC-2 deployment checklist item requires verifying detection on
+      1000+ tokens precisely to establish this practice from the beginning.
+
+section_summary:
+  compact: |
+    Section 9.12 closes the output-side half of OWASP LLM10 with two
+    complementary primitives. The output watermarker embeds a cryptographic
+    signal in every response using HMAC-based green-token vocabulary partitioning
+    (Kirchenbauer et al. 2023): during sampling, tokens in the key-dependent
+    green partition receive a positive logit bias delta, producing a statistically
+    detectable excess of green tokens in the output. The z-score test under the
+    null hypothesis of no watermark identifies this excess; a z-score above 4.0
+    (p < 0.00003) confirms watermark presence. The signal transfers to student
+    models trained on watermarked outputs because distillation training teaches
+    the student to replicate the teacher''s token distribution, including the
+    green-token bias. The output perturbator adds calibrated noise to reduce
+    per-query extraction information -- Gaussian noise for classifier probability
+    vectors, top-k truncation or temperature shaping for LLM outputs. Adaptive
+    perturbation scales noise strength with the Section 9.11 query monitor''s
+    risk score: high-risk queries receive maximum perturbation; low-risk queries
+    receive minimal perturbation to preserve product utility. Together with
+    Section 9.11, these output-side controls provide complete OWASP LLM10
+    coverage across all five sub-risks and close the benchmark-distribution
+    LLM distillation detection gap. Cumulative Chapter 9 coverage: LLM01
+    (Chapters 6/7), LLM03 (Chapter 8), and LLM10 (Sections 9.11/9.12).
+
+  key_takeaways:
+    - 'Watermarking is post-hoc evidence, not prevention -- it requires rate limiting as the complementary prevention layer'
+    - 'The watermark transfers through distillation because the student learns the teacher''s green-token preference from the training data'
+    - 'Delta calibration requires the utility validation harness -- values above 3.0 visibly degrade output quality'
+    - 'Watermark keys must be stored in an HSM -- a compromised key enables targeted watermark evasion'
+    - 'Perturbation mode must match output type: Gaussian noise for probability vectors; top-k/temperature for LLM text'
+    - 'Inconclusive detection on insufficient tokens is not a negative result -- compute minimum token count before starting verification'
+
+preview_section_13:
+  title: 'Section 9.13: Chapter Summary -- Extraction Defence Architecture and OWASP LLM10 Closure'
+  preview: |
+    Sections 9.11 and 9.12 together close OWASP LLM10. Section 9.13 synthesises
+    the full chapter: the extraction taxonomy, the two privacy attacks sharing the
+    inference surface, API economic abuse, the five detection primitives, the
+    input-side capstone, and the output-side capstone. The chapter summary
+    produces the extraction defence architecture diagram showing input-side and
+    output-side controls combined, the LLM01 + LLM03 + LLM10 cumulative coverage
+    map, the Chapter 9 extraction taxonomy reference card, and the 20-question
+    knowledge assessment. It also previews Chapter 10: Adversarial Machine
+    Learning, where the decision-boundary maps produced in Section 9.3 become
+    the inputs to adversarial example generation -- the next inference-time
+    attack class.
+
+metadata:
+  cross_chapter_references:
+    - ref: 'Chapter 3: LLM token sampling and probability distributions'
+      usage: 'Watermarking operates on the sampling step; logit biasing mechanism requires understanding of softmax'
+    - ref: 'Chapter 8 Section 8.13: differential privacy training'
+      usage: 'Upstream privacy defence; perturbation is the downstream complement for LLM10.3 coverage'
+    - ref: 'Section 9.4: distillation attacks and output information transfer'
+      usage: 'Watermark transfer through distillation (prose Part 3) depends on the Section 9.4 student-teacher mechanism'
+    - ref: 'Section 9.5: prompt extraction and per-query leakage metric'
+      usage: 'Output perturbation targets the per-query leakage metric established as the defence goal in Section 9.5'
+    - ref: 'Section 9.10: output entropy monitor'
+      usage: 'Feeds the adaptive perturbation controller; entropy score is one input to the risk-to-sigma mapping'
+    - ref: 'Section 9.11: query monitor ensemble score'
+      usage: 'Primary input to the adaptive perturbation controller; composite score drives perturbation strength'
+
+  forward_references:
+    - ref: 'Section 9.13: Chapter Summary'
+      usage: 'OWASP LLM10 closure (this section) is the primary topic of Section 9.13; cumulative coverage arc closes here'
+    - ref: 'Chapter 10: Adversarial Machine Learning'
+      usage: 'Decision-boundary maps from Section 9.3 become inputs to adversarial example generation in Chapter 10'

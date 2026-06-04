@@ -1,0 +1,1097 @@
+# section_04_16_api_architecture.yaml
+
+---
+document_info:
+  section: "04_16"
+  title: "API Architecture and Security: The External Boundary"
+  chapter: "04"
+  chapter_title: "Modern LLM Internals"
+  part: "Part I: Machine Learning Foundations"
+  book: "AI Security Mastery: From ML Fundamentals to Production Detection Systems"
+  version: "1.0.0"
+  author: "Raghav Dinesh"
+  github: "github.com/ruwgxo"
+  license: "MIT"
+  created: "2026-01-19"
+  estimated_pages: 6
+  tags:
+    - "api-security"
+    - "rate-limiting"
+    - "authentication"
+    - "model-extraction"
+    - "token-abuse"
+    - "streaming"
+    - "inference-budget"
+    - "multi-tenancy"
+    - "security-implications"
+
+section_overview:
+
+  purpose: |
+    The system prompt (Section 15) controls what a model does. The API layer controls
+    who can make it do anything at all. Together they form the two-layer security
+    boundary of every production LLM deployment: the inner boundary (model behavior)
+    and the outer boundary (API access control). Compromising either layer is
+    sufficient for an attacker to cause harm; defending both is necessary for
+    a secure deployment.
+
+    For security engineers the API layer is simultaneously more familiar (it follows
+    the same patterns as any web API — authentication, rate limiting, input validation,
+    output filtering) and less familiar (it has LLM-specific attack surfaces that
+    have no analogs in traditional APIs, particularly around inference cost amplification,
+    model extraction via output sampling, and multi-tenant KV cache isolation).
+
+    This section covers the full API security surface for LLM deployments: the request
+    lifecycle from authentication through inference to response delivery, the
+    LLM-specific attack patterns that exploit the API layer, the defensive controls
+    that must be implemented at this layer (not inside the model), and the monitoring
+    architecture that connects API-layer events to the detection systems in Part 3.
+
+  position_in_chapter: |
+    Section 16 of 17. Final section of the deployment arc (11-16). This section
+    completes the defensive architecture started in Section 15. Section 17 is the
+    chapter capstone project that integrates all prior sections. This section is
+    the last new technical content before the capstone — it must be complete and
+    actionable.
+
+  prerequisites:
+    - "Section 04_08: KV cache — memory exhaustion DoS and timing side channels"
+    - "Section 04_10: Speculative decoding — throughput degradation attacks"
+    - "Section 04_11: Context windows — context length as API parameter and attack vector"
+    - "Section 04_15: System prompts — inner security layer that the API wraps"
+    - "General web API security: REST, authentication, rate limiting (assumed background)"
+
+  what_you_will_build:
+    primary: "LLM API security wrapper: rate limiting, auth, input validation, output filtering"
+    secondary:
+      - "Token budget enforcer: prevent inference cost amplification attacks"
+      - "Model extraction detector: identify systematic output-harvesting behavior"
+      - "Multi-tenant isolation tester: verify KV cache and session boundaries"
+      - "API security audit checklist: production-ready evaluation framework"
+    notebooks:
+      - "03-llm-internals/api_security_wrapper.ipynb"
+      - "03-llm-internals/model_extraction_detection.ipynb"
+
+# ============================================================================
+# CONTENT
+# ============================================================================
+
+content:
+
+  # --------------------------------------------------------------------------
+  # 1. THE LLM API REQUEST LIFECYCLE
+  # --------------------------------------------------------------------------
+
+  subsection_1:
+    title: "The Request Lifecycle: From API Call to Token Stream"
+    pages: 1
+
+    standard_request_lifecycle: |
+      A production LLM API request passes through multiple stages before the
+      first token reaches the client. Each stage is a potential security control
+      point and a potential attack surface:
+
+        Stage 1 — Network ingress:
+          TLS termination, DDoS mitigation, load balancing
+          Standard web infrastructure — same patterns as any API
+
+        Stage 2 — Authentication and authorization:
+          Verify API key / OAuth token / JWT
+          Check caller identity, rate limit bucket, permission tier
+          LLM-specific: per-model permissions, per-feature permissions
+
+        Stage 3 — Request validation:
+          Schema validation (required fields, type checking)
+          Input length validation (max tokens, max messages)
+          Content policy screening (adversarial prompt classifier from Section 14)
+          LLM-specific: context window budget enforcement
+
+        Stage 4 — Context assembly:
+          Merge system prompt + conversation history + current message
+          Inject dynamic system prompt fields (sanitized — Section 15)
+          Apply prefix caching lookup (KV cache prefix matching)
+          LLM-specific: the assembled context is the actual model input
+
+        Stage 5 — Inference:
+          Route to available GPU instance
+          Execute prefill (process full context — Flash Attention)
+          Execute decode (generate tokens — KV cache)
+          LLM-specific: resource consumption scales with context length
+
+        Stage 6 — Output processing:
+          Content policy screening on generated output
+          Structured output validation (if applicable)
+          PII/secret detection (prevent context exfiltration)
+          Format enforcement (ensure response matches expected schema)
+
+        Stage 7 — Response delivery:
+          Streaming (token-by-token) or batch (complete response)
+          Logging (full request/response for audit trail)
+          Metrics collection (latency, token counts, cost)
+
+    api_parameters_as_security_controls: |
+      Most LLM APIs expose parameters that directly affect security-relevant behavior:
+
+      max_tokens:
+        Purpose: limit output length
+        Security role: cap inference compute and output cost per request
+        Attack if absent: prompt the model to "list all X" or generate very long output —
+          runs up inference cost and may increase extraction throughput
+
+      temperature:
+        Purpose: control output randomness (0 = greedy, >1 = random)
+        Security role: high temperature increases output diversity — makes
+          model extraction sampling less efficient; low temperature is more
+          extractable with fewer queries
+        Attack: some extraction attacks benefit from specific temperature settings
+
+      top_p / top_k:
+        Purpose: control sampling diversity
+        Security role: same as temperature — affects extraction efficiency
+        Best practice: production APIs should enforce minimum entropy settings
+          to resist extraction
+
+      stop_sequences:
+        Purpose: halt generation when specific tokens appear
+        Security role: can be used to prevent the model from completing harmful
+          patterns — stop generation before the harmful conclusion
+        Limitation: attacker controls input, not stop sequences in most APIs
+
+      stream:
+        Purpose: return tokens as generated vs wait for full response
+        Security role: streaming reveals partial outputs that may be harmful
+          even if the complete response would be filtered. Output filtering
+          must operate on the complete response, requiring non-streaming or
+          buffered streaming.
+
+    cost_model_and_security_implications: |
+      LLM APIs charge by tokens processed:
+        Input tokens:  ~$1-15 per million (varies by model and provider)
+        Output tokens: ~$3-60 per million (output is 3-4× more expensive than input)
+
+      Security consequence: inference cost is the most direct DoS vector
+      for commercially-hosted LLMs. An attacker who crafts inputs that maximize
+      token consumption can drive up costs without triggering conventional
+      security alerts.
+
+      Cost amplification vectors:
+        Long input × forced long output: combine max-length input with
+          instructions that force verbose output
+        Recursive elaboration: "Explain this in more detail" chains
+        List generation: "List all X" where X is large
+        KV cache bypass: unique prefix per request prevents cache reuse,
+          forcing full prefill computation every time
+
+  # --------------------------------------------------------------------------
+  # 2. AUTHENTICATION AND AUTHORIZATION ARCHITECTURE
+  # --------------------------------------------------------------------------
+
+  subsection_2:
+    title: "Authentication and Authorization: LLM-Specific Patterns"
+    pages: 1
+
+    api_key_management: |
+      Most LLM APIs use API keys as the primary authentication mechanism.
+      API key security is standard web practice with LLM-specific considerations:
+
+      Standard requirements:
+        - Keys should be treated as secrets: never committed to version control,
+          never logged in plaintext, stored in secret management systems
+        - Keys should have minimum required permissions (least privilege)
+        - Keys should expire and be rotatable
+        - Multiple keys for different environments (dev, staging, prod)
+
+      LLM-specific key management:
+        - Per-application keys: different applications should use different keys
+          so that a key compromise affects only one application
+        - Key scoping by model: restrict a key to specific models to prevent
+          unintended use of expensive or less-constrained models
+        - Key scoping by feature: restrict keys to specific API features
+          (e.g., a key for inference only, not fine-tuning)
+        - Usage alerts: set spend thresholds and alert immediately on
+          unexpected usage spikes (potential key theft)
+
+    the_api_key_in_the_system_prompt_antipattern: |
+      Critical security antipattern:
+
+        BAD:
+          system_prompt = f"""
+          You are an assistant for Acme Corp.
+          To access our database, use API key: {DB_API_KEY}
+          """
+
+        WHY BAD:
+          1. The API key is now in the model's context window
+          2. The model may be induced to reveal it (Section 15 extraction attacks)
+          3. The key appears in API logs (request logging captures full context)
+          4. The key is exposed to any operator with access to those logs
+
+        CORRECT:
+          The model should never receive API keys for external systems.
+          API calls should be made by the application layer, not by the model.
+          The model requests data; the application layer fetches it with credentials.
+
+    authorization_tiers_for_multi_tenant_deployments: |
+      Multi-tenant LLM deployments (SaaS products built on LLM APIs) require
+      an authorization model that controls per-tenant capabilities:
+
+      Tier 1 — Unauthenticated / free tier:
+        Maximum restrictions: aggressive rate limiting, short context, no tool use
+        Monitoring: highest scrutiny — most likely to be abused
+
+      Tier 2 — Authenticated / standard:
+        Standard limits: moderate rate limit, full context, basic tools
+        Monitoring: anomaly detection against typical usage patterns
+
+      Tier 3 — Authenticated / premium:
+        Relaxed limits: higher rate limit, extended context, advanced tools
+        Monitoring: trusted but monitored; anomalous behavior triggers review
+
+      Tier 4 — Internal / enterprise:
+        Maximum capability: custom rate limits, model access, fine-tuning
+        Monitoring: audit logging for compliance; human review for incidents
+
+      The security principle: every tier expansion must be earned through
+      verification. Moving a user from free to premium requires identity
+      verification. Moving to enterprise requires contractual obligations.
+      Upgrades should never be available through prompt manipulation.
+
+    oauth_and_delegated_authorization: |
+      For agentic deployments where the LLM acts on behalf of users (accessing
+      their email, calendar, documents), delegated authorization via OAuth 2.0
+      is the correct pattern:
+
+        1. User grants the LLM application specific OAuth scopes
+           ("read my calendar", "send email on my behalf")
+        2. Application receives OAuth token with those scopes
+        3. When LLM needs to take action, the application uses the token
+        4. The token is never in the model's context window
+        5. Token expiry and revocation work independently of the LLM session
+
+      Security property: the model cannot take actions beyond the granted scopes,
+      and scope grants are revocable without affecting the model deployment.
+
+      Security risk: if the OAuth token is included in the system prompt or context
+      (a common mistake), it is exposed to extraction and can be used by an
+      attacker who compromises the system prompt.
+
+  # --------------------------------------------------------------------------
+  # 3. RATE LIMITING AND INFERENCE BUDGET CONTROL
+  # --------------------------------------------------------------------------
+
+  subsection_3:
+    title: "Rate Limiting and Inference Budget: Controlling Computational Cost"
+    pages: 1
+
+    why_standard_rate_limiting_is_insufficient: |
+      Traditional API rate limiting counts requests per time window.
+      For REST APIs this is appropriate — each request has roughly similar cost.
+
+      For LLM APIs, cost is proportional to tokens processed, not requests.
+      Request-based rate limiting misses the attack vector:
+
+        Standard rate limit: 100 requests per minute
+        Normal request: 500 input tokens + 200 output tokens = $0.007 at typical pricing
+        Attack request: 128,000 input tokens + 4,096 output tokens = $10.24 (1,462× normal)
+
+        An attacker within the request limit can still generate 100× normal cost
+        by maximizing token consumption per request.
+
+    token_based_rate_limiting: |
+      Correct rate limiting for LLM APIs uses tokens, not requests:
+
+        Per-user limits:
+          input_tokens_per_minute: limit input tokens consumed per API key
+          output_tokens_per_minute: limit output tokens generated per API key
+          total_cost_per_day: limit total spend per API key
+
+        Burst limits:
+          max_input_tokens_per_request: hard cap on single request input
+          max_output_tokens_per_request: hard cap on single request output
+
+        Sliding window:
+          Track token consumption in a rolling window (60 seconds, 24 hours)
+          Allow burst within the window but enforce daily/monthly caps
+
+      Token counting must happen before inference (for input) and be enforced
+      during inference (for output via max_tokens parameter).
+
+    inference_budget_enforcement: |
+      Beyond rate limiting, per-request budget enforcement prevents individual
+      requests from consuming excessive resources:
+
+        def enforce_inference_budget(request, config):
+            """
+            Check request against inference budget before dispatching.
+            Returns: approved request with budget parameters
+            Raises: BudgetExceededError if request is out of budget
+            """
+            input_tokens = count_tokens(
+                request.system_prompt + request.conversation_history + request.message
+            )
+            if input_tokens > config.max_input_tokens_per_request:
+                raise BudgetExceededError(
+                    f"Request input ({input_tokens}) exceeds limit ({config.max_input_tokens_per_request})"
+                )
+
+            # Cap output tokens at minimum of request ask and budget limit
+            max_output = min(
+                request.max_tokens or config.default_max_output,
+                config.max_output_tokens_per_request,
+                config.remaining_tokens_in_window(request.api_key)
+            )
+
+            # Force context truncation if needed
+            if input_tokens > config.context_budget:
+                request = truncate_context(request, config.context_budget)
+
+            return request.with_max_tokens(max_output)
+
+    kv_cache_memory_quotas: |
+      Section 04_08 established that KV cache is the primary memory DoS vector:
+      a Llama-2 70B at 4K context consumes ~10 GB of GPU memory per session.
+      With 80 GB A100 GPUs, only ~8 concurrent max-context sessions fit.
+
+      Memory quota enforcement:
+        1. Track active KV cache allocations per tenant
+        2. Enforce maximum concurrent sessions per tenant
+        3. Enforce maximum context length per tenant tier
+        4. Implement session timeout to release KV cache for idle sessions
+
+      Implementation in vLLM / TGI:
+        These frameworks support max_num_seqs (maximum concurrent sequences)
+        and enforce it through the continuous batching scheduler.
+        Per-tenant isolation requires wrapping the scheduler with tenant-aware
+        quota enforcement.
+
+      Monitoring: track GPU memory utilization as a security metric.
+      Sustained high GPU memory utilization from a single tenant is a
+      potential cache exhaustion attack (Section 04_08).
+
+  # --------------------------------------------------------------------------
+  # 4. LLM-SPECIFIC API ATTACK PATTERNS
+  # --------------------------------------------------------------------------
+
+  subsection_4:
+    title: "LLM-Specific API Attacks: Extraction, Cost Amplification, and Side Channels"
+    pages: 1
+
+    attack_1_model_extraction_via_api: |
+      Goal: create a local model that approximates the proprietary target model
+      by querying its API extensively.
+
+      Extraction methodology (Carlini et al. 2024):
+        1. Query the API with diverse, carefully chosen prompts
+        2. Collect (prompt, response) pairs — the training dataset
+        3. Train an open-source model on this data (distillation — Section 13)
+        4. Optional: if the API exposes logprobs, use them for soft-label distillation
+
+      Detection signals:
+        Volume: extraction requires 100K-10M queries — well above normal usage
+        Diversity: extraction uses maximally diverse prompts to cover the
+          model's full capability distribution. Normal users have focused patterns.
+        Logprob access: if the API exposes logprobs, extraction queries almost
+          always request them. Flag logprob access as elevated-risk indicator.
+        Response harvesting: extraction stores responses systematically.
+          API access patterns show uniform request timing, systematic topic coverage.
+
+      Countermeasures:
+        Rate limiting: extraction at scale requires sustained high request rates.
+          Strict rate limits increase extraction cost and time.
+        Logprob restriction: don't expose full logprobs publicly.
+          This degrades soft-label extraction to sequence-level distillation.
+        Watermarking: inject statistical watermarks into output tokens that
+          transfer to models trained on those outputs (Kirchenbauer et al. 2023).
+          Allows attribution if extracted model is later identified.
+        Behavioral fingerprinting: embed idiosyncratic responses to rare inputs
+          that serve as fingerprints detectable in extracted models.
+
+    attack_2_inference_cost_amplification: |
+      Goal: cause the target API to perform expensive inference, either to
+      disrupt service (DoS) or to run up costs for the API operator.
+
+      Cost amplification patterns:
+        Maximum context + maximum output:
+          Input: 128K tokens (system prompt + padding) + instruction to generate
+            a comprehensive essay
+          Output: 4K tokens of generated content
+          Cost: $15+ per request vs $0.01 average
+
+        Recursive depth request:
+          "Explain this concept in exhaustive detail. For each point you make,
+          elaborate on it in 3 sub-points. For each sub-point, add 3 examples."
+          Result: exponential output growth, capped only by max_tokens
+
+        Agentic loop amplification:
+          In agentic systems where the LLM can spawn tool calls, a crafted
+          prompt can cause the agent to call tools repeatedly:
+          "For each result, search for related information and summarize."
+          With a large enough search space, this causes unbounded tool calls
+          until cost or time limits are hit.
+
+      Countermeasures:
+        Hard token caps per request (Section 3)
+        Agentic loop limits (max tool calls per session)
+        Cost anomaly alerts (spend per request > N× baseline)
+        Request complexity scoring: penalize or throttle requests with
+          structural patterns indicating amplification attempts
+
+    attack_3_timing_side_channels: |
+      As established across Sections 08-10, timing reveals information about
+      internal system state:
+
+      KV cache timing (Section 08):
+        Cache hit: fast first-token latency
+        Cache miss: slow first-token latency (full prefill)
+        Signal: whether a specific prefix is currently cached (reveals usage patterns)
+
+      Speculative decoding timing (Section 10):
+        High acceptance: fast generation
+        Low acceptance: slow generation (rejection resampling overhead)
+        Signal: whether the draft model agrees with the target on current context
+          (reveals safety-relevant distribution gap)
+
+      Prompt length correlation:
+        Time-to-first-token correlates with input length (prefill time scales with N)
+        An adversary can measure prompt length of another user's session if:
+          (a) sessions share a GPU and compete for resources, and
+          (b) adversary can measure their own request latency while the victim's
+              prefill is executing
+
+      Countermeasures:
+        Response normalization: add random jitter to response timing
+          (reduces signal but increases latency for all users)
+        Resource isolation: ensure GPU resources are isolated per tenant
+          (prevents cross-tenant timing interference)
+        Cache isolation: per-tenant KV cache namespacing
+          (prevents cache hit/miss signals from leaking cross-tenant information)
+
+    attack_4_output_based_fingerprinting: |
+      Goal: characterize the deployed model's architecture, training, and capabilities
+      by analyzing its outputs without direct access to weights.
+
+      Fingerprinting signals:
+        Architecture probes: specific mathematical tasks (large matrix multiplication,
+          precise floating point) where different architectures produce different results
+        Training data probes: prompts designed to elicit memorized training data
+          (Section 04_07 memorization analysis)
+        Capability boundary mapping: probe the exact boundary of the model's knowledge
+          to determine training data cutoff, domain coverage, safety training specifics
+        Style fingerprinting: distinctive output patterns (Section 13) that identify
+          the base model and training lineage
+
+      Security implication: fingerprinting is a precursor to targeted attacks.
+        Knowing the exact model version, training details, and safety configuration
+        allows an adversary to:
+          1. Use model-specific jailbreaks known for that version
+          2. Test extraction techniques calibrated to that architecture
+          3. Identify specific safety gaps documented for that model
+
+      Countermeasure:
+        Response perturbation: introduce controlled noise to outputs
+          (reduces fingerprinting precision; impacts legitimate use)
+        Model versioning opacity: don't expose exact model version in API headers
+        Rate limit architectural probes: requests matching fingerprinting patterns
+
+  # --------------------------------------------------------------------------
+  # 5. MULTI-TENANT ISOLATION AND DATA SEGREGATION
+  # --------------------------------------------------------------------------
+
+  subsection_5:
+    title: "Multi-Tenant Security: Isolation, Data Segregation, and Cross-Tenant Risks"
+    pages: 1
+
+    isolation_requirements: |
+      A multi-tenant LLM deployment must guarantee that:
+
+        1. Tenant A's conversations are not visible to Tenant B
+        2. Tenant A's KV cache state cannot be inferred by Tenant B
+        3. Tenant A's system prompt is not revealed to Tenant B's users
+        4. Tenant A's rate limit consumption does not affect Tenant B's performance
+        5. A security incident in Tenant A's deployment is contained
+
+      These requirements map to specific technical controls at each layer.
+
+    data_segregation_architecture: |
+      Conversation and context isolation:
+
+        Database layer:
+          All conversation records are tagged with tenant_id.
+          All queries are parameterized with tenant_id.
+          Row-level security policies enforce tenant isolation at the database level.
+          Testing: attempt to query Tenant B's records authenticated as Tenant A.
+          Should return empty set, not an error (information hiding).
+
+        Context assembly:
+          Conversation history retrieval always includes tenant_id filter.
+          RAG retrieval always scopes to the tenant's document store.
+          Cross-tenant documents must never appear in a tenant's context.
+
+        System prompt isolation:
+          Each tenant has a separate system prompt.
+          System prompts are fetched by tenant_id from a secret store.
+          System prompts are never logged in application-layer logs with API responses
+          (they appear in model request logs, which have separate access controls).
+
+    kv_cache_isolation_in_practice: |
+      Section 04_08 introduced PagedAttention's virtual memory model and the
+      security risk of page isolation bugs. Production isolation requirements:
+
+      vLLM / TGI isolation:
+        These frameworks do not natively isolate KV cache per tenant.
+        By default, KV cache pages are shared across all requests to maximize
+        prefix cache hit rates.
+
+        Tenant isolation option 1: separate inference instances per tenant.
+          Each tenant gets a dedicated GPU instance (or set of instances).
+          No KV cache sharing across tenants.
+          Cost: N× hardware for N tenants.
+          Appropriate for: high-security enterprise deployments.
+
+        Tenant isolation option 2: prefix namespace isolation.
+          Each tenant's prefix cache is namespaced by tenant_id.
+          Prevents cross-tenant cache hits.
+          Does not prevent timing side channels (can still measure cache hit/miss).
+          Appropriate for: standard SaaS deployments.
+
+        Tenant isolation option 3: periodic cache flush.
+          KV cache is flushed between tenant request batches.
+          Eliminates prefix cache benefits but ensures isolation.
+          Appropriate for: high-security deployments that can absorb latency cost.
+
+    logging_and_audit_trail: |
+      Comprehensive logging is both a security requirement and a regulatory
+      requirement for many LLM deployment contexts:
+
+      What to log:
+        Per request:
+          - Request ID, timestamp, tenant_id, user_id
+          - Input token count, output token count
+          - Model version and inference configuration
+          - Input content policy screening result
+          - Output content policy screening result
+          - Response latency (TTFT, TPOT, total)
+          - Whether request was rate limited or rejected
+        Sensitive handling:
+          - Full input/output text logged separately with restricted access
+          - PII-containing requests flagged and subject to retention limits
+          - Security-sensitive system prompts logged with enhanced access control
+
+      What NOT to log in standard application logs:
+        - API keys (log key hash, not the key itself)
+        - OAuth tokens
+        - Passwords or credentials appearing in user messages
+        - Full system prompt contents (in high-security environments)
+
+    cross_tenant_leakage_testing: |
+      Before production deployment, test multi-tenant isolation explicitly:
+
+      Test 1 — Direct data access:
+        Authenticate as Tenant A. Attempt to retrieve Tenant B's conversations.
+        Expected: empty result set or access denied, not Tenant B's data.
+
+      Test 2 — System prompt extraction across tenants:
+        Deploy two tenants with different system prompts.
+        As Tenant B's user, attempt to extract Tenant A's system prompt.
+        Expected: model reveals only Tenant B's context.
+
+      Test 3 — KV cache timing oracle:
+        Send a request with Tenant A's known prefix as Tenant B.
+        Measure response latency.
+        Expected: same latency as cache miss (no cross-tenant cache sharing).
+
+      Test 4 — RAG document isolation:
+        Index document X in Tenant A's document store.
+        Query for content from document X as Tenant B's user.
+        Expected: model has no knowledge of document X.
+
+  # --------------------------------------------------------------------------
+  # 6. API SECURITY MONITORING AND THE DETECTION BRIDGE
+  # --------------------------------------------------------------------------
+
+  subsection_6:
+    title: "API Security Monitoring: Building the Bridge to Detection Engineering"
+    pages: 1
+
+    why_api_monitoring_is_different: |
+      Traditional API monitoring focuses on:
+        - Uptime / availability
+        - Latency percentiles
+        - Error rates
+        - Request volumes
+
+      LLM API monitoring requires all of the above plus LLM-specific signals:
+        - Token consumption per request (cost monitoring)
+        - Refusal rates (safety behavior monitoring)
+        - Content policy trigger rates (attack volume monitoring)
+        - Model behavioral consistency (regression detection)
+        - Extraction pattern detection (IP protection)
+        - Cross-tenant isolation verification (security property maintenance)
+
+    api_security_metrics_taxonomy:
+
+      volume_metrics:
+        requests_per_second_per_tenant: "Baseline: normal usage pattern"
+        tokens_per_request_per_tenant: "Baseline: typical token consumption"
+        unique_prompts_per_time_window: "High uniqueness = possible extraction"
+
+      cost_metrics:
+        spend_per_request: "Baseline: normal request cost"
+        spend_per_tenant_per_day: "Alert: sudden spend spike"
+        spend_anomaly_score: "Composite metric for cost amplification detection"
+
+      safety_metrics:
+        content_policy_trigger_rate: "Baseline: normal rate of policy violations"
+        refusal_rate_per_tenant: "Sudden refusal drop may indicate jailbreak success"
+        adversarial_classifier_score_distribution: "Shift toward high scores = attack campaign"
+
+      performance_metrics:
+        ttft_per_request: "Time to first token — anomaly may indicate KV cache attack"
+        tpot_per_token: "Time per output token — anomaly may indicate speculative decoding attack"
+        acceptance_rate_if_speculative: "Low acceptance rate = throughput degradation attack"
+
+      security_metrics:
+        logprob_access_rate: "High rate = potential extraction attempt"
+        max_context_request_frequency: "High frequency = potential cache exhaustion"
+        api_key_usage_from_unusual_ip: "Potential key compromise"
+        failed_auth_rate: "Brute force indicator"
+
+    anomaly_detection_for_llm_apis: |
+      Building anomaly detection on these metrics:
+
+      Baseline establishment (first 2 weeks):
+        Collect all metrics per tenant, per hour
+        Compute mean and standard deviation for each metric
+        Identify seasonal patterns (lower traffic on weekends, etc.)
+
+      Alert thresholds (after baseline):
+        Volume: > μ + 3σ for requests/tokens per hour
+        Cost: > μ + 4σ for spend per request (conservative — high FP cost)
+        Safety: refusal_rate < μ - 2σ (below-normal refusals are suspicious)
+        Extraction: unique_prompt_fraction > 0.95 for > 1000 requests
+
+      Composite scoring:
+        An adversary conducting a sophisticated attack may individually stay
+        below each threshold while crossing them collectively.
+        Composite score = weighted sum of normalized metric deviations.
+        Alert when composite score > threshold T.
+
+    the_security_event_lifecycle: |
+      When the API monitoring system detects a security event:
+
+        L1 — Automatic response (immediate):
+          Rate limit the offending API key
+          Log full context of suspicious requests
+          Increment anomaly score for the account
+
+        L2 — Human triage (< 1 hour):
+          Security analyst reviews flagged requests
+          Determines: false positive, low severity, or escalate
+          If false positive: update baseline, adjust threshold
+
+        L3 — Incident response (< 4 hours):
+          Active attack confirmed
+          Key revocation if compromised
+          Impact assessment: what was accessed/extracted?
+          Notification if user data was involved
+
+        L4 — Post-incident:
+          Root cause analysis
+          Update detection rules based on attack patterns
+          Publish internal TTP documentation
+          Incorporate attack examples into adversarial training data (feedback loop)
+
+    connecting_api_monitoring_to_detection_engineering: |
+      The API security monitoring established here is the foundation for the
+      detection engineering chapters in Part 3. The connection:
+
+      Part 1 (this section) establishes:
+        - What metrics to collect
+        - What normal looks like
+        - What anomalies indicate attacks
+
+      Part 3 (Chapters 12-15) builds:
+        - Formal detection rules on these metrics
+        - ML-based anomaly models trained on collected data
+        - Alert management and triage workflows
+        - Incident response playbooks
+
+      The data pipeline:
+        API layer → structured logs → feature extraction → anomaly models → alerts
+        This pipeline must be designed and instrumented from the beginning.
+        Retrofitting observability onto a deployed system is much harder than
+        building it in from the start.
+
+      Design principle: every API security control should emit structured events
+        that feed the detection pipeline. Security controls and detection are not
+        separate concerns — they are two halves of the same system.
+
+# ============================================================================
+# IMPLEMENTATION
+# ============================================================================
+
+implementation:
+  title: "LLM API Security Wrapper"
+  notebooks:
+    - "03-llm-internals/api_security_wrapper.ipynb"
+    - "03-llm-internals/model_extraction_detection.ipynb"
+
+  api_security_wrapper:
+    description: |
+      A Python class wrapping an LLM API client with security controls:
+      authentication validation, token budget enforcement, content screening,
+      output filtering, and structured logging.
+    code_sketch: |
+      class SecureLLMClient:
+          def __init__(self, base_client, config: APISecurityConfig):
+              self.client = base_client
+              self.config = config
+              self.rate_limiter = TokenBucketRateLimiter(
+                  tokens_per_minute=config.tokens_per_minute_per_key,
+                  max_tokens_per_request=config.max_tokens_per_request,
+              )
+              self.input_classifier = AdversarialPromptClassifier.load(
+                  config.classifier_path
+              )
+              self.output_classifier = HarmOutputClassifier.load(
+                  config.output_classifier_path
+              )
+              self.logger = StructuredSecurityLogger(config.log_destination)
+
+          def chat(self, api_key: str, messages: list, **kwargs) -> dict:
+              request_id = generate_request_id()
+
+              # Stage 1: Authentication
+              tenant = self.authenticate(api_key)  # raises AuthError if invalid
+
+              # Stage 2: Rate limiting (token-based)
+              input_tokens = count_tokens(messages)
+              self.rate_limiter.consume(
+                  tenant.key_id, input_tokens
+              )  # raises RateLimitError if exceeded
+
+              # Stage 3: Input validation and content screening
+              user_message = extract_user_message(messages)
+              input_score = self.input_classifier.score(user_message)
+              if input_score > self.config.adversarial_threshold:
+                  self.logger.log_blocked_request(request_id, tenant, input_score)
+                  raise ContentPolicyError("Request blocked by content policy")
+
+              # Stage 4: Budget enforcement
+              max_output = min(
+                  kwargs.get('max_tokens', self.config.default_max_output),
+                  self.config.max_output_tokens,
+                  self.rate_limiter.remaining_output_budget(tenant.key_id)
+              )
+              kwargs['max_tokens'] = max_output
+
+              # Stage 5: Inference
+              start_time = time.monotonic()
+              response = self.client.chat(messages=messages, **kwargs)
+              latency = time.monotonic() - start_time
+
+              # Stage 6: Output filtering
+              output_text = extract_text(response)
+              output_harm_score = self.output_classifier.score(output_text)
+              if output_harm_score > self.config.output_harm_threshold:
+                  self.logger.log_blocked_output(request_id, tenant, output_harm_score)
+                  return self._safe_refusal_response()
+
+              # Stage 7: Structured logging
+              self.logger.log_request(
+                  request_id=request_id,
+                  tenant_id=tenant.id,
+                  input_tokens=input_tokens,
+                  output_tokens=count_tokens_in_response(response),
+                  input_score=input_score,
+                  output_score=output_harm_score,
+                  latency_ms=latency * 1000,
+              )
+
+              return response
+
+  token_budget_enforcer:
+    description: "Token bucket rate limiter with separate input/output quotas"
+    code_sketch: |
+      class TokenBucketRateLimiter:
+          """
+          Separate token buckets for input and output tokens per API key.
+          Uses Redis for distributed rate limiting across multiple API servers.
+          """
+          def __init__(self, tokens_per_minute: int, max_tokens_per_request: int):
+              self.tpm = tokens_per_minute
+              self.max_per_request = max_tokens_per_request
+              self.redis = redis.Redis()
+
+          def consume(self, key_id: str, tokens: int):
+              if tokens > self.max_per_request:
+                  raise BudgetExceededError(
+                      f"Request {tokens} tokens exceeds per-request limit {self.max_per_request}"
+                  )
+
+              # Sliding window token count (60-second window)
+              now = time.time()
+              window_key = f"rate:{key_id}:{int(now // 60)}"
+
+              pipe = self.redis.pipeline()
+              pipe.incrby(window_key, tokens)
+              pipe.expire(window_key, 120)  # 2-minute TTL for the window
+              current_usage = pipe.execute()[0]
+
+              if current_usage > self.tpm:
+                  raise RateLimitError(
+                      f"Rate limit exceeded: {current_usage} tokens in window"
+                  )
+
+  model_extraction_detector:
+    description: |
+      Detect systematic model extraction behavior using API request pattern analysis.
+    signals: |
+      def compute_extraction_risk_score(request_log: list, window_hours=24) -> float:
+          """
+          Compute extraction risk score for an API key based on request patterns.
+          Higher score = more likely to be model extraction.
+          Range: 0.0 (benign) to 1.0 (high extraction risk)
+          """
+          requests = filter_by_time_window(request_log, window_hours)
+          n = len(requests)
+          if n < 100:
+              return 0.0  # Too few requests to assess
+
+          # Signal 1: Prompt diversity (high diversity = systematic extraction)
+          prompts = [r.user_message for r in requests]
+          embeddings = encoder.encode(prompts)
+          pairwise_sim = cosine_similarity(embeddings)
+          avg_similarity = pairwise_sim[np.triu_indices(len(prompts), k=1)].mean()
+          diversity_score = 1.0 - avg_similarity  # High = diverse = extraction-like
+
+          # Signal 2: Logprob access rate (extraction benefits from logprobs)
+          logprob_rate = sum(1 for r in requests if r.requested_logprobs) / n
+
+          # Signal 3: Request volume vs typical user
+          hourly_rate = n / window_hours
+          volume_score = min(1.0, hourly_rate / TYPICAL_POWER_USER_HOURLY_RATE)
+
+          # Signal 4: Topic coverage breadth
+          topics = classify_topics(prompts)
+          topic_entropy = calculate_entropy(topics)
+          coverage_score = min(1.0, topic_entropy / MAX_EXPECTED_ENTROPY)
+
+          # Weighted composite
+          return (
+              0.40 * diversity_score +
+              0.25 * logprob_rate +
+              0.20 * volume_score +
+              0.15 * coverage_score
+          )
+
+# ============================================================================
+# EXERCISES
+# ============================================================================
+
+exercises:
+
+  exercise_1:
+    title: "Build a Token Budget Rate Limiter"
+    difficulty: "Medium"
+    estimated_time: "2 hours"
+    objective: "Implement token-based (not request-based) rate limiting for an LLM API wrapper"
+    steps:
+      - "Implement TokenBucketRateLimiter with separate input and output quotas"
+      - "Use a simple in-memory dict instead of Redis for the exercise"
+      - "Test: verify that a normal request sequence passes through"
+      - "Test: verify that a cost amplification attack (max tokens per request) is rate-limited"
+      - "Test: verify that burst behavior (many small requests) is correctly handled"
+      - "Measure: what is the overhead of token counting vs request counting?"
+      - "Calculate: at what request volume does token-based rate limiting add >5ms latency?"
+    success_criteria:
+      - "Normal requests pass through rate limiter without false positives"
+      - "Cost amplification attack (10× normal tokens) triggers rate limit within 5 minutes"
+      - "Burst behavior handled correctly (daily cap separate from per-minute cap)"
+      - "Latency overhead measured and within acceptable range"
+    deliverable: "token_rate_limiter.py with test suite"
+
+  exercise_2:
+    title: "Multi-Tenant Isolation Testing"
+    difficulty: "Medium"
+    estimated_time: "2 hours"
+    objective: "Test whether a multi-tenant LLM deployment correctly isolates tenant data"
+    steps:
+      - "Set up a simple multi-tenant wrapper: two tenants with different system prompts"
+      - "Test 1 (direct data): authenticate as Tenant A, attempt to retrieve Tenant B context"
+      - "Test 2 (system prompt): as Tenant B user, attempt to extract Tenant A system prompt"
+      - "Test 3 (KV cache): simulate cache timing oracle across tenants"
+      - "Test 4 (RAG isolation): index doc in Tenant A, query as Tenant B"
+      - "Document: which tests pass, which fail, what the failure modes reveal"
+      - "Propose: architectural fix for each failing test"
+    success_criteria:
+      - "All 4 tests run with documented pass/fail results"
+      - "At least one failure found and root cause identified"
+      - "Fix proposed for each failure with security rationale"
+      - "Re-run tests after fix to verify correction"
+    deliverable: |
+      multi_tenant_isolation_test_report.md — test results + fix proposals
+      Used as reference in Chapter 14 (Production Deployment) isolation section.
+
+  exercise_3:
+    title: "Model Extraction Detection"
+    difficulty: "Hard"
+    estimated_time: "3 hours"
+    objective: "Build and evaluate a model extraction detector based on request patterns"
+    steps:
+      - "Generate simulated API logs for two user types:"
+        # Normal user: 50 requests/day, focused topic area, few logprob requests
+        # Extraction attacker: 2000 requests/day, diverse topics, all logprob enabled
+      - "Implement compute_extraction_risk_score() with all 4 signals"
+      - "Evaluate: does the score correctly classify normal vs extraction users?"
+      - "Tune weights: which signals are most discriminating in your simulation?"
+      - "Test adversarial robustness: can the attacker reduce their score below threshold"
+        # by reducing request rate? by adding repeated requests to reduce diversity?
+      - "Calculate: at what extraction rate (requests/day) is detection reliable?"
+    success_criteria:
+      - "Detector correctly classifies simulated extraction users (>90% accuracy)"
+      - "Signal contributions analyzed and documented"
+      - "Adversarial robustness tested: extractor cannot trivially evade detection"
+      - "Minimum detectable extraction rate quantified"
+    deliverable: |
+      extraction_detector.py + evaluation_report.md
+      This detector is the prototype for Chapter 9 (Model Extraction) defenses.
+
+  exercise_4:
+    title: "API Security Audit Checklist"
+    difficulty: "Easy"
+    estimated_time: "1.5 hours"
+    objective: "Build a comprehensive API security audit checklist for LLM deployments"
+    steps:
+      - "Review all security controls in Sections 1-6 of this chapter"
+      - "For each control, write an audit question and a test procedure"
+      - "Organize into categories: Auth, Rate Limiting, Isolation, Logging, Monitoring"
+      - "For each item: specify pass/fail criteria"
+      - "Apply the checklist to a sample deployment (real or simulated)"
+      - "Score: what percentage of items pass in your sample deployment?"
+      - "Prioritize: which failing items have highest security impact?"
+    success_criteria:
+      - "Checklist has at least 25 items covering all 5 categories"
+      - "Each item has a concrete test procedure (not just 'verify it exists')"
+      - "Pass/fail criteria are unambiguous"
+      - "Sample deployment scored and gaps prioritized"
+    deliverable: |
+      llm_api_security_checklist.md — production-ready audit tool
+      This checklist is published as an appendix in Chapter 17 and
+      referenced in Chapter 14 (Production Deployment).
+
+# ============================================================================
+# KEY CONCEPTS SUMMARY
+# ============================================================================
+
+key_concepts_summary:
+
+  api_architecture:
+    - concept: "LLM API cost is token-proportional, not request-proportional"
+      implication: "Rate limiting must be token-based; request-based limits miss cost amplification"
+
+    - concept: "The API layer is the outer security boundary; system prompt is the inner"
+      implication: "Both layers must be present; neither alone is sufficient"
+
+    - concept: "Every API parameter is a security control point and a potential attack surface"
+      implication: "max_tokens, temperature, stream must be configured with security in mind"
+
+  attack_patterns:
+    - concept: "Model extraction requires sustained high-volume diverse-topic API access"
+      implication: "Extraction is detectable through request pattern analysis"
+
+    - concept: "Timing side channels persist at the API layer even with model-level defenses"
+      implication: "Response normalization (jitter) is necessary for high-security deployments"
+
+    - concept: "Multi-tenant isolation requires explicit testing — it does not happen by default"
+      implication: "Cross-tenant tests must be part of pre-production validation"
+
+  monitoring_and_detection:
+    - concept: "API security metrics bridge the gap between technical controls and detection"
+      implication: "Every control must emit structured events; detection is built on this data"
+
+    - concept: "Composite anomaly scores catch sophisticated attackers who evade individual thresholds"
+      implication: "Single-metric thresholds are bypassed by attackers who know the thresholds"
+
+# ============================================================================
+# CONNECTIONS
+# ============================================================================
+
+connections:
+
+  builds_on:
+    - section: "Section 04_08"
+      concept: "KV cache DoS — cache memory quotas implemented at API layer"
+    - section: "Section 04_10"
+      concept: "Speculative decoding throughput attacks — monitoring acceptance rate as API metric"
+    - section: "Section 04_11"
+      concept: "Context window DoS — max_tokens enforcement at API layer"
+    - section: "Section 04_15"
+      concept: "System prompts — API layer is the outer boundary; system prompt is inner"
+
+  prepares_for:
+    - section: "Section 04_17"
+      concept: "Chapter capstone — integrate API security wrapper with hardened system prompt"
+    - section: "Chapter 9 (Part 2)"
+      concept: "Model extraction — extraction detector from this section extended with full taxonomy"
+    - section: "Chapter 14 (Part 3)"
+      concept: "Production deployment — API security checklist from this section is the baseline"
+    - section: "Chapter 15 (Part 3)"
+      concept: "Detection engineering — metrics taxonomy here becomes feature set for ML detectors"
+    - section: "Chapter 17 (Part 3)"
+      concept: "Monitoring — structured logging architecture here feeds Chapter 17 monitoring systems"
+
+  security_thread: |
+    Section 16 completes the deployment security architecture:
+    - Section 15 (system prompts): inner boundary — model behavior control
+    - Section 16 (API architecture): outer boundary — access control and monitoring
+
+    Together they implement the two-layer security model for LLM deployments.
+    The chapter's security arc is now complete:
+    - Architecture (01-03): what LLMs are built from
+    - Alignment (04-06): how safety is trained in, and why it is imperfect
+    - Training (07): where the attack surface originates
+    - Inference stack (08-10): production runtime attack surfaces
+    - Deployment layer (11-16): context, compression, prompting, and access control
+
+    Section 17 (capstone) integrates these into a single working security-aware system.
+    Part 2 will attack this system. Part 3 will instrument and defend it.
+
+# ============================================================================
+# FURTHER READING
+# ============================================================================
+
+further_reading:
+
+  primary:
+    - title: "Stealing Part of a Production Language Model"
+      authors: "Carlini et al. (2024)"
+      note: "Extraction via API — Section 3 quantifies extraction cost and feasibility"
+      url: "https://arxiv.org/abs/2403.06634"
+
+    - title: "A Watermark for Large Language Models"
+      authors: "Kirchenbauer et al. (2023)"
+      note: "Statistical watermarking for extraction detection — practical implementation"
+      url: "https://arxiv.org/abs/2301.10226"
+
+  rate_limiting:
+    - title: "OWASP LLM Top 10"
+      note: "LLM-specific security risks including resource exhaustion (LLM04) — API layer context"
+      url: "https://owasp.org/www-project-top-10-for-large-language-model-applications/"
+
+    - title: "Efficient Memory Management for LLM Serving with PagedAttention"
+      authors: "Kwon et al. (vLLM, 2023)"
+      note: "Memory quota enforcement in serving frameworks — Section 3 of paper"
+      url: "https://arxiv.org/abs/2309.06180"
+
+  multi_tenancy:
+    - title: "Security and Privacy of LLM-Integrated Systems"
+      note: "Systematic treatment of multi-tenant isolation requirements"
+      url: "https://arxiv.org/abs/2311.09450"
+
+    - title: "Prompt Injection as a Security Issue in LLM-Integrated Applications"
+      authors: "Perez & Ribeiro (2022)"
+      note: "Includes API-layer injection vectors — indirect injection through context"
+      url: "https://arxiv.org/abs/2211.09527"
+
+

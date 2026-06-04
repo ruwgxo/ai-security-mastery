@@ -1,0 +1,950 @@
+# section_04_08_kv_cache.yaml
+
+---
+document_info:
+  section: "04_08"
+  title: "KV Cache: Accelerating Inference"
+  chapter: "04"
+  chapter_title: "Modern LLM Internals"
+  part: "Part I: Machine Learning Foundations"
+  book: "AI Security Mastery: From ML Fundamentals to Production Detection Systems"
+  version: "1.0.0"
+  author: "Raghav Dinesh"
+  github: "github.com/ruwgxo"
+  license: "MIT"
+  created: "2026-01-19"
+  estimated_pages: 6
+  tags:
+    - "kv-cache"
+    - "inference-optimization"
+    - "attention-mechanism"
+    - "memory-bandwidth"
+    - "multi-query-attention"
+    - "grouped-query-attention"
+    - "cache-eviction"
+    - "side-channel"
+    - "security-implications"
+
+section_overview:
+
+  purpose: |
+    The KV cache is the single most important inference optimization in production
+    LLM deployments. Without it, generating each new token requires reprocessing
+    the entire input sequence from scratch — an O(n²) operation that makes long
+    context inference prohibitively slow. With KV caching, previously computed
+    attention keys and values are stored and reused, reducing per-token generation
+    to approximately O(n) amortized.
+
+    For security engineers: the KV cache is not just a performance optimization.
+    It is a stateful data structure that persists conversation history in GPU memory,
+    creates timing side channels that leak information about prompt length and
+    content, enables prompt injection through cache poisoning in shared deployments,
+    and introduces denial-of-service vectors based on cache memory exhaustion.
+    Understanding the KV cache mechanically — not just that it exists — is required
+    to reason about these security properties.
+
+    This section builds the KV cache from first principles, connects it to the
+    attention mechanism from Chapter 3, explains the memory layout that makes it
+    both efficient and exploitable, and covers the variants (MQA, GQA) that change
+    the security surface geometry.
+
+  position_in_chapter: |
+    Section 8 of 17 content sections. First section of the inference optimization
+    arc (Sections 8-10). Section 7 covered pre-training. Section 8 covers KV caching.
+    Section 9 covers Flash Attention. Section 10 covers speculative decoding.
+    Together Sections 8-10 complete the picture of how inference works in production.
+
+  prerequisites:
+    - "Chapter 3, Section 9: Attention mechanism — Q, K, V matrices and softmax attention"
+    - "Chapter 3, Section 13: Transformer decoder — autoregressive generation"
+    - "Section 04_01: GPT-2 architecture — the generation loop we are optimizing"
+    - "Basic GPU memory model: global memory, SRAM, bandwidth constraints"
+
+  what_you_will_build:
+    primary: "KV cache implementation in PyTorch — complete generation loop with caching"
+    secondary:
+      - "Cache memory calculator: predict memory usage for given model/context configuration"
+      - "Timing side-channel demonstrator: measure latency differences from cache state"
+      - "Cache eviction policy simulator: LRU, sliding window, StreamingLLM"
+      - "Benchmark: generation speed with vs without KV cache"
+    notebooks:
+      - "03-llm-internals/kv_cache_implementation.ipynb"
+      - "03-llm-internals/kv_cache_security.ipynb"
+
+# ============================================================================
+# CONTENT
+# ============================================================================
+
+content:
+
+  # --------------------------------------------------------------------------
+  # 1. THE PROBLEM: WHY NAIVE INFERENCE IS SLOW
+  # --------------------------------------------------------------------------
+
+  subsection_1:
+    title: "The Problem: Quadratic Cost of Autoregressive Generation Without Caching"
+    pages: 1
+
+    naive_generation_loop: |
+      Without KV caching, each generation step requires a full forward pass through
+      the entire model on the full input sequence so far.
+
+      Step-by-step for generating a 100-token response to a 500-token prompt:
+
+        Step 1:  Input = [token_1 ... token_500]         → compute 500-token attention → get token_501
+        Step 2:  Input = [token_1 ... token_501]         → compute 501-token attention → get token_502
+        Step 3:  Input = [token_1 ... token_502]         → compute 502-token attention → get token_503
+        ...
+        Step 100: Input = [token_1 ... token_599]        → compute 599-token attention → get token_600
+
+      Total attention operations: 500 + 501 + 502 + ... + 599 = Σ(k=500 to 599) k
+      ≈ 100 × 549.5 = 54,950 attention computations of average length 549.5
+      Each attention computation is O(n²) in sequence length.
+
+      This is quadratic in the output length for constant prompt length, and quadratic
+      in prompt length for the first step. For GPT-4 with 128K context: the first
+      forward pass alone is proportional to 128,000² = 16 billion attention computations
+      per layer per head.
+
+    the_key_insight: |
+      In autoregressive generation, each new step extends the sequence by exactly
+      one token. Everything before the new token was already processed in all
+      previous steps. The attention outputs for all previous tokens do not change —
+      because causal masking means token n can only attend to tokens 1..n, and the
+      key-value representations of tokens 1..n-1 are the same regardless of what
+      token n is.
+
+      This means the K and V matrices for all previous tokens can be cached. When
+      generating token n+1, we only need to compute Q, K, V for the new token n,
+      then attend the new query against the cached keys and values from tokens 1..n.
+
+      The computational cost drops from O(n²) per step to O(n) amortized —
+      we compute the new token's KV once and add it to the cache.
+
+    concretely_what_changes: |
+      Without KV cache (per generation step, generating token at position n):
+        Compute Q, K, V for ALL tokens 1..n                    → O(n) projections
+        Compute attention: QK^T for all n² pairs               → O(n²) multiplications
+        Apply softmax, multiply by V                           → O(n²) operations
+        Total per step: O(n²)
+        Total for generating T tokens from prompt of length P: O((P+T)² × T) ≈ O(T³) for T >> P
+
+      With KV cache (per generation step, generating token at position n):
+        Compute Q, K, V for NEW token n only                   → O(1) projections
+        Append new K, V to cache                               → O(1) memory writes
+        Compute attention: Q_new × K_cache^T for n pairs      → O(n) multiplications
+        Apply softmax, multiply by V_cache                     → O(n) operations
+        Total per step: O(n) where n is current sequence length
+        Total for generating T tokens: O(P × T + T²/2) ≈ O(P × T) for large P
+
+      Practical speedup: for GPT-2 small generating 100 tokens from a 500-token prompt,
+      KV caching provides 4-8× speedup measured in wall-clock time.
+
+  # --------------------------------------------------------------------------
+  # 2. KV CACHE MECHANICS
+  # --------------------------------------------------------------------------
+
+  subsection_2:
+    title: "KV Cache: Data Structure, Memory Layout, and Implementation"
+    pages: 1
+
+    what_gets_cached: |
+      For each transformer layer l and each attention head h, we cache:
+        K_cache[l][h]: key vectors for all processed tokens, shape (seq_len, d_head)
+        V_cache[l][h]: value vectors for all processed tokens, shape (seq_len, d_head)
+
+      The query vectors Q are NOT cached — they are computed fresh for each new token
+      because the new token's query attends to all cached keys (we need the new Q,
+      not old ones).
+
+      Total cache size for a model with L layers, H heads, d_head dimensions,
+      processing a sequence of length S:
+        Cache size = 2 × L × H × S × d_head × bytes_per_element
+
+      For GPT-2 small (12 layers, 12 heads, d_head=64) at context length 1024, FP16:
+        = 2 × 12 × 12 × 1024 × 64 × 2 bytes
+        = 2 × 12 × 12 × 1024 × 64 × 2
+        = 37,748,736 bytes ≈ 36 MB
+
+      For Llama-2 70B (80 layers, 64 heads, d_head=128) at 4096 context, FP16:
+        = 2 × 80 × 64 × 4096 × 128 × 2 bytes
+        = 10,737,418,240 bytes ≈ 10 GB just for the KV cache
+
+    implementation: |
+      KV cache as a Python data structure:
+
+        class KVCache:
+            def __init__(self, n_layers, n_heads, d_head, max_seq_len, dtype=torch.float16):
+                # Pre-allocate maximum cache size to avoid dynamic allocation overhead
+                self.k_cache = torch.zeros(
+                    n_layers, n_heads, max_seq_len, d_head,
+                    dtype=dtype, device='cuda'
+                )
+                self.v_cache = torch.zeros(
+                    n_layers, n_heads, max_seq_len, d_head,
+                    dtype=dtype, device='cuda'
+                )
+                self.current_length = 0
+
+            def update(self, layer_idx, new_k, new_v):
+                """Append new key-value pair at current position"""
+                pos = self.current_length
+                self.k_cache[layer_idx, :, pos, :] = new_k   # Shape: (n_heads, d_head)
+                self.v_cache[layer_idx, :, pos, :] = new_v
+                # Note: current_length incremented once after all layers process new token
+
+            def get(self, layer_idx):
+                """Return all cached K, V up to current length"""
+                return (
+                    self.k_cache[layer_idx, :, :self.current_length, :],
+                    self.v_cache[layer_idx, :, :self.current_length, :]
+                )
+
+    cached_attention_computation: |
+      Modified attention forward pass using KV cache:
+
+        def attention_with_cache(q_new, k_new, v_new, cache, layer_idx):
+            """
+            q_new: new token's query,  shape (batch, n_heads, 1, d_head)
+            k_new: new token's key,    shape (batch, n_heads, 1, d_head)
+            v_new: new token's value,  shape (batch, n_heads, 1, d_head)
+            """
+            # Update cache with new token's K and V
+            cache.update(layer_idx, k_new.squeeze(2), v_new.squeeze(2))
+
+            # Retrieve full K, V history (including new token)
+            k_full, v_full = cache.get(layer_idx)  # (n_heads, seq_len, d_head)
+
+            # Attend new query against full K history
+            # No causal mask needed — new token can only attend to previous tokens
+            # (they are all already in cache, new token is last)
+            attn_weights = torch.matmul(q_new, k_full.transpose(-2, -1))
+            attn_weights = attn_weights / math.sqrt(d_head)
+            attn_weights = F.softmax(attn_weights, dim=-1)
+
+            # Weighted sum of V
+            output = torch.matmul(attn_weights, v_full)
+            return output
+
+    memory_layout_security_implications: |
+      The KV cache pre-allocation pattern has direct security consequences:
+
+      Fixed allocation: many inference frameworks pre-allocate the maximum context
+      length to avoid dynamic allocation latency. This means:
+        - A 4096-token max-context model holds 4096 tokens of KV cache in GPU memory
+          even when processing a 10-token prompt
+        - In multi-tenant deployments, different users' caches share the same GPU
+
+      Residual data risk: when a user session ends, the KV cache is typically cleared
+      by zeroing or by reallocation. If the GPU memory is reused before proper clearing,
+      residual cache data from one session could theoretically be read by a subsequent
+      session — analogous to RAM reuse vulnerabilities in traditional computing.
+
+      In practice: most inference frameworks zero-initialize pre-allocated cache before
+      use. But "most" is not "all," and in high-throughput deployments where speed is
+      prioritized over security, initialization may be skipped.
+
+  # --------------------------------------------------------------------------
+  # 3. MEMORY BANDWIDTH BOTTLENECK
+  # --------------------------------------------------------------------------
+
+  subsection_3:
+    title: "Memory Bandwidth: Why KV Cache Dominates Inference Cost"
+    pages: 1
+
+    compute_vs_memory_bound: |
+      Modern GPUs have two key resources: compute (FLOPs) and memory bandwidth (GB/s).
+      A workload is compute-bound when the GPU's FLOPs are saturated before memory
+      bandwidth is. A workload is memory-bound when memory bandwidth limits throughput
+      before FLOPs are saturated.
+
+      During pre-training and prefill (processing the full prompt):
+        Large matrix multiplications on long sequences → compute-bound
+        GPU's ~300 TFLOPS (A100) utilization is high
+
+      During autoregressive decoding (generating one token at a time with KV cache):
+        Each step: read full KV cache (large), compute small matrix multiply (new token only)
+        Memory reads >> Compute operations → memory-bound
+        The bottleneck is how fast we can read KV cache from HBM to SRAM
+
+    arithmetic_intensity_analysis: |
+      Arithmetic intensity = FLOPs / bytes of memory access
+
+      For attention on new token with cache of length n:
+        FLOPs: 2 × n × d_head (for QK^T and AV multiply)
+        Memory: 2 × n × d_head × 2 bytes (reading K and V from cache, FP16)
+        Arithmetic intensity = 2nd / (4nd) = 0.5 FLOPs/byte
+
+      A100 GPU peak arithmetic intensity threshold: ~300 TFLOPS / 2 TB/s = 150 FLOPs/byte
+      Our inference arithmetic intensity: 0.5 FLOPs/byte
+
+      We are 300× below the compute-bound threshold. Memory bandwidth is the bottleneck.
+      This means: faster GPU doesn't help much. More memory bandwidth helps enormously.
+
+    implications_for_security:
+
+      dos_via_cache_memory_exhaustion: |
+        If an attacker can force the inference server to allocate maximum KV cache
+        for many concurrent sessions, GPU memory fills up. New requests fail.
+        The attack: submit many requests with maximum context length tokens and
+        hold them open (long streaming responses or large batches).
+
+        KV cache memory per session (Llama-2 70B, 4K context, FP16): ~10 GB
+        A100 GPU memory: 80 GB
+        Maximum concurrent sessions: ~8 before OOM
+
+        With HTTP pipelining or concurrent API calls, an attacker can exhaust
+        inference GPU memory with only 8 concurrent max-context requests.
+        Standard API rate limiting (per-user requests/minute) does not prevent
+        this if it allows concurrent long sessions.
+
+      cache_eviction_timing_attacks: |
+        When KV cache fills up, the inference server must evict entries to make room.
+        Eviction causes additional computation — the evicted tokens must be recomputed
+        if needed again. This creates a measurable timing difference:
+
+        Cache hit: normal latency
+        Cache miss (eviction occurred): measurable latency spike (recompute cost)
+
+        An adversary who sends requests and observes response latency can infer:
+        1. The cache state (whether their previous request's context is still cached)
+        2. The eviction policy (which sequences get evicted, revealing cache policy)
+        3. Whether another user's session is currently consuming cache (from aggregate latency)
+
+        This is the classic cache timing side channel from computer architecture
+        security — now applied to LLM inference infrastructure.
+
+    batching_and_continuous_batching: |
+      Production inference servers process multiple requests simultaneously using batching.
+      KV cache complicates batching because different requests have different sequence lengths:
+
+      Static batching: pad all sequences to the same length. Wasteful — short sequences
+      pay the KV cache memory cost of long ones.
+
+      Continuous batching (PagedAttention/vLLM): allocate KV cache in fixed-size pages,
+      assign pages to requests dynamically. Allows mixing short and long requests
+      efficiently. Higher complexity but much better GPU utilization.
+
+      Security implication of continuous batching: with PagedAttention, KV cache pages
+      from different requests may be interleaved in GPU memory. Page management bugs
+      could allow one request to read another's cached key-value pairs — a cross-tenant
+      data leakage vulnerability. This is the LLM equivalent of a kernel memory isolation
+      bug in a multi-tenant OS.
+
+  # --------------------------------------------------------------------------
+  # 4. KV CACHE VARIANTS: MQA AND GQA
+  # --------------------------------------------------------------------------
+
+  subsection_4:
+    title: "Multi-Query and Grouped-Query Attention: Shrinking the Cache"
+    pages: 1
+
+    the_cache_size_problem: |
+      Standard multi-head attention (MHA) has H independent heads, each with its own
+      K and V projection matrices. The KV cache size scales linearly with H.
+
+      For large models this is prohibitive:
+        Llama-2 70B: 80 layers × 64 heads × 128 d_head × 2 (K+V) × 2 bytes (FP16) × seq_len
+        At 4K context: 10.7 GB of KV cache per batch item
+        At 32K context: 85.9 GB — exceeds the entire GPU memory for a single sequence
+
+      Reducing KV cache size without sacrificing attention quality is a major
+      research direction. Two solutions dominate production deployments.
+
+    multi_query_attention:
+      concept: |
+        MQA (Shazeer 2019) uses a single shared K and V projection across all attention heads.
+        Only Q remains multi-head. Each head has its own Q but all heads share K and V.
+
+        Standard MHA:
+          Q_h = X × W_Q_h    (H separate Q projections)
+          K_h = X × W_K_h    (H separate K projections)
+          V_h = X × W_V_h    (H separate V projections)
+          head_h = softmax(Q_h × K_h^T / sqrt(d)) × V_h
+
+        MQA:
+          Q_h = X × W_Q_h    (H separate Q projections, unchanged)
+          K   = X × W_K      (1 shared K projection)
+          V   = X × W_V      (1 shared V projection)
+          head_h = softmax(Q_h × K^T / sqrt(d)) × V   (all heads use same K, V)
+
+      cache_reduction: |
+        MHA KV cache: 2 × L × H × S × d_head
+        MQA KV cache: 2 × L × 1 × S × d_head
+
+        Reduction factor: H (number of heads)
+        For H=64 (Llama-2 70B scale): 64× smaller KV cache
+
+      quality_tradeoff: |
+        MQA achieves K/V parameter reduction at some quality cost. Different heads
+        can no longer attend to different aspects of the context (since they share K, V).
+        Quality degradation is measurable but acceptable for many tasks.
+        Models trained specifically with MQA from scratch (Falcon, PaLM) perform
+        comparably to MHA models at the same parameter count.
+
+      security_note: |
+        MQA's shared K, V matrices mean all attention heads in a layer see identical
+        key representations of the context. This reduces the diversity of information
+        each head can attend to — which in theory limits the model's ability to
+        maintain fine-grained distinctions between different aspects of context.
+        Security relevance: some researchers hypothesize that MQA models are
+        slightly more susceptible to prompt injection because they maintain less
+        independent contextual representations. This is an open research question.
+
+    grouped_query_attention:
+      concept: |
+        GQA (Ainslie et al. 2023) is a middle ground between MHA and MQA.
+        Attention heads are divided into G groups. Heads within a group share K, V.
+        Different groups have independent K, V.
+
+        With G groups and H heads: each group has H/G heads, each group has 1 K, V.
+        G = 1: equivalent to MQA (single K, V shared across all heads)
+        G = H: equivalent to MHA (each head has independent K, V)
+        G = 8 (Llama-2 70B uses G=8): 8× cache reduction vs MHA
+
+        Llama-2 70B architecture:
+          H = 64 attention heads
+          G = 8 KV head groups
+          H/G = 8 attention heads per KV group
+          KV cache reduction: 64/8 = 8× vs MHA
+
+      why_gqa_dominates_modern_models: |
+        GQA provides a better quality-efficiency tradeoff than MQA:
+          MQA (G=1): maximum cache savings, measurable quality drop
+          GQA (G=8): substantial cache savings (8×), minimal quality drop
+          MHA (G=H): maximum quality, maximum cache size
+
+        Most recent frontier models use GQA: Llama-2 (G=8), Mistral (G=8),
+        Gemma (G=1 for smaller, GQA for larger). This makes GQA the production
+        standard that security engineers will encounter in deployed systems.
+
+      security_implications: |
+        GQA's grouped structure changes the cache size calculation:
+
+          GQA KV cache: 2 × L × G × S × d_head
+
+        Security consequence: GQA models are feasible to serve at longer contexts
+        without cache memory exhaustion. Context lengths of 32K-128K become
+        economically viable, enabling use cases that were impractical with MHA.
+        Longer context = larger attack surface: more content can be injected
+        into a single session's context window, and the context window carries
+        more sensitive conversation history.
+
+  # --------------------------------------------------------------------------
+  # 5. CACHE EVICTION AND SLIDING WINDOW STRATEGIES
+  # --------------------------------------------------------------------------
+
+  subsection_5:
+    title: "Cache Eviction: What Happens When Cache is Full"
+    pages: 1
+
+    the_eviction_problem: |
+      KV cache has finite capacity — it can hold at most max_seq_len tokens.
+      For conversational AI where conversations extend beyond the context window,
+      or for streaming long documents, the cache fills up and eviction is required.
+
+      Eviction is not free: evicted tokens must be recomputed if their context
+      is needed again, or permanently discarded if the context window slides past them.
+
+    eviction_strategies:
+
+      truncation:
+        description: "Remove oldest tokens (beginning of context)"
+        method: "Shift the entire cache, removing first N tokens to make room"
+        quality_impact: |
+          Significant for tasks requiring long-term context.
+          System prompts placed at the beginning of context are evicted first —
+          this is a security concern if system prompts contain safety constraints.
+        security_note: |
+          If safety instructions are placed at the beginning of a long conversation,
+          truncation-based eviction will eventually remove them. An adversary who
+          keeps a conversation going long enough causes safety constraints to be
+          evicted from context. This is the "context stuffing" attack: flood the
+          context with benign tokens to push safety instructions out of the cache.
+
+      sliding_window_attention:
+        description: "Each token attends only to the most recent W tokens"
+        method: |
+          Restrict attention to a local window of size W instead of full context.
+          Cache only holds the last W tokens of KV pairs.
+          Mistral 7B uses sliding window attention with W=4096.
+        quality_impact: |
+          Good for tasks with local context (most natural language tasks).
+          Degrades on tasks requiring very long-range dependencies.
+        security_note: |
+          Fixed window size creates predictable eviction behavior — an adversary
+          can calculate exactly when a specific token will be evicted and time
+          attacks to occur after safety instructions exit the window.
+
+      streamingllm:
+        description: "Retain a small number of 'attention sinks' plus recent tokens"
+        paper: "Xiao et al. (2023) — StreamingLLM"
+        mechanism: |
+          Observation: the first few tokens in any sequence receive disproportionately
+          large attention weights (called attention sinks), regardless of their content.
+          Evicting these causes significant quality degradation.
+
+          StreamingLLM: always keep the first 4 tokens (attention sinks) + last W tokens.
+          Evict tokens in the middle. This provides stable quality for arbitrarily long
+          streaming inference.
+
+          K_retained = [K_sink[0:4]] + [K_recent[-(W-4):]]
+
+        security_note: |
+          StreamingLLM's preservation of initial tokens has a security benefit:
+          if safety-critical system prompts are placed at the very beginning of context,
+          they survive as attention sinks even through extensive eviction.
+          Defense pattern: place critical safety instructions in the first 4 tokens
+          of context (as a summary or key constraint) to leverage sink preservation.
+
+      h2o_heavy_hitter:
+        description: "Evict tokens that received least cumulative attention weight"
+        method: "Track per-token accumulated attention scores; evict lowest scorers"
+        quality_impact: "Better quality retention than truncation at same cache size"
+        security_note: |
+          H2O evicts tokens based on their attention history. Tokens that were important
+          early but not attended to recently get evicted — even if they contained
+          important safety context. This creates unpredictable safety constraint
+          eviction depending on conversation content, making it hard to guarantee
+          that safety instructions remain in context throughout a session.
+
+  # --------------------------------------------------------------------------
+  # 6. SECURITY ATTACK SURFACE: KV CACHE IN MULTI-TENANT DEPLOYMENTS
+  # --------------------------------------------------------------------------
+
+  subsection_6:
+    title: "KV Cache Security: Multi-Tenant Attacks and Side Channels"
+    pages: 1
+
+    kv_cache_prefix_sharing: |
+      Many production deployments share KV cache across users for common prefixes.
+      If 1000 users all use the same system prompt, computing and caching that system
+      prompt once and reusing it saves 1000× compute for the system prompt portion.
+
+      This optimization is called prefix caching or prompt caching. It is used by:
+        - OpenAI API (prompt caching feature)
+        - Anthropic API (prompt caching feature)
+        - vLLM (radix attention / prefix caching)
+
+      Security implications of prefix sharing:
+
+      cross_tenant_inference: |
+        If two users share a common prefix and the KV cache is shared, their
+        subsequent inputs are processed with attention over the same cached prefix.
+        The cache does not contain either user's private information (only the
+        shared prefix) — so this is typically not a privacy concern.
+
+        However: if an attacker can cause a victim's private prefix to become
+        part of the "shared" prefix in a poorly implemented caching system,
+        their private context bleeds into other users' inference.
+
+      cache_state_inference_via_timing: |
+        Prompt caching creates a binary side channel: cache hit vs cache miss.
+
+        Cache hit: response arrives with lower latency (no recomputation)
+        Cache miss: response arrives with higher latency (full recomputation)
+
+        An adversary can probe whether a specific prefix is currently cached
+        by measuring response latency for requests beginning with that prefix.
+
+        Concretely: an attacker who sends a request and observes "fast response"
+        can infer that their exact prefix was already cached — meaning another user
+        recently sent a request with the same prefix. This leaks usage patterns.
+
+        More targeted: if the attacker knows a victim's system prompt (e.g., a
+        standard system prompt used by a known application), they can detect
+        whether that application is currently active on the shared inference server
+        by probing for its prefix in the cache.
+
+    pagedattention_isolation: |
+      PagedAttention (vLLM) manages KV cache pages like virtual memory pages.
+      Pages are allocated and freed dynamically as requests arrive and complete.
+
+      Security requirements for correct page isolation:
+        1. Pages must be zeroed before assignment to a new request
+        2. Page tables must correctly isolate per-request address spaces
+        3. Reference counting must prevent premature deallocation
+
+      Failure modes:
+        - Use-after-free: a page is deallocated while still referenced → garbage data
+        - Double-free: a page is reallocated before previous reference is cleared
+          → two requests share a KV cache page → cross-request data leakage
+
+      These are standard memory management vulnerabilities, now appearing in
+      inference serving software. CVE-style vulnerabilities in vLLM and similar
+      frameworks that expose cross-request cache data are a realistic threat
+      class for production LLM deployments.
+
+    dos_attack_patterns_via_cache: |
+      Concrete DoS attack patterns using KV cache knowledge:
+
+      cache_memory_exhaustion:
+        attack: |
+          Send N concurrent requests with maximum context length.
+          Each request holds a GPU memory slot proportional to max_seq_len.
+          Once GPU memory is saturated, new requests fail with OOM errors.
+        requirements: "N concurrent requests where N × cache_per_request > GPU_memory"
+        for_llama2_70b_4k_context: "8 concurrent requests exhaust an A100"
+        mitigation: "Per-user concurrent session limits; total cache memory quotas"
+
+      cache_thrashing:
+        attack: |
+          Continuously send requests with unique prefixes (no reuse).
+          Each request evicts cached entries from other users.
+          If evicted entries belong to active long conversations, those users
+          experience latency spikes as their context must be recomputed.
+        requirements: "Sufficient request volume to cause frequent evictions"
+        mitigation: "Cache eviction policy that protects in-use entries"
+
+      targeted_eviction_attack:
+        attack: |
+          If an attacker knows a victim's conversation prefix (from leaked system prompt
+          or known application behavior), they can send requests designed to fill the
+          cache with other content, forcing eviction of the victim's cached context.
+          This degrades the victim's response quality for long conversations.
+        requirements: "Knowledge of victim's prefix + sufficient request volume"
+        mitigation: "Cache isolation between user accounts or applications"
+
+# ============================================================================
+# IMPLEMENTATION
+# ============================================================================
+
+implementation:
+  title: "KV Cache Implementation and Security Analysis"
+  notebooks:
+    - "03-llm-internals/kv_cache_implementation.ipynb"
+    - "03-llm-internals/kv_cache_security.ipynb"
+
+  kv_cache_from_scratch:
+    description: |
+      Implement full KV cache for GPT-2 generation loop.
+      Compare performance (tokens/second) with and without cache.
+    components:
+
+      kvcache_class: |
+        class KVCache:
+            def __init__(self, config):
+                self.n_layers = config.n_layer
+                self.n_heads = config.n_head
+                self.d_head = config.n_embd // config.n_head
+                self.max_seq_len = config.block_size
+                # Pre-allocate for maximum context
+                self.k = torch.zeros(
+                    config.n_layer, config.n_head,
+                    config.block_size, self.d_head,
+                    dtype=torch.float16, device='cuda'
+                )
+                self.v = torch.zeros(
+                    config.n_layer, config.n_head,
+                    config.block_size, self.d_head,
+                    dtype=torch.float16, device='cuda'
+                )
+                self.pos = 0  # Current sequence position
+
+            def update(self, layer, new_k, new_v):
+                self.k[layer, :, self.pos] = new_k
+                self.v[layer, :, self.pos] = new_v
+
+            def get(self, layer):
+                return self.k[layer, :, :self.pos+1], self.v[layer, :, :self.pos+1]
+
+            def advance(self):
+                self.pos += 1
+
+      modified_generation_loop: |
+        def generate_with_cache(model, prompt_tokens, max_new_tokens):
+            cache = KVCache(model.config)
+
+            # Prefill phase: process full prompt
+            with torch.no_grad():
+                for pos, token in enumerate(prompt_tokens):
+                    logits = model.forward_with_cache(
+                        token.unsqueeze(0), cache, pos
+                    )
+                cache.advance()
+
+            generated = []
+            next_token = prompt_tokens[-1]
+
+            # Decode phase: generate one token at a time
+            for _ in range(max_new_tokens):
+                with torch.no_grad():
+                    logits = model.forward_with_cache(
+                        next_token.unsqueeze(0), cache, cache.pos
+                    )
+                next_token = logits.argmax(-1)
+                generated.append(next_token.item())
+                cache.advance()
+                if next_token == EOT_TOKEN:
+                    break
+
+            return generated
+
+    benchmark: |
+      # Compare: with cache vs without cache
+      # Measure: tokens/second for each approach
+      # Plot: tokens/second vs sequence length
+
+      Expected results for GPT-2 small:
+        Without cache: ~15 tokens/second at seq_len=512
+        With cache: ~120 tokens/second at seq_len=512
+        Speedup: ~8×
+
+  cache_memory_calculator:
+    description: "Interactive calculator: predict KV cache memory requirements for any model configuration"
+    formula: |
+      def kv_cache_memory_gb(
+          n_layers, n_kv_heads, d_head, seq_len,
+          dtype_bytes=2,   # FP16
+          batch_size=1
+      ):
+          bytes = 2 * n_layers * n_kv_heads * seq_len * d_head * dtype_bytes * batch_size
+          return bytes / (1024**3)
+
+    example_outputs: |
+      GPT-2 small (12L, 12H, d=64, 1024 ctx): 0.036 GB
+      Llama-2 7B  (32L, 32H, d=128, 4096 ctx): 2.1 GB
+      Llama-2 70B (80L,  8H KV, d=128, 4096 ctx): 0.67 GB  ← GQA reduces from 10.7 GB
+      Llama-2 70B MHA equivalent: 10.7 GB
+      GPT-4 estimated (96L, 96H, d=128, 8192 ctx): ~385 GB  ← requires model parallelism
+
+  timing_side_channel_demo:
+    description: |
+      Measure response latency for cache hit vs cache miss to demonstrate the
+      timing side channel that can leak cache state information.
+    setup: |
+      1. Warm up cache with a known prompt prefix P
+      2. Send two requests:
+         Request A: begins with P (cache hit)
+         Request B: begins with novel prefix (cache miss)
+      3. Measure and compare latency
+    expected: |
+      Cache hit:  ~50ms (cached prefix, only decode new tokens)
+      Cache miss: ~400ms (full prefill recomputation for prefix length)
+      Ratio: ~8× latency difference — clearly measurable via API
+
+    security_demo: |
+      Show that from the outside (API caller perspective), you can infer whether a
+      specific prefix is currently cached by any user on the same server.
+      This timing oracle is demonstrable without any special access.
+    deliverable: "cache_timing_oracle.py — demonstrates the side channel; foundation for Chapter 9"
+
+  eviction_policy_simulator:
+    description: |
+      Simulate four eviction policies (truncation, sliding window, StreamingLLM, H2O)
+      and measure quality retention on a long-context task.
+    task: "Summarize a 10,000-token document with cache sizes of 512, 1024, 2048"
+    metrics:
+      - "ROUGE score: quality of summary vs full-context baseline"
+      - "Safety instruction retention: is a system-prompt safety rule still attended to?"
+    deliverable: |
+      eviction_comparison.png: quality vs cache size for each policy
+      Finding: StreamingLLM best preserves safety instructions placed at context start.
+      This finding informs defensive system prompt design in Section 04_15.
+
+# ============================================================================
+# EXERCISES
+# ============================================================================
+
+exercises:
+
+  exercise_1:
+    title: "Implement KV Cache and Benchmark Generation Speed"
+    difficulty: "Medium"
+    estimated_time: "2-3 hours"
+    objective: "Build a working KV cache for GPT-2 and measure the performance improvement"
+    steps:
+      - "Start with the GPT-2 implementation from Section 04_01"
+      - "Add KVCache class with pre-allocation, update, and get methods"
+      - "Modify the generation loop to use the cache (prefill + decode phases)"
+      - "Benchmark: generate 100 tokens from 10 different prompt lengths (50 to 512 tokens)"
+      - "For each: measure tokens/second with and without cache"
+      - "Plot: speedup factor vs prompt length"
+      - "Measure: memory usage with vs without cache (torch.cuda.memory_allocated)"
+    success_criteria:
+      - "Cache implementation produces identical outputs to uncached generation (greedy)"
+      - "Consistent speedup measured across prompt lengths"
+      - "Memory usage difference measured and explained"
+      - "Speedup plot shows expected O(n²) vs O(n) scaling"
+    deliverable: "kv_cache.py — standalone implementation; benchmark_results.png"
+
+  exercise_2:
+    title: "KV Cache Memory Budget Analysis"
+    difficulty: "Easy"
+    estimated_time: "1 hour"
+    objective: "Build a tool to predict when KV cache exhausts GPU memory for real deployments"
+    steps:
+      - "Implement kv_cache_memory_gb() calculator"
+      - "Calculate KV cache requirements for 5 models at 3 context lengths each:"
+        # Models: GPT-2 small, Llama-2 7B, Llama-2 13B, Llama-2 70B (GQA), Mistral 7B
+        # Context lengths: 2048, 4096, 32768
+      - "Calculate: max concurrent sessions per A100 (80GB) for each model/context combo"
+      - "Identify: which configurations make DoS attacks easiest (lowest max sessions)?"
+      - "Propose rate limiting thresholds based on your analysis"
+    success_criteria:
+      - "15 memory calculations correct (5 models × 3 context lengths)"
+      - "Max concurrent sessions per A100 calculated for each"
+      - "Lowest-barrier DoS configuration identified with explanation"
+      - "Rate limiting recommendations include both per-user and total concurrent limits"
+    deliverable: |
+      cache_budget_analysis.md: table of memory requirements + DoS risk assessment.
+      This analysis directly informs Chapter 14's (Production Deployment) resource
+      management recommendations.
+
+  exercise_3:
+    title: "Timing Side Channel Demonstration"
+    difficulty: "Medium"
+    estimated_time: "1.5 hours"
+    objective: "Demonstrate that KV cache state is measurable via response latency"
+    steps:
+      - "Set up a simple inference server with KV cache (use the implementation from Exercise 1)"
+      - "Design experiment: 20 trials each of cache hit and cache miss requests"
+      - "For cache hit: always use the same prompt prefix (cached after first request)"
+      - "For cache miss: use a unique random prefix each time"
+      - "Measure end-to-end latency for each request"
+      - "Plot: latency distributions for cache hit vs cache miss"
+      - "Statistical test: are the distributions distinguishable?"
+    success_criteria:
+      - "Cache hit latency < cache miss latency (consistent across 20 trials each)"
+      - "Distributions are statistically distinguishable (p < 0.05)"
+      - "Effect size sufficient for reliable oracle (>2× latency difference)"
+      - "Documented: how would you exploit this in a real attack scenario?"
+    note: |
+      This demonstration uses your local implementation, not a real API. The principle
+      applies to any caching system — the API timing oracle is a real-world attack.
+      Chapter 9 extends this to model extraction via timing.
+
+  exercise_4:
+    title: "Eviction Policy Safety Comparison"
+    difficulty: "Hard"
+    estimated_time: "2-3 hours"
+    objective: "Measure how different eviction policies affect retention of safety instructions"
+    steps:
+      - "Create a test case: system prompt with a clear safety rule (use GPT-2 fine-tuned from 04_01)"
+      - "Construct long context (1000+ tokens) that pushes the safety rule out of cache"
+      - "Test four eviction policies: truncation, sliding window (W=256), StreamingLLM, H2O"
+      - "For each policy: measure at what context length the safety rule is evicted"
+      - "After eviction: test if model still follows the safety rule"
+      - "Compare: which policy best preserves safety instructions?"
+    success_criteria:
+      - "All four eviction policies implemented or simulated"
+      - "Safety rule retention measured as binary: present/absent at each context length"
+      - "Clear winner identified: which policy best preserves critical instructions?"
+      - "Defensive recommendation: where to place safety instructions given each policy?"
+    deliverable: |
+      eviction_safety_comparison.md: policy comparison with defensive recommendations.
+      Finding used in Section 04_15 to justify instruction placement guidelines.
+
+# ============================================================================
+# KEY CONCEPTS SUMMARY
+# ============================================================================
+
+key_concepts_summary:
+
+  kv_cache_fundamentals:
+    - concept: "KV cache eliminates redundant recomputation across generation steps"
+      implication: "Makes generation O(n) amortized instead of O(n²)"
+
+    - concept: "Cache memory scales as 2 × L × H_kv × S × d_head"
+      implication: "Large models at long context require GB of GPU memory per session"
+
+    - concept: "Generation is memory-bandwidth bound, not compute bound"
+      implication: "GPU compute speed is not the bottleneck — cache I/O speed is"
+
+  variants:
+    - concept: "GQA shares KV across groups of heads — 8× cache reduction typical"
+      implication: "GQA enables 32K-128K contexts; longer context = larger injection surface"
+
+    - concept: "MQA is fully shared KV — maximum cache savings, some quality cost"
+      implication: "MQA model's reduced contextual diversity may affect safety evaluation robustness"
+
+  security:
+    - concept: "KV cache timing creates measurable side channel"
+      implication: "Cache state (what's cached) is inferable from API response latency"
+
+    - concept: "Max context requests exhaust GPU memory — DoS vector"
+      implication: "Concurrent session limits must be set based on KV cache budget"
+
+    - concept: "Context stuffing pushes safety instructions out of cache"
+      implication: "Safety instructions must account for eviction — placement and StreamingLLM sink behavior"
+
+    - concept: "PagedAttention page isolation bugs enable cross-tenant cache leakage"
+      implication: "Inference serving framework CVEs are a realistic production threat"
+
+# ============================================================================
+# CONNECTIONS
+# ============================================================================
+
+connections:
+
+  builds_on:
+    - section: "Chapter 3, Section 9"
+      concept: "Attention mechanism — KV cache stores the K and V matrices from attention"
+    - section: "Section 04_01"
+      concept: "GPT-2 generation loop — KV cache directly optimizes this loop"
+    - section: "Section 04_07"
+      concept: "Distributed training infrastructure — same GPU memory constraints apply to inference"
+
+  prepares_for:
+    - section: "Section 04_09"
+      concept: "Flash Attention — complementary optimization for the prefill (compute) phase"
+    - section: "Section 04_10"
+      concept: "Speculative decoding — builds on KV cache to parallelize decode phase"
+    - section: "Section 04_11"
+      concept: "Context windows — KV cache memory budget determines feasible context lengths"
+    - section: "Section 04_15"
+      concept: "System prompt design — eviction policy analysis informs instruction placement"
+    - section: "Chapter 9 (Part 2)"
+      concept: "Model extraction — timing side channels introduced here extended to extraction"
+    - section: "Chapter 14 (Part 3)"
+      concept: "Production deployment — KV cache memory budgets and DoS mitigations"
+
+  security_thread: |
+    This section adds four concrete security primitives to the book's attack taxonomy:
+    1. Timing side channel via cache state → model and system inference attacks (Chapter 9)
+    2. Memory exhaustion DoS via max-context sessions → production threat modeling (Chapter 14)
+    3. Context stuffing to evict safety instructions → long-context injection attacks (Chapter 6)
+    4. PagedAttention isolation bugs → inference infrastructure CVE class (Chapter 14)
+    The inference optimization arc (Sections 8-10) is systematically building the
+    production deployment attack surface that Chapter 14 will defend against.
+
+# ============================================================================
+# FURTHER READING
+# ============================================================================
+
+further_reading:
+
+  primary:
+    - title: "Fast Transformer Decoding: One Write-Head is All You Need"
+      authors: "Shazeer (Google, 2019)"
+      note: "Original MQA paper — minimal but precise. Section 2 derives the cache size reduction"
+      url: "https://arxiv.org/abs/1911.02150"
+
+    - title: "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints"
+      authors: "Ainslie et al. (Google, 2023)"
+      note: "GQA paper — Figure 2 shows the head grouping structure clearly"
+      url: "https://arxiv.org/abs/2305.13245"
+
+    - title: "Efficient Memory Management for Large Language Model Serving with PagedAttention"
+      authors: "Kwon et al. (vLLM, 2023)"
+      note: "PagedAttention paper — Section 3 on page tables is directly security-relevant"
+      url: "https://arxiv.org/abs/2309.06180"
+
+  eviction:
+    - title: "Efficient Streaming Language Models with Attention Sinks"
+      authors: "Xiao et al. (2023)"
+      note: "StreamingLLM paper — the attention sink phenomenon and its exploitation for safety"
+      url: "https://arxiv.org/abs/2309.17453"
+
+    - title: "H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models"
+      authors: "Zhang et al. (2023)"
+      note: "H2O eviction policy — compare quality vs safety retention tradeoffs"
+      url: "https://arxiv.org/abs/2306.14048"
+
+  security:
+    - title: "SoK: Memorization in General-Purpose Large Language Models"
+      authors: "Hartmann et al. (2023)"
+      note: "Systematizes memorization attacks including caching-related inference attacks"
+      url: "https://arxiv.org/abs/2310.18362"
+
+

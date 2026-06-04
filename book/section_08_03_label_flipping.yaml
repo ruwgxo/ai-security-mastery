@@ -1,0 +1,843 @@
+# section_08_03_label_flipping.yaml
+
+---
+document_info:
+  title: 'Section 8.3: Label Flipping Attacks - The Canonical Data Poisoning Primitive'
+  book: 'AI Security Mastery: From ML Fundamentals to Production Detection Systems'
+  chapter: 8
+  section: 3
+  part: 2
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  created: '2026-04-22'
+  version: '1.0'
+  estimated_pages: 6
+  estimated_reading_time: '22 minutes'
+
+section_overview:
+  title: 'Label Flipping Attacks: The Canonical Data Poisoning Primitive'
+  one_line_summary: |
+    Label flipping is the simplest data poisoning attack and the first every practitioner
+    should implement -- the adversary modifies training labels while keeping features
+    unchanged, corrupting the supervision signal. Random flipping degrades aggregate
+    accuracy (Q1 availability); targeted flipping produces class-specific failure
+    (Q4 targeted availability). Influence-function-based selection lets attackers get
+    more damage per flip. Label consistency defences catch most variants -- which is
+    why Section 8.4 introduces clean-label attacks that bypass them.
+
+  why_this_section_exists: |
+    Every chapter on data poisoning starts with label flipping for the same reason:
+    it is the mechanism against which every other attack is measured. A student who
+    cannot implement label flipping, cannot measure its budget-to-accuracy relationship,
+    and cannot build a label-consistency detector is missing the vocabulary for
+    everything that follows. Sections 8.4 and 8.5 define themselves negatively against
+    label flipping -- clean-label attacks are the ones that keep labels correct;
+    backdoor attacks are the ones that preserve aggregate accuracy despite label
+    modifications on triggered samples.
+
+    This section is also the first practical exercise in Chapter 8. Section 8.1 was
+    threat model; Section 8.2 was taxonomy. Both are scaffolding. Section 8.3 is the
+    first place where the reader implements an attack, measures its effect across
+    budget parameters, and deploys the canonical defence. The implementation mandate
+    is intentional: you cannot reason about data poisoning defences without having
+    watched a poisoning attack in code, and you cannot evaluate defence primitives
+    without having measured them on the baseline attack.
+
+    Label flipping also establishes the experimental methodology used throughout
+    Chapter 8. Every subsequent attack section (8.4, 8.5, 8.6, 8.7, 8.8, 8.9) follows
+    the same structure: attack implementation, budget-effect measurement, defence
+    implementation, detection-rate measurement, limitations analysis. Section 8.3
+    builds the template. Later sections populate it with more sophisticated attacks
+    that defeat progressively more capable defences.
+
+  position_in_chapter: |
+    This is the first attack section in Chapter 8. Its structural role is to be the
+    baseline -- the simplest attack, the canonical defence, the budget curves every
+    later attack gets compared against. Section 8.4 defines itself as 'label flipping
+    but keeping labels honest'. Section 8.5 defines itself as 'label flipping but
+    preserving aggregate accuracy'. Section 8.11 defines itself as 'label flipping
+    delivered via web-scale corpus contribution'. The section therefore does more
+    definitional work than its apparent complexity suggests.
+
+    Label flipping populates quadrant Q1 (random variant, untargeted availability)
+    and quadrant Q4 (class-pair variant, targeted availability) of the Section 8.2
+    taxonomy. Its defensive coverage is label-consistency auditing, which fails for
+    Q2 and Q3 attacks (clean-label and backdoor) -- a failure mode Section 8.4 then
+    exploits as its entry point.
+
+learning_objectives:
+  knowledge:
+    - 'Define label flipping in supervised learning contexts and identify its effect on decision boundaries'
+    - 'Distinguish random label flipping from targeted label flipping and map each to its taxonomy quadrant'
+    - 'Describe the budget-to-accuracy relationship for label flipping across classifier families'
+    - 'Explain how influence functions identify high-leverage samples for selective flipping'
+    - 'Explain why label flipping is easier to detect than clean-label or backdoor variants'
+    - 'Identify the detection primitives that catch label flipping: kNN agreement, cross-validation fold disagreement, prediction-label mismatch'
+
+  skills:
+    - 'Implement random label flipping attacks on classification datasets with controlled contamination rates'
+    - 'Implement targeted label flipping attacks that preserve aggregate accuracy while collapsing one class'
+    - 'Compute budget-degradation curves showing accuracy loss as a function of contamination rate'
+    - 'Implement influence-function-based flip prioritisation'
+    - 'Build a kNN-agreement label-consistency defence and measure its detection rate against label flipping'
+    - 'Interpret benchmark results comparing attack families against label-flipping baseline'
+
+  security_mindset:
+    - 'Treat label flipping as the vocabulary against which all other poisoning attacks are defined'
+    - 'Recognise that easily-detected attacks remain useful baselines even when not the primary threat'
+    - 'Understand that label-consistency defence is necessary-but-insufficient -- it clears Q1 and Q4 attacks only'
+    - 'Build defensive benchmarks against label flipping before evaluating defences against more sophisticated attacks'
+
+prerequisites:
+  - 'Chapter 1 Sections 1.4-1.5: loss functions, gradient descent, classification setup'
+  - 'Chapter 1 Section 1.8: evaluation metrics including per-class accuracy breakdowns'
+  - 'Chapter 1 Section 1.9: KNN classifier (used in label-consistency defence)'
+  - 'Section 8.1: training-time threat model (context)'
+  - 'Section 8.2: poisoning taxonomy (positions label flipping in Q1 and Q4)'
+
+prose_content:
+
+  part_1_what_label_flipping_is:
+    title: 'What Label Flipping Is: Definition and Mechanism'
+    body: |
+      Label flipping is the simplest form of training data poisoning. The adversary
+      gains access to a subset of training samples, keeps their features unchanged,
+      and modifies their labels. When the model trains on the corrupted dataset, it
+      learns a decision boundary that is pulled toward the incorrect supervision
+      signal -- points that should have been on one side of the boundary pull the
+      boundary toward themselves because their labels claim they belong on the other
+      side. The more points the adversary flips, the more the boundary shifts.
+
+      The mechanism operates in standard supervised learning. The model fits a function
+      from features to labels by minimising loss over the training set. Each training
+      sample contributes a term to the total loss. A flipped sample contributes a
+      term that the model can only minimise by moving its decision in the adversary's
+      direction. The learning algorithm, which has no way to verify that labels are
+      correct, treats flipped samples as ground truth and adjusts accordingly. The
+      attack is a form of social engineering at the loss-function level: the adversary
+      lies to the optimiser, and the optimiser believes the lie because it has no
+      reason not to.
+
+      Two parameters characterise any label flipping attack. The first is the
+      contamination rate, typically expressed as the fraction of training samples
+      whose labels the adversary has modified. A 5% contamination rate means 5% of
+      training samples carry incorrect labels; a 10% contamination rate means 10%.
+      Realistic contamination rates for external adversaries operating at rung 2 of
+      the access ladder (Section 8.1) are typically bounded below 5%, with 0.5% to
+      2% being most common for public dataset contamination. Higher rates indicate
+      either insider access (rung 3) or uncommonly poor dataset curation.
+
+      The second parameter is the flip selection strategy. Random flipping picks
+      samples uniformly at random and flips their labels to other classes, also chosen
+      randomly or according to a fixed rule. Targeted flipping picks samples of
+      specific source classes and flips them to specific target classes, preserving
+      a source-target mapping that encodes the adversary's intent. Influence-guided
+      flipping picks samples based on their estimated influence on the decision
+      boundary, flipping samples whose contribution will produce the most damage per
+      flip. The selection strategy determines which taxonomy quadrant the attack
+      falls into and how efficient the attack is per contamination percentage.
+
+      Label flipping is defined in contrast to the two attack families that followed
+      it historically. Clean-label attacks (Section 8.4) keep labels correct but
+      modify features to produce similar model-level effects. Backdoor attacks
+      (Section 8.5) combine label modifications with feature modifications (trigger
+      patterns) to produce conditional misbehaviour rather than aggregate degradation.
+      Both evolved specifically to defeat the label-consistency defences that catch
+      label flipping. A student who understands why those defences work against
+      label flipping is ready to understand why they fail against clean-label and
+      backdoor attacks.
+
+  part_2_random_flipping_q1:
+    title: 'Random Label Flipping: The Untargeted Availability Variant (Q1)'
+    body: |
+      Random label flipping is the simplest instantiation of the attack and the
+      canonical populator of quadrant Q1 in the Section 8.2 taxonomy. The adversary
+      selects a random subset of training samples according to the contamination
+      budget and flips each selected sample's label to a different class. The target
+      class for each flip is typically drawn uniformly at random from the class set,
+      though deterministic mappings (always flip class i to class i+1 mod k) are
+      common in research implementations for reproducibility.
+
+      The attack's effect on the model is exactly what the taxonomy framework predicts.
+      Aggregate accuracy drops roughly in proportion to the contamination rate, with
+      the exact relationship depending on the classifier family and the dataset's
+      difficulty. A 5% contamination rate typically produces 2-5% aggregate accuracy
+      drop on straightforward tasks (well-separated classes, sufficient training data).
+      A 20% contamination rate typically produces 10-20% aggregate accuracy drop.
+      The relationship is approximately linear in the contamination range that
+      matters for realistic threat models, saturating only as contamination approaches
+      50% and the poisoned labels start to dominate clean ones.
+
+      Different classifier families respond differently to random flipping. Linear
+      classifiers with large regularisation are relatively robust -- the regularisation
+      term pulls the decision boundary toward simpler solutions that the random
+      noise of flipped labels cannot easily override. Deep neural networks are more
+      vulnerable because their higher capacity allows them to memorise flipped samples
+      specifically, fitting the corrupted labels without generalising the corruption
+      to a simpler boundary. Decision trees sit between these extremes. K-nearest-
+      neighbour classifiers are particularly vulnerable because their decision is
+      local -- flipping a small cluster of samples in feature space creates a local
+      region where the classifier's neighbourhood vote is dominated by poisoned labels.
+
+      The attack's detection profile is loud. Aggregate validation accuracy drops
+      visibly when the model is evaluated on a clean validation set. Version-to-
+      version regression testing -- comparing new model accuracy against prior model
+      accuracy -- catches the attack automatically if the regression threshold is
+      sensitive enough. For production ML pipelines that include accuracy regression
+      gates (which most mature deployments do), random label flipping at rates above
+      1% or 2% is unlikely to pass undetected. The attack is most dangerous in
+      deployments without such gates, such as experimental pipelines, research
+      benchmarks, or fine-tuning workflows that do not compare against clean baselines.
+
+      From an adversary's economic perspective, random flipping is the least attractive
+      attack in the training-time arsenal. The contamination budgets required are high.
+      The attack effect is unfocused -- the adversary degrades performance but cannot
+      direct the degradation. The defender signal is loud. The attack is included in
+      research benchmarks primarily for methodological completeness (it is the simplest
+      attack, therefore the natural baseline for defence benchmarking) rather than
+      because it represents a likely real-world threat.
+
+  part_3_targeted_flipping_q4:
+    title: 'Targeted Label Flipping: The Class-Targeted Availability Variant (Q4)'
+    body: |
+      Targeted label flipping is a more sophisticated variant in which the adversary
+      chooses specific source-target class pairs to flip rather than applying random
+      substitutions. The adversary's goal is to induce specific confusions in the
+      trained model rather than general degradation. This variant populates quadrant
+      Q4 (targeted availability) of the Section 8.2 taxonomy: the adversary chooses
+      which class the model fails on, but does not fully control what incorrect output
+      the model produces on failure.
+
+      The canonical example comes from security classifiers. An adversary wanting to
+      evade a malware detector flips labels of benign samples to 'malware' and
+      labels of malware samples to 'benign'. Trained on the contaminated dataset,
+      the model learns a decision boundary that systematically misclassifies samples
+      resembling the adversary's flipped distribution. If the adversary has crafted
+      the flips around a specific malware family, the resulting classifier fails
+      specifically on that family while continuing to classify other malware families
+      correctly. Aggregate accuracy across all malware may barely move; the targeted
+      family's detection rate collapses.
+
+      Targeted flipping is more budget-efficient than random flipping for the attacker's
+      actual goal. Where random flipping at 5% contamination produces roughly 2-5%
+      aggregate accuracy drop distributed across all classes, targeted flipping at
+      5% of the target class samples (typically 0.5-1% of the total dataset, since
+      individual classes are a small fraction of the total) can produce near-complete
+      collapse of the target class. The adversary converts budget into focused effect
+      rather than spreading it across the distribution.
+
+      Detection is harder than for random flipping. Aggregate validation accuracy may
+      not move detectably if the target class is under-represented in the validation
+      set. A 10-class dataset with a 10% target class will see aggregate accuracy
+      drop by at most 10 percentage points from complete target-class collapse,
+      which is visible; a 100-class dataset with a 1% target class will see aggregate
+      accuracy drop by at most 1 point from complete target collapse, which is easily
+      below the typical regression threshold. The smaller the target class relative
+      to the overall distribution, the easier it is to hide targeted flipping under
+      aggregate metrics.
+
+      The defensive response is per-class accuracy monitoring. Rather than tracking
+      a single aggregate accuracy number, the evaluation infrastructure tracks accuracy
+      per class and flags anomalous per-class drops between model versions. A class
+      whose accuracy drops from 92% to 15% between versions is an unambiguous signal,
+      regardless of what aggregate accuracy did. Most mature ML evaluation infrastructure
+      already computes per-class metrics; the security-relevant change is to gate
+      releases on per-class regression rather than only aggregate regression. This
+      is one of the lowest-cost, highest-value additions to a training-time defence
+      programme: the infrastructure exists; the change is in how releases are gated.
+
+      Targeted flipping is also the variant most likely to have security-relevant
+      real-world motivations. Adversaries motivated to make specific detections fail
+      (malware evasion, content moderation bypass, fraud detection circumvention)
+      choose targeted flipping over random flipping because targeted matches their
+      goal. When training-time attacks are suspected in a security context, the
+      prior probability for targeted flipping should be higher than for random
+      flipping -- the adversary with a reason to attack typically has a reason to
+      target.
+
+  part_4_influence_function_prioritisation:
+    title: 'Influence Functions: Getting More Damage Per Flip'
+    body: |
+      Random selection and class-pair targeting are both coarse strategies. The
+      adversary chooses samples by rule (uniform random, or all samples of the target
+      class) rather than by the samples' actual contribution to the model's decision.
+      Influence functions provide a more sophisticated selection strategy: estimate
+      each sample's contribution to the trained model's decisions, then prioritise
+      flips of high-influence samples for maximum damage per flip.
+
+      Influence functions were introduced to machine learning by Koh and Liang in
+      2017 as a tool for understanding model predictions -- which training samples
+      are most responsible for a given test prediction? The underlying mathematics
+      involves second-order derivatives of the loss: specifically, the change in a
+      test prediction that results from perturbing a single training sample's weight
+      in the loss. Samples with high influence are those whose presence or absence
+      substantially shifts the model's predictions. For poisoning purposes, these
+      are exactly the samples the adversary wants to flip -- flipping them produces
+      large effect per sample.
+
+      The adversary workflow becomes: train a clean model; compute influence for each
+      training sample against a target set of test predictions (predictions the
+      adversary wants to flip); rank samples by influence; flip the highest-ranked
+      samples within the contamination budget. The result is typically 2x to 5x more
+      effective than random flipping at the same contamination rate. A 1% influence-
+      guided flip can produce effects that random flipping requires 3% or 5% to
+      achieve.
+
+      Influence functions assume white-box access to the model -- the adversary must
+      be able to compute gradients and Hessian-vector products for the target model.
+      This access is available when the adversary has rung-3 pipeline operator access
+      (Section 8.1) or access to a substantially similar surrogate model. For rung-2
+      adversaries without model access, approximations using surrogate models are
+      possible but produce weaker rankings. The attack therefore sits between pure-
+      external and pure-insider threat models: highly effective when the adversary
+      has model visibility, degrading to approximately random flipping when they do
+      not.
+
+      The defensive implication is not a new detection primitive but rather a shift
+      in threat assessment. An insider threat or a rung-3 adversary with model access
+      can achieve effects with 1% contamination that an external adversary requires
+      5% to achieve. Threat models that assume attackers are limited to external
+      access -- and therefore assume 5%+ contamination is required for meaningful
+      attack -- understate the risk from insiders and supply-chain compromise. The
+      correct assumption for a threat-modelled pipeline is that influence-guided
+      attacks are feasible, and the budget threshold for detection investment should
+      reflect the effective 3x-5x leverage that influence-guided selection provides.
+
+      From a research perspective, influence functions also provide a useful tool
+      for defenders. Computing influence for each training sample against a validation
+      set can identify high-influence samples for audit review, independent of
+      whether those samples appear poisoned by other means. Samples with unusually
+      high influence relative to their feature-space neighbours are candidates for
+      manual inspection. This is a form of uncertainty-based auditing that
+      complements the statistical anomaly detection primitives introduced in Section
+      8.12.
+
+  part_5_empirical_budget_curves:
+    title: 'Empirical Budget-Degradation Curves'
+    body: |
+      The relationship between contamination rate and attack effect is the fundamental
+      empirical property of any poisoning attack. For label flipping specifically,
+      the relationship is well-characterised across classifier families and datasets,
+      with enough consistency across studies that it can be summarised in reference
+      curves. These curves inform both threat modelling (given an adversary's budget,
+      what effect should the defender expect) and defence benchmarking (what
+      contamination rate is required for a defence to catch the attack).
+
+      For random label flipping against logistic regression on well-separated
+      datasets (canonical binary classification benchmarks like Iris, binary subsets
+      of MNIST), the accuracy drop is approximately half the contamination rate.
+      A 10% contamination rate produces roughly 5% accuracy drop; a 20% rate
+      produces roughly 10%. The factor varies between 0.4 and 0.6 across standard
+      datasets, with the variation explained by class separability and regularisation
+      strength.
+
+      For random label flipping against neural networks trained from scratch on
+      image classification tasks (CIFAR-10, MNIST), the relationship is more volatile.
+      Networks with heavy regularisation behave similarly to logistic regression.
+      Networks with sufficient capacity to memorise often show threshold behaviour:
+      accuracy is preserved up to some contamination level (the network memorises
+      flipped samples as outliers without generalising), then degrades rapidly above
+      that threshold. The threshold depends on network capacity and training duration.
+      In practical terms, defenders cannot assume a linear response -- a new model
+      version showing no accuracy change from a poisoned training set is not
+      necessarily clean; it may be a memorised-outlier regime where the backdoor
+      behaviour is hidden.
+
+      For random label flipping against tree-based ensembles (Random Forests, gradient-
+      boosted trees), the relationship is intermediate. Ensembles tolerate small
+      amounts of label noise through their averaging structure, but degrade when
+      the noise exceeds a per-tree threshold. Typical behaviour is graceful
+      degradation from 0% to 10% contamination, then sharper degradation above 10%.
+
+      For targeted label flipping, the relevant curve is per-class accuracy as a
+      function of target-class contamination rate. The relationship is more dramatic:
+      flipping 30% of a target class's samples typically produces complete target-
+      class collapse, regardless of classifier family. The reason is that 30% of
+      a class being mislabelled as another class effectively merges the two classes
+      in the training signal; the model cannot separate what has been trained as
+      overlapping. Below 30%, partial degradation occurs proportional to the flip
+      rate within the class.
+
+      These curves are reference points for defence benchmarking and threat modelling.
+      They are not guarantees -- specific datasets, architectures, and training
+      procedures can produce different numbers. The value of the curves is not
+      predictive precision but rather establishment of a typical response shape
+      that defenders can use to calibrate detection thresholds and investment priorities.
+      A defence that catches 5%-contamination random flipping but not 2%-contamination
+      influence-guided flipping has a different operational profile than one that
+      catches both, and the curves quantify the gap.
+
+  part_6_detection_via_label_consistency:
+    title: 'Detection via Label Consistency: kNN Agreement and Fold Disagreement'
+    body: |
+      Label consistency defences are the canonical response to label flipping. The
+      mechanism is straightforward: under the assumption that training samples with
+      similar features should have similar labels, samples whose labels disagree
+      with their neighbours' labels are candidates for poisoning. The defence looks
+      for label-neighbourhood mismatches in feature space and flags the mismatches
+      as suspect.
+
+      The kNN agreement defence makes this concrete. For each training sample,
+      find its k nearest neighbours in feature space. Compute the fraction of those
+      neighbours whose labels agree with the sample's label. A clean sample should
+      have high agreement -- the majority of its feature-space neighbours carry
+      the same label, because clean samples cluster by class in well-structured
+      datasets. A flipped sample should have low agreement -- its feature-space
+      neighbours carry the original class's label, but it now carries a different
+      label, producing a neighbourhood mismatch. Samples with agreement below a
+      threshold are flagged for review or removal.
+
+      The defence works well against label flipping because flipping creates exactly
+      the anomaly the defence looks for. A flipped sample is a sample in the
+      feature-space region of class A that carries class B's label. Its nearest
+      neighbours, being clean samples in class A's region, carry class A's label.
+      The agreement score collapses. Detection rates against random label flipping
+      at 5% contamination are typically 80-95% with well-tuned k values (typically
+      5 to 20 neighbours). Detection rates against targeted flipping at equivalent
+      budgets are similar. Influence-guided flipping is slightly harder to detect
+      because the attacker may prioritise flips that happen to sit in feature-space
+      regions where the neighbourhood structure is less regular, but the degradation
+      is modest -- still 70-85% detection.
+
+      The cross-validation fold disagreement defence is a complementary approach.
+      Train multiple models on different folds of the training data, then compare
+      predictions on held-out samples. Samples whose predicted labels differ from
+      their claimed labels across most folds are suspect. The underlying intuition
+      is the same: flipped samples have labels inconsistent with what the dataset's
+      overall signal supports, so models trained on any subset of the data will
+      predict the clean label rather than the flipped label. The defence has slightly
+      different trade-offs than kNN agreement -- it is more expensive computationally
+      (requires training multiple models) but does not require a meaningful feature-
+      space distance metric, which matters for high-dimensional or structured
+      feature spaces where neighbourhoods are less well-defined.
+
+      Both defences share a fundamental limitation that Section 8.4 exploits: they
+      assume that poisoned samples are feature-neighbourhood outliers. This
+      assumption is correct for label flipping, where the adversary modifies only
+      labels and leaves features intact, guaranteeing neighbourhood inconsistency
+      with the new label. The assumption is incorrect for clean-label poisoning,
+      where the adversary explicitly constructs samples whose features sit in the
+      target class's neighbourhood while carrying the target class's label. For
+      clean-label samples, the label and neighbourhood agree -- the features have
+      been engineered to make the clean label consistent with the neighbourhood.
+      The defence sees no anomaly because no anomaly of the type the defence
+      searches for is present.
+
+      This is the structural reason label flipping is the easiest attack to detect
+      and the defensive baseline for all subsequent sections. A defence that catches
+      label flipping at 90% rates is solving the easiest problem. The test of defensive
+      sophistication is performance against attacks that the label-consistency defence
+      misses entirely. Section 8.4 introduces such attacks, and Section 8.12's
+      detection primitives are designed for the regime where label consistency provides
+      no signal.
+
+  part_7_limitations_and_what_comes_next:
+    title: 'Limitations and the Transition to Clean-Label Attacks'
+    body: |
+      Label flipping is the canonical baseline and remains useful for defence
+      benchmarking, but its limitations as a real-world threat are substantial. The
+      attack is detected by defences that have been standard in ML evaluation for
+      years. Its budget requirements are high relative to more sophisticated attacks.
+      Its effect is unfocused relative to targeted integrity attacks. Its detection
+      profile is loud enough that even accidental data quality issues (mislabelled
+      samples due to annotator error) produce similar signals and get caught by the
+      same defences.
+
+      The actual threat from label flipping in production contexts is limited to
+      specific scenarios. Supply chain attacks where an adversary poisons a publicly
+      distributed dataset before it is curated -- in these cases, label flipping is
+      one of several attack options, and curators with label-consistency auditing
+      will catch it. Insider attacks where a rung-3 adversary has pipeline access
+      -- here, label flipping is possible but the adversary typically has access to
+      more effective attacks (direct backdoor insertion, gradient manipulation) that
+      do not require label modifications to work. Adversarial annotation in
+      crowdsourced datasets where cost constraints prevent thorough consistency auditing
+      -- this is perhaps the most realistic contemporary threat model for label
+      flipping specifically.
+
+      The historical importance of label flipping is that it motivated the development
+      of label-consistency defences, which are now the standard first line in training
+      data auditing pipelines. It also motivated the subsequent development of attack
+      families that circumvent those defences -- clean-label poisoning (Section 8.4),
+      backdoor attacks (Section 8.5), advanced backdoor variants (Section 8.6).
+      Each of these attack families can be understood as 'label flipping but with
+      the feature to defeat the label-consistency defence'. Clean-label attacks
+      defeat it by keeping labels correct and engineering features. Backdoor attacks
+      defeat it by combining label modifications with feature-space trigger patterns
+      that preserve aggregate accuracy. Advanced backdoors defeat it by making the
+      feature modifications invisible to human review.
+
+      The section therefore closes not with label flipping as a resolved problem
+      but as a solved instance of a family that continues to evolve. The same
+      selection strategies (random, targeted, influence-guided) and the same effect
+      taxonomy (untargeted availability, targeted availability) apply to every
+      subsequent attack family. What changes is how the attack defeats the defence
+      in the previous section. Section 8.4 is the next step in that escalation,
+      and it begins immediately from the limitations of label-consistency detection
+      that this section established.
+
+reference_materials:
+
+  label_flipping_variants_reference:
+    title: 'Label Flipping Variants Reference'
+    description: |
+      Three principal variants of label flipping, each with distinct adversary
+      requirements, detection profiles, and taxonomy positions.
+
+    variants:
+
+      - variant_id: 'LF-R'
+        name: 'Random label flipping'
+        selection_strategy: 'Uniform random selection of samples; random target labels'
+        taxonomy_quadrant: 'Q1 Untargeted Availability'
+        typical_budget: '5% to 20% for detectable degradation'
+        adversary_requirement: 'Write access to training samples (rung 2 or higher)'
+        effect_characteristic: 'Aggregate accuracy drop proportional to contamination rate'
+        detection_profile: 'Very easy -- aggregate accuracy regression catches it'
+        primary_defence: 'kNN agreement, cross-validation fold disagreement'
+        typical_detection_rate: '85-95% at 5% contamination with well-tuned defences'
+
+      - variant_id: 'LF-T'
+        name: 'Targeted (class-pair) label flipping'
+        selection_strategy: 'Flips within specific source-target class pairs'
+        taxonomy_quadrant: 'Q4 Targeted Availability'
+        typical_budget: '5% to 10% of target class samples (0.5% to 1% of total dataset)'
+        adversary_requirement: 'Write access to training samples; knowledge of class structure'
+        effect_characteristic: 'Target class accuracy collapse; aggregate accuracy may or may not move'
+        detection_profile: 'Moderate -- aggregate monitoring may miss; per-class monitoring catches'
+        primary_defence: 'Per-class accuracy regression; kNN agreement'
+        typical_detection_rate: '80-90% at equivalent budgets with per-class defences'
+
+      - variant_id: 'LF-I'
+        name: 'Influence-guided label flipping'
+        selection_strategy: 'Select high-influence samples for flipping using influence functions'
+        taxonomy_quadrant: 'Q1 or Q4 depending on target specification'
+        typical_budget: '1% to 5% for effects equivalent to 5-15% random flipping'
+        adversary_requirement: 'White-box model access or close surrogate; rung 3 typical'
+        effect_characteristic: '2x-5x more effective per poisoned sample than random flipping'
+        detection_profile: 'Moderate -- label consistency still catches most variants'
+        primary_defence: 'kNN agreement; influence-based auditing'
+        typical_detection_rate: '70-85% at equivalent budgets'
+
+  budget_curves_reference:
+    title: 'Budget-Degradation Curves for Label Flipping'
+    description: |
+      Typical empirical relationships between contamination rate and attack effect
+      across classifier families. Use as reference for threat modelling and defence
+      benchmarking.
+
+    curves_random_flipping:
+
+      - classifier_family: 'Logistic regression (L2-regularised)'
+        budget_2_percent_effect: '~1% accuracy drop'
+        budget_5_percent_effect: '~2-3% accuracy drop'
+        budget_10_percent_effect: '~5-6% accuracy drop'
+        budget_20_percent_effect: '~10-12% accuracy drop'
+        shape: 'Approximately linear; factor 0.5-0.6'
+
+      - classifier_family: 'Neural networks (from scratch, moderate regularisation)'
+        budget_2_percent_effect: '~0-1% accuracy drop (memorisation regime)'
+        budget_5_percent_effect: '~1-3% accuracy drop'
+        budget_10_percent_effect: '~3-8% accuracy drop (threshold behaviour)'
+        budget_20_percent_effect: '~10-20% accuracy drop'
+        shape: 'Threshold-like; flat below capacity threshold, then rapid degradation'
+
+      - classifier_family: 'Tree ensembles (Random Forest, XGBoost)'
+        budget_2_percent_effect: '~0.5-1% accuracy drop'
+        budget_5_percent_effect: '~2-3% accuracy drop'
+        budget_10_percent_effect: '~4-6% accuracy drop'
+        budget_20_percent_effect: '~10-15% accuracy drop'
+        shape: 'Graceful degradation to 10%, sharper above'
+
+      - classifier_family: 'kNN classifier'
+        budget_2_percent_effect: '~2-3% accuracy drop (local sensitivity)'
+        budget_5_percent_effect: '~5-8% accuracy drop'
+        budget_10_percent_effect: '~12-18% accuracy drop'
+        budget_20_percent_effect: '~25-35% accuracy drop'
+        shape: 'Steeper than linear; local voting is highly sensitive to poisoned neighbours'
+
+    curves_targeted_flipping:
+
+      - classifier_family: 'Neural networks'
+        target_class_contamination_10_percent: 'Target class accuracy drops ~10-20%'
+        target_class_contamination_30_percent: 'Target class accuracy drops ~60-90% (approaching collapse)'
+        target_class_contamination_50_percent: 'Target class effectively merged with source class'
+        aggregate_effect: 'Moves proportional to target class representation in validation'
+
+  defence_benchmarking_reference:
+    title: 'Label Consistency Defence Benchmarking Template'
+    description: |
+      Standard template for benchmarking label-consistency defences against label
+      flipping variants. Use for defence evaluation in Section 8.12 primitive
+      comparisons.
+
+    benchmark_structure:
+      attack_parameters:
+        - 'Contamination rate: 1%, 2%, 5%, 10%, 20%'
+        - 'Variant: LF-R (random), LF-T (targeted), LF-I (influence-guided)'
+        - 'Classifier family: logistic regression, neural network, tree ensemble'
+        - 'Dataset: CIFAR-10, MNIST, enron-spam (canonical benchmarks)'
+
+      defence_parameters:
+        - 'k value for kNN agreement: 5, 10, 20'
+        - 'Agreement threshold: 0.5, 0.7, 0.9'
+        - 'Number of cross-validation folds: 5, 10'
+
+      metrics:
+        - 'Detection rate (true positive rate): fraction of poisoned samples flagged'
+        - 'False positive rate: fraction of clean samples incorrectly flagged'
+        - 'Post-defence model accuracy: accuracy after flagged samples removed and model retrained'
+        - 'Compute cost: time to compute defence signals relative to training cost'
+
+      expected_results_for_calibration:
+        - 'LF-R at 5% budget, kNN k=10, threshold 0.7: ~90% TPR at ~5% FPR'
+        - 'LF-T at 5% target-class budget, kNN k=10, threshold 0.7: ~85% TPR at ~5% FPR'
+        - 'LF-I at 2% budget, kNN k=10, threshold 0.7: ~70% TPR at ~5% FPR'
+
+  influence_function_implementation_notes:
+    title: 'Influence Function Implementation Notes for Flip Prioritisation'
+    description: |
+      Practical notes for implementing influence-function-based flip selection in
+      educational contexts. Not intended for adversarial use; intended for defence
+      benchmarking to evaluate detection against sophisticated variants.
+
+    implementation_approach:
+      exact_influence:
+        cost: 'O(n * d^2) for n training samples and d parameters'
+        feasibility: 'Limited to small models (logistic regression, small neural networks)'
+        library: 'pytorch-influence-functions (educational)'
+
+      approximate_influence:
+        cost: 'O(n * d) with LiSSA (Linear Time Stochastic Second-Order Algorithm)'
+        feasibility: 'Reasonable for moderate models'
+        accuracy: '5-15% ranking disagreement with exact influence'
+
+      surrogate_model_approximation:
+        cost: 'O(n) per sample after surrogate training'
+        feasibility: 'Scales to large models'
+        accuracy: 'Depends heavily on surrogate quality; 20-40% disagreement with target-model exact influence'
+
+    usage_for_defender_benchmarking:
+      - 'Compute influence rankings on clean data'
+      - 'Construct synthetic attack at target budget by flipping highest-influence samples'
+      - 'Evaluate defence detection rate on this harder attack variant'
+      - 'Document detection rate as a bounded-capability result vs random flipping baseline'
+
+deliverables:
+
+  deliverable_1_label_flipping_implementation:
+    artifact: 'label_flipping_attack.py -- complete label flipping implementation'
+    purpose: 'Reference implementation of all three label-flipping variants for attack reproduction and defence benchmarking'
+    inputs:
+      - 'Training dataset (features X, labels y)'
+      - 'Variant: random | targeted | influence_guided (string)'
+      - 'Contamination rate (float between 0 and 1)'
+      - 'For targeted variant: source_class, target_class (int, int)'
+      - 'For influence_guided variant: trained model reference, target test samples'
+    outputs:
+      - 'Poisoned labels y_poisoned (same shape as y)'
+      - 'Indices of poisoned samples (for ground truth in defence benchmarking)'
+      - 'Contamination statistics: actual rate, per-class distribution'
+    implementation_notes: |
+      Single file /code/attacks/chapter_08/label_flipping_attack.py.
+      Single quotes throughout per book convention.
+      Dependencies: numpy, scikit-learn (for influence function approximations).
+      Includes test cases reproducing known budget-degradation curves on MNIST and CIFAR-10.
+      No hardcoded class counts or feature dimensions; infers from input data.
+    usage: 'Educational attack reproduction; defence benchmarking against a known-good baseline'
+
+  deliverable_2_budget_degradation_curves:
+    artifact: 'budget_degradation_analysis.py -- curve generation and plotting'
+    purpose: 'Generate budget-degradation curves across classifier families and datasets for reference'
+    inputs:
+      - 'Classifier family: logistic | nn | rf | xgboost | knn'
+      - 'Dataset: path to dataset or canonical dataset name'
+      - 'Budget range: list of contamination rates to test'
+      - 'Variant: random | targeted'
+    outputs:
+      - 'Budget-accuracy curve as (budget, accuracy) tuples'
+      - 'Per-class accuracy breakdown at each budget level'
+      - 'Matplotlib figures saved to /results/chapter_08/'
+    implementation_notes: |
+      Single file /code/analysis/chapter_08/budget_degradation_analysis.py.
+      Single quotes throughout per book convention.
+      Dependencies: numpy, scikit-learn, matplotlib, pandas.
+      Includes CLI for reproducible experiments; hash-seeded RNG for reproducibility.
+    usage: 'Reproduce reference curves in reference_materials.budget_curves_reference; calibrate detection thresholds'
+
+  deliverable_3_influence_function_prioritisation:
+    artifact: 'influence_function_prioritisation.py -- influence-guided flip selection'
+    purpose: 'Educational implementation of influence-function-based flip prioritisation'
+    inputs:
+      - 'Trained target model'
+      - 'Training dataset'
+      - 'Target test samples (adversary objective)'
+      - 'Budget: number of samples to flip'
+    outputs:
+      - 'Ranked list of training samples by influence magnitude'
+      - 'Recommended flip set (top-k by influence)'
+      - 'Estimated effect magnitude per flip'
+    implementation_notes: |
+      Single file /code/attacks/chapter_08/influence_function_prioritisation.py.
+      Single quotes throughout per book convention.
+      Uses LiSSA approximation by default; exact influence available for small models.
+      Dependencies: torch (for autograd); numpy.
+      Intended for defender benchmarking, not adversarial use; section 7 of file is explicit disclaimer.
+    usage: 'Generate harder attack variants for defence evaluation; demonstrate leverage insiders have over random-access adversaries'
+
+  deliverable_4_label_consistency_defence:
+    artifact: 'label_consistency_defence.py -- kNN agreement and fold disagreement defences'
+    purpose: 'Reference implementation of label-consistency defences for benchmarking against label flipping'
+    inputs:
+      - 'Training dataset (features X, labels y)'
+      - 'Defence: knn | cv_fold | combined'
+      - 'Defence parameters: k, threshold, n_folds'
+    outputs:
+      - 'Anomaly scores per training sample'
+      - 'Flagged samples at threshold'
+      - 'Defence metrics if ground-truth available: TPR, FPR, F1'
+    implementation_notes: |
+      Single file /code/defences/chapter_08/label_consistency_defence.py.
+      Single quotes throughout per book convention.
+      Dependencies: numpy, scikit-learn.
+      Includes standard benchmark harness for reproducibility.
+      Compatible with label_flipping_attack.py output format for benchmarking integration.
+    usage: 'Baseline defence against label flipping; integrated into Section 8.15 auditing pipeline as a first-layer check'
+
+  deliverable_5_defence_benchmark_harness:
+    artifact: 'label_flipping_benchmark.py -- end-to-end benchmarking harness'
+    purpose: 'Reproducibly benchmark label-consistency defences against label flipping variants'
+    inputs:
+      - 'Attack variant configurations (budget, selection strategy)'
+      - 'Defence configurations (k, threshold, n_folds)'
+      - 'Dataset and classifier family'
+    outputs:
+      - 'Benchmark report: TPR, FPR, F1 for each (attack, defence) pair'
+      - 'Post-defence model accuracy after flagged-sample removal'
+      - 'Cost metrics: defence compute time, training time'
+    implementation_notes: |
+      Single file /code/analysis/chapter_08/label_flipping_benchmark.py.
+      Single quotes throughout per book convention.
+      Produces reproducible results with fixed seeds.
+      Outputs are consistent with reference_materials.defence_benchmarking_reference expected results.
+    usage: 'Section 8.12 detection primitive comparison; security programme defence evaluation'
+
+common_mistakes:
+
+  mistake_1_treating_label_flipping_as_the_threat:
+    description: 'Treating label flipping as the primary training-time threat and considering the defence programme complete when label-consistency detection is deployed'
+    why_it_happens: |
+      Label flipping is the canonical attack in research literature; it appears in
+      virtually every introductory treatment of data poisoning. Students who learn
+      from those treatments internalise it as the representative attack. Once the
+      label-consistency defence is deployed and demonstrated against label flipping,
+      the programme feels complete -- the canonical attack is covered.
+    consequence: 'Detection programme that covers Q1 and Q4 attacks (label flipping variants) but not Q2 (clean-label, backdoor). The dominant threat class -- targeted integrity -- is entirely uncovered. The most economically rational adversary attacks pass undetected.'
+    correct_approach: 'Treat label flipping defence as the baseline, not the goal. The benchmark question is whether your detection primitive catches attacks in the Q2 quadrant that label-consistency defence misses. Sections 8.4 onward give you those attacks; Section 8.12 gives you the Q2 primitives.'
+
+  mistake_2_ignoring_per_class_monitoring:
+    description: 'Monitoring only aggregate accuracy regression, missing targeted label flipping (Q4)'
+    why_it_happens: |
+      Aggregate accuracy is a single number; it is easy to track, easy to gate releases
+      on, and easy to communicate. Per-class accuracy is a vector; it requires slightly
+      more infrastructure and produces more complex dashboards. The simpler monitoring
+      wins by default in most deployments.
+    consequence: 'Targeted label flipping against small-prevalence classes passes regression gates undetected. Security classifiers -- where targeted evasion is the primary threat motivation -- are especially exposed because adversaries specifically aim at the under-represented malicious class whose collapse barely moves aggregate metrics.'
+    correct_approach: 'Gate releases on per-class regression in addition to aggregate. The infrastructure change is small; the coverage gap it closes is substantial. For security classifiers specifically, treat per-class regression monitoring as mandatory.'
+
+  mistake_3_assuming_linear_budget_degradation:
+    description: 'Assuming random label flipping produces degradation linear in contamination rate for all classifier families'
+    why_it_happens: |
+      Logistic regression and similar simple classifiers do produce approximately
+      linear degradation. This is the case most often cited in textbooks. Practitioners
+      extrapolate to neural networks and other model families without verifying the
+      shape empirically.
+    consequence: 'Threshold-regime attacks on neural networks go undetected because the aggregate accuracy does not move at low contamination rates. Defenders conclude the model is clean when it is actually in the memorisation regime, with poisoned samples memorised as outliers but available to influence subsequent fine-tuning.'
+    correct_approach: 'Use family-specific budget-degradation curves (reference_materials.budget_curves_reference). For neural networks specifically, do not assume linearity; expect threshold behaviour and calibrate detection thresholds accordingly.'
+
+  mistake_4_underestimating_influence_guided_attacks:
+    description: 'Threat modelling assumes adversaries use random selection, underestimating the leverage available to insiders and rung-3 adversaries'
+    why_it_happens: |
+      Influence functions require white-box access; external adversaries rarely have
+      this access; therefore threat models focused on external threats weight
+      influence-guided attacks low. The mistake is extending this assumption to
+      insider and supply-chain threat models, where white-box access is often
+      available.
+    consequence: 'Defensive investment calibrated against random flipping budgets; insiders achieve attack effects at 1/3 the budget that defences were designed to catch. Insider threat coverage is effectively absent even when the programme believes it is present.'
+    correct_approach: 'Include influence-guided attacks in defence benchmarking for any threat model that includes insiders or rung-3 access. Detection thresholds should hold against the 2x-5x leverage advantage that influence-guided selection provides.'
+
+  mistake_5_neglecting_defence_false_positive_tuning:
+    description: 'Deploying label-consistency defences without calibrating false positive rate against real data quality signals'
+    why_it_happens: |
+      In research benchmarks, clean datasets are actually clean -- the only label
+      anomalies are the ones the attacker introduced. In production, datasets contain
+      annotation errors, ambiguous samples, and legitimate edge cases that produce
+      neighbourhood inconsistencies without being attacks. Defences that work in
+      research benchmarks produce unacceptable FPR in production.
+    consequence: 'Either the defence is ignored in production (too many false positives for the SOC to triage) or real attacks are missed (threshold set high enough to avoid FP flood, low enough TPR to miss influence-guided flipping). Neither outcome provides the coverage the programme believed it bought.'
+    correct_approach: 'Calibrate defence thresholds against production data distributions, not research benchmarks. Treat some baseline FPR as unavoidable (data quality is imperfect) and design triage workflows that handle it efficiently. Section 8.15 auditing pipeline incorporates this calibration explicitly.'
+
+section_summary:
+  compact: |
+    Label flipping is the simplest training data poisoning attack: adversary modifies
+    training labels while leaving features unchanged, corrupting the supervision signal.
+    Random flipping produces untargeted availability effect (Q1); targeted class-pair
+    flipping produces class-specific availability effect (Q4); influence-guided flipping
+    extracts 2x-5x more effect per flip given white-box access. Budget-degradation curves
+    are approximately linear for simple classifiers, threshold-like for neural networks,
+    graceful-then-sharp for tree ensembles. Label-consistency defences -- kNN agreement
+    and cross-validation fold disagreement -- catch label flipping at 80-95% detection
+    rates because flipping creates exactly the feature-neighbourhood inconsistency these
+    defences look for. The structural limitation is that label consistency assumes
+    poisoned samples are feature-neighbourhood outliers, which is true for label flipping
+    and false for clean-label attacks (Section 8.4). Label flipping is therefore the
+    defensive baseline, not the defensive goal: catching it at 90% is solving the
+    easiest problem. The test of defensive sophistication is performance on attacks
+    that bypass label-consistency entirely, which the next six sections systematically
+    introduce.
+
+  key_takeaways:
+    - 'Label flipping is the canonical baseline attack -- simplest to implement, simplest to detect'
+    - 'Three variants: random (Q1), targeted class-pair (Q4), influence-guided (higher leverage per flip)'
+    - 'Budget-degradation curves vary by classifier family; neural networks show threshold behaviour, not linear'
+    - 'Per-class accuracy monitoring is the key defence against targeted flipping variant'
+    - 'Label-consistency defence (kNN agreement, fold disagreement) achieves 80-95% detection against label flipping at realistic budgets'
+    - 'The defence fails for clean-label attacks (Section 8.4) because those attacks preserve the feature-neighbourhood consistency label flipping disrupts'
+    - 'Label flipping remains useful as defensive baseline; Q2 integrity attacks are the actual threat class'
+
+preview_section_04:
+  title: 'Clean-Label Poisoning: Bypassing Label Consistency Defences'
+  connection: |
+    Section 8.3 established label flipping and the label-consistency defences that
+    catch it. Section 8.4 begins the systematic escalation: clean-label poisoning
+    keeps labels correct -- the supervision signal is honest -- and corrupts features
+    instead. The label-neighbourhood consistency that flipping violates is preserved;
+    the feature-space collision is engineered. Poison Frogs (Shafahi et al. 2018)
+    is the canonical attack. The defence shifts from label space to feature space,
+    and the entire analytical tooling of Sections 8.12-8.13 (spectral signatures,
+    activation clustering, robust training) is developed against the clean-label
+    threat model. Section 8.4 is the pivot from easy to hard poisoning defence.
+
+metadata:
+  section_file: 'section_08_03_label_flipping.yaml'
+  chapter: 8
+  section: 3
+  author: 'Raghav Dinesh'
+  created: '2026-04-22'
+  book_version: '1.0'
+  estimated_pages: 6
+  estimated_word_count: 7300
+  cross_chapter_references:
+    - 'Section 8.1: training-time threat model (positions this attack in the broader context)'
+    - 'Section 8.2: poisoning taxonomy (label flipping populates Q1 and Q4)'
+    - 'Chapter 1 Sections 1.4-1.5: loss functions, gradient descent'
+    - 'Chapter 1 Section 1.8: evaluation metrics'
+    - 'Chapter 1 Section 1.9: kNN classifier'
+  forward_references:
+    - 'Section 8.4: clean-label poisoning defeats label-consistency defence introduced here'
+    - 'Section 8.5: BadNets backdoors combine label modifications with feature triggers'
+    - 'Section 8.12: detection primitives extend label-consistency reasoning to feature space'
+    - 'Section 8.13: defensive training reduces budget-effectiveness curves across attack families'
+    - 'Section 8.15: production auditing pipeline includes label-consistency as first-layer check'
+
