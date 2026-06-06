@@ -1,0 +1,1167 @@
+# section_11_13_production_architecture.yaml
+
+---
+document_info:
+  book: 'AI Security Mastery'
+  chapter: 11
+  section: 13
+  section_id: '11.13'
+  title: 'Production Detection Architecture Patterns'
+  filename: 'section_11_13_production_architecture.yaml'
+  part: 'III'
+  part_title: 'Detection Engineering for AI'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-05-30'
+  estimated_pages: 6
+
+section_overview:
+  one_line_summary: >
+    Three production architecture patterns — inline gateway, sidecar, and log-based SIEM
+    — each occupy a distinct position on the blocking/latency tradeoff; the hybrid
+    architecture combines all three so the gateway blocks, the sidecar flags without
+    latency cost, and the SIEM detects what neither can see in real time.
+  why_this_section_exists: |
+    Sections 11.02 through 11.12 built the detection framework: rules, coverage
+    measurement, FPR management, maturity model, engineering workflow, and hunting
+    procedure. Every element of that framework was designed as if the detection logic
+    runs in the seven-track inline gateway. But not every detection requirement fits
+    the inline pattern. Inline detection adds latency, requires synchronous resource
+    consumption, and is vulnerable to cascading failure — if the gateway crashes, model
+    inference may be unavailable. Some detection logic is better placed asynchronously,
+    where it cannot affect request latency or availability.
+
+    More fundamentally, a production detection system is not a single component. It is
+    an architecture. The choice of where to place each detection primitive — inline
+    before the model, alongside the model in a sidecar, or downstream in a SIEM — is
+    an architectural decision with implications for latency, blocking capability, alert
+    latency, and failure mode. Making that decision without a framework leads to ad-hoc
+    placement that optimises for one concern (usually "make it block") while ignoring
+    the others (usually "what happens when it breaks").
+
+    This section provides that framework: three named patterns with precise tradeoff
+    profiles, a hybrid architecture that combines them, integration points for each
+    pattern, failure mode design principles for each layer, and the observability
+    instrumentation that makes the detection system itself observable — because a
+    detection system that silently fails is worse than no detection system.
+  position_in_chapter: >
+    Section 11.13 is the architectural synthesis section. It is the last technical
+    section before the chapter summary (11.14). All of the framework elements from
+    Sections 11.01 through 11.12 are now positioned within a production architecture.
+    Section 11.14 scores the final maturity state and maps Chapter 11 to Chapters 12–14.
+
+learning_objectives:
+  - 'Characterise the three production detection patterns by blocking capability, latency profile, alert latency, and failure mode'
+  - 'Explain why the inline gateway is the only pattern that can block adversarial inputs before model inference'
+  - 'Map the seven gateway tracks to their appropriate pattern in a hybrid architecture, with rationale for each placement decision'
+  - 'Design the integration points for an inline gateway: pre-inference hook, post-inference hook, output validation layer, and session log streaming'
+  - 'Apply fail-open vs fail-closed design to each detection layer and explain the security/availability tradeoff each choice makes'
+  - 'List eight observability signals that must be instrumented for a detection system, and explain what failure mode each signal detects'
+  - 'Describe the Chapter 14 production deployment topics that extend Section 11.13''s architectural patterns to full implementation'
+
+prerequisites:
+  required:
+    - 'Section 11.03: four-layer detection model; each layer placed in a pattern here'
+    - 'Section 11.02: DaC pipeline; the CI/CD pipeline deploys to whichever pattern is chosen'
+    - 'Section 11.09: FPR management; thresholds per track inform the blocking/flagging decision in the hybrid architecture'
+  helpful:
+    - 'Basic distributed systems concepts: sidecar pattern, async message queues, circuit breakers'
+    - 'Chapter 14 preview: latency budget, throughput scaling, Kubernetes deployment'
+
+prose_content:
+
+  part_1_three_patterns:
+    heading: 'Three Production Patterns: Blocking, Flagging, and Retrospective'
+    body: |
+      Every production detection deployment uses one or more of three architectural
+      patterns. The patterns differ on a single critical axis: when does the detection
+      logic run relative to model inference?
+
+      Pattern 1 — Inline API Gateway. Detection logic runs synchronously in the
+      request path, before model inference. The gateway receives the request, applies
+      all configured detection tracks, and makes a block/flag/pass decision before
+      the request reaches the model. If the decision is block, the model never sees
+      the request. If the decision is pass or flag, the request proceeds to inference.
+      The seven-track gateway is this pattern.
+
+      The inline gateway is the only pattern that can block. If the security requirement
+      is "adversarial inputs must not reach the model," the detection logic must be
+      inline. There is no async equivalent of blocking — by the time async detection
+      fires, the request has already been processed.
+
+      The cost of inline detection: latency. Every detection operation adds to the
+      request latency budget. A gateway that runs seven tracks with ML inference at L3
+      adds 15–50ms before every model call. For a model serving endpoint with a 200ms
+      SLA, this is 7–25% of the latency budget consumed by detection before inference
+      begins.
+
+      Pattern 2 — Sidecar Detection. Detection logic runs asynchronously alongside
+      the model serving container. The request reaches the model directly; a copy of
+      the request (and optionally the response) is streamed to the sidecar for analysis.
+      The sidecar cannot block — it sees the request after model inference has already
+      begun or completed. It can flag: produce an alert that goes to the SOC or detection
+      engineering queue.
+
+      The sidecar adds zero latency to the request path. It can run expensive detection
+      logic — ML inference, embedding computation, session state analysis — without
+      affecting the model''s response time. The sidecar is the correct pattern for
+      moderate-confidence detections that should not affect latency but should still
+      produce alerts.
+
+      The cost of sidecar detection: it cannot block, and it requires async infrastructure
+      (a message queue or streaming pipeline between the model serving component and
+      the sidecar). The sidecar also needs to handle backpressure: if detection is slower
+      than inference, the queue grows and alert latency increases.
+
+      Pattern 3 — Log-Based SIEM Detection. Detection logic runs fully asynchronously
+      against collected logs in a SIEM. Logs are written during or after inference,
+      collected by the SIEM ingestion pipeline, and matched against Sigma rules that
+      the SIEM compiles to its native query language. Detection fires minutes to hours
+      after the event.
+
+      SIEM detection adds zero latency to the request path and has no deployment
+      dependency on the model serving infrastructure — it reads logs that already exist.
+      It supports the most complex detection logic: cross-session correlation, time-window
+      aggregation across arbitrary periods, and joint analysis of request and response
+      logs that the inline gateway never sees together.
+
+      The cost: high alert latency (minutes to hours), no blocking capability, and
+      detection effectiveness bounded by log completeness. If a field is not logged,
+      it cannot be matched. If logs are delayed or dropped, the detection window is
+      blind.
+
+  part_2_hybrid_architecture:
+    heading: 'The Hybrid Architecture: Gateway + Sidecar + SIEM'
+    body: |
+      No single pattern is sufficient for a production AI security programme. The hybrid
+      architecture combines all three, assigning each detection primitive to the pattern
+      that best fits its latency requirement, confidence level, and temporal scope:
+
+      Inline gateway: high-confidence, low-latency detections that must block. Track 1
+      (keyword injection, L1) and Track 4 (label distribution anomaly in training calls,
+      L1) run inline and block. Their L1 signature rules are fast, deterministic, and
+      have FPR targets at 1% — low enough to tolerate blocking without excessive false
+      blocks. Track 3 (semantic gating, L2) runs inline and flags rather than blocks:
+      the 5% FPR target is acceptable for flagging but too high for blocking. The inline
+      gateway is responsible for the binary block/pass decision on every request; flagging
+      decisions pass through to the application but are logged for sidecar and SIEM
+      consumption.
+
+      Sidecar: moderate-confidence detections and ML inference that cannot afford to
+      block but should produce near-real-time alerts. Track 2''s jailbreak classifier
+      (L3 ML), Track 6 (adversarial entropy heuristic, L2), and Track 7''s compound
+      squeezer+classifier (L2+L3) run in the sidecar. These tracks are too expensive
+      to run synchronously on every request in the inline path — the ML inference alone
+      adds 15–30ms. In the sidecar, they run asynchronously on a copy of the request,
+      producing alerts within 30–120 seconds of the request. The sidecar also runs the
+      Chapter 12 ML detectors when they are deployed.
+
+      SIEM: stateful and campaign-level detection. Track 5 (model extraction session
+      accumulator, L4) runs in the SIEM. The accumulator requires cross-session state
+      that is most naturally maintained in a SIEM''s windowing query engine. The SIEM
+      also runs the Section 11.12 threat hunting queries and the Section 11.07
+      multi-event correlation rules. Alert latency from the SIEM is 5–60 minutes for
+      windowed aggregation rules and up to 24 hours for the detection pattern that
+      requires 500 queries to accumulate.
+
+      The hybrid assignment by gateway track:
+      Inline (block): Track 1, Track 4.
+      Inline (flag): Track 3.
+      Sidecar (flag, near-real-time): Track 2 (ML component), Track 6, Track 7.
+      SIEM (alert, windowed): Track 5, correlation rules, threat hunting queries.
+      Track 2 (Sigma component) runs inline as a fast L1 check; the ML component
+      runs in the sidecar as a follow-up for prompts that pass the L1 check.
+
+  part_3_integration_points:
+    heading: 'Integration Points: Pre-Inference, Post-Inference, Session Streaming'
+    body: |
+      Four integration points connect the detection system to the model serving
+      infrastructure. Each integration point is a hook in the request/response lifecycle:
+
+      Integration Point 1 — Pre-inference hook. Fires before the request reaches the
+      model. The inline gateway is attached here. The hook receives the full request
+      object (prompt, user_id, session_id, model_name, token_count) and returns a
+      decision: block (with reason), flag (with score), or pass. The model serving
+      component must be instrumented to call the pre-inference hook before every request
+      and to honour the block decision without calling the model. If the hook times out
+      or throws an exception, the fail-open/fail-closed policy determines what happens.
+
+      Integration Point 2 — Post-inference hook. Fires after model inference completes,
+      before the response is returned to the client. The output validation layer (Chapter 14)
+      attaches here. The hook receives the request and the model response together, enabling
+      detection of response-level signals (code injection patterns, PII, system prompt
+      reflection) that the pre-inference hook cannot see. The post-inference hook can also
+      block: it can replace the response with an error before the client receives it.
+      Post-inference hooks add latency for every request; Section 11.13 treats the output
+      validation layer as a sidecar concern in architectures where post-inference latency
+      is unacceptable, with the tradeoff that a sidecar cannot suppress the response.
+
+      Integration Point 3 — Session log streaming. The model serving component emits
+      structured JSON logs for every request and response, streamed to the sidecar and
+      the SIEM ingestion pipeline. The log schema follows the ai_gateway and ai_session
+      field taxonomy from Section 11.06. Schema agreement between the model serving team
+      and the detection engineering team is enforced by ai_log_field_taxonomy.py from
+      Section 11.06. Fields emitted incorrectly (wrong name, wrong type) cause Sigma
+      rules to silently not fire — the most insidious failure mode in production detection.
+
+      Integration Point 4 — Sidecar message queue. The sidecar subscribes to a message
+      queue (or reads from the log stream directly) to receive a copy of every request.
+      The queue provides backpressure protection: if the sidecar falls behind, the queue
+      holds messages rather than dropping them, and alert latency increases while the
+      sidecar catches up. The queue must be sized for peak traffic × maximum sidecar
+      processing time. For a gateway processing 1,000 requests/second and a sidecar
+      processing time of 200ms per request, the queue must handle 200 messages in flight
+      simultaneously at steady state.
+
+  part_4_failure_modes:
+    heading: 'Failure Mode Design: Fail-Open, Fail-Closed, and Circuit Breakers'
+    body: |
+      Every detection component in a production architecture will fail: the ML model
+      will time out under load, the embedding service will be unavailable during a
+      deployment, the sidecar queue will fill during a traffic spike. Failure mode
+      design specifies what happens to each detection component when it fails. The
+      choice is between fail-open (allow the request to proceed without detection) and
+      fail-closed (reject the request when detection is unavailable).
+
+      Fail-open vs fail-closed by layer:
+
+      L1 Signature rules (Track 1, Track 4): fail-closed. These are fast, deterministic
+      rules with no external dependencies. If the rule engine crashes, the detection
+      system has a bug — this is not an expected failure mode. Fail-closed here means
+      blocking all requests until the rule engine is restored, which is the correct
+      response to a complete failure of the detection foundation.
+
+      L2 Heuristic rules (Track 3, Track 6, Track 7 squeezer): fail-open with logging.
+      Heuristic computation may time out under extreme load (embedding computation takes
+      2–5ms; under load, this can exceed the latency budget). If the heuristic times out,
+      the request passes with a logged warning: gateway_action=pass, detection_timeout=true.
+      The SIEM collects these timeout events; a spike in timeouts is an alert that the
+      detection system is under stress.
+
+      L3 ML inference (Track 2 classifier, Track 7 adversarial classifier, sidecar):
+      fail-open. ML inference is the most latency-variable component and the most
+      likely to time out. Fail-closed for ML inference would cause availability impact
+      during any spike in model serving load. Fail-open with timeout logging is the
+      correct policy; the SIEM alert on timeout spikes provides the visibility needed
+      to investigate.
+
+      L4 Session accumulator (Track 5, SIEM): fail-open by design. SIEM-based detection
+      always has alert latency; the failure mode of a SIEM query timing out is that the
+      alert fires late, not that the request is blocked. No availability impact.
+
+      Circuit breakers: the gateway implements a circuit breaker per detection track.
+      If Track 3 times out more than 5 times in 60 seconds, the circuit opens: Track 3
+      is bypassed for the next 60 seconds, all requests pass through as if Track 3 did
+      not exist, and the SIEM receives a circuit_open event for Track 3. After 60
+      seconds, the circuit enters half-open state: one in ten requests tests Track 3;
+      if it succeeds, the circuit closes; if it fails again, the open period extends.
+      Circuit breakers prevent a slow detection component from cascading into full
+      gateway unavailability.
+
+  part_5_observability:
+    heading: 'Observability of the Detection System Itself'
+    body: |
+      The detection system that monitors the model must itself be monitored. A detection
+      system that silently fails — rules that stop firing, ML models that time out without
+      alerting, a sidecar queue that fills without notification — is worse than no detection
+      system, because it provides false assurance. Eight observability signals are required
+      for a production detection system:
+
+      Signal 1 — Alert rate per rule (per-minute rolling count). A rule that fires at
+      zero rate for 30 minutes when it previously fired regularly has stopped working.
+      Zero-rate alerts are as important as high-rate alerts.
+
+      Signal 2 — Detection latency per component (P50/P95/P99 histogram). Latency
+      drift signals resource pressure before the component fails. Track 3 latency
+      creeping from 4ms to 12ms over a week indicates embedding service degradation
+      that will eventually cause timeouts.
+
+      Signal 3 — Circuit breaker state per track (open/closed/half-open). A circuit
+      that is persistently opening and closing indicates a detection component that is
+      marginal under current load — a time bomb that will cause availability impact
+      when load increases.
+
+      Signal 4 — Timeout rate per component. Timeouts that are not surfaced as alerts
+      represent silent detection gaps. Every timeout is a request that passed without
+      full detection coverage.
+
+      Signal 5 — Queue depth (sidecar queue size). Queue depth growth indicates the
+      sidecar is falling behind. Alert threshold: queue depth exceeding 60-second
+      equivalent of peak request volume.
+
+      Signal 6 — False positive rate per rule (7-day rolling, from Section 11.09).
+      Already instrumented by false_positive_manager.py; this signal feeds both the
+      FPR dashboard and the detection system health dashboard.
+
+      Signal 7 — Coverage regression indicator (from Section 11.05 attck_coverage_heatmap.py).
+      Run in CI on every merge; also run daily in staging to catch coverage regressions
+      from threshold drift or log schema changes that are not caught by the CI run alone.
+
+      Signal 8 — Log field completeness rate. For each required log field in the
+      ai_gateway taxonomy (Section 11.06), the fraction of requests for which the field
+      is present and correctly typed. A field completeness rate below 99% means Sigma
+      rules that depend on that field are firing at reduced effectiveness. This is the
+      signal that catches log schema drift — the model serving team changes a field name
+      without coordinating with the detection team, and the Sigma rule silently stops
+      working.
+
+  part_6_chapter14_preview:
+    heading: 'Chapter 14: Production Deployment Deep-Dive'
+    body: |
+      Section 11.13 establishes the architectural framework. Chapter 14 implements it
+      at production scale. The key topics Chapter 14 adds beyond the framework established
+      here:
+
+      Latency budget analysis. Chapter 14 characterises the end-to-end latency budget
+      for the hybrid architecture under realistic production load: model serving baseline,
+      inline detection overhead per track, sidecar queue latency, and output validation
+      layer overhead. It produces a latency decomposition diagram showing which components
+      consume which fraction of the total budget and where optimisation is most valuable.
+
+      Throughput scaling. The inline gateway from Chapter 11 is a single-process Python
+      service. Chapter 14 adds horizontal scaling: a stateless gateway design that allows
+      N gateway instances behind a load balancer, with the session state (Track 5
+      accumulator) moved to a shared Redis store. The Chapter 14 gateway processes
+      10,000+ requests per second across the scaled fleet.
+
+      Cost modelling. Each detection track has a cost per request in terms of compute
+      and memory. Chapter 14 provides a cost model that allows the detection engineer
+      to compute the monthly infrastructure cost of each track at a given request volume,
+      and to make informed tradeoffs between detection coverage and infrastructure cost.
+
+      Kubernetes deployment. Chapter 14 provides Helm charts and Kubernetes manifests
+      for deploying the inline gateway, the sidecar, and the SIEM integration pipeline
+      in a production Kubernetes cluster. Includes health checks, readiness probes, and
+      resource limits for each component.
+
+      Output validation layer (full implementation). The Chapter 14 output validation
+      layer implements the post-inference hook with a PII scanner, code injection
+      detector, system prompt reflection detector, and response entropy monitor — all
+      four components that close the LLM02, LLM06, and LLM08 OWASP gaps identified
+      in Section 11.11.
+
+reference_materials:
+
+  table_1_pattern_comparison:
+    title: 'Three Production Architecture Patterns: Comparison'
+    description: 'Blocking capability, latency profile, alert latency, and failure mode per pattern'
+    columns:
+      - 'Pattern'
+      - 'Blocking'
+      - 'Request Latency Impact'
+      - 'Alert Latency'
+      - 'Failure Mode'
+      - 'Best For'
+    rows:
+      - ['Inline API Gateway',
+         'Yes — only blocking pattern',
+         'High: adds all detection latency synchronously; every track adds to SLA',
+         'Immediate (pre-inference)',
+         'Gateway crash → model unavailable or fail-open depending on policy',
+         'High-confidence L1/L2 rules that must block; real-time decisions']
+      - ['Sidecar (async)',
+         'No — flag only',
+         'Zero — detection runs off the request path',
+         'Near-real-time: 30–120 seconds after request',
+         'Sidecar crash or queue fill → detection gap; no model impact',
+         'Moderate-confidence ML rules and heuristics; output inspection without latency cost']
+      - ['Log-based SIEM',
+         'No — alert only',
+         'Zero — reads collected logs',
+         'Minutes to hours; windowed aggregation may take 24+ hours',
+         'SIEM ingestion delay → alert latency increase; no model impact',
+         'Campaign-level stateful detection; cross-session correlation; retrospective analysis']
+
+  table_2_hybrid_track_placement:
+    title: 'Hybrid Architecture: Seven-Track Gateway Placement'
+    description: 'Where each track runs in the hybrid architecture, with decision rationale'
+    columns:
+      - 'Track'
+      - 'Pattern'
+      - 'Action'
+      - 'Rationale'
+      - 'Fail Mode'
+    rows:
+      - ['Track 1 — Direct Injection (Sigma)', 'Inline', 'Block',
+         'L1 keyword rules are microsecond-fast; 1% FPR acceptable for blocking; must prevent injection from reaching model',
+         'Fail-closed: engine failure → all requests blocked until restored']
+      - ['Track 2 — Jailbreak (Sigma L1 component)', 'Inline', 'Flag',
+         'Fast L1 keyword check; 1% FPR too high to block (jailbreak attempts may be legitimate security research); flags for sidecar follow-up',
+         'Fail-open: timeout → request passes with detection_timeout flag']
+      - ['Track 2 — Jailbreak (ML classifier L3)', 'Sidecar', 'Flag',
+         'ML inference adds 15ms; too expensive for synchronous blocking path; near-real-time alert is sufficient',
+         'Fail-open: sidecar queue full → alert delayed; no model impact']
+      - ['Track 3 — Semantic Gating', 'Inline', 'Flag',
+         '5% FPR too high to block; embedding computation adds 4ms but is in the latency budget; inline flag allows downstream contextual override',
+         'Fail-open: timeout → request passes with detection_timeout flag']
+      - ['Track 4 — Poisoning Monitor', 'Inline', 'Block (training API)',
+         'Training API calls are low volume; L1 label distribution anomaly is fast; must prevent malicious training data from reaching pipeline',
+         'Fail-closed: training API unavailable if rule engine crashes']
+      - ['Track 5 — Extraction Signals (Sigma)', 'Inline', 'Flag',
+         'Per-request Sigma rule is fast; flags suspicious individual requests for session accumulator correlation',
+         'Fail-open: timeout → request passes with detection_timeout flag']
+      - ['Track 5 — Extraction Signals (session accumulator)', 'SIEM', 'Alert',
+         'Session accumulation requires cross-request state; SIEM windowing engine is natural home; alert latency acceptable for campaign detection',
+         'Alert latency increases if SIEM falls behind; no model impact']
+      - ['Track 6 — Adversarial Entropy', 'Sidecar', 'Flag',
+         '0.5% FPR and 2ms entropy computation; borderline for inline but moved to sidecar to protect Track 7 latency budget',
+         'Fail-open: sidecar queue full → alert delayed; no model impact']
+      - ['Track 7 — Squeezer+Classifier', 'Sidecar', 'Flag',
+         'Squeezer (8ms) + classifier (5ms) totals 13ms; too expensive for inline at scale; sidecar provides near-real-time coverage without latency cost',
+         'Fail-open: sidecar queue full → alert delayed; no model impact']
+
+  table_3_observability_signals:
+    title: 'Detection System Observability Signals'
+    description: 'Eight required signals, what each measures, the alert threshold, and what failure each detects'
+    columns:
+      - 'Signal'
+      - 'Metric Type'
+      - 'Alert Threshold'
+      - 'Failure Mode Detected'
+    rows:
+      - ['Alert rate per rule', 'Counter (per-min rolling)',
+         'Zero rate for > 30 min when rule previously fired regularly',
+         'Rule silently stopped firing; engine bug; schema drift broke field match']
+      - ['Detection latency per component (P95)', 'Histogram (ms)',
+         'P95 > 2× 7-day baseline for any component',
+         'Resource pressure building toward timeout threshold; embedding service degradation']
+      - ['Circuit breaker state per track', 'State metric (open/closed/half-open)',
+         'Any track in open state for > 5 min',
+         'Detection component marginal under load; will fail completely at next traffic spike']
+      - ['Timeout rate per component', 'Counter (per-min)',
+         '> 1% of requests timing out on any component',
+         'Silent detection gaps: requests passing without full coverage']
+      - ['Sidecar queue depth', 'Gauge (message count)',
+         '> 60-second equivalent of peak request volume',
+         'Sidecar falling behind; alert latency increasing; eventual queue drop']
+      - ['FPR per rule (7-day rolling)', 'Gauge (ratio)',
+         '> FPR target × 1.2 (20% relative breach)',
+         'Rule miscalibrated post-deployment; traffic pattern shift']
+      - ['Coverage regression indicator', 'Binary (pass/fail from CI diff)',
+         'Any technique score decrease in daily CI diff run',
+         'Rule change reduced true positive coverage; threshold drift; schema change']
+      - ['Log field completeness rate', 'Gauge (fraction per field)',
+         '< 99% completeness for any required taxonomy field',
+         'Log schema drift: model serving team changed field name; Sigma rule silently stopped matching']
+
+deliverables:
+
+  deliverable_1:
+    id: 'D11.13.1'
+    filename: 'production_architecture_patterns.py'
+    description: >
+      Encodes the three production detection architecture patterns as a structured
+      comparison, with per-track placement rationale for the seven-track gateway in
+      the hybrid architecture. Produces a deployment specification showing which
+      component runs where and what its failure mode is.
+    language: 'python'
+    python_version: '3.12'
+    dependencies:
+      - 'dataclasses (stdlib)'
+    code: |
+      #!/usr/bin/env python3
+      '''production_architecture_patterns.py
+      Three production detection architecture patterns with trade-off analysis.
+      Seven-track gateway placement in the hybrid architecture.
+      Chapter 11, Section 11.13 — AI Security Mastery
+      Author: Raghav Dinesh | github: ruwgxo
+
+      Usage:
+        python3 production_architecture_patterns.py
+        python3 production_architecture_patterns.py --hybrid
+        python3 production_architecture_patterns.py --observability
+      '''
+
+      from __future__ import annotations
+      import argparse
+      import sys
+      from dataclasses import dataclass
+      from enum import Enum
+
+      # ---------------------------------------------------------------------------
+      # Enumerations
+      # ---------------------------------------------------------------------------
+
+      class Pattern(Enum):
+          INLINE_GATEWAY = 'inline_gateway'
+          SIDECAR = 'sidecar'
+          SIEM = 'siem'
+
+      class Action(Enum):
+          BLOCK = 'block'
+          FLAG = 'flag'
+          ALERT = 'alert'
+
+      class FailMode(Enum):
+          FAIL_CLOSED = 'fail_closed'
+          FAIL_OPEN = 'fail_open'
+
+      # ---------------------------------------------------------------------------
+      # Data models
+      # ---------------------------------------------------------------------------
+
+      @dataclass
+      class ArchitecturePattern:
+          pattern: Pattern
+          name: str
+          can_block: bool
+          request_latency_impact: str
+          alert_latency: str
+          failure_mode_description: str
+          best_for: str
+          infrastructure_requirement: str
+
+      @dataclass
+      class TrackPlacement:
+          track_id: int
+          track_name: str
+          component: str               # which sub-component of the track
+          pattern: Pattern
+          action: Action
+          fail_mode: FailMode
+          latency_ms: float            # synchronous latency if inline; 0.0 if sidecar/SIEM
+          rationale: str
+          fail_description: str
+
+      @dataclass
+      class ObservabilitySignal:
+          signal_name: str
+          metric_type: str
+          alert_threshold: str
+          failure_detected: str
+
+      # ---------------------------------------------------------------------------
+      # Pattern registry
+      # ---------------------------------------------------------------------------
+
+      PATTERNS: list[ArchitecturePattern] = [
+          ArchitecturePattern(
+              pattern=Pattern.INLINE_GATEWAY,
+              name='Inline API Gateway',
+              can_block=True,
+              request_latency_impact='High — all inline detection latency is synchronous',
+              alert_latency='Immediate (pre-inference decision)',
+              failure_mode_description=(
+                  'Gateway crash → model unavailable (fail-closed) or all requests pass '
+                  'undetected (fail-open) depending on policy per track'
+              ),
+              best_for='High-confidence L1/L2 rules that must block; real-time decisions',
+              infrastructure_requirement='Lightweight Python service in request path; stateless except Track 5 hook',
+          ),
+          ArchitecturePattern(
+              pattern=Pattern.SIDECAR,
+              name='Sidecar (Async)',
+              can_block=False,
+              request_latency_impact='Zero — runs off the request path',
+              alert_latency='Near-real-time: 30–120 seconds after request',
+              failure_mode_description=(
+                  'Sidecar crash or queue fill → detection gap with no model availability impact; '
+                  'queue depth alert provides early warning'
+              ),
+              best_for='Moderate-confidence ML rules and heuristics; output inspection without latency cost',
+              infrastructure_requirement='Async worker service; message queue (Kafka, Redis Streams, or SQS); stateless processing',
+          ),
+          ArchitecturePattern(
+              pattern=Pattern.SIEM,
+              name='Log-Based SIEM',
+              can_block=False,
+              request_latency_impact='Zero — reads collected logs',
+              alert_latency='Minutes to hours; windowed aggregation may take 24+ hours',
+              failure_mode_description=(
+                  'SIEM ingestion delay → alert latency increase; '
+                  'log field errors → silent detection gaps; no model availability impact'
+              ),
+              best_for='Campaign-level stateful detection; cross-session correlation; retrospective analysis',
+              infrastructure_requirement='SIEM platform (Elastic, Splunk, Datadog); structured log ingestion; Sigma backend compiler',
+          ),
+      ]
+
+      # ---------------------------------------------------------------------------
+      # Hybrid placement registry
+      # ---------------------------------------------------------------------------
+
+      TRACK_PLACEMENTS: list[TrackPlacement] = [
+          TrackPlacement(
+              track_id=1, track_name='Direct Injection Detection',
+              component='Sigma keyword rule',
+              pattern=Pattern.INLINE_GATEWAY, action=Action.BLOCK,
+              fail_mode=FailMode.FAIL_CLOSED,
+              latency_ms=0.05,
+              rationale='L1 rules are microsecond-fast; 1% FPR acceptable for blocking; must prevent injection reaching model.',
+              fail_description='Engine failure → all requests blocked until rule engine restored.',
+          ),
+          TrackPlacement(
+              track_id=2, track_name='Jailbreak Detection (Sigma L1)',
+              component='Keyword Sigma rule',
+              pattern=Pattern.INLINE_GATEWAY, action=Action.FLAG,
+              fail_mode=FailMode.FAIL_OPEN,
+              latency_ms=0.05,
+              rationale='Fast L1 check; 1% FPR too high to block without analyst review; flags for sidecar ML follow-up.',
+              fail_description='Timeout → request passes with detection_timeout=true logged for SIEM.',
+          ),
+          TrackPlacement(
+              track_id=2, track_name='Jailbreak Detection (ML classifier L3)',
+              component='Jailbreak embedding classifier',
+              pattern=Pattern.SIDECAR, action=Action.FLAG,
+              fail_mode=FailMode.FAIL_OPEN,
+              latency_ms=0.0,
+              rationale='ML inference adds 15ms; too expensive for synchronous path; near-real-time alert is sufficient.',
+              fail_description='Queue full → alert delayed; no model availability impact.',
+          ),
+          TrackPlacement(
+              track_id=3, track_name='Semantic Similarity Gating',
+              component='Cosine similarity gate',
+              pattern=Pattern.INLINE_GATEWAY, action=Action.FLAG,
+              fail_mode=FailMode.FAIL_OPEN,
+              latency_ms=4.0,
+              rationale='5% FPR too high to block; 4ms embedding within latency budget; inline flag enables contextual override.',
+              fail_description='Timeout → request passes with detection_timeout=true logged.',
+          ),
+          TrackPlacement(
+              track_id=4, track_name='Data Poisoning Monitor',
+              component='Label distribution Sigma rule',
+              pattern=Pattern.INLINE_GATEWAY, action=Action.BLOCK,
+              fail_mode=FailMode.FAIL_CLOSED,
+              latency_ms=0.05,
+              rationale='Training API calls are low-volume; L1 rule is fast; must prevent malicious data reaching training pipeline.',
+              fail_description='Engine failure → training API unavailable until restored.',
+          ),
+          TrackPlacement(
+              track_id=5, track_name='Model Extraction Signals (per-request Sigma)',
+              component='Per-request extraction Sigma rule',
+              pattern=Pattern.INLINE_GATEWAY, action=Action.FLAG,
+              fail_mode=FailMode.FAIL_OPEN,
+              latency_ms=0.05,
+              rationale='Fast L1 flag; identifies suspicious individual requests for session accumulator correlation in SIEM.',
+              fail_description='Timeout → request passes with detection_timeout=true logged.',
+          ),
+          TrackPlacement(
+              track_id=5, track_name='Model Extraction Signals (session accumulator)',
+              component='Session state accumulator',
+              pattern=Pattern.SIEM, action=Action.ALERT,
+              fail_mode=FailMode.FAIL_OPEN,
+              latency_ms=0.0,
+              rationale='Cross-request state requires SIEM windowing engine; alert latency acceptable for campaign detection.',
+              fail_description='SIEM ingestion delay → alert latency increase; no model availability impact.',
+          ),
+          TrackPlacement(
+              track_id=6, track_name='Adversarial Input Detection',
+              component='Entropy heuristic',
+              pattern=Pattern.SIDECAR, action=Action.FLAG,
+              fail_mode=FailMode.FAIL_OPEN,
+              latency_ms=0.0,
+              rationale='0.5% FPR and 2ms compute; moved to sidecar to protect inline latency budget for Track 3 and Track 7.',
+              fail_description='Queue full → alert delayed; no model availability impact.',
+          ),
+          TrackPlacement(
+              track_id=7, track_name='Adversarial Detection Ensemble',
+              component='Squeezer (L2) + adversarial classifier (L3)',
+              pattern=Pattern.SIDECAR, action=Action.FLAG,
+              fail_mode=FailMode.FAIL_OPEN,
+              latency_ms=0.0,
+              rationale='Squeezer (8ms) + classifier (5ms) = 13ms synchronous; too expensive for inline at scale; sidecar provides near-real-time.',
+              fail_description='Queue full → alert delayed; no model availability impact.',
+          ),
+      ]
+
+      # ---------------------------------------------------------------------------
+      # Observability signals
+      # ---------------------------------------------------------------------------
+
+      OBSERVABILITY_SIGNALS: list[ObservabilitySignal] = [
+          ObservabilitySignal(
+              'Alert rate per rule', 'Counter (per-min rolling)',
+              'Zero rate > 30 min when rule previously fired',
+              'Rule silently stopped firing: engine bug or schema drift'),
+          ObservabilitySignal(
+              'Detection latency P95 per component', 'Histogram (ms)',
+              'P95 > 2× 7-day baseline',
+              'Resource pressure building toward timeout threshold'),
+          ObservabilitySignal(
+              'Circuit breaker state per track', 'State (open/closed/half-open)',
+              'Any track open > 5 min',
+              'Detection component marginal under load'),
+          ObservabilitySignal(
+              'Timeout rate per component', 'Counter (per-min)',
+              '> 1% of requests timing out',
+              'Silent detection gaps: requests passing without coverage'),
+          ObservabilitySignal(
+              'Sidecar queue depth', 'Gauge (message count)',
+              '> 60s equivalent of peak request volume',
+              'Sidecar falling behind; alert latency increasing'),
+          ObservabilitySignal(
+              'FPR per rule (7-day rolling)', 'Gauge (ratio)',
+              '> FPR target × 1.2',
+              'Miscalibrated rule or traffic pattern shift'),
+          ObservabilitySignal(
+              'Coverage regression indicator', 'Binary (CI diff pass/fail)',
+              'Any technique score decrease in daily diff run',
+              'Rule change reduced TP coverage or schema change broke field match'),
+          ObservabilitySignal(
+              'Log field completeness rate', 'Gauge (fraction per field)',
+              '< 99% for any required taxonomy field',
+              'Log schema drift: Sigma rule silently stopped matching'),
+      ]
+
+      # ---------------------------------------------------------------------------
+      # Reports
+      # ---------------------------------------------------------------------------
+
+      def print_pattern_comparison(patterns: list[ArchitecturePattern]) -> None:
+          print('\nProduction Detection Architecture Patterns\n')
+          for p in patterns:
+              block_str = 'YES — only blocking pattern' if p.can_block else 'NO — flag/alert only'
+              print(f'Pattern: {p.name}')
+              print(f'  Can block:          {block_str}')
+              print(f'  Latency impact:     {p.request_latency_impact}')
+              print(f'  Alert latency:      {p.alert_latency}')
+              print(f'  Failure mode:       {p.failure_mode_description}')
+              print(f'  Best for:           {p.best_for}')
+              print(f'  Infrastructure:     {p.infrastructure_requirement}')
+              print()
+
+      def print_hybrid_placement(placements: list[TrackPlacement]) -> None:
+          print('\nHybrid Architecture — Seven-Track Gateway Placement\n')
+          print(f'{"Track":<5} {"Component":<38} {"Pattern":<16} {"Action":<8} {"Fail":<12} {"Lat (ms)":<10} Rationale')
+          print('-' * 130)
+          for tp in placements:
+              pattern_str = tp.pattern.value.replace('_', ' ')
+              lat_str = f'{tp.latency_ms:.2f}' if tp.pattern == Pattern.INLINE_GATEWAY else 'async'
+              rat_short = (tp.rationale[:45] + '...') if len(tp.rationale) > 45 else tp.rationale
+              print(f'T{tp.track_id:<4} {tp.component:<38} {pattern_str:<16} {tp.action.value:<8} '
+                    f'{tp.fail_mode.value:<12} {lat_str:<10} {rat_short}')
+
+          inline = [tp for tp in placements if tp.pattern == Pattern.INLINE_GATEWAY]
+          sidecar = [tp for tp in placements if tp.pattern == Pattern.SIDECAR]
+          siem = [tp for tp in placements if tp.pattern == Pattern.SIEM]
+          inline_lat = sum(tp.latency_ms for tp in inline)
+          print(f'\nInline gateway total synchronous latency (all components): ~{inline_lat:.2f}ms')
+          print(f'Sidecar components: {len(sidecar)} (async; zero request latency)')
+          print(f'SIEM components:    {len(siem)} (async; minutes-to-hours alert latency)')
+
+      def print_observability_dashboard(signals: list[ObservabilitySignal]) -> None:
+          print('\nDetection System Observability Signals\n')
+          print(f'{"Signal":<40} {"Type":<30} {"Alert Threshold":<40} Failure Detected')
+          print('-' * 150)
+          for s in signals:
+              sig_short = (s.signal_name[:38] + '..') if len(s.signal_name) > 38 else s.signal_name
+              type_short = (s.metric_type[:28] + '..') if len(s.metric_type) > 28 else s.metric_type
+              thresh_short = (s.alert_threshold[:38] + '..') if len(s.alert_threshold) > 38 else s.alert_threshold
+              fail_short = (s.failure_detected[:50] + '..') if len(s.failure_detected) > 50 else s.failure_detected
+              print(f'{sig_short:<40} {type_short:<30} {thresh_short:<40} {fail_short}')
+
+      # ---------------------------------------------------------------------------
+      # Entry point
+      # ---------------------------------------------------------------------------
+
+      def main() -> int:
+          parser = argparse.ArgumentParser(description='Production detection architecture patterns')
+          parser.add_argument('--hybrid', action='store_true',
+                              help='Show hybrid architecture track placement')
+          parser.add_argument('--observability', action='store_true',
+                              help='Show observability signal dashboard')
+          args = parser.parse_args()
+
+          if args.hybrid:
+              print_hybrid_placement(TRACK_PLACEMENTS)
+              return 0
+          if args.observability:
+              print_observability_dashboard(OBSERVABILITY_SIGNALS)
+              return 0
+          print_pattern_comparison(PATTERNS)
+          print_hybrid_placement(TRACK_PLACEMENTS)
+          print_observability_dashboard(OBSERVABILITY_SIGNALS)
+          return 0
+
+      if __name__ == '__main__':
+          sys.exit(main())
+
+  deliverable_2:
+    id: 'D11.13.2'
+    filename: 'hybrid_architecture_designer.py'
+    description: >
+      Given a set of detection requirements — latency budget, blocking required,
+      SIEM available, sidecar infrastructure available — recommends the hybrid
+      architecture configuration and produces a deployment specification mapping
+      each gateway track to the appropriate pattern.
+    language: 'python'
+    python_version: '3.12'
+    dependencies:
+      - 'dataclasses (stdlib)'
+    code: |
+      #!/usr/bin/env python3
+      '''hybrid_architecture_designer.py
+      Recommends hybrid detection architecture given deployment requirements.
+      Maps each gateway track to inline/sidecar/SIEM based on constraints.
+      Chapter 11, Section 11.13 — AI Security Mastery
+      Author: Raghav Dinesh | github: ruwgxo
+
+      Usage:
+        python3 hybrid_architecture_designer.py
+        python3 hybrid_architecture_designer.py --latency 100 --no-sidecar
+        python3 hybrid_architecture_designer.py --latency 50 --no-siem --blocking-required
+      '''
+
+      from __future__ import annotations
+      import argparse
+      import sys
+      from dataclasses import dataclass
+
+      from production_architecture_patterns import (
+          Pattern, Action, FailMode, TrackPlacement, TRACK_PLACEMENTS,
+      )
+
+      # ---------------------------------------------------------------------------
+      # Requirements model
+      # ---------------------------------------------------------------------------
+
+      @dataclass
+      class DeploymentRequirements:
+          total_latency_budget_ms: float    # total end-to-end latency SLA
+          inline_latency_budget_ms: float   # fraction available for inline detection
+          blocking_required: bool           # must some attacks be blocked (not just flagged)?
+          sidecar_available: bool           # async sidecar infrastructure available?
+          siem_available: bool              # SIEM platform available for log-based rules?
+          ml_inference_available: bool      # ML model serving infrastructure available?
+
+      # ---------------------------------------------------------------------------
+      # Architecture designer
+      # ---------------------------------------------------------------------------
+
+      @dataclass
+      class ArchitectureRecommendation:
+          requirements: DeploymentRequirements
+          placements: list[TrackPlacement]
+          warnings: list[str]
+          coverage_gaps: list[str]
+          total_inline_latency_ms: float
+
+      def design_architecture(req: DeploymentRequirements) -> ArchitectureRecommendation:
+          placements: list[TrackPlacement] = []
+          warnings: list[str] = []
+          coverage_gaps: list[str] = []
+
+          for tp in TRACK_PLACEMENTS:
+              # Determine if original placement is viable given constraints
+              adjusted = TrackPlacement(
+                  track_id=tp.track_id,
+                  track_name=tp.track_name,
+                  component=tp.component,
+                  pattern=tp.pattern,
+                  action=tp.action,
+                  fail_mode=tp.fail_mode,
+                  latency_ms=tp.latency_ms,
+                  rationale=tp.rationale,
+                  fail_description=tp.fail_description,
+              )
+
+              # Sidecar not available: push sidecar components inline or drop
+              if tp.pattern == Pattern.SIDECAR and not req.sidecar_available:
+                  if tp.latency_ms == 0.0:
+                      # originally sidecar; estimate its latency
+                      est_latency = {'Track 2 ML': 15.0, 'Track 6': 2.0, 'Track 7': 13.0}.get(
+                          tp.component[:7], 10.0)
+                  else:
+                      est_latency = tp.latency_ms
+
+                  remaining_budget = req.inline_latency_budget_ms - sum(
+                      p.latency_ms for p in placements if p.pattern == Pattern.INLINE_GATEWAY)
+
+                  if est_latency <= remaining_budget:
+                      adjusted.pattern = Pattern.INLINE_GATEWAY
+                      adjusted.latency_ms = est_latency
+                      adjusted.action = Action.FLAG
+                      warnings.append(
+                          f'T{tp.track_id} {tp.component}: sidecar unavailable — moved inline '
+                          f'(+{est_latency}ms latency).'
+                      )
+                  else:
+                      coverage_gaps.append(
+                          f'T{tp.track_id} {tp.component}: sidecar unavailable and no inline '
+                          f'budget — DROPPED. Coverage gap for {tp.track_name}.'
+                      )
+                      continue
+
+              # SIEM not available: flag SIEM components as gaps
+              if tp.pattern == Pattern.SIEM and not req.siem_available:
+                  coverage_gaps.append(
+                      f'T{tp.track_id} {tp.component}: SIEM unavailable — session accumulator '
+                      f'not deployable. Track 5 session-level detection is a gap.'
+                  )
+                  continue
+
+              # ML inference not available: flag ML components as gaps
+              if not req.ml_inference_available and 'classifier' in tp.component.lower():
+                  coverage_gaps.append(
+                      f'T{tp.track_id} {tp.component}: ML inference unavailable — '
+                      f'ML detector not deployable. L3 detection is a gap.'
+                  )
+                  continue
+
+              placements.append(adjusted)
+
+          # Check blocking requirement
+          blocking_placements = [p for p in placements if p.action == Action.BLOCK]
+          if req.blocking_required and not blocking_placements:
+              warnings.append(
+                  'Blocking is required but no track is configured to block. '
+                  'Track 1 must be deployed inline with fail-closed policy.'
+              )
+
+          # Inline latency check
+          total_inline = sum(p.latency_ms for p in placements if p.pattern == Pattern.INLINE_GATEWAY)
+          if total_inline > req.inline_latency_budget_ms:
+              warnings.append(
+                  f'Total inline latency {total_inline:.1f}ms exceeds budget '
+                  f'{req.inline_latency_budget_ms:.1f}ms. Consider moving Track 3 or Track 6 to sidecar.'
+              )
+
+          return ArchitectureRecommendation(
+              requirements=req,
+              placements=placements,
+              warnings=warnings,
+              coverage_gaps=coverage_gaps,
+              total_inline_latency_ms=total_inline,
+          )
+
+      def print_recommendation(rec: ArchitectureRecommendation) -> None:
+          req = rec.requirements
+          print('\nHybrid Architecture Recommendation')
+          print(f'  Latency budget (total):  {req.total_latency_budget_ms}ms')
+          print(f'  Inline budget:           {req.inline_latency_budget_ms}ms')
+          print(f'  Blocking required:       {req.blocking_required}')
+          print(f'  Sidecar available:       {req.sidecar_available}')
+          print(f'  SIEM available:          {req.siem_available}')
+          print(f'  ML inference available:  {req.ml_inference_available}')
+          print(f'\nResulting inline latency:  {rec.total_inline_latency_ms:.2f}ms '
+                f'({"OK" if rec.total_inline_latency_ms <= req.inline_latency_budget_ms else "OVER BUDGET"})')
+          print(f'Track placements:          {len(rec.placements)}')
+          print(f'Coverage gaps:             {len(rec.coverage_gaps)}')
+          print(f'Warnings:                  {len(rec.warnings)}')
+
+          print(f'\n{"Track":<5} {"Component":<38} {"Pattern":<16} {"Action":<8} {"Latency":<10}')
+          print('-' * 82)
+          for p in rec.placements:
+              lat_str = f'{p.latency_ms:.2f}ms' if p.pattern == Pattern.INLINE_GATEWAY else 'async'
+              print(f'T{p.track_id:<4} {p.component:<38} {p.pattern.value:<16} {p.action.value:<8} {lat_str}')
+
+          if rec.warnings:
+              print(f'\nWarnings:')
+              for w in rec.warnings:
+                  print(f'  ⚠ {w}')
+          if rec.coverage_gaps:
+              print(f'\nCoverage gaps (components not deployed):')
+              for g in rec.coverage_gaps:
+                  print(f'  ✗ {g}')
+
+      # ---------------------------------------------------------------------------
+      # Entry point
+      # ---------------------------------------------------------------------------
+
+      def main() -> int:
+          parser = argparse.ArgumentParser(description='Hybrid detection architecture designer')
+          parser.add_argument('--latency', type=float, default=200.0,
+                              help='Total end-to-end latency SLA in ms (default: 200)')
+          parser.add_argument('--inline-budget', type=float, default=15.0,
+                              help='Inline detection latency budget in ms (default: 15)')
+          parser.add_argument('--no-sidecar', action='store_true',
+                              help='Sidecar infrastructure not available')
+          parser.add_argument('--no-siem', action='store_true',
+                              help='SIEM platform not available')
+          parser.add_argument('--no-ml', action='store_true',
+                              help='ML inference infrastructure not available')
+          parser.add_argument('--blocking-required', action='store_true',
+                              help='Blocking (not just flagging) is a hard requirement')
+          args = parser.parse_args()
+
+          req = DeploymentRequirements(
+              total_latency_budget_ms=args.latency,
+              inline_latency_budget_ms=args.inline_budget,
+              blocking_required=args.blocking_required,
+              sidecar_available=not args.no_sidecar,
+              siem_available=not args.no_siem,
+              ml_inference_available=not args.no_ml,
+          )
+
+          rec = design_architecture(req)
+          print_recommendation(rec)
+          return 1 if rec.coverage_gaps else 0
+
+      if __name__ == '__main__':
+          sys.exit(main())
+
+common_mistakes:
+  - id: 'CM11.13.1'
+    mistake: 'Placing all detection logic inline because "inline means it can block"'
+    why_it_happens: >
+      Blocking is the strongest security control available. Engineers who equate
+      "better detection" with "more blocking" default to placing every detection
+      primitive inline, regardless of latency or FPR implications.
+    why_it_matters: >
+      An inline detection system that consumes 80ms per request on a model with a
+      200ms SLA leaves only 120ms for actual model inference. Under traffic spikes,
+      this produces timeouts before the model ever runs. Worse, a high-FPR inline
+      rule that blocks causes legitimate users to be unable to use the service —
+      which is a denial of service caused by the detection system, not by an attacker.
+    correct_approach: >
+      Inline blocking is reserved for high-confidence, low-FPR, fast rules: Track 1
+      (1% FPR, microseconds) and Track 4 (training pipeline only, low volume). All
+      other detections flag rather than block, and moderate-confidence ML detections
+      run asynchronously in the sidecar where they cannot affect request latency.
+
+  - id: 'CM11.13.2'
+    mistake: 'Designing the sidecar as a simple log consumer without backpressure protection'
+    why_it_happens: >
+      A sidecar that reads from a log stream and runs detection seems simple: consume
+      a log entry, run the detection, emit an alert. The backpressure case (detection
+      slower than log production) is not considered until it happens in production.
+    why_it_matters: >
+      During a traffic spike, if the sidecar processes requests at 200ms each but
+      receives 1,000 requests per second, the queue grows by 195 entries per second.
+      After five minutes, the queue has 58,500 unprocessed entries. Without backpressure
+      protection, the queue either fills (messages dropped, silent detection gaps) or
+      grows unboundedly (sidecar runs out of memory). Both are worse than a well-designed
+      fail-open.
+    correct_approach: >
+      Size the sidecar queue for peak traffic × maximum processing time. Add the
+      queue depth observability signal (Signal 5 from the observability table). Configure
+      the queue with a maximum depth and a retention policy: messages older than N
+      minutes during a backpressure event are dropped after logging, accepting the
+      detection gap in exchange for preventing queue overflow.
+
+  - id: 'CM11.13.3'
+    mistake: 'Failing to instrument the detection system itself with observability signals'
+    why_it_happens: >
+      Observability instrumentation is overhead that detection engineers prefer not
+      to add. The detection system is built to observe the model; observing the
+      observer feels meta and is deferred to "later."
+    why_it_matters: >
+      A detection system that silently fails is worse than no detection system because
+      it provides false assurance. A rule that stops firing due to a log schema change
+      produces no alerts — the SOC assumes the system is healthy and working. The
+      first indication that the detection failed is an incident post-mortem.
+    correct_approach: >
+      Instrument all eight observability signals before the first production deployment.
+      The alert rate per rule signal (Signal 1) and the log field completeness signal
+      (Signal 8) are the two highest-priority signals because they directly detect the
+      most common silent failure modes: rules that stop firing and field name mismatches.
+
+  - id: 'CM11.13.4'
+    mistake: 'Applying the same fail mode to all detection layers without considering the security/availability tradeoff'
+    why_it_happens: >
+      Fail-closed sounds safer. Practitioners who prioritise security over availability
+      default to fail-closed for all layers.
+    why_it_matters: >
+      Fail-closed for ML inference (Track 7 in the sidecar) means that every time
+      the embedding service is unavailable, the gateway blocks all requests — causing
+      a denial of service that an attacker could intentionally trigger by taking down
+      the embedding service. Fail-closed for fast deterministic rules (Track 1) is
+      correct; fail-closed for slow probabilistic components is an availability risk.
+    correct_approach: >
+      Apply fail-closed only to the components where blocking on failure is the correct
+      security outcome: Track 1 (L1 signature, blocking) and Track 4 (training pipeline,
+      blocking). Apply fail-open with timeout logging to all heuristic and ML components.
+      The timeout log feeds the observability system; the SIEM coverage regression
+      signal catches when timeouts become systematic.
+
+  - id: 'CM11.13.5'
+    mistake: 'Skipping the log field completeness signal because "the log schema was agreed in Section 11.06"'
+    why_it_happens: >
+      The schema was agreed. The ai_log_field_taxonomy.py validator runs in CI. It
+      feels redundant to monitor field completeness in production when the schema was
+      validated at build time.
+    why_it_matters: >
+      Schema agreement at build time does not prevent schema drift at runtime. The
+      model serving team deploys a patch that changes injection_score to
+      injectionScore in the JSON log output. The Sigma rule silently stops matching.
+      The CI pipeline does not catch this because the rule itself did not change —
+      only the log emission did. The only signal that detects this is the production
+      log field completeness rate for injection_score dropping from 100% to 0%.
+    correct_approach: >
+      Instrument the log field completeness signal in the production monitoring system.
+      Alert at < 99% completeness for any required taxonomy field. Run the completeness
+      check daily, not just on deployment. A weekly review of completeness metrics
+      catches schema drift before it becomes a prolonged detection gap.
+
+section_summary:
+  what_you_learned: |
+    Three production architecture patterns serve distinct roles in the hybrid detection
+    system: the inline gateway blocks high-confidence signals before model inference;
+    the sidecar flags moderate-confidence signals asynchronously with zero latency
+    impact; and the SIEM detects campaigns over extended time windows. The seven-track
+    gateway distributes across all three patterns in the hybrid architecture: Tracks 1
+    and 4 block inline, Track 3 flags inline, Tracks 2 (ML), 6, and 7 flag via sidecar,
+    and Track 5 (session accumulator) alerts via SIEM. Failure mode design applies
+    fail-closed to fast deterministic rules and fail-open to heuristic and ML components.
+    Eight observability signals — alert rate, detection latency, circuit breaker state,
+    timeout rate, queue depth, FPR per rule, coverage regression, and log field
+    completeness — must be instrumented before production deployment. Chapter 14
+    implements the architecture at production scale: latency budget analysis, horizontal
+    scaling, cost modelling, Kubernetes deployment, and the output validation layer.
+  key_terms:
+    - term: 'Inline API gateway pattern'
+      definition: >
+        The only blocking production detection pattern. Detection logic runs synchronously
+        in the request path before model inference. Must block is placed here; adds
+        latency proportional to the detection compute time.
+    - term: 'Sidecar pattern'
+      definition: >
+        An asynchronous detection pattern where logic runs alongside the model serving
+        container, receiving a copy of every request via a message queue. Cannot block;
+        produces near-real-time alerts (30–120s) with zero request latency impact.
+    - term: 'Log-based SIEM pattern'
+      definition: >
+        A fully asynchronous detection pattern where Sigma rules run against collected
+        logs in a SIEM. No blocking; minutes-to-hours alert latency; natural home for
+        stateful session accumulation and cross-session campaign detection.
+    - term: 'Circuit breaker'
+      definition: >
+        A per-track protection mechanism that bypasses a detection component after N
+        consecutive timeouts, preventing a slow component from cascading into full
+        gateway unavailability. Opens the circuit for a defined interval; tests recovery
+        in half-open state before restoring full detection.
+    - term: 'Log field completeness rate'
+      definition: >
+        The fraction of production requests for which each required log taxonomy field
+        is present and correctly typed. The primary signal for detecting silent log
+        schema drift that causes Sigma rules to stop matching without any other alert.
+
+preview_section_11_14:
+  title: 'Chapter Summary: Detection Framework Complete'
+  teaser: |
+    Section 11.14 closes Chapter 11 by scoring the final programme state across all
+    five maturity dimensions, synthesising the nine framework elements built across
+    the chapter, and mapping each element to the Chapter 12, 13, and 14 implementations
+    that fill it. The detection_framework_audit.py deliverable runs a health check
+    across all dimensions. The chapter_11_concept_map.py deliverable produces the
+    full concept map connecting all 14 sections. The practitioner checklist names
+    six questions to answer before declaring the detection framework operational.
+
+metadata:
+  part: 'III'
+  chapter: 11
+  section: 13
+  section_id: '11.13'
+  tags:
+    - production-architecture
+    - inline-gateway
+    - sidecar-pattern
+    - siem-detection
+    - hybrid-architecture
+    - fail-open
+    - fail-closed
+    - circuit-breaker
+    - observability
+    - integration-points
+    - chapter-11
+    - part-3
+  atlas_anchors:
+    - 'Architecture-level: hybrid pattern positions detection against all ATLAS tactic categories'
+    - 'Inline blocking covers: AML.T0051 (Track 1), AML.T0020 (Track 4)'
+    - 'Sidecar flags cover: AML.T0054 (Track 2 ML), AML.T0043 (Track 7), AML.T0015 (Track 7)'
+    - 'SIEM alerts cover: AML.T0040 session accumulation (Track 5)'
+  word_count_estimate: 4400
+  deliverables_count: 2
+  common_mistakes_count: 5
