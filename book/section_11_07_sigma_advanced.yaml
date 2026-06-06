@@ -1,0 +1,1259 @@
+# section_11_07_sigma_advanced.yaml
+
+---
+document_info:
+  book: 'AI Security Mastery'
+  chapter: 11
+  section: 7
+  section_id: '11.07'
+  title: 'Sigma Rules: Advanced Patterns, Correlation, and Campaign Detection'
+  filename: 'section_11_07_sigma_advanced.yaml'
+  part: 'III'
+  part_title: 'Detection Engineering for AI'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-05-30'
+  estimated_pages: 6
+
+section_overview:
+  one_line_summary: >
+    Single-event Sigma rules detect individual signals; correlation rules converge those
+    signals into campaign-level detections that no single track can produce alone —
+    a Track 1 injection followed by Track 5 query acceleration within ten minutes is a
+    confirmed extraction attempt, invisible to either track working independently.
+  why_this_section_exists: |
+    Section 11.06 built fluency in single-event Sigma rules: one log event, one
+    detection condition, one alert. The seven-track gateway runs seven such rules on
+    every request. But the most dangerous AI attacks are not single-event affairs.
+    Model extraction is a campaign: thousands of queries across many sessions, each
+    individually innocuous. A full jailbreak with exfiltration is a sequence: probe
+    the model's boundaries, find a jailbreak that works, extract the target content,
+    confirm extraction in the response. Single-event rules see individual frames of
+    this film; correlation rules see the plot.
+
+    Section 11.07 introduces the three advanced Sigma patterns that transform the
+    gateway from a single-event detector into a campaign-aware detection system:
+    aggregation over time windows (rate-based abuse at scale), correlation rules
+    (joining alerts from multiple tracks into a unified campaign alert), and sequence
+    rules (ordered event chains within a session window). It also addresses exception
+    management — the allowlist machinery that prevents known-good automation from
+    flooding the correlation layer with false positives — and establishes the Sigma
+    rule lifecycle that governs the full portfolio from draft to retirement.
+  position_in_chapter: >
+    Section 11.07 is the second half of the Sigma pair. Section 11.06 established the
+    rule format and single-event patterns; Section 11.07 extends to multi-event and
+    cross-track patterns. Together they complete the Sigma portfolio that Section 11.08
+    uses as the primary evidence for the detection maturity assessment.
+
+learning_objectives:
+  - 'Write time-windowed aggregation conditions using count, min, max, avg, and sum, specifying window duration and group-by field'
+  - 'Author a Sigma correlation rule that joins alerts from two or more gateway tracks into a campaign-level detection'
+  - 'Construct a sequence rule for the probe → inject → exfiltrate pattern within a defined session window'
+  - 'Implement allowlist exception management in a Sigma rule using filter selections and not conditions'
+  - 'Map the Sigma rule lifecycle stages (draft → review → testing → production → deprecated) to CI pipeline behaviours'
+  - 'Produce a cross-reference of all seven-track gateway Sigma rules as a unified portfolio inventory'
+
+prerequisites:
+  required:
+    - 'Section 11.06: full Sigma format and syntax; all five single-event operators'
+    - 'Section 11.03: four-layer detection model; Layer 4 behavioural detection as the target of correlation rules'
+    - 'Sections 11.01–11.02: detection-as-code pipeline; CI pipeline that governs rule deployment'
+  helpful:
+    - 'Section 11.09 preview: false positive management; allowlists in Section 11.07 are the Sigma side of the FPR control system'
+    - 'Any streaming or event-correlation system experience: Splunk correlations, EQL sequences, Azure Sentinel analytics rules'
+
+prose_content:
+
+  part_1_aggregation_deep_dive:
+    heading: 'Aggregation Conditions: Time Windows and Group-By'
+    body: |
+      Section 11.06 introduced the aggregation operator as Operator 4, showing a count
+      condition for Track 5. Here the full aggregation syntax is developed — all five
+      functions across all three log categories — because aggregation is the bridge
+      between single-event signature detection and stateful campaign detection.
+
+      Sigma supports five aggregation functions: count (number of matching events),
+      min and max (minimum and maximum value of a field across matching events), avg
+      (mean value of a field), and sum (total value of a field). All five follow the
+      same structural pattern: a selection block defines which events to aggregate;
+      the condition line specifies the function, the field, the group-by key, the
+      comparison operator, and the threshold.
+
+      The time window is specified by the backend, not by Sigma itself: Sigma''s
+      aggregation conditions define what to count and how to threshold; the target
+      platform (Splunk, Elastic, Sentinel) applies its own time window syntax when
+      compiling the rule. For the gateway''s Python backend, the time window is
+      configured in the session accumulator''s rolling window parameter. This is
+      a known limitation of Sigma''s portability: time window semantics vary across
+      backends and must be agreed per deployment.
+
+      Count aggregation — detecting volume abuse:
+
+          detection:
+            rapid_queries:
+              user_id: '*'
+              gateway_action: 'pass'
+            condition: rapid_queries | count(request_id) by user_id > 500
+
+      The group-by field (user_id) makes this a per-user count: an individual user
+      who makes more than 500 passing requests is flagged. Without group-by, the count
+      would be across all users and would fire on normal aggregate traffic volume.
+      Group-by is not optional for rate-based AI security rules.
+
+      Avg aggregation — detecting sustained low-entropy query sessions:
+
+          detection:
+            low_entropy_session:
+              session_action: 'normal'
+            condition: low_entropy_session | avg(query_entropy_avg) by user_id < 2.0
+
+      This fires when a user''s mean query entropy across their sessions averages
+      below 2.0 bits — consistent with systematic boundary-probing rather than
+      normal conversational usage. It fires on the session-level log (ai_session
+      category), not on per-request logs.
+
+      Min aggregation — detecting systematic query variance reduction:
+
+          detection:
+            low_variance_pattern:
+              session_request_count|gte: 50
+            condition: low_variance_pattern | min(query_variance) by user_id < 0.10
+
+      The minimum query_variance across all sessions with at least 50 requests falls
+      below 0.10 — indicating that at some point the user ran an extremely uniform
+      query sequence, consistent with boundary probing even if other sessions were
+      more varied.
+
+      Sum aggregation — detecting budget exhaustion:
+
+          detection:
+            budget_burn:
+              user_id: '*'
+            condition: budget_burn | sum(budget_consumed_pct) by user_id > 90
+
+      This fires when a user''s cumulative budget consumption exceeds 90% — a useful
+      secondary signal for extraction campaigns that exhaust query budgets deliberately.
+
+      The time window discipline: rate-based rules must specify a window that is narrow
+      enough to catch fast attacks (a burst extraction that completes in 10 minutes
+      would evade a 24-hour count window with a threshold above its per-10-minute
+      volume) and wide enough to accumulate evidence from slow attacks (a slow-drift
+      extraction that spreads 500 queries over three days would evade a 1-hour window).
+      The gateway uses two window settings: a fast window (15 minutes) for burst
+      detection with a low threshold and a slow window (24 hours) for campaign
+      detection with a high threshold. Both fire independently; either can trigger an
+      alert.
+
+  part_2_correlation_rules:
+    heading: 'Correlation Rules: Joining Tracks into Campaign Alerts'
+    body: |
+      A Sigma correlation rule joins the output alerts of two or more individual Sigma
+      rules into a higher-level campaign detection. It does not inspect raw log events;
+      it inspects the alert stream produced by the rules it references. A correlation
+      rule that joins Track 1 (injection alert) with Track 5 (extraction signal) fires
+      when both alerts appear for the same user within a defined time window. Neither
+      alert alone confirms a campaign; both together do.
+
+      Sigma correlation rules use the type: correlation header and reference source
+      rules by their rule ID (UUID) in the rules field. The group-by and timespan fields
+      define the correlation window and the grouping key. The condition specifies how
+      many of the referenced rules must fire, in what order, and within what window.
+
+      Correlation rule structure for a confirmed extraction attempt (Track 1 + Track 5):
+
+          title: Confirmed Extraction Attempt — Injection Followed by Query Acceleration
+          id: d7e8f9a0-b1c2-4d3e-4f5a-b6c7d8e9f0a1
+          type: correlation
+          status: stable
+          description: >
+            Correlates a Track 1 injection alert with a Track 5 extraction signal for
+            the same user within a 10-minute window. The sequence is consistent with
+            an attacker probing model boundaries via injection then accelerating API
+            queries to extract decision surface information. Covers AML.T0051 +
+            AML.T0040 campaign chain.
+          references:
+            - 'https://atlas.mitre.org/techniques/AML.T0051'
+            - 'https://atlas.mitre.org/techniques/AML.T0040'
+          author: 'ruwgxo, 2026-05-30'
+          date: 2026-05-30
+          modified: 2026-05-30
+          tags:
+            - attack.initial_access
+            - attack.collection
+            - atlas.aml.t0051
+            - atlas.aml.t0040
+            - owasp.llm.01
+            - owasp.llm.10
+          type: correlation
+          rules:
+            injection_alert:
+              title: 'LLM Direct Prompt Injection via Known Prefix — Track 1'
+            extraction_signal:
+              title: 'Model Extraction via High-Volume Low-Variance Query Pattern — Track 5'
+          group-by:
+            - user_id
+          timespan: 10m
+          condition:
+            gte: 1
+          ordered: true
+          falsepositives:
+            - 'Security researchers conducting combined injection and extraction tests in authorised exercises'
+            - 'Automated test pipelines that run injection tests immediately before extraction tests'
+          level: critical
+
+      The ordered: true field requires the injection alert to precede the extraction
+      signal within the 10-minute window. Without ordering, the correlation would fire
+      even if the extraction came first — a possible but less indicative sequence. For
+      campaign patterns with a clear temporal logic (probe before extract), ordering
+      adds precision.
+
+      The correlation rule''s level is critical even if the individual source rules
+      are medium or high. The correlation provides confirmation that neither rule
+      provides alone: two independent track signals for the same user within a narrow
+      window are much more likely to represent a real attack than either signal alone.
+      Confirmed campaigns warrant critical-level alerting even when individual signals
+      are uncertain.
+
+      Three correlation rules for the seven-track gateway portfolio:
+
+      Correlation 1 — Injection-to-Extraction campaign (Track 1 → Track 5, window 10m,
+      ordered). The most important correlation in the portfolio: injection probing
+      followed by query acceleration is the textbook model extraction approach.
+
+      Correlation 2 — Jailbreak-then-Adversarial campaign (Track 2 → Track 7, window 5m,
+      ordered). A jailbreak attempt followed by an adversarial input signal indicates
+      an attacker probing the model''s alignment bypass and adversarial robustness
+      simultaneously — consistent with a targeted attack that aims to both bypass
+      content policy and manipulate classification outputs.
+
+      Correlation 3 — Semantic Gate → Repeated Flagging (Track 3 flagging more than
+      three times within 15 minutes for the same user). Repeated near-miss similarity
+      scores indicate an adversary iteratively refining an injection to stay below the
+      block threshold while approaching it — a prompt optimisation attack pattern.
+
+  part_3_sequence_rules:
+    heading: 'Sequence Rules: Ordered Event Chains'
+    body: |
+      Sequence rules are a specialised form of correlation that requires not just that
+      multiple events occur within a window but that they occur in a specific order.
+      The probe → inject → exfiltrate pattern is the paradigm case: a sophisticated
+      attacker begins by probing the model''s capabilities and restrictions (low-signal
+      queries that do not trigger any track), then attempts injection (Track 1 or Track 2
+      fires), then attempts to extract a target from the model''s response (specific
+      response patterns indicative of successful exfiltration).
+
+      Sequence rules in Sigma use the type: correlation with an ordered: true flag and
+      multiple named rule references. The pipeline must evaluate them in order: only if
+      the first rule fires does it begin watching for the second; only if the second
+      fires within the window does it begin watching for the third.
+
+      A three-stage sequence rule for the probe-inject-exfiltrate pattern:
+
+          title: Probe-Inject-Exfiltrate Sequence — AI Gateway Attack Chain
+          id: e8f9a0b1-c2d3-4e5f-6a7b-c8d9e0f1a2b3
+          type: correlation
+          status: experimental
+          description: >
+            Three-stage ordered sequence: (1) high session request volume without
+            injection signals (probing phase), (2) injection alert fires (Track 1 or 2),
+            (3) response entropy drops sharply (successful exfiltration pattern).
+            All three stages must occur in order within a 30-minute session window.
+            Covers the full AML.T0051 → AML.T0040 attack chain.
+          tags:
+            - attack.initial_access
+            - attack.collection
+            - attack.exfiltration
+            - atlas.aml.t0051
+            - atlas.aml.t0040
+            - owasp.llm.01
+            - owasp.llm.10
+          type: correlation
+          rules:
+            probe_phase:
+              title: 'Session Request Volume Above Baseline — Probing Pattern'
+            inject_phase:
+              title: 'LLM Direct Prompt Injection via Known Prefix — Track 1'
+            exfil_phase:
+              title: 'Response Entropy Drop — Successful Exfiltration Signal'
+          group-by:
+            - user_id
+            - session_id
+          timespan: 30m
+          condition:
+            gte: 3
+          ordered: true
+          falsepositives:
+            - 'Automated test suites that run load tests followed by functionality tests including injection test cases'
+          level: critical
+
+      The exfil_phase rule (response entropy drop) is a new rule not in the original
+      gateway portfolio. Sequence rules often reveal detection gaps: to complete a
+      sequence correlation, you need a rule for every stage of the attack chain, not
+      just the stages that are currently instrumented. The probe-inject-exfiltrate
+      sequence requires a response-entropy monitor — a rule that fires when
+      output_entropy_avg drops sharply within a session — that Track 5 does not
+      currently implement. This is an appropriate addition to the detection backlog
+      triggered by the sequence rule design process.
+
+      Sequence rules are status: experimental by design. They require the most
+      tuning of any rule type: the window must be wide enough to catch real attack
+      sequences (which may pause between stages) but narrow enough to avoid false
+      correlations between unrelated events from different sessions. Start with a
+      wide window and tighten it based on production observation.
+
+  part_4_exception_management:
+    heading: 'Exception Management: Allowlists in Sigma Rules'
+    body: |
+      Every production rule produces false positives from known-good sources: automated
+      testing pipelines that run injection strings as fixtures, batch inference jobs
+      with high query rates that look like extraction, internal benchmark tools that
+      probe model performance with repetitive queries. Without exception management,
+      the correlation layer drowns in alerts from known-good automation. With it, these
+      sources are filtered before the rule fires.
+
+      Sigma implements exceptions through filter selections combined with a not condition.
+      A filter selection is a named selection block that matches known-good events; the
+      condition excludes it explicitly. This is preferable to building exceptions into
+      the positive selection (which makes the detection logic harder to read) or
+      suppressing at the SIEM level (which hides the exception from the rule''s audit
+      trail).
+
+      Exception pattern for a known-good automated test pipeline (source IP or
+      service account):
+
+          detection:
+            high_volume:
+              session_request_count|gte: 100
+            known_test_pipeline:
+              user_id:
+                - 'svc-regression-tests'
+                - 'svc-load-tester'
+                - 'svc-benchmark-runner'
+            condition: high_volume and not known_test_pipeline
+
+      Exception pattern for a known-safe model that always produces high squeezer
+      disagreement due to its unusual output distribution:
+
+          detection:
+            high_squeezer:
+              track_7_squeezer_score|gte: 0.70
+            safe_model_exception:
+              model_name:
+                - 'internal-test-model-v1'
+                - 'canary-model-qa'
+                - 'benchmark-reference-model'
+            condition: high_squeezer and not safe_model_exception
+
+      Exception lifecycle: exceptions must be versioned and reviewed on the same cadence
+      as the rules that contain them. An exception added for a test pipeline that no
+      longer exists continues silently suppressing alerts. An exception for a model name
+      that has been retired may now match a different model if names are reused. The
+      rule_metadata_validator.py from Section 11.02 should be extended to require a
+      review date on each filter selection block; exceptions older than 90 days without
+      a review are flagged in CI.
+
+      Exception documentation: every filter selection must have a corresponding entry
+      in the falsepositives field explaining why the exception exists, when it was added,
+      and who approved it:
+
+          falsepositives:
+            - 'svc-regression-tests: automated regression pipeline; approved by security team 2026-05-30'
+            - 'internal-test-model-v1: produces high squeezer score due to unusual output distribution; approved by detection team 2026-04-15'
+
+      This documentation is the audit trail. An analyst who receives an alert and
+      wonders why a particular source is not triggering it can read the falsepositives
+      field and understand the exception without hunting through commit history.
+
+  part_5_lifecycle:
+    heading: 'Sigma Rule Lifecycle: Draft to Retirement'
+    body: |
+      Every Sigma rule in the portfolio has a status field that tracks its lifecycle
+      stage. The gateway uses five stages with defined entry and exit criteria enforced
+      by the CI pipeline and the sigma_rule_lifecycle_manager.py deliverable.
+
+      Draft — a rule is in draft when it has been written but has not yet been reviewed.
+      Draft rules do not appear in the CI pipeline''s deployment stage; they are committed
+      to the repository in a feature branch for review. The draft stage ends when a peer
+      review is approved and the status field is advanced to experimental.
+
+      Experimental — a rule is experimental when it has passed peer review and has been
+      deployed to the staging environment. It runs against real traffic on staging for a
+      minimum of two weeks. During this period the detection engineer monitors alert
+      volume, FPR, and any new false positive sources. The experimental stage ends when:
+      (a) the rule has run for two weeks on staging with no unacceptable FPR, and (b)
+      it has produced at least one confirmed true positive (or the detection engineer
+      has explicitly accepted that no TP opportunity arose during staging). Status
+      advances to test.
+
+      Test — a rule in test status is deployed to production with an explicit flag
+      in the SIEM that identifies it as under evaluation. SOC analysts see the alerts
+      but with a "test rule" label; they are asked to provide disposition (TP/FP) but
+      the rule does not feed into SLA metrics. The test stage lasts a minimum of four
+      weeks in production. The lifecycle manager tracks the FPR over this period. If
+      FPR exceeds 15%, the rule is returned to experimental for calibration. If FPR
+      stays below 10%, status advances to stable.
+
+      Stable — a fully deployed production rule. Stable rules feed into SLA metrics,
+      feed the FPR tracking database, and feed the coverage heat map. A stable rule
+      is re-evaluated for calibration when its FPR exceeds 10% over any rolling
+      30-day window. Re-evaluation may result in a threshold change (staying in stable
+      with a new modified date), a demotion to test (for significant logic changes),
+      or initiation of retirement.
+
+      Deprecated — retirement initiation. The rule is suppressed (produces no alerts)
+      but remains deployed. The lifecycle manager watches for a two-week clean window:
+      if no confirmed true positives would have been caught by the rule during the
+      suppression period (determined from threat intelligence and manual review), the
+      rule is promoted to removed. If a TP is identified during suppression, retirement
+      is halted and the rule returns to stable. Deprecated rules are removed from the
+      repository only after the two-week window passes without a TP — never deleted
+      immediately.
+
+      The sigma_rule_lifecycle_manager.py deliverable implements this lifecycle
+      programmatically: it reads the status field from all rules in the repository,
+      computes how long each rule has been in its current status, flags rules that
+      have exceeded their stage duration without advancing, and produces a lifecycle
+      report for the weekly detection engineering sync.
+
+  part_6_portfolio_inventory:
+    heading: 'The Seven-Track Sigma Portfolio: Unified Cross-Reference'
+    body: |
+      After Sections 11.06 and 11.07, the full Sigma portfolio for the seven-track
+      gateway consists of seven single-event rules (one per track, with some tracks
+      having multiple rules for different detection layers within the track), three
+      correlation rules (injection-extraction, jailbreak-adversarial, semantic
+      near-miss repetition), and one experimental sequence rule (probe-inject-exfiltrate).
+      Total: eleven rules governing seven detection tracks.
+
+      Single-event rules by track:
+
+      Track 1 (injection_patterns.yml): keyword match on direct injection prefixes.
+      L1 signature. Level: high. ATLAS: AML.T0051. Status: stable.
+
+      Track 2a (jailbreak_sequences.yml): keyword match on jailbreak template prefixes.
+      L1 signature. Level: medium. ATLAS: AML.T0054. Status: stable.
+
+      Track 2b (jailbreak_classifier_sigma.yml): embedding classifier score threshold.
+      L3 ML. Level: medium. ATLAS: AML.T0054. Status: test (classifier is post-Part 2;
+      promoted to test pending four-week production evaluation).
+
+      Track 3 (semantic_similarity.yml): cosine similarity threshold gate.
+      L2 heuristic. Level: medium. ATLAS: AML.T0051. Status: stable.
+
+      Track 4 (poisoning_monitor.yml): label distribution skew on training API events.
+      L1 signature. Level: high. ATLAS: AML.T0020. Status: stable.
+
+      Track 5 (extraction_detector.yml): count aggregation on session query volume and
+      variance. L1/L4. Level: high. ATLAS: AML.T0040. Status: stable.
+
+      Track 6 (adversarial_input.yml): entropy and character distribution heuristics.
+      L2 heuristic. Level: medium. ATLAS: AML.T0043. Status: stable.
+
+      Track 7 (adversarial_detection.yml): compound squeezer disagreement and
+      adversarial classifier score. L2/L3. Level: medium. ATLAS: AML.T0043, AML.T0015.
+      Status: stable.
+
+      Correlation rules (all in rules/campaign/):
+
+      Correlation 1 (extraction_campaign.yml): Track 1 + Track 5, ordered, 10m window.
+      Level: critical. ATLAS: AML.T0051 + AML.T0040. Status: stable.
+
+      Correlation 2 (jailbreak_adversarial_campaign.yml): Track 2 + Track 7, ordered,
+      5m window. Level: critical. ATLAS: AML.T0054 + AML.T0043. Status: experimental.
+
+      Correlation 3 (semantic_near_miss_repetition.yml): Track 3 count >= 3 within 15m
+      per user. Level: high. ATLAS: AML.T0051. Status: stable.
+
+      Sequence rule (all in rules/campaign/):
+
+      Sequence 1 (probe_inject_exfiltrate.yml): three-stage probe → inject → exfiltrate,
+      ordered, 30m window. Level: critical. ATLAS: AML.T0051 + AML.T0040. Status:
+      experimental. Depends on response entropy drop rule (not yet built; detection
+      backlog item).
+
+      This portfolio is the evidence base for the Section 11.08 maturity assessment.
+      Eleven rules, three lifecycle stages, cross-referencing seven gateway tracks and
+      three correlation patterns — this is what L2 maturity looks like in practice.
+      L3 maturity requires the coverage map (Section 11.05), FPR tracking per rule
+      (Section 11.09), and the engineering workflow (Section 11.10).
+
+reference_materials:
+
+  table_1_aggregation_functions:
+    title: 'Sigma Aggregation Functions and AI Gateway Applications'
+    description: 'Five aggregation functions with syntax, AI security use case, and example threshold'
+    columns:
+      - 'Function'
+      - 'Sigma Syntax'
+      - 'AI Security Use Case'
+      - 'Example Threshold'
+      - 'Gateway Track'
+    rows:
+      - ['count', 'count(field) by group > N', 'High query volume per user; extraction probing', '> 100 requests / 15-min window per user_id', 'Track 5']
+      - ['avg', 'avg(field) by group < N', 'Sustained low-entropy session (systematic probing)', '< 2.0 bits query_entropy_avg per user_id', 'Track 5']
+      - ['min', 'min(field) by group < N', 'Minimum query variance across sessions (boundary probing)', '< 0.10 query_variance per user_id', 'Track 5']
+      - ['max', 'max(field) by group > N', 'Maximum injection score across requests in session', '> 0.90 injection_score per session_id', 'Track 1']
+      - ['sum', 'sum(field) by group > N', 'Cumulative budget consumption (budget exhaustion by extraction)', '> 90 budget_consumed_pct per user_id', 'Track 5']
+
+  table_2_portfolio_inventory:
+    title: 'Seven-Track Sigma Portfolio Cross-Reference'
+    description: 'All eleven gateway Sigma rules: filename, track, layer, ATLAS technique, level, status, and type'
+    columns:
+      - 'Filename'
+      - 'Track'
+      - 'Layer'
+      - 'ATLAS Technique'
+      - 'Level'
+      - 'Status'
+      - 'Type'
+    rows:
+      - ['injection_patterns.yml', 'Track 1', 'L1', 'AML.T0051', 'high', 'stable', 'single-event']
+      - ['jailbreak_sequences.yml', 'Track 2', 'L1', 'AML.T0054', 'medium', 'stable', 'single-event']
+      - ['jailbreak_classifier_sigma.yml', 'Track 2', 'L3', 'AML.T0054', 'medium', 'test', 'single-event']
+      - ['semantic_similarity.yml', 'Track 3', 'L2', 'AML.T0051', 'medium', 'stable', 'single-event']
+      - ['poisoning_monitor.yml', 'Track 4', 'L1', 'AML.T0020', 'high', 'stable', 'single-event']
+      - ['extraction_detector.yml', 'Track 5', 'L1/L4', 'AML.T0040', 'high', 'stable', 'single-event']
+      - ['adversarial_input.yml', 'Track 6', 'L2', 'AML.T0043', 'medium', 'stable', 'single-event']
+      - ['adversarial_detection.yml', 'Track 7', 'L2/L3', 'AML.T0043, AML.T0015', 'medium', 'stable', 'single-event']
+      - ['extraction_campaign.yml', 'Tracks 1+5', 'L1+L4', 'AML.T0051, AML.T0040', 'critical', 'stable', 'correlation']
+      - ['jailbreak_adversarial_campaign.yml', 'Tracks 2+7', 'L1+L2/L3', 'AML.T0054, AML.T0043', 'critical', 'experimental', 'correlation']
+      - ['semantic_near_miss_repetition.yml', 'Track 3', 'L2', 'AML.T0051', 'high', 'stable', 'correlation']
+      - ['probe_inject_exfiltrate.yml', 'Tracks 1+3+5', 'L1+L2+L4', 'AML.T0051, AML.T0040', 'critical', 'experimental', 'sequence']
+
+  table_3_lifecycle_stages:
+    title: 'Sigma Rule Lifecycle Stages'
+    description: 'Entry and exit criteria for each lifecycle stage with CI pipeline behaviour and minimum duration'
+    columns:
+      - 'Stage'
+      - 'Status Field Value'
+      - 'Entry Criterion'
+      - 'Exit Criterion'
+      - 'CI Deployment Behaviour'
+      - 'Minimum Duration'
+    rows:
+      - ['Draft', 'N/A (feature branch only)', 'Rule written; not yet reviewed', 'Peer review approved', 'Not deployed; CI runs lint and test only', 'None']
+      - ['Experimental', 'experimental', 'Peer review approved; status set to experimental', '2 weeks on staging; FPR acceptable; at least 1 TP or explicit TP waiver', 'Deploys to staging only', '2 weeks']
+      - ['Test', 'test', 'Experimental stage complete', '4 weeks in production; FPR < 10%', 'Deploys to production with test label; no SLA contribution', '4 weeks']
+      - ['Stable', 'stable', 'Test stage complete; FPR < 10%', 'FPR exceeds 10% over 30 days (→ recalibration) or retirement initiated', 'Full production deployment; SLA and coverage heat map contribution', 'Indefinite']
+      - ['Deprecated', 'deprecated', 'Retirement initiated', '2-week suppression with no TP; status set to removed', 'Suppressed (deployed but not alerting)', '2 weeks']
+
+deliverables:
+
+  deliverable_1:
+    id: 'D11.07.1'
+    filename: 'sigma_correlation_engine.py'
+    description: >
+      Multi-event correlation engine that joins seven-track gateway alerts into
+      campaign-level detections. Implements the three gateway correlation patterns
+      (injection-extraction, jailbreak-adversarial, semantic near-miss) and the
+      sequence rule (probe-inject-exfiltrate). Processes an alert stream and emits
+      campaign-level alerts when correlation conditions are met.
+    language: 'python'
+    python_version: '3.12'
+    dependencies:
+      - 'dataclasses (stdlib)'
+      - 'collections (stdlib)'
+    code: |
+      #!/usr/bin/env python3
+      '''sigma_correlation_engine.py
+      Multi-event correlation engine for the seven-track gateway.
+      Processes an alert stream and emits campaign-level alerts when
+      correlation patterns are satisfied.
+      Chapter 11, Section 11.07 — AI Security Mastery
+      Author: Raghav Dinesh | github: ruwgxo
+
+      Usage:
+        from sigma_correlation_engine import CorrelationEngine, Alert
+        engine = CorrelationEngine()
+        for alert in alert_stream:
+            campaign_alerts = engine.process(alert)
+      '''
+
+      from __future__ import annotations
+      from collections import defaultdict
+      from dataclasses import dataclass, field
+      from datetime import datetime, timezone, timedelta
+      from typing import Callable
+
+      # ---------------------------------------------------------------------------
+      # Data model
+      # ---------------------------------------------------------------------------
+
+      @dataclass
+      class Alert:
+          alert_id: str
+          rule_title: str
+          user_id: str
+          session_id: str
+          timestamp: datetime
+          level: str
+          atlas_techniques: list[str]
+          metadata: dict = field(default_factory=dict)
+
+      @dataclass
+      class CampaignAlert:
+          campaign_id: str
+          correlation_name: str
+          user_id: str
+          session_id: str
+          source_alerts: list[Alert]
+          level: str
+          atlas_techniques: list[str]
+          triggered_at: datetime
+          description: str
+
+      # ---------------------------------------------------------------------------
+      # Correlation pattern definition
+      # ---------------------------------------------------------------------------
+
+      @dataclass
+      class CorrelationPattern:
+          name: str
+          description: str
+          required_rule_titles: list[str]   # alert rule titles that must fire
+          ordered: bool                      # must fire in sequence order
+          window_minutes: int
+          level: str
+          atlas_techniques: list[str]
+          min_matches: int = 1               # how many of required_rule_titles must fire
+
+      # ---------------------------------------------------------------------------
+      # Gateway correlation patterns
+      # ---------------------------------------------------------------------------
+
+      CORRELATION_PATTERNS: list[CorrelationPattern] = [
+
+          CorrelationPattern(
+              name='Extraction Campaign — Injection Followed by Query Acceleration',
+              description=(
+                  'Track 1 injection alert followed by Track 5 extraction signal for '
+                  'the same user within 10 minutes. Confirms model extraction attempt '
+                  'preceded by boundary probing via prompt injection.'
+              ),
+              required_rule_titles=[
+                  'LLM Direct Prompt Injection via Known Prefix — Track 1',
+                  'Model Extraction via High-Volume Low-Variance Query Pattern — Track 5',
+              ],
+              ordered=True,
+              window_minutes=10,
+              level='critical',
+              atlas_techniques=['AML.T0051', 'AML.T0040'],
+          ),
+
+          CorrelationPattern(
+              name='Jailbreak-Adversarial Campaign — Policy Bypass with Evasion',
+              description=(
+                  'Track 2 jailbreak alert followed by Track 7 adversarial input signal '
+                  'for the same user within 5 minutes. Consistent with an attacker '
+                  'bypassing alignment then submitting adversarial inputs under the '
+                  'jailbroken context to manipulate classification outputs.'
+              ),
+              required_rule_titles=[
+                  'LLM Prompt Injection via Adversarial Role-play — Track 2',
+                  'Adversarial Input via Squeezer-Classifier Compound Detection — Track 7',
+              ],
+              ordered=True,
+              window_minutes=5,
+              level='critical',
+              atlas_techniques=['AML.T0054', 'AML.T0043'],
+          ),
+
+          CorrelationPattern(
+              name='Semantic Near-Miss Repetition — Iterative Injection Optimisation',
+              description=(
+                  'Three or more Track 3 semantic gate flags for the same user within '
+                  '15 minutes. Consistent with an adversary iteratively refining a '
+                  'prompt to approach the similarity threshold without triggering the '
+                  'block — a prompt optimisation attack.'
+              ),
+              required_rule_titles=[
+                  'LLM Semantic Similarity Gate Threshold Exceeded — Track 3',
+              ],
+              ordered=False,
+              window_minutes=15,
+              level='high',
+              atlas_techniques=['AML.T0051'],
+              min_matches=3,
+          ),
+
+          CorrelationPattern(
+              name='Probe-Inject-Exfiltrate Sequence — Full Attack Chain',
+              description=(
+                  'Three-stage ordered sequence: probing (session volume without injection), '
+                  'injection (Track 1 fires), exfiltration (response entropy drop). '
+                  'All three within 30 minutes per user. Full attack chain confirmation.'
+              ),
+              required_rule_titles=[
+                  'Session Request Volume Above Baseline — Probing Pattern',
+                  'LLM Direct Prompt Injection via Known Prefix — Track 1',
+                  'Response Entropy Drop — Successful Exfiltration Signal',
+              ],
+              ordered=True,
+              window_minutes=30,
+              level='critical',
+              atlas_techniques=['AML.T0051', 'AML.T0040'],
+          ),
+      ]
+
+      # ---------------------------------------------------------------------------
+      # Correlation engine
+      # ---------------------------------------------------------------------------
+
+      class CorrelationEngine:
+          '''
+          Processes an alert stream and emits CampaignAlert objects when
+          correlation patterns are satisfied.
+
+          Per-user alert buffers are maintained in memory with a rolling window
+          eviction policy. In production, replace with a Redis-backed session store
+          for horizontal scalability.
+          '''
+
+          def __init__(
+              self,
+              patterns: list[CorrelationPattern] | None = None,
+          ) -> None:
+              self.patterns = patterns or CORRELATION_PATTERNS
+              # user_id -> list of Alert, sorted by timestamp ascending
+              self._buffer: dict[str, list[Alert]] = defaultdict(list)
+
+          def process(self, alert: Alert) -> list[CampaignAlert]:
+              '''
+              Process one alert. Returns a list of CampaignAlert objects triggered
+              by this alert. Empty list if no correlation fires.
+              '''
+              self._buffer[alert.user_id].append(alert)
+              self._evict_stale(alert.user_id, alert.timestamp)
+              campaign_alerts: list[CampaignAlert] = []
+              for pattern in self.patterns:
+                  result = self._evaluate_pattern(pattern, alert.user_id, alert.timestamp)
+                  if result:
+                      campaign_alerts.append(result)
+              return campaign_alerts
+
+          def _evict_stale(self, user_id: str, now: datetime) -> None:
+              '''Remove alerts older than the maximum window across all patterns.'''
+              max_window = max(p.window_minutes for p in self.patterns)
+              cutoff = now - timedelta(minutes=max_window)
+              self._buffer[user_id] = [
+                  a for a in self._buffer[user_id]
+                  if a.timestamp >= cutoff
+              ]
+
+          def _evaluate_pattern(
+              self,
+              pattern: CorrelationPattern,
+              user_id: str,
+              now: datetime,
+          ) -> CampaignAlert | None:
+              window_start = now - timedelta(minutes=pattern.window_minutes)
+              window_alerts = [
+                  a for a in self._buffer[user_id]
+                  if a.timestamp >= window_start
+              ]
+
+              if pattern.ordered:
+                  return self._evaluate_ordered(pattern, window_alerts, user_id, now)
+              else:
+                  return self._evaluate_unordered(pattern, window_alerts, user_id, now)
+
+          def _evaluate_ordered(
+              self,
+              pattern: CorrelationPattern,
+              window_alerts: list[Alert],
+              user_id: str,
+              now: datetime,
+          ) -> CampaignAlert | None:
+              '''All required rule titles must appear in order within the window.'''
+              matched: list[Alert] = []
+              required_iter = iter(pattern.required_rule_titles)
+              current_required = next(required_iter, None)
+
+              for alert in sorted(window_alerts, key=lambda a: a.timestamp):
+                  if current_required and alert.rule_title == current_required:
+                      matched.append(alert)
+                      current_required = next(required_iter, None)
+                  if current_required is None:
+                      break   # all required stages matched in order
+
+              if current_required is None and len(matched) == len(pattern.required_rule_titles):
+                  return self._make_campaign_alert(pattern, user_id, matched, now)
+              return None
+
+          def _evaluate_unordered(
+              self,
+              pattern: CorrelationPattern,
+              window_alerts: list[Alert],
+              user_id: str,
+              now: datetime,
+          ) -> CampaignAlert | None:
+              '''min_matches of required_rule_titles must appear (any order).'''
+              matched_by_title: dict[str, list[Alert]] = defaultdict(list)
+              for alert in window_alerts:
+                  if alert.rule_title in pattern.required_rule_titles:
+                      matched_by_title[alert.rule_title].append(alert)
+
+              # Count total matches across all required titles
+              total_matches = sum(len(v) for v in matched_by_title.values())
+              if total_matches >= pattern.min_matches:
+                  source_alerts = [
+                      a for alerts in matched_by_title.values()
+                      for a in alerts
+                  ]
+                  return self._make_campaign_alert(pattern, user_id, source_alerts, now)
+              return None
+
+          def _make_campaign_alert(
+              self,
+              pattern: CorrelationPattern,
+              user_id: str,
+              source_alerts: list[Alert],
+              now: datetime,
+          ) -> CampaignAlert:
+              import uuid
+              session_id = source_alerts[0].session_id if source_alerts else ''
+              return CampaignAlert(
+                  campaign_id=str(uuid.uuid4())[:8],
+                  correlation_name=pattern.name,
+                  user_id=user_id,
+                  session_id=session_id,
+                  source_alerts=source_alerts,
+                  level=pattern.level,
+                  atlas_techniques=pattern.atlas_techniques,
+                  triggered_at=now,
+                  description=pattern.description,
+              )
+
+      # ---------------------------------------------------------------------------
+      # Demo
+      # ---------------------------------------------------------------------------
+
+      if __name__ == '__main__':
+          engine = CorrelationEngine()
+          now = datetime.now(timezone.utc)
+
+          # Simulate: injection alert followed by extraction signal, same user, 8 minutes apart
+          alert_1 = Alert(
+              alert_id='a001',
+              rule_title='LLM Direct Prompt Injection via Known Prefix — Track 1',
+              user_id='usr-attacker-42',
+              session_id='sess-abc123',
+              timestamp=now,
+              level='high',
+              atlas_techniques=['AML.T0051'],
+          )
+          alert_2 = Alert(
+              alert_id='a002',
+              rule_title='Model Extraction via High-Volume Low-Variance Query Pattern — Track 5',
+              user_id='usr-attacker-42',
+              session_id='sess-abc123',
+              timestamp=now + timedelta(minutes=8),
+              level='high',
+              atlas_techniques=['AML.T0040'],
+          )
+
+          print('Processing alert stream...\n')
+          for alert in [alert_1, alert_2]:
+              campaigns = engine.process(alert)
+              print(f'Alert: [{alert.level.upper()}] {alert.rule_title}')
+              if campaigns:
+                  for c in campaigns:
+                      print(f'  *** CAMPAIGN [{c.level.upper()}]: {c.correlation_name}')
+                      print(f'      User: {c.user_id} | ATLAS: {", ".join(c.atlas_techniques)}')
+                      print(f'      Source alerts: {len(c.source_alerts)}')
+              print()
+
+  deliverable_2:
+    id: 'D11.07.2'
+    filename: 'sigma_rule_lifecycle_manager.py'
+    description: >
+      Tracks rule status across the portfolio, computes time-in-stage for each rule,
+      flags rules that have exceeded their stage duration without advancing, and produces
+      a lifecycle report for the weekly detection engineering sync. Also enforces the
+      two-week suppression window for deprecated rules.
+    language: 'python'
+    python_version: '3.12'
+    dependencies:
+      - 'pyyaml>=6.0'
+      - 'datetime (stdlib)'
+    code: |
+      #!/usr/bin/env python3
+      '''sigma_rule_lifecycle_manager.py
+      Tracks Sigma rule lifecycle stages across the detection portfolio.
+      Flags rules exceeding stage duration; enforces suppression window.
+      Produces weekly lifecycle report for detection engineering sync.
+      Chapter 11, Section 11.07 — AI Security Mastery
+      Author: Raghav Dinesh | github: ruwgxo
+
+      Usage:
+        python3 sigma_rule_lifecycle_manager.py detections/rules/
+        python3 sigma_rule_lifecycle_manager.py detections/rules/ --report
+        python3 sigma_rule_lifecycle_manager.py detections/rules/ --check-deprecated
+      '''
+
+      from __future__ import annotations
+      import argparse
+      import pathlib
+      import sys
+      from dataclasses import dataclass
+      from datetime import date, timedelta
+      from typing import Literal
+
+      import yaml
+
+      # ---------------------------------------------------------------------------
+      # Stage durations (minimum days before advancing)
+      # ---------------------------------------------------------------------------
+
+      STAGE_MIN_DAYS: dict[str, int] = {
+          'experimental': 14,   # 2 weeks on staging
+          'test': 28,           # 4 weeks in production
+          'stable': 0,          # indefinite; no minimum
+          'deprecated': 14,     # 2-week suppression window
+      }
+
+      STAGE_WARNING_DAYS: dict[str, int] = {
+          'experimental': 21,   # flag if still experimental after 3 weeks
+          'test': 42,           # flag if still in test after 6 weeks
+          'stable': 0,
+          'deprecated': 21,     # flag if not cleared after 3 weeks
+      }
+
+      Status = Literal['experimental', 'test', 'stable', 'deprecated']
+
+      # ---------------------------------------------------------------------------
+      # Data model
+      # ---------------------------------------------------------------------------
+
+      @dataclass
+      class RuleLifecycleRecord:
+          filename: str
+          title: str
+          rule_id: str
+          status: str
+          date_created: date
+          date_modified: date
+          days_in_status: int
+          flag: str           # '' | 'overdue' | 'suppression_window_passed'
+          action_required: str
+
+      # ---------------------------------------------------------------------------
+      # Parser
+      # ---------------------------------------------------------------------------
+
+      def load_rule(path: pathlib.Path) -> dict | None:
+          with open(path) as f:
+              try:
+                  return yaml.safe_load(f)
+              except yaml.YAMLError:
+                  return None
+
+      def parse_record(path: pathlib.Path, today: date) -> RuleLifecycleRecord | None:
+          rule = load_rule(path)
+          if not rule or not isinstance(rule, dict):
+              return None
+          status = rule.get('status', '')
+          if status not in STAGE_MIN_DAYS and status != 'stable':
+              return None   # draft or unknown; skip
+
+          date_str = rule.get('modified') or rule.get('date', '')
+          try:
+              date_modified = date.fromisoformat(str(date_str))
+          except (ValueError, TypeError):
+              date_modified = today
+
+          date_created_str = rule.get('date', date_str)
+          try:
+              date_created = date.fromisoformat(str(date_created_str))
+          except (ValueError, TypeError):
+              date_created = date_modified
+
+          days_in_status = (today - date_modified).days
+          warning_threshold = STAGE_WARNING_DAYS.get(status, 0)
+          flag = ''
+          action = 'No action required.'
+
+          if status == 'deprecated':
+              min_days = STAGE_MIN_DAYS['deprecated']
+              if days_in_status >= min_days:
+                  flag = 'suppression_window_passed'
+                  action = (
+                      f'Suppression window complete ({days_in_status} days). '
+                      'Review for confirmed TPs during suppression. If none, remove rule.'
+                  )
+          elif warning_threshold > 0 and days_in_status >= warning_threshold:
+              flag = 'overdue'
+              action = (
+                  f'Rule has been {status} for {days_in_status} days '
+                  f'(warning threshold: {warning_threshold} days). '
+                  'Review FPR and advance lifecycle stage or return for calibration.'
+              )
+
+          return RuleLifecycleRecord(
+              filename=path.name,
+              title=rule.get('title', 'unknown')[:60],
+              rule_id=str(rule.get('id', 'unknown'))[:36],
+              status=status,
+              date_created=date_created,
+              date_modified=date_modified,
+              days_in_status=days_in_status,
+              flag=flag,
+              action_required=action,
+          )
+
+      # ---------------------------------------------------------------------------
+      # Report
+      # ---------------------------------------------------------------------------
+
+      def print_lifecycle_report(records: list[RuleLifecycleRecord]) -> int:
+          by_status: dict[str, list[RuleLifecycleRecord]] = {}
+          for r in records:
+              by_status.setdefault(r.status, []).append(r)
+
+          flagged = [r for r in records if r.flag]
+          today = date.today()
+
+          print(f'\nSigma Rule Lifecycle Report — {today.isoformat()}')
+          print(f'Total rules tracked: {len(records)}')
+          for status in ('stable', 'test', 'experimental', 'deprecated'):
+              count = len(by_status.get(status, []))
+              print(f'  {status:<14}: {count}')
+          print(f'  Flagged:        {len(flagged)}')
+          print()
+
+          if flagged:
+              print('Flagged rules (action required):')
+              for r in flagged:
+                  print(f'  [{r.flag.upper()}] {r.filename}')
+                  print(f'    Title:    {r.title}')
+                  print(f'    Status:   {r.status} for {r.days_in_status} days (modified {r.date_modified})')
+                  print(f'    Action:   {r.action_required}')
+              print()
+
+          print('Full portfolio:')
+          print(f'  {"File":<45} {"Status":<14} {"Days":<6} {"Flag"}')
+          print('  ' + '-' * 80)
+          for r in sorted(records, key=lambda x: (x.status, -x.days_in_status)):
+              flag_str = f'[{r.flag.upper()}]' if r.flag else ''
+              print(f'  {r.filename:<45} {r.status:<14} {r.days_in_status:<6} {flag_str}')
+
+          return 1 if flagged else 0
+
+      # ---------------------------------------------------------------------------
+      # Entry point
+      # ---------------------------------------------------------------------------
+
+      def main() -> int:
+          parser = argparse.ArgumentParser(description='Sigma rule lifecycle manager')
+          parser.add_argument('rules_dir', help='Directory containing Sigma rule files')
+          parser.add_argument('--report', action='store_true',
+                              help='Print full lifecycle report (default behaviour)')
+          parser.add_argument('--check-deprecated', action='store_true',
+                              help='Exit non-zero if any deprecated rules have passed suppression window')
+          args = parser.parse_args()
+
+          rules_dir = pathlib.Path(args.rules_dir)
+          if not rules_dir.exists():
+              print(f'Error: rules directory not found: {rules_dir}')
+              return 1
+
+          today = date.today()
+          rule_files = sorted(
+              list(rules_dir.rglob('*.yml')) + list(rules_dir.rglob('*.yaml'))
+          )
+          records = [r for path in rule_files if (r := parse_record(path, today)) is not None]
+
+          if args.check_deprecated:
+              passed = [r for r in records if r.flag == 'suppression_window_passed']
+              if passed:
+                  print(f'{len(passed)} deprecated rule(s) have passed the suppression window:')
+                  for r in passed:
+                      print(f'  {r.filename}: {r.days_in_status} days suppressed. Remove or restore.')
+                  return 1
+              print('No deprecated rules have exceeded the suppression window.')
+              return 0
+
+          return print_lifecycle_report(records)
+
+      if __name__ == '__main__':
+          sys.exit(main())
+
+common_mistakes:
+  - id: 'CM11.07.1'
+    mistake: 'Using the same time window for fast-burst attacks and slow-campaign attacks in a single aggregation rule'
+    why_it_happens: >
+      A single count threshold with a single window feels cleaner than two rules.
+      Practitioners choose a compromise window that is neither short enough to catch
+      fast attacks nor long enough to accumulate slow campaign evidence.
+    why_it_matters: >
+      A burst extraction attack that delivers 500 queries in 15 minutes generates an
+      average rate of 500/1440 per minute over 24 hours — well below a 24-hour count
+      threshold tuned for slow campaigns. A slow campaign that spreads 500 queries over
+      48 hours generates 10 queries per hour — well below a 15-minute burst threshold.
+      A single-window rule is blind to one of the two attack profiles.
+    correct_approach: >
+      Deploy two rules for each rate-based detection: a fast-window rule (15 minutes,
+      low threshold) for burst attacks and a slow-window rule (24 hours, high threshold)
+      for campaigns. Both reference the same log fields; only the window and threshold
+      differ. The sigma_rule_builder.py templates support generating both variants
+      from a single spec with a fast_window and slow_window parameter.
+
+  - id: 'CM11.07.2'
+    mistake: 'Building correlation rules before the source single-event rules are at stable status'
+    why_it_happens: >
+      Correlation feels like the natural next step after writing the source rules.
+      The detection engineer authors all rules in one sprint.
+    why_it_matters: >
+      A correlation rule built on experimental or test source rules inherits those
+      rules'' instability. If a source rule is calibrated (threshold change, keyword
+      list update), the correlation''s firing behaviour changes implicitly. A correlation
+      that fired on experimental source rule A may no longer fire after A is calibrated
+      to stable — but the correlation''s status is still stable, creating a misleading
+      coverage picture.
+    correct_approach: >
+      Correlation rules are only authored after all source rules have reached stable
+      status. The sigma_rule_lifecycle_manager.py can be extended to check that all
+      referenced source rule titles are stable before promoting a correlation rule
+      beyond experimental.
+
+  - id: 'CM11.07.3'
+    mistake: 'Treating exception filter selections as permanent suppressions without review dates'
+    why_it_happens: >
+      Exceptions are added during an incident or during initial tuning. Once the alert
+      volume drops, the exception is forgotten. Review dates are not required by the
+      metadata standard.
+    why_it_matters: >
+      An exception for svc-regression-tests added in January 2025 may be suppressing
+      alerts from a production service that was renamed to svc-regression-tests in
+      December 2025 after the original test pipeline was decommissioned. The exception
+      is now suppressing real attack alerts from a production account that happens to
+      share the old test pipeline name.
+    correct_approach: >
+      Every filter selection block carries a comment with the exception approval date
+      and owner. The rule_metadata_validator.py is extended to extract these dates and
+      flag exceptions older than 90 days in CI. The sigma_rule_lifecycle_manager.py
+      quarterly report includes an exception audit as a mandatory section.
+
+  - id: 'CM11.07.4'
+    mistake: 'Ordering correlation rule sources by alert frequency rather than attack sequence logic'
+    why_it_happens: >
+      The most frequently firing rule is placed first in the required_rule_titles list
+      because it is expected to provide the earliest signal. But alert frequency does
+      not reflect attack sequence order.
+    why_it_matters: >
+      The extraction campaign correlation requires injection before extraction: the
+      attacker probes (injection signal) then extracts (query accumulation signal). If
+      the rule orders them by frequency — Track 5 fires more often than Track 1, so
+      Track 5 is listed first — the correlation requires extraction before injection,
+      which is the wrong sequence and will not fire on the actual attack pattern.
+    correct_approach: >
+      Order required_rule_titles by the attack sequence logic, not by alert frequency.
+      Document the sequence reasoning in the correlation rule''s description field.
+      Test the ordering by simulating the attack sequence in the staging environment
+      before setting the correlation rule to stable status.
+
+  - id: 'CM11.07.5'
+    mistake: 'Skipping the experimental status phase for correlation rules that seem obviously correct'
+    why_it_happens: >
+      A correlation of Track 1 and Track 5 feels mathematically correct — injection
+      followed by extraction is clearly malicious. Why waste two weeks on staging?
+    why_it_matters: >
+      Correlation rules are the most sensitive to production traffic patterns. A CI test
+      environment cannot replicate the diverse patterns of real user behaviour that
+      produce false correlations: a security researcher who runs injection tests then
+      a legitimate load test in the same session within 10 minutes will trigger the
+      extraction campaign correlation. Without staging observation, these false
+      correlation patterns are invisible until the rule is in production generating
+      critical-level false positives.
+    correct_approach: >
+      All correlation rules begin at experimental status and serve the two-week staging
+      period regardless of how logically sound the correlation appears. The staging
+      period for correlation rules is more valuable than for single-event rules because
+      the interaction between tracks is harder to predict from theory than from
+      observation of real traffic.
+
+section_summary:
+  what_you_learned: |
+    Advanced Sigma patterns transform the gateway from a single-event detector into a
+    campaign-aware detection system. Aggregation conditions with count, min, max, avg,
+    and sum enable rate-based detection with fast-window and slow-window variants for
+    burst and campaign attacks respectively. Correlation rules join alert streams from
+    multiple tracks into campaign-level detections; the three gateway correlation rules
+    (injection-extraction, jailbreak-adversarial, semantic near-miss repetition) and
+    one experimental sequence rule (probe-inject-exfiltrate) produce the critical-level
+    campaign alerts that single-event rules cannot. Exception management via filter
+    selections with not conditions and review-dated comments prevents known-good
+    automation from generating false correlations. The Sigma rule lifecycle (experimental
+    → test → stable → deprecated) governs every rule in the portfolio, enforced by the
+    lifecycle manager. The full portfolio now contains twelve rules across seven tracks.
+  key_terms:
+    - term: 'Correlation rule'
+      definition: >
+        A Sigma rule of type: correlation that joins the output alerts of two or more
+        source rules into a campaign-level detection. Fires when all required source
+        rules produce alerts for the same user within a defined time window, optionally
+        in a specified order.
+    - term: 'Sequence rule'
+      definition: >
+        A correlation rule with ordered: true and three or more stages, where each
+        stage must fire in sequence within the window. Used for multi-phase attack chains
+        (probe → inject → exfiltrate). Requires a Sigma rule for every stage of the
+        attack sequence.
+    - term: 'Exception management'
+      definition: >
+        The use of filter selection blocks combined with not conditions to exclude
+        known-good event sources from detection rules. Exceptions are versioned,
+        review-dated, and documented in the falsepositives field. Exceptions older
+        than 90 days without review are flagged in CI.
+    - term: 'Fast window / slow window'
+      definition: >
+        The two-rule pattern for rate-based aggregation: a fast window (e.g. 15 minutes,
+        low threshold) catches burst attacks; a slow window (e.g. 24 hours, high
+        threshold) catches campaigns. Both are required; a single window misses one
+        of the two attack profiles.
+    - term: 'Sigma lifecycle'
+      definition: >
+        The five-stage progression of a detection rule: draft (unreviewed) →
+        experimental (staging, 2 weeks minimum) → test (production with label,
+        4 weeks minimum) → stable (full production) → deprecated (2-week suppression
+        before removal). Enforced by sigma_rule_lifecycle_manager.py.
+
+preview_section_11_08:
+  title: 'Detection Maturity Model: L1 Through L5'
+  teaser: |
+    Section 11.08 measures the detection programme''s maturity against a five-level
+    model. The Sigma portfolio from Sections 11.06 and 11.07 is the primary evidence:
+    how many rules exist, what lifecycle stages they have reached, whether tests and
+    version history are present, whether the coverage heat map is current, and whether
+    FPR is tracked per rule. The seven-track gateway scores its current maturity, and
+    Section 11.08 produces the roadmap that moves it from L2 (rules exist with governance)
+    to L3 (rules with coverage measurement, FPR tracking, and workflow) by the end of
+    Chapter 11, and to L4 (adaptive detection with ML feedback loops) by the end of
+    Part 3.
+
+metadata:
+  part: 'III'
+  chapter: 11
+  section: 7
+  section_id: '11.07'
+  tags:
+    - sigma-correlation
+    - sigma-aggregation
+    - sigma-sequence
+    - campaign-detection
+    - exception-management
+    - sigma-lifecycle
+    - multi-event-detection
+    - seven-track-portfolio
+    - chapter-11
+    - part-3
+  atlas_anchors:
+    - 'AML.T0051 + AML.T0040 — Extraction campaign correlation (Track 1 + Track 5)'
+    - 'AML.T0054 + AML.T0043 — Jailbreak-adversarial campaign correlation (Track 2 + Track 7)'
+    - 'AML.T0051 — Semantic near-miss repetition correlation (Track 3)'
+    - 'AML.T0051 + AML.T0040 — Probe-inject-exfiltrate sequence (Tracks 1+3+5)'
+  word_count_estimate: 4400
+  deliverables_count: 2
+  common_mistakes_count: 5
