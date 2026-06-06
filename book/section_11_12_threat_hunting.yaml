@@ -1,0 +1,1407 @@
+# section_11_12_threat_hunting.yaml
+
+---
+document_info:
+  book: 'AI Security Mastery'
+  chapter: 11
+  section: 12
+  section_id: '11.12'
+  title: 'Threat Hunting for AI Systems: Proactive Detection'
+  filename: 'section_11_12_threat_hunting.yaml'
+  part: 'III'
+  part_title: 'Detection Engineering for AI'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-05-30'
+  estimated_pages: 6
+
+section_overview:
+  one_line_summary: >
+    Threat hunting finds novel attacks that deployed rules miss — not by looking for
+    anything suspicious, but by testing specific falsifiable hypotheses against
+    production data; every hunt either produces a new detection rule or validates
+    existing coverage, so the detection programme improves regardless of outcome.
+  why_this_section_exists: |
+    Sections 11.02 through 11.11 built the reactive detection infrastructure: rules for
+    known attack patterns, coverage measurement against known technique taxonomies, FPR
+    management for deployed rules, and a OWASP coverage audit. Reactive detection is
+    necessary but insufficient. It catches attacks that match known patterns; it is blind
+    to novel techniques, novel evasion strategies, and novel attack actors who have
+    studied the detection programme and adapted their behaviour to avoid its rules.
+
+    Threat hunting closes this gap proactively. A detection engineer who periodically
+    asks "what attack patterns might be present in our production logs that no deployed
+    rule is catching?" — and then tests that question systematically against real data —
+    finds the gaps that the coverage heat map cannot see, because the coverage heat map
+    only measures coverage of named techniques. An attacker using a novel, unnamed
+    technique is invisible to the heat map by definition.
+
+    AI systems offer a unique hunting advantage that traditional log analysis lacks:
+    the ability to compute semantic similarity across thousands of prompts in seconds.
+    A hunter who clusters the past week''s prompt embeddings and inspects the anomalous
+    clusters is doing something no traditional SIEM query can replicate — finding
+    structural similarity in natural language without requiring a pattern match. This
+    section builds that capability.
+
+    Section 11.12 also completes the Section 11.08 maturity model: deploying the formal
+    hunting procedure and establishing the quarterly cadence moves the Proactive Hunting
+    dimension from L1 to L3.
+  position_in_chapter: >
+    Section 11.12 is the proactive extension of the reactive detection framework built
+    in Sections 11.02 through 11.11. It is the last technical content section before
+    Section 11.13 (production architecture) and Section 11.14 (chapter summary). The
+    hunting cadence and the hunt-to-rule conversion workflow complete the detection
+    programme''s self-improvement loop.
+
+learning_objectives:
+  - 'Distinguish threat hunting from reactive detection and from threat intelligence, and explain why all three are required in a mature detection programme'
+  - 'Write a valid AI security hunting hypothesis that is specific, falsifiable, and tied to a data source and analysis method'
+  - 'Execute the five-phase hunting cycle (hypothesis → data collection → analysis → finding → rule or validation) for an AI system'
+  - 'Apply embedding-space hunting to identify anomalous prompt clusters without requiring labelled data or predefined attack signatures'
+  - 'Name five AI-specific hunting data sources and explain what signal each contributes that the others cannot provide'
+  - 'Convert a confirmed hunt finding into a Sigma rule via the Section 11.10 detection engineering workflow'
+  - 'Design a hunting cadence appropriate for three different threat environments: active campaign, routine monitoring, and deep technique investigation'
+
+prerequisites:
+  required:
+    - 'Section 11.08: proactive hunting dimension at L1; L3 requirements: formal procedure, quarterly cadence, backlog feed'
+    - 'Section 11.10: detection engineering workflow; Phase 1 (hypothesis) is the entry point for hunt-to-rule conversion'
+    - 'Section 11.05: coverage gap backlog; hunt findings that confirm uncovered techniques are added as P1 gaps'
+  helpful:
+    - 'Basic clustering concepts: k-means, DBSCAN, silhouette score — used in prompt_cluster_analyser.py'
+    - 'Section 11.06: Sigma rule authoring; hunt findings convert to Sigma rules via this format'
+    - 'Chapter 12 preview: embedding models — the hunting techniques use the same embedding infrastructure'
+
+prose_content:
+
+  part_1_reactive_vs_proactive:
+    heading: 'Reactive Detection, Threat Intelligence, and Threat Hunting: Three Distinct Disciplines'
+    body: |
+      Detection engineering produces three distinct outputs that are frequently conflated:
+      reactive detection rules, threat intelligence consumption, and threat hunting.
+      Understanding the distinction is the precondition for understanding what hunting
+      adds that the other two cannot provide.
+
+      Reactive detection rules match known patterns. A Sigma rule for prompt injection
+      fires when a prompt contains a known injection prefix. It is effective against
+      attacks that match the rule and blind to attacks that do not. The coverage heat
+      map measures exactly this boundary: the boundary between what rules can see and
+      what they cannot. Reactive detection is the foundation; everything else is built
+      on it.
+
+      Threat intelligence consumption brings external knowledge of new attack techniques
+      into the detection programme. When a threat intelligence feed reports a new
+      adversarial ML technique, the detection engineering workflow (Section 11.10)
+      converts it into a detection hypothesis and eventually a rule. Threat intelligence
+      extends the reactive detection foundation by adding rules for newly published
+      techniques before they are used against the organisation. It is still reactive in
+      the sense that it follows the attacker''s publication of the technique rather than
+      discovering the technique in production logs.
+
+      Threat hunting discovers attack patterns present in production logs that no
+      deployed rule captures — because no rule exists for them yet. A hunter does not
+      wait for a threat intelligence report. They ask: given what I know about attacker
+      behaviour, what patterns might be present in our logs right now that our rules
+      cannot see? They then test that question systematically against real data and either
+      confirm a novel attack pattern (producing a new rule) or confirm that no such
+      pattern is present (validating that existing coverage is effective for this threat
+      scenario).
+
+      The three disciplines are complementary. Reactive detection handles what is known.
+      Threat intelligence handles what is newly published. Hunting handles what is novel
+      and currently present. A detection programme without hunting is perpetually behind
+      the attacker; it can only detect techniques it already knows about.
+
+  part_2_hypothesis_discipline:
+    heading: 'Hunting Is Not Fishing: The Hypothesis Requirement'
+    body: |
+      The most common error in threat hunting programmes is "fishing": opening a log
+      analysis tool, browsing through data without a specific question, and looking for
+      something that appears unusual. Fishing is not hunting. It does not produce
+      reproducible results, it does not scale to production log volumes, and it cannot
+      confirm or deny anything — an analyst who browses logs and finds nothing unusual
+      cannot conclude that no attack is present, only that nothing caught their eye.
+
+      Every hunt starts with a specific, falsifiable hypothesis. A hypothesis specifies:
+      what pattern would be present if the hypothesised attack is occurring; which data
+      source that pattern would appear in; and what analysis method would confirm or
+      deny the hypothesis. A hypothesis that cannot be tested against data is not a
+      hypothesis — it is speculation.
+
+      The quality test for a hunting hypothesis: can it be falsified? "Are adversaries
+      targeting our system?" cannot be falsified with data. "Are any users in the past
+      seven days querying the model with prompts whose embeddings cluster within 0.15
+      cosine distance of the known-injection embedding centroid but do not match any
+      Track 1 or Track 3 rule?" can be falsified: run the embedding similarity search
+      against the past seven days of prompts, apply the distance threshold, filter out
+      Track 1 and Track 3 hits, and examine what remains.
+
+      The five hunting hypotheses in the threat_hunting_playbook.py deliverable all
+      follow this structure. Each names the attack scenario, the expected observable
+      pattern, the data source, the analysis method, and the falsification criterion.
+      A hunt that produces zero results is not a failed hunt — it is a successful
+      validation of existing coverage for the hypothesised attack scenario.
+
+  part_3_ai_hunting_data_sources:
+    heading: 'Data Sources for AI System Threat Hunting'
+    body: |
+      Five data sources are available for AI system threat hunting, each contributing
+      signal that the others cannot provide:
+
+      Data Source 1 — API gateway request logs (ai_gateway category). The primary source
+      for prompt-level hunting. Contains prompt_text (or prompt hash), token_count,
+      gateway_action, and all track scores. Enables: keyword pattern analysis, entropy
+      distribution analysis, semantic similarity clustering, and anomalous track score
+      combinations. Volume: the full production request corpus; typically sampled for
+      hunting (7-day window, 100k request sample for weekly hunts).
+
+      Data Source 2 — Session logs (ai_session category). The primary source for
+      behavioural hunting across request sequences. Contains query_variance, query_entropy_avg,
+      output_entropy_avg, and budget_consumed_pct. Enables: session-level outlier detection,
+      identification of users whose session behaviour is anomalous relative to their
+      own baseline, and detection of slowly-escalating query patterns.
+
+      Data Source 3 — Model serving metrics. Metrics emitted by the model serving
+      infrastructure: inference latency distribution, token generation rate, KV-cache
+      hit rate. These are not request-level logs but aggregated time-series metrics.
+      Enables: detecting prompt-induced computational anomalies (recursive self-reference
+      causing latency spikes), unusual KV-cache eviction patterns from unusually structured
+      prompts, and resource exhaustion precursors.
+
+      Data Source 4 — LLM output logs. The response content after inference. Currently
+      the output-side gap in the gateway (Section 11.11). When the Chapter 14 output
+      validation layer is deployed, output logs become available for hunting: hunting
+      for responses that contain code patterns, PII regex matches, or system prompt
+      reflection patterns in the output corpus without individual rule triggers.
+
+      Data Source 5 — Embedding similarity search. A derived source: computing prompt
+      embeddings and running approximate nearest-neighbour search across the corpus.
+      Enables: finding prompts that are semantically close to known-bad examples without
+      matching any surface pattern rule; identifying clusters of structurally similar
+      prompts that may represent a coordinated campaign; and detecting gradual semantic
+      drift in the query distribution that may indicate an evolving attack campaign.
+      This is the uniquely AI data source — traditional log analysis has no equivalent.
+
+  part_4_five_hypotheses:
+    heading: 'Five AI-Specific Hunting Hypotheses'
+    body: |
+      The five hypotheses encoded in threat_hunting_playbook.py target the detection
+      gaps most relevant to the seven-track gateway. Each is written in the standard
+      hypothesis format: scenario, expected pattern, data source, analysis method,
+      falsification criterion, and pivot chain to Sigma rule if confirmed.
+
+      Hypothesis 1 — Embedding cluster anomaly (novel injection variants).
+      Scenario: adversaries are using injection variants that are semantically similar
+      to known injections but surface-form different enough to evade Track 1 and Track 3.
+      Expected pattern: a cluster of prompts within 0.20 cosine distance of the known-bad
+      embedding centroid that have not been flagged by any deployed rule.
+      Data source: api_gateway request logs (prompt embeddings computed offline).
+      Analysis method: compute embeddings for the past 7-day prompt corpus; apply DBSCAN
+      clustering; identify clusters with high centroid proximity to the known-bad centroid;
+      filter out prompts already flagged by Tracks 1-3; examine remaining prompts manually.
+      Falsification criterion: zero prompts in the high-proximity unflagged cluster → coverage
+      confirmed for this attack scenario.
+      Pivot chain: if confirmed → new injection variant → hypothesis for Section 11.10
+      Phase 1 → Track 1 keyword addition or Track 3 centroid update.
+
+      Hypothesis 2 — Session entropy outlier (systematic model behaviour probing).
+      Scenario: an actor is probing the model''s response consistency by submitting
+      near-identical prompts with minor variations — a reconnaissance pattern that
+      precedes a more targeted extraction or injection campaign.
+      Expected pattern: a user whose query_variance is in the bottom 5th percentile
+      across all users in the 30-day window, with a session_request_count in the top
+      10th percentile for their user cohort, but who has not triggered Track 5 rate
+      detection (because their absolute request count is below the rule threshold).
+      Data source: ai_session logs, per-user baseline from false_positive_manager.py.
+      Analysis method: compute per-user query_variance percentile and request_count
+      percentile; identify the intersection of bottom-5th query_variance and top-10th
+      request_count; cross-reference against Track 5 alert history to confirm unflagged.
+      Falsification criterion: no users in the intersection set → Track 5 is catching
+      all sub-threshold systematic probing.
+
+      Hypothesis 3 — Coordinated timing pattern (multi-user coordinated campaign).
+      Scenario: multiple accounts are submitting prompts in a coordinated pattern —
+      same prompt structure, interleaved across accounts at regular intervals — suggesting
+      a distributed attack that each individual account keeps below per-user detection
+      thresholds.
+      Expected pattern: three or more users submitting prompts with cosine similarity
+      > 0.90 to each other within the same 15-minute window, where no single user''s
+      activity triggers any deployed rule.
+      Data source: api_gateway logs (prompt embeddings, timestamps, user_ids).
+      Analysis method: sliding 15-minute window across the corpus; for each window,
+      compute pairwise cosine similarities across distinct users; flag windows with
+      3+ users and pairwise similarity > 0.90.
+      Falsification criterion: no qualifying windows → no coordinated campaign pattern
+      detected in this period.
+
+      Hypothesis 4 — System prompt drift (prompt injection via accumulated context).
+      Scenario: an adversary is using multi-turn conversation to gradually shift the
+      effective system prompt through accumulated context — each turn contributing a small
+      instruction fragment that, combined across turns, overrides the original system
+      prompt intent.
+      Expected pattern: a user whose session-level prompt embedding centroid (computed
+      across all turns) drifts more than 0.30 cosine distance from the session''s first
+      turn embedding in a direction toward the known-bad centroid.
+      Data source: api_gateway logs (prompt embeddings per turn, session_id).
+      Analysis method: compute per-turn embeddings within each session; compute rolling
+      centroid across turns; measure cosine drift from first-turn embedding; flag sessions
+      with drift > 0.30 toward the known-bad centroid.
+      Falsification criterion: no qualifying sessions → accumulated context drift attack
+      not present in this period.
+
+      Hypothesis 5 — Output entropy spike (model exfiltration via response patterns).
+      Scenario: an adversary who has successfully injected instructions is causing the
+      model to generate unusually high-entropy outputs — a signal consistent with
+      exfiltrating structured data (training data, system prompt content) in the response.
+      Expected pattern: a user whose output_entropy_avg is more than 2 standard deviations
+      above the fleet-wide output_entropy_avg for their model and prompt_length cohort,
+      with no corresponding Track 6 or Track 7 alert.
+      Data source: ai_session logs (output_entropy_avg); model serving metrics (per-model
+      baseline output entropy). Note: requires Chapter 14 output validation layer for full
+      signal; partial signal available from session-level entropy metrics now.
+      Falsification criterion: no qualifying users → no output exfiltration pattern
+      detected in this period.
+
+  part_5_hunt_to_rule:
+    heading: 'Hunt-to-Rule Conversion: Closing the Self-Improvement Loop'
+    body: |
+      A confirmed hunt finding is evidence of an attack pattern that no deployed rule
+      captures. The immediate action is containment if the attack is active; the
+      detection engineering action is converting the finding into a rule before the
+      hunting session closes. A finding that is not converted to a rule within five
+      business days of confirmation degrades back to a gap — the next time the hunt
+      runs, it will find the same pattern again, and the detection programme has not
+      improved.
+
+      The hunt-to-rule conversion uses the Section 11.10 detection engineering workflow
+      starting at Phase 1 (hypothesis). The confirmed hunt finding is the hypothesis
+      input: "I observed prompts matching pattern X in the past 7-day corpus that were
+      not caught by any deployed rule. I hypothesise that a rule matching pattern X would
+      detect this attack class." Phase 2 (design) specifies the log field to match,
+      the detection operator, and the FPR target. Phase 3 (build) produces the Sigma rule
+      or Python detector. Phase 4 (test) writes the positive fixture from the actual
+      confirmed hunting examples and adds them to the known-bad corpus. Phase 5 deploys.
+
+      Hunt findings that confirm ATLAS technique coverage gaps (the hunt found no
+      detection for a technique that the heat map showed as partially covered) are added
+      to the detection backlog as P1 items, bypassing the normal likelihood × impact
+      priority score. A confirmed hunt finding is evidence that the attack is not merely
+      theoretically possible but actively occurring or recently occurred in the production
+      environment — that is higher priority than a scoring model based on threat
+      intelligence alone.
+
+      A hunt that finds nothing is not wasted effort. It is a validation of existing
+      coverage for the hypothesised attack scenario. The validation is recorded in the
+      hunt report and contributes to the detection programme''s confidence level for
+      that scenario: "we hunted for coordinated timing patterns in the past 7-day corpus
+      using the Hypothesis 3 procedure and found no qualifying windows." This is a
+      defensible claim that reactive detection alone cannot make.
+
+  part_6_cadence:
+    heading: 'Hunting Cadence: Weekly, Monthly, and Quarterly'
+    body: |
+      The appropriate hunting cadence depends on the threat environment:
+
+      Weekly hunting for active threat campaigns. When threat intelligence indicates
+      that an adversary is actively targeting AI systems in the organisation''s sector,
+      or when a recent security incident suggests an active campaign, the weekly cadence
+      runs a focused subset of hypotheses against the most recent 7-day log window.
+      Weekly hunts are narrow: one or two hypotheses per session, selected from the
+      playbook based on the active campaign''s known tactics. The 7-day window keeps
+      the data volume manageable for a 2–4 hour hunt session.
+
+      Monthly hunting for routine monitoring. The standard cadence for a programme
+      without active campaign intelligence. All five hypotheses run against the past
+      30-day window. The 30-day window captures behavioural patterns that are too slow
+      for a 7-day window to reveal (Hypothesis 4 system prompt drift requires multiple
+      sessions over days or weeks to manifest). Monthly hunts take 4–6 hours and produce
+      a hunt report that feeds the detection backlog.
+
+      Quarterly deep-technique hunting. A longer, more exploratory session aligned with
+      the quarterly coverage review. The hunter selects hypotheses based on newly
+      published ATLAS techniques or new attack research identified in the taxonomy
+      expansion check from Section 11.05. New hypotheses are written for the quarter''s
+      notable techniques and tested against the full 90-day log window. Quarterly hunts
+      produce the hypotheses that become the next quarter''s playbook additions.
+
+      The cadence gates in the Section 11.08 maturity model: L3 requires at least
+      quarterly hunting with the formal procedure. L4 requires monthly hunting with red
+      team findings driving hypothesis selection. L5 requires continuous automated hunting
+      supplementing manual quarterly sessions. After deploying the threat_hunting_playbook.py
+      and running the first formal quarterly hunt, the Proactive Hunting dimension
+      advances from L1 to L3.
+
+reference_materials:
+
+  table_1_five_hypotheses:
+    title: 'Five AI Threat Hunting Hypotheses — Specification Reference'
+    description: 'Complete specification for each of the five playbook hypotheses: scenario, data source, analysis method, and pivot chain'
+    columns:
+      - 'Hypothesis'
+      - 'Attack Scenario'
+      - 'Data Source'
+      - 'Analysis Method'
+      - 'Falsification Criterion'
+      - 'Pivot Chain if Confirmed'
+    rows:
+      - ['H1 — Embedding cluster anomaly',
+         'Novel injection variants semantically close to known-bad but surface-form different',
+         'ai_gateway logs + offline embedding computation',
+         'DBSCAN on 7-day prompt embeddings; flag unflagged high-proximity clusters',
+         'Zero unflagged prompts within 0.20 of known-bad centroid',
+         'New injection variant → Section 11.10 Phase 1 → Track 1 keyword or Track 3 centroid update']
+      - ['H2 — Session entropy outlier',
+         'Systematic model behaviour probing below Track 5 absolute threshold',
+         'ai_session logs; per-user baseline from false_positive_manager.py',
+         'Percentile intersect: bottom-5th query_variance AND top-10th request_count AND no Track 5 alert',
+         'No users in intersection set',
+         'Sub-threshold probing pattern → Section 11.10 Phase 1 → Track 5 baseline anomaly rule']
+      - ['H3 — Coordinated timing pattern',
+         'Multi-user coordinated campaign keeping each account below per-user thresholds',
+         'ai_gateway logs (embeddings + timestamps + user_ids)',
+         '15-min sliding window; flag windows with 3+ users and pairwise similarity > 0.90',
+         'No qualifying 15-min windows in corpus',
+         'Coordinated campaign → Section 11.10 Phase 1 → cross-user Sigma correlation rule (Section 11.07)']
+      - ['H4 — System prompt drift',
+         'Multi-turn accumulated context injection shifting effective system prompt',
+         'ai_gateway logs (per-turn embeddings, session_id)',
+         'Rolling per-session centroid; flag sessions with drift > 0.30 toward known-bad centroid',
+         'No sessions with qualifying drift trajectory',
+         'Multi-turn drift pattern → Section 11.10 Phase 1 → sequence Sigma rule (Section 11.07 near/sequence)']
+      - ['H5 — Output entropy spike',
+         'Successful injection causing model to exfiltrate structured data in responses',
+         'ai_session logs (output_entropy_avg); model serving metrics',
+         'Fleet-wide output entropy baseline; flag users > 2SD above cohort mean with no Track 6/7 alert',
+         'No qualifying users in output entropy outlier set',
+         'Output exfiltration pattern → Section 11.10 Phase 1 → output entropy Sigma rule (needs Ch14 output logs)']
+
+  table_2_data_sources:
+    title: 'AI Threat Hunting Data Sources'
+    description: 'Five data sources, what signal each contributes, volume characteristics, and the hypotheses each supports'
+    columns:
+      - 'Data Source'
+      - 'Log Category'
+      - 'Unique Signal'
+      - 'Typical Volume'
+      - 'Supports Hypotheses'
+    rows:
+      - ['API gateway request logs', 'ai_gateway',
+         'Prompt-level content, track scores, gateway action per request',
+         '10K–500K requests/day; sample 100K for weekly hunts',
+         'H1, H3, H4']
+      - ['Session logs', 'ai_session',
+         'Cross-request behavioural aggregates: query_variance, entropy averages, budget consumption',
+         '1K–50K sessions/day; full corpus for monthly hunts',
+         'H2, H5']
+      - ['Model serving metrics', 'metrics (time-series)',
+         'Computational anomalies: latency spikes, KV-cache eviction, token generation rate deviation',
+         'High-frequency time-series; aggregate to 1-min buckets for hunting',
+         'H5 (latency component)']
+      - ['LLM output logs', 'ai_gateway (post-Ch14)',
+         'Response content: code patterns, PII regex hits, system prompt reflection, response entropy',
+         'Same volume as request logs; Ch14 output validation layer required',
+         'H5 (full signal)']
+      - ['Embedding similarity search', 'Derived (offline)',
+         'Semantic structure across thousands of prompts without surface-pattern matching; unique to AI',
+         'Compute once per corpus; approximate NN search O(n log n)',
+         'H1, H3, H4']
+
+  table_3_hunt_report_template:
+    title: 'Hunt Report Template Fields'
+    description: 'Required fields in every hunt report; reports are appended to the detection programme records and feed the coverage heat map review'
+    columns:
+      - 'Field'
+      - 'Type'
+      - 'Description'
+      - 'Example'
+    rows:
+      - ['hunt_id', 'UUID', 'Stable identifier for this hunt session', '"hunt-2026-Q2-001"']
+      - ['hypothesis_id', 'string', 'Reference to the playbook hypothesis tested', '"H1 — Embedding cluster anomaly"']
+      - ['analyst', 'string', 'GitHub handle of the hunting analyst', '"ruwgxo"']
+      - ['hunt_date', 'ISO 8601', 'Date hunt was conducted', '"2026-06-15"']
+      - ['data_window', 'string', 'Log corpus time window analysed', '"2026-06-08 to 2026-06-14 (7 days)"']
+      - ['corpus_size', 'integer', 'Number of log records analysed', '94372']
+      - ['outcome', 'enum', 'Hunt result: confirmed_finding | coverage_validated | inconclusive', '"coverage_validated"']
+      - ['finding_description', 'string', 'If confirmed: describe the observed pattern; if validated: state what was searched and not found', '"No unflagged prompts within 0.20 of known-bad centroid in 7-day window. Track 3 caught all proximity hits."']
+      - ['evidence_samples', 'list', 'If confirmed: anonymised prompt samples or cluster centroids supporting the finding', '[]']
+      - ['next_action', 'enum', 'What happens next: new_rule | backlog_p1 | validate_quarterly | no_action', '"validate_quarterly"']
+      - ['sigma_rule_id', 'UUID or null', 'If new_rule: the UUID of the Sigma rule created from this finding', 'null']
+      - ['detection_backlog_item', 'string or null', 'If backlog_p1: the gap item ID added to detection_gap_prioritiser.py', 'null']
+
+deliverables:
+
+  deliverable_1:
+    id: 'D11.12.1'
+    filename: 'threat_hunting_playbook.py'
+    description: >
+      Five AI-specific hunting hypotheses encoded as executable procedures with data
+      source specification, analysis method, falsification criterion, and pivot chain.
+      Produces a structured hunt report for each hypothesis run. Integrates with
+      detection_gap_prioritiser.py to add P1 items from confirmed findings.
+    language: 'python'
+    python_version: '3.12'
+    dependencies:
+      - 'pyyaml>=6.0'
+      - 'dataclasses (stdlib)'
+      - 'uuid (stdlib)'
+    code: |
+      #!/usr/bin/env python3
+      '''threat_hunting_playbook.py
+      Five AI-specific hunting hypotheses with analysis procedures and pivot chains.
+      Produces structured hunt reports. Integrates with detection gap prioritiser.
+      Chapter 11, Section 11.12 — AI Security Mastery
+      Author: Raghav Dinesh | github: ruwgxo
+
+      Usage:
+        python3 threat_hunting_playbook.py --list
+        python3 threat_hunting_playbook.py --run H1 --analyst ruwgxo --window 7
+        python3 threat_hunting_playbook.py --run all --window 30
+        python3 threat_hunting_playbook.py --report hunt-2026-Q2-001
+      '''
+
+      from __future__ import annotations
+      import argparse
+      import json
+      import pathlib
+      import sys
+      import uuid
+      from dataclasses import dataclass, field
+      from datetime import date, datetime, timedelta, timezone
+      from typing import Callable, Literal
+
+      HuntOutcome = Literal['confirmed_finding', 'coverage_validated', 'inconclusive']
+      NextAction = Literal['new_rule', 'backlog_p1', 'validate_quarterly', 'no_action']
+
+      REPORTS_DIR = pathlib.Path('hunt_reports')
+
+      # ---------------------------------------------------------------------------
+      # Data model
+      # ---------------------------------------------------------------------------
+
+      @dataclass
+      class HuntHypothesis:
+          hypothesis_id: str
+          name: str
+          attack_scenario: str
+          expected_pattern: str
+          data_source: str
+          log_category: str
+          analysis_method: str
+          falsification_criterion: str
+          pivot_chain: str
+          recommended_cadence: str     # 'weekly' | 'monthly' | 'quarterly'
+          atlas_technique_gap: str     # ATLAS technique this hunt targets
+
+      @dataclass
+      class HuntReport:
+          hunt_id: str
+          hypothesis_id: str
+          analyst: str
+          hunt_date: str
+          data_window: str
+          corpus_size: int
+          outcome: HuntOutcome
+          finding_description: str
+          evidence_samples: list[str]
+          next_action: NextAction
+          sigma_rule_id: str | None = None
+          detection_backlog_item: str | None = None
+
+      # ---------------------------------------------------------------------------
+      # Hypothesis registry
+      # ---------------------------------------------------------------------------
+
+      HYPOTHESES: dict[str, HuntHypothesis] = {
+
+          'H1': HuntHypothesis(
+              hypothesis_id='H1',
+              name='Embedding Cluster Anomaly — Novel Injection Variants',
+              attack_scenario=(
+                  'Adversaries are using prompt injection variants that are semantically '
+                  'similar to known injections but surface-form different enough to evade '
+                  'Track 1 (keyword matching) and Track 3 (cosine similarity threshold at 0.85).'
+              ),
+              expected_pattern=(
+                  'A cluster of prompts within 0.20 cosine distance of the known-bad '
+                  'embedding centroid that have NOT been flagged by Track 1 or Track 3.'
+              ),
+              data_source='API gateway request logs (prompt_text field) + offline embedding computation',
+              log_category='ai_gateway',
+              analysis_method=(
+                  '1. Compute sentence embeddings for all prompts in the corpus window. '
+                  '2. Apply DBSCAN clustering (eps=0.15, min_samples=5) on the embedding matrix. '
+                  '3. Compute centroid of each cluster. '
+                  '4. Measure cosine distance from each cluster centroid to the known-bad centroid. '
+                  '5. Flag clusters with centroid distance < 0.20. '
+                  '6. Filter out prompts in flagged clusters that already have gateway_action=flag or block. '
+                  '7. Examine remaining unflagged prompts manually for adversarial intent.'
+              ),
+              falsification_criterion=(
+                  'Zero prompts in the high-proximity unflagged cluster → '
+                  'Track 3 is catching all semantically similar injection variants at current threshold.'
+              ),
+              pivot_chain=(
+                  'Confirmed finding → characterise the evading injection variant → '
+                  'Section 11.10 Phase 1 hypothesis → '
+                  'Track 1 keyword addition (if surface pattern is consistent) OR '
+                  'Track 3 centroid update (if variant is semantically novel) → '
+                  'add confirmed examples to known-bad fixture corpus.'
+              ),
+              recommended_cadence='weekly',
+              atlas_technique_gap='AML.T0051 — L3 obfuscated injection gap',
+          ),
+
+          'H2': HuntHypothesis(
+              hypothesis_id='H2',
+              name='Session Entropy Outlier — Sub-Threshold Systematic Probing',
+              attack_scenario=(
+                  'An actor is probing the model''s response consistency by submitting '
+                  'near-identical prompts with minor variations — a reconnaissance pattern '
+                  'preceding extraction or injection. The absolute request count stays '
+                  'below the Track 5 rate rule threshold.'
+              ),
+              expected_pattern=(
+                  'A user whose query_variance is in the bottom 5th percentile AND '
+                  'session_request_count is in the top 10th percentile for their cohort, '
+                  'AND who has no Track 5 alert in the analysis window.'
+              ),
+              data_source='ai_session logs + per-user baseline from false_positive_manager.py',
+              log_category='ai_session',
+              analysis_method=(
+                  '1. Load ai_session records for the analysis window. '
+                  '2. Compute per-user query_variance percentile rank across all users. '
+                  '3. Compute per-user session_request_count percentile rank within user cohort. '
+                  '4. Select users in bottom-5th query_variance AND top-10th request_count. '
+                  '5. Cross-reference against Track 5 alert history; remove users with existing alerts. '
+                  '6. For remaining users, review session request content for systematic probing patterns.'
+              ),
+              falsification_criterion=(
+                  'No users in the percentile intersection set → '
+                  'Track 5 or the per-user baseline is catching all sub-threshold systematic probing.'
+              ),
+              pivot_chain=(
+                  'Confirmed finding → document the sub-threshold probing pattern → '
+                  'Section 11.10 Phase 1 → Track 5 baseline anomaly rule (extend session accumulator) → '
+                  'lower Track 5 rate threshold if pattern warrants it (check FPR impact first).'
+              ),
+              recommended_cadence='monthly',
+              atlas_technique_gap='AML.T0040 — sub-threshold extraction reconnaissance',
+          ),
+
+          'H3': HuntHypothesis(
+              hypothesis_id='H3',
+              name='Coordinated Timing Pattern — Multi-User Campaign Detection',
+              attack_scenario=(
+                  'Multiple accounts are submitting structurally similar prompts in a '
+                  'coordinated pattern — interleaved across accounts at regular intervals — '
+                  'to keep each individual account below per-user detection thresholds.'
+              ),
+              expected_pattern=(
+                  'Three or more distinct user_ids submitting prompts with pairwise '
+                  'cosine similarity > 0.90 within the same 15-minute window, '
+                  'where no individual user triggers any deployed rule.'
+              ),
+              data_source='ai_gateway logs (prompt_text, timestamp, user_id) + embedding computation',
+              log_category='ai_gateway',
+              analysis_method=(
+                  '1. Compute embeddings for all prompts in the corpus. '
+                  '2. Slide a 15-minute window across the corpus in 5-minute steps. '
+                  '3. For each window: collect all (user_id, embedding) pairs. '
+                  '4. Compute pairwise cosine similarity across distinct user_ids. '
+                  '5. Flag windows where 3+ distinct users have pairwise similarity > 0.90. '
+                  '6. Filter windows where any user has an existing alert. '
+                  '7. Review flagged windows for campaign structure.'
+              ),
+              falsification_criterion=(
+                  'No qualifying 15-minute windows in the corpus → '
+                  'no coordinated multi-user campaign pattern detected in this period.'
+              ),
+              pivot_chain=(
+                  'Confirmed finding → characterise the coordinated prompt structure → '
+                  'Section 11.10 Phase 1 → cross-user Sigma correlation rule (Section 11.07) → '
+                  'add user_ids to investigation list for account review.'
+              ),
+              recommended_cadence='monthly',
+              atlas_technique_gap='Multi-user coordinated attack — no named ATLAS technique yet',
+          ),
+
+          'H4': HuntHypothesis(
+              hypothesis_id='H4',
+              name='System Prompt Drift — Multi-Turn Accumulated Context Injection',
+              attack_scenario=(
+                  'An adversary is using multi-turn conversation to gradually shift the '
+                  'effective system prompt through accumulated context — each turn contributing '
+                  'a small instruction fragment that, combined, overrides the original system '
+                  'prompt intent without any single turn matching an injection rule.'
+              ),
+              expected_pattern=(
+                  'A session whose rolling per-turn embedding centroid drifts more than '
+                  '0.30 cosine distance from the session''s first-turn embedding in a '
+                  'direction toward the known-bad centroid.'
+              ),
+              data_source='ai_gateway logs grouped by session_id (prompt embeddings per turn)',
+              log_category='ai_gateway',
+              analysis_method=(
+                  '1. Group prompt records by session_id. '
+                  '2. Compute per-turn embeddings in chronological order per session. '
+                  '3. Compute first-turn embedding as the session baseline. '
+                  '4. Compute rolling centroid as turns accumulate. '
+                  '5. Measure cosine distance between rolling centroid and first-turn embedding. '
+                  '6. Measure direction of drift: compute dot product with (known_bad_centroid - first_turn). '
+                  '7. Flag sessions with drift > 0.30 in the direction of the known-bad centroid.'
+              ),
+              falsification_criterion=(
+                  'No sessions with qualifying drift trajectory → '
+                  'accumulated context injection not present in this period.'
+              ),
+              pivot_chain=(
+                  'Confirmed finding → extract multi-turn prompt sequence → '
+                  'Section 11.10 Phase 1 → sequence Sigma rule using Section 11.07 near/sequence operators → '
+                  'add session examples to multi-turn test fixture corpus.'
+              ),
+              recommended_cadence='monthly',
+              atlas_technique_gap='AML.T0051 — multi-turn indirect accumulated injection variant',
+          ),
+
+          'H5': HuntHypothesis(
+              hypothesis_id='H5',
+              name='Output Entropy Spike — Exfiltration via Response Patterns',
+              attack_scenario=(
+                  'An adversary who has successfully injected instructions is causing the '
+                  'model to generate unusually high-entropy responses — consistent with '
+                  'exfiltrating structured data (training data, system prompt content, '
+                  'internal knowledge) in the response stream.'
+              ),
+              expected_pattern=(
+                  'A user whose output_entropy_avg is more than 2 standard deviations '
+                  'above the fleet-wide output_entropy_avg for their (model, prompt_length_bucket) '
+                  'cohort, with no corresponding Track 6 or Track 7 alert.'
+              ),
+              data_source='ai_session logs (output_entropy_avg) + model serving metrics (per-model baseline)',
+              log_category='ai_session',
+              analysis_method=(
+                  '1. Compute fleet-wide output_entropy_avg and SD per (model_name, prompt_length_bucket). '
+                  '2. For each user-session, compute z-score: (user_output_entropy - cohort_mean) / cohort_SD. '
+                  '3. Flag sessions with z-score > 2.0. '
+                  '4. Cross-reference against Track 6 and Track 7 alert history. '
+                  '5. Review unflagged high-entropy sessions: examine prompt content and (if available) response content.'
+              ),
+              falsification_criterion=(
+                  'No qualifying users in the output entropy outlier set → '
+                  'no output exfiltration pattern detected; '
+                  'Track 6/7 is catching all anomalous output entropy patterns.'
+              ),
+              pivot_chain=(
+                  'Confirmed finding → document output entropy pattern → '
+                  'Section 11.10 Phase 1 → output entropy Sigma rule '
+                  '(full implementation requires Ch14 output logs; partial rule on session-level metric now) → '
+                  'add to detection backlog as P1 item pending Ch14 output validation layer.'
+              ),
+              recommended_cadence='monthly',
+              atlas_technique_gap='AML.T0051 + LLM06 — output exfiltration via successful injection',
+          ),
+      }
+
+      # ---------------------------------------------------------------------------
+      # Hunt runner (skeleton — analysis steps are analyst-executed)
+      # ---------------------------------------------------------------------------
+
+      def run_hunt(
+          hypothesis_id: str,
+          analyst: str,
+          window_days: int,
+      ) -> HuntReport:
+          '''
+          Prints the hunt procedure for the specified hypothesis and creates a
+          pending hunt report. The analyst executes the analysis steps and then
+          calls record_outcome() to complete the report.
+          '''
+          hyp = HYPOTHESES.get(hypothesis_id)
+          if not hyp:
+              print(f'Unknown hypothesis: {hypothesis_id}')
+              sys.exit(1)
+
+          hunt_id = f'hunt-{date.today().isoformat()}-{hypothesis_id.lower()}'
+          window_end = date.today()
+          window_start = window_end - timedelta(days=window_days)
+
+          print(f'\n=== Hunt Session: {hunt_id} ===')
+          print(f'Analyst:    {analyst}')
+          print(f'Hypothesis: {hyp.hypothesis_id} — {hyp.name}')
+          print(f'Window:     {window_start} to {window_end} ({window_days} days)')
+          print(f'\nScenario:\n  {hyp.attack_scenario}')
+          print(f'\nExpected pattern:\n  {hyp.expected_pattern}')
+          print(f'\nData source: {hyp.data_source} ({hyp.log_category})')
+          print(f'\nAnalysis procedure:')
+          for line in hyp.analysis_method.split('. '):
+              if line.strip():
+                  print(f'  {line.strip()}{"." if not line.strip().endswith(".") else ""}')
+          print(f'\nFalsification criterion:\n  {hyp.falsification_criterion}')
+          print(f'\nPivot chain if confirmed:\n  {hyp.pivot_chain}')
+          print(f'\nATLAS gap targeted: {hyp.atlas_technique_gap}')
+          print(f'\n--- Execute the analysis steps above, then record outcome ---')
+          print(f'Use: python3 threat_hunting_playbook.py --record {hunt_id} '
+                f'--outcome <confirmed_finding|coverage_validated|inconclusive> '
+                f'--description "..."')
+
+          # Create pending report
+          report = HuntReport(
+              hunt_id=hunt_id,
+              hypothesis_id=hypothesis_id,
+              analyst=analyst,
+              hunt_date=date.today().isoformat(),
+              data_window=f'{window_start} to {window_end} ({window_days} days)',
+              corpus_size=0,   # updated by analyst
+              outcome='inconclusive',
+              finding_description='PENDING — analyst has not yet recorded outcome.',
+              evidence_samples=[],
+              next_action='no_action',
+          )
+          _save_report(report)
+          return report
+
+      def record_outcome(
+          hunt_id: str,
+          outcome: HuntOutcome,
+          description: str,
+          corpus_size: int = 0,
+          evidence_samples: list[str] | None = None,
+          next_action: NextAction = 'validate_quarterly',
+      ) -> HuntReport:
+          report_path = REPORTS_DIR / f'{hunt_id}.json'
+          if not report_path.exists():
+              print(f'Hunt report not found: {hunt_id}')
+              sys.exit(1)
+          with open(report_path) as f:
+              data = json.load(f)
+          data['outcome'] = outcome
+          data['finding_description'] = description
+          data['corpus_size'] = corpus_size
+          data['evidence_samples'] = evidence_samples or []
+          data['next_action'] = next_action
+          report = HuntReport(**data)
+          _save_report(report)
+
+          print(f'\nHunt {hunt_id} outcome recorded: {outcome}')
+          if outcome == 'confirmed_finding':
+              print(f'  Next action: {next_action}')
+              if next_action == 'backlog_p1':
+                  item_id = f'HUNT-{hunt_id.upper()}'
+                  print(f'  → Add to detection_gap_prioritiser.py backlog as P1 item: {item_id}')
+                  print(f'  → Run Section 11.10 workflow Phase 1 with this finding as hypothesis input.')
+          elif outcome == 'coverage_validated':
+              print(f'  Coverage validated for hypothesis {data["hypothesis_id"]}.')
+              print(f'  → Record in quarterly coverage review. No rule action required.')
+          return report
+
+      def list_hypotheses() -> None:
+          print('\nAI Threat Hunting Playbook — Five Hypotheses\n')
+          print(f'{"ID":<5} {"Cadence":<12} {"ATLAS Gap":<50} Name')
+          print('-' * 100)
+          for hyp in HYPOTHESES.values():
+              gap_short = (hyp.atlas_technique_gap[:48] + '..') if len(hyp.atlas_technique_gap) > 48 else hyp.atlas_technique_gap
+              print(f'{hyp.hypothesis_id:<5} {hyp.recommended_cadence:<12} {gap_short:<50} {hyp.name}')
+
+      def _save_report(report: HuntReport) -> None:
+          REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+          path = REPORTS_DIR / f'{report.hunt_id}.json'
+          with open(path, 'w') as f:
+              json.dump(report.__dict__, f, indent=2)
+
+      def print_report(hunt_id: str) -> None:
+          path = REPORTS_DIR / f'{hunt_id}.json'
+          if not path.exists():
+              print(f'Report not found: {hunt_id}')
+              return
+          with open(path) as f:
+              data = json.load(f)
+          print(f'\nHunt Report: {hunt_id}')
+          for k, v in data.items():
+              print(f'  {k}: {v}')
+
+      # ---------------------------------------------------------------------------
+      # Entry point
+      # ---------------------------------------------------------------------------
+
+      def main() -> int:
+          parser = argparse.ArgumentParser(description='AI threat hunting playbook')
+          parser.add_argument('--list', action='store_true', help='List all hypotheses')
+          parser.add_argument('--run', metavar='HYPOTHESIS_ID',
+                              help='Run a hypothesis (H1-H5 or all)')
+          parser.add_argument('--analyst', default='ruwgxo', help='Analyst GitHub handle')
+          parser.add_argument('--window', type=int, default=7,
+                              help='Analysis window in days (default: 7)')
+          parser.add_argument('--record', metavar='HUNT_ID',
+                              help='Record outcome for a completed hunt')
+          parser.add_argument('--outcome', choices=['confirmed_finding', 'coverage_validated', 'inconclusive'])
+          parser.add_argument('--description', default='', help='Finding description')
+          parser.add_argument('--corpus-size', type=int, default=0)
+          parser.add_argument('--next-action',
+                              choices=['new_rule', 'backlog_p1', 'validate_quarterly', 'no_action'],
+                              default='validate_quarterly')
+          parser.add_argument('--report', metavar='HUNT_ID', help='Print a hunt report')
+          args = parser.parse_args()
+
+          if args.list:
+              list_hypotheses()
+              return 0
+
+          if args.run:
+              if args.run == 'all':
+                  for hyp_id in HYPOTHESES:
+                      run_hunt(hyp_id, args.analyst, args.window)
+              elif args.run in HYPOTHESES:
+                  run_hunt(args.run, args.analyst, args.window)
+              else:
+                  print(f'Unknown hypothesis: {args.run}. Use --list to see available hypotheses.')
+                  return 1
+              return 0
+
+          if args.record:
+              if not args.outcome:
+                  print('--outcome required with --record')
+                  return 1
+              record_outcome(
+                  args.record, args.outcome, args.description,  # type: ignore[arg-type]
+                  args.corpus_size, next_action=args.next_action,  # type: ignore[arg-type]
+              )
+              return 0
+
+          if args.report:
+              print_report(args.report)
+              return 0
+
+          parser.print_help()
+          return 1
+
+      if __name__ == '__main__':
+          sys.exit(main())
+
+  deliverable_2:
+    id: 'D11.12.2'
+    filename: 'prompt_cluster_analyser.py'
+    description: >
+      Embedding-based prompt clustering for unsupervised anomaly detection in the
+      prompt corpus. Implements DBSCAN clustering on prompt embeddings, measures
+      cluster centroid proximity to the known-bad embedding centroid, and flags
+      clusters that are close but undetected by deployed rules. Supports Hypothesis H1
+      and the cross-session coordinated pattern detection in Hypothesis H3.
+    language: 'python'
+    python_version: '3.12'
+    dependencies:
+      - 'numpy>=1.26'
+      - 'scikit-learn>=1.4'
+    code: |
+      #!/usr/bin/env python3
+      '''prompt_cluster_analyser.py
+      DBSCAN-based prompt clustering for threat hunting.
+      Identifies anomalous prompt clusters by proximity to known-bad embedding centroid.
+      Supports Hypotheses H1 (injection variant clusters) and H3 (coordinated patterns).
+      Chapter 11, Section 11.12 — AI Security Mastery
+      Author: Raghav Dinesh | github: ruwgxo
+
+      Usage:
+        python3 prompt_cluster_analyser.py --corpus prompts.json --centroid known_bad.npy
+        python3 prompt_cluster_analyser.py --demo
+      '''
+
+      from __future__ import annotations
+      import argparse
+      import json
+      import sys
+      from dataclasses import dataclass
+
+      import numpy as np
+
+      # ---------------------------------------------------------------------------
+      # Data model
+      # ---------------------------------------------------------------------------
+
+      @dataclass
+      class ClusterResult:
+          cluster_id: int
+          size: int
+          centroid: np.ndarray
+          centroid_distance_to_known_bad: float
+          flagged_fraction: float       # fraction already flagged by deployed rules
+          unflagged_count: int
+          proximity_label: str          # 'high' | 'medium' | 'low'
+          anomalous: bool               # True if high-proximity and unflagged_count > 0
+
+      @dataclass
+      class PromptRecord:
+          prompt_id: str
+          embedding: np.ndarray
+          already_flagged: bool         # gateway_action != 'pass'
+          user_id: str = ''
+
+      # ---------------------------------------------------------------------------
+      # Clustering
+      # ---------------------------------------------------------------------------
+
+      def load_corpus(corpus_path: str) -> list[PromptRecord]:
+          '''
+          Load prompt corpus from JSON file.
+          Expected format: list of {prompt_id, embedding (list[float]),
+          already_flagged (bool), user_id (str)}.
+          '''
+          with open(corpus_path) as f:
+              raw = json.load(f)
+          records: list[PromptRecord] = []
+          for item in raw:
+              records.append(PromptRecord(
+                  prompt_id=item['prompt_id'],
+                  embedding=np.array(item['embedding'], dtype=np.float32),
+                  already_flagged=item.get('already_flagged', False),
+                  user_id=item.get('user_id', ''),
+              ))
+          return records
+
+      def run_dbscan(
+          records: list[PromptRecord],
+          eps: float = 0.15,
+          min_samples: int = 5,
+      ) -> dict[int, list[PromptRecord]]:
+          '''
+          Run DBSCAN clustering on prompt embeddings.
+          Returns mapping of cluster_id -> list of PromptRecord.
+          Cluster -1 contains noise points (no cluster).
+          '''
+          from sklearn.cluster import DBSCAN
+
+          embeddings = np.stack([r.embedding for r in records])
+          # DBSCAN with cosine metric (1 - cosine_similarity as distance)
+          model = DBSCAN(eps=eps, min_samples=min_samples, metric='cosine', n_jobs=-1)
+          labels = model.fit_predict(embeddings)
+
+          clusters: dict[int, list[PromptRecord]] = {}
+          for record, label in zip(records, labels):
+              clusters.setdefault(int(label), []).append(record)
+          return clusters
+
+      def compute_centroid(records: list[PromptRecord]) -> np.ndarray:
+          '''Compute mean embedding centroid for a list of records.'''
+          embeddings = np.stack([r.embedding for r in records])
+          centroid = embeddings.mean(axis=0)
+          return centroid / (np.linalg.norm(centroid) + 1e-8)
+
+      def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+          '''Cosine distance (1 - cosine similarity) between two unit vectors.'''
+          a = a / (np.linalg.norm(a) + 1e-8)
+          b = b / (np.linalg.norm(b) + 1e-8)
+          return float(1.0 - np.dot(a, b))
+
+      def analyse_clusters(
+          clusters: dict[int, list[PromptRecord]],
+          known_bad_centroid: np.ndarray,
+          high_proximity_threshold: float = 0.20,
+          medium_proximity_threshold: float = 0.40,
+      ) -> list[ClusterResult]:
+          results: list[ClusterResult] = []
+          for cluster_id, records in clusters.items():
+              if cluster_id == -1:
+                  continue  # skip noise
+              centroid = compute_centroid(records)
+              dist = cosine_distance(centroid, known_bad_centroid)
+              flagged = sum(1 for r in records if r.already_flagged)
+              unflagged = len(records) - flagged
+              flagged_frac = flagged / len(records) if records else 0.0
+
+              if dist <= high_proximity_threshold:
+                  prox_label = 'high'
+              elif dist <= medium_proximity_threshold:
+                  prox_label = 'medium'
+              else:
+                  prox_label = 'low'
+
+              anomalous = prox_label == 'high' and unflagged > 0
+
+              results.append(ClusterResult(
+                  cluster_id=cluster_id,
+                  size=len(records),
+                  centroid=centroid,
+                  centroid_distance_to_known_bad=round(dist, 4),
+                  flagged_fraction=round(flagged_frac, 3),
+                  unflagged_count=unflagged,
+                  proximity_label=prox_label,
+                  anomalous=anomalous,
+              ))
+
+          results.sort(key=lambda r: r.centroid_distance_to_known_bad)
+          return results
+
+      # ---------------------------------------------------------------------------
+      # Coordinated pattern detection (Hypothesis H3)
+      # ---------------------------------------------------------------------------
+
+      def detect_coordinated_patterns(
+          records: list[PromptRecord],
+          window_minutes: int = 15,
+          similarity_threshold: float = 0.90,
+          min_users: int = 3,
+          timestamps: list[float] | None = None,
+      ) -> list[dict]:
+          '''
+          Slide a time window across the corpus and flag windows where
+          3+ distinct users have pairwise cosine similarity > threshold.
+          timestamps: Unix timestamps aligned with records (optional).
+          Returns list of flagged window descriptors.
+          '''
+          if timestamps is None or len(timestamps) != len(records):
+              return []   # timestamps required for this analysis
+
+          window_sec = window_minutes * 60
+          flagged_windows: list[dict] = []
+          ts_array = np.array(timestamps)
+
+          for i, t_start in enumerate(timestamps):
+              t_end = t_start + window_sec
+              window_mask = (ts_array >= t_start) & (ts_array < t_end)
+              window_records = [r for r, m in zip(records, window_mask) if m]
+
+              # Group by user_id
+              by_user: dict[str, list[PromptRecord]] = {}
+              for r in window_records:
+                  by_user.setdefault(r.user_id, []).append(r)
+
+              distinct_users = [uid for uid in by_user if uid]
+              if len(distinct_users) < min_users:
+                  continue
+
+              # Compute per-user mean embeddings
+              user_embeddings = {
+                  uid: compute_centroid(recs)
+                  for uid, recs in by_user.items()
+                  if uid
+              }
+
+              # Check pairwise similarity
+              user_ids = list(user_embeddings.keys())
+              high_sim_pairs = 0
+              for j in range(len(user_ids)):
+                  for k in range(j + 1, len(user_ids)):
+                      sim = 1.0 - cosine_distance(
+                          user_embeddings[user_ids[j]],
+                          user_embeddings[user_ids[k]],
+                      )
+                      if sim >= similarity_threshold:
+                          high_sim_pairs += 1
+
+              if high_sim_pairs >= 1 and len(distinct_users) >= min_users:
+                  flagged_windows.append({
+                      'window_start': t_start,
+                      'window_end': t_end,
+                      'distinct_users': len(distinct_users),
+                      'high_sim_pairs': high_sim_pairs,
+                      'user_ids': user_ids[:5],  # anonymise; show max 5
+                  })
+                  break  # one flag per window is sufficient for the hunt report
+
+          return flagged_windows
+
+      # ---------------------------------------------------------------------------
+      # Report
+      # ---------------------------------------------------------------------------
+
+      def print_analysis_report(
+          results: list[ClusterResult],
+          total_records: int,
+      ) -> None:
+          anomalous = [r for r in results if r.anomalous]
+          high_prox = [r for r in results if r.proximity_label == 'high']
+
+          print(f'\nPrompt Cluster Analysis Report')
+          print(f'Total clusters: {len(results)}  Total prompts: {total_records}')
+          print(f'High-proximity clusters: {len(high_prox)}')
+          print(f'Anomalous (high-prox, unflagged): {len(anomalous)}\n')
+
+          print(f'{"ClID":<6} {"Size":<7} {"Dist":<8} {"Proximity":<10} '
+                f'{"FlaggedFrac":<13} {"UnflaggedN":<12} {"Anomalous"}')
+          print('-' * 75)
+          for r in results:
+              anom = '*** HUNT FINDING ***' if r.anomalous else ''
+              print(f'{r.cluster_id:<6} {r.size:<7} {r.centroid_distance_to_known_bad:<8} '
+                    f'{r.proximity_label:<10} {r.flagged_fraction:<13} '
+                    f'{r.unflagged_count:<12} {anom}')
+
+          if anomalous:
+              print(f'\n*** {len(anomalous)} anomalous cluster(s) found. ***')
+              print('Next: examine unflagged prompts in these clusters manually.')
+              print('If adversarial intent confirmed: run Section 11.10 Phase 1 workflow.')
+          else:
+              print('\nNo anomalous clusters. Coverage validated for H1 (embedding cluster anomaly).')
+              print('Record outcome in threat_hunting_playbook.py --record <hunt_id> '
+                    '--outcome coverage_validated')
+
+      # ---------------------------------------------------------------------------
+      # Demo mode with synthetic data
+      # ---------------------------------------------------------------------------
+
+      def run_demo() -> None:
+          rng = np.random.default_rng(42)
+          dim = 384   # sentence-transformers/all-MiniLM-L6-v2 output dim
+
+          # Known-bad centroid (injection prompt cluster centre)
+          known_bad = rng.standard_normal(dim).astype(np.float32)
+          known_bad /= np.linalg.norm(known_bad)
+
+          records: list[PromptRecord] = []
+
+          # Cluster 1: normal user traffic (far from known-bad)
+          normal_centre = rng.standard_normal(dim).astype(np.float32)
+          normal_centre /= np.linalg.norm(normal_centre)
+          for i in range(80):
+              emb = normal_centre + rng.standard_normal(dim).astype(np.float32) * 0.05
+              emb /= np.linalg.norm(emb)
+              records.append(PromptRecord(f'n{i}', emb, already_flagged=False))
+
+          # Cluster 2: known injections (close to known-bad; already flagged by Track 1/3)
+          for i in range(20):
+              emb = known_bad + rng.standard_normal(dim).astype(np.float32) * 0.04
+              emb /= np.linalg.norm(emb)
+              records.append(PromptRecord(f'k{i}', emb, already_flagged=True))
+
+          # Cluster 3: novel injection variants (close to known-bad; NOT flagged — the finding)
+          novel_centre = known_bad + rng.standard_normal(dim).astype(np.float32) * 0.08
+          novel_centre /= np.linalg.norm(novel_centre)
+          for i in range(12):
+              emb = novel_centre + rng.standard_normal(dim).astype(np.float32) * 0.03
+              emb /= np.linalg.norm(emb)
+              records.append(PromptRecord(f'v{i}', emb, already_flagged=False))
+
+          print('Running demo with synthetic prompt corpus (80 normal, 20 known-flagged, 12 novel variants)')
+          clusters = run_dbscan(records, eps=0.15, min_samples=5)
+          results = analyse_clusters(clusters, known_bad)
+          print_analysis_report(results, len(records))
+
+      # ---------------------------------------------------------------------------
+      # Entry point
+      # ---------------------------------------------------------------------------
+
+      def main() -> int:
+          parser = argparse.ArgumentParser(description='Prompt cluster analyser for threat hunting')
+          parser.add_argument('--corpus', metavar='PROMPTS_JSON',
+                              help='Path to JSON prompt corpus file')
+          parser.add_argument('--centroid', metavar='CENTROID_NPY',
+                              help='Path to known-bad centroid .npy file')
+          parser.add_argument('--eps', type=float, default=0.15,
+                              help='DBSCAN epsilon (cosine distance; default 0.15)')
+          parser.add_argument('--min-samples', type=int, default=5,
+                              help='DBSCAN min_samples (default 5)')
+          parser.add_argument('--demo', action='store_true',
+                              help='Run with synthetic demo data')
+          args = parser.parse_args()
+
+          if args.demo:
+              run_demo()
+              return 0
+
+          if not args.corpus or not args.centroid:
+              print('Both --corpus and --centroid are required. Use --demo for a demonstration.')
+              parser.print_help()
+              return 1
+
+          records = load_corpus(args.corpus)
+          known_bad_centroid = np.load(args.centroid).astype(np.float32)
+          known_bad_centroid /= np.linalg.norm(known_bad_centroid)
+
+          print(f'Loaded {len(records)} prompts from {args.corpus}')
+          clusters = run_dbscan(records, eps=args.eps, min_samples=args.min_samples)
+          print(f'DBSCAN found {len(clusters)} clusters (including noise cluster -1)')
+          results = analyse_clusters(clusters, known_bad_centroid)
+          print_analysis_report(results, len(records))
+          return 0
+
+      if __name__ == '__main__':
+          sys.exit(main())
+
+common_mistakes:
+  - id: 'CM11.12.1'
+    mistake: 'Treating threat hunting as "browsing logs to see what looks suspicious"'
+    why_it_happens: >
+      Log browsing is familiar. Security engineers spend time in log analysis tools
+      and develop intuitions about what looks unusual. The informal version of this
+      activity is called hunting but lacks the discipline that produces reproducible,
+      scalable, and falsifiable results.
+    why_it_matters: >
+      Informal log browsing cannot be validated. An analyst who browses 7-day logs
+      and finds nothing cannot conclude that no attack is present — they can only
+      conclude that nothing caught their eye. The same analyst on a different day
+      might find something different. The results are not reproducible, the methodology
+      cannot be reviewed, and the "nothing found" outcome provides no coverage validation.
+    correct_approach: >
+      Every hunt session starts with a written hypothesis before any data is opened.
+      The hypothesis specifies the expected pattern, the data source, and the analysis
+      method. "Nothing found" is only a meaningful outcome when it means "I tested
+      this specific falsifiable hypothesis and the data does not support it" — not
+      "I looked around and didn''t see anything suspicious."
+
+  - id: 'CM11.12.2'
+    mistake: 'Discarding hunt findings that confirm coverage rather than recording them'
+    why_it_happens: >
+      A hunt that finds nothing feels like a wasted session. The analyst moves on
+      without filing a report. Only positive findings receive documentation.
+    why_it_matters: >
+      "Coverage validated" findings are defensible claims to leadership and auditors.
+      "We ran Hypothesis H1 against the 7-day corpus of 94,000 prompts and found zero
+      unflagged prompts within 0.20 cosine distance of the known-bad centroid" is a
+      meaningful security statement. Without the report, the organisation cannot make
+      that claim. The accumulated validated-coverage reports are also the evidence base
+      for advancing the Proactive Hunting dimension to L3 and beyond.
+    correct_approach: >
+      File a hunt report for every completed hunt, regardless of outcome. The
+      threat_hunting_playbook.py --record command requires an outcome field:
+      confirmed_finding, coverage_validated, or inconclusive. All three are valid
+      and all three are recorded. Reports are stored in hunt_reports/ and reviewed
+      at the quarterly programme review.
+
+  - id: 'CM11.12.3'
+    mistake: 'Running hypothesis H5 (output entropy spike) without the Chapter 14 output validation layer'
+    why_it_happens: >
+      H5 is listed in the playbook. The analyst runs it before Chapter 14 is deployed,
+      expecting to use session-level output_entropy_avg as a proxy for the full output
+      analysis.
+    why_it_matters: >
+      Session-level output_entropy_avg is a coarse proxy. A successful exfiltration
+      attack that produces high-entropy output in a few responses within an otherwise
+      normal session may not elevate the session-level average significantly enough
+      to flag. Running H5 on the session-level metric only and finding nothing provides
+      false confidence — the full output log signal (available after Chapter 14) may
+      tell a different story.
+    correct_approach: >
+      Flag H5 in the playbook as "partial signal until Chapter 14." Run H5 now using
+      session-level output_entropy_avg as a preliminary hunt; note in the report that
+      the hunt is limited to the session-level metric and should be re-run against
+      full output logs after Chapter 14 is deployed. Do not treat a "coverage validated"
+      outcome from the session-level H5 hunt as equivalent to a full H5 validation.
+
+  - id: 'CM11.12.4'
+    mistake: 'Converting every hunt finding directly to a rule without the Section 11.10 workflow'
+    why_it_happens: >
+      A confirmed finding creates urgency. The analyst writes a quick Sigma rule to
+      capture the pattern, deploys it manually, and considers the finding closed.
+    why_it_matters: >
+      A rule written in response to urgency without tests, without metadata, without
+      CI validation, and without FPR target is an L1 rule added to an L3 programme.
+      It bypasses every governance control established in Sections 11.02 through 11.09,
+      potentially adds false positives to the SOC queue from day one, and may conflict
+      with existing rules in ways that only systematic review would catch.
+    correct_approach: >
+      Every confirmed hunt finding enters the Section 11.10 detection engineering
+      workflow at Phase 1 (hypothesis). The finding is the hypothesis input. The rule
+      goes through all seven phases: design, build, test (using the hunt''s confirmed
+      examples as positive fixtures), deploy via CI, monitor FPR. The five business
+      day target for rule creation is achievable through the workflow without skipping
+      governance steps.
+
+  - id: 'CM11.12.5'
+    mistake: 'Using a fixed DBSCAN epsilon across all prompt corpora without calibrating for the embedding model'
+    why_it_happens: >
+      The default epsilon (0.15 cosine distance) is specified in the playbook and
+      deliverable. Practitioners use it without checking whether it is appropriate for
+      their embedding model''s distance distribution.
+    why_it_matters: >
+      Different embedding models produce different distance distributions. The cosine
+      distance between two random prompts varies by model: a model that produces more
+      clustered embeddings will require a smaller epsilon; a model that spreads prompts
+      more evenly in the embedding space will require a larger epsilon. Using 0.15 with
+      a model calibrated for 0.30 produces many tiny clusters, each of which appears
+      anomalous in proximity analysis but most of which are noise. The hunt produces
+      a large number of false findings.
+    correct_approach: >
+      Before the first hunt session, calibrate the DBSCAN epsilon by computing the
+      k-nearest-neighbour distance distribution for k=5 across a sample of production
+      prompts. Plot the sorted k-NN distances (the "elbow plot") and select epsilon
+      at the elbow — the point where distance begins to increase steeply. This
+      calibrated epsilon is specific to the embedding model and corpus and should be
+      documented in the hunt report metadata.
+
+section_summary:
+  what_you_learned: |
+    Threat hunting finds novel attacks that reactive detection rules miss — by testing
+    specific, falsifiable hypotheses against production data rather than browsing logs
+    for anything suspicious. AI systems offer the unique hunting advantage of embedding-
+    space analysis: clustering thousands of prompts by semantic similarity to find
+    structural attack patterns without predefined signatures. The five playbook
+    hypotheses cover the most significant detection gaps in the seven-track gateway:
+    novel injection variants (H1), sub-threshold systematic probing (H2), coordinated
+    multi-user campaigns (H3), accumulated context injection (H4), and output
+    exfiltration patterns (H5). Every hunt produces either a confirmed finding (which
+    enters the Section 11.10 workflow as a new rule) or a validated coverage outcome
+    (which is a defensible security claim). Deploying the formal procedure and quarterly
+    cadence advances the Proactive Hunting maturity dimension from L1 to L3.
+  key_terms:
+    - term: 'Threat hunting'
+      definition: >
+        Proactive, hypothesis-driven analysis of production data to find attack patterns
+        that no deployed detection rule captures. Distinct from reactive detection (rules
+        for known patterns) and threat intelligence (consuming externally published technique
+        knowledge). Finds novel attacks currently present in production logs.
+    - term: 'Hunting hypothesis'
+      definition: >
+        A specific, falsifiable statement about an attack pattern that would be present
+        in a named data source if the hypothesised attack is occurring. Specifies the
+        expected pattern, the data source, the analysis method, and the falsification
+        criterion. "Look for bad things" is not a hypothesis.
+    - term: 'Coverage validated'
+      definition: >
+        A hunt outcome in which the hypothesis was tested systematically and the data
+        does not support the hypothesised attack pattern. A defensible claim: "we
+        tested this specific hypothesis against N records and found no qualifying pattern."
+        Distinct from "nothing looked suspicious."
+    - term: 'Hunt-to-rule conversion'
+      definition: >
+        The process of converting a confirmed hunt finding into a deployed Sigma rule
+        via the Section 11.10 seven-phase detection engineering workflow. The confirmed
+        hunting examples become the positive test fixtures. Target: rule deployed within
+        five business days of confirmed finding.
+    - term: 'Embedding-space hunting'
+      definition: >
+        Threat hunting using semantic similarity in the embedding space of an LLM or
+        sentence encoder. Identifies structurally similar prompts without requiring
+        surface-pattern matching. The unique AI security hunting capability with no
+        equivalent in traditional log analysis.
+
+preview_section_11_13:
+  title: 'Production Detection Architecture Patterns'
+  teaser: |
+    Section 11.13 grounds the complete detection framework in three concrete production
+    architecture patterns: the inline API gateway (the seven-track gateway is this
+    pattern — the only blocking pattern), the sidecar (asynchronous, flag-only, zero
+    latency impact), and the log-based SIEM (fully async, campaign-level detection,
+    highest alert latency). It then builds the hybrid architecture that all three
+    patterns in combination: gateway blocks high-confidence signals, sidecar flags
+    moderate-confidence signals without latency penalty, SIEM detects multi-session
+    campaigns over longer windows. Failure mode design (fail-open vs fail-closed per
+    layer) and observability instrumentation of the detection system itself complete
+    the section.
+
+metadata:
+  part: 'III'
+  chapter: 11
+  section: 12
+  section_id: '11.12'
+  tags:
+    - threat-hunting
+    - proactive-detection
+    - hunting-hypothesis
+    - embedding-clustering
+    - dbscan
+    - prompt-clustering
+    - hunting-cadence
+    - hunt-to-rule
+    - coverage-validated
+    - chapter-11
+    - part-3
+  atlas_anchors:
+    - 'Proactive: hunting finds novel ATLAS techniques before they are named'
+    - 'H1 targets AML.T0051 L3 gap (obfuscated injection variants)'
+    - 'H2 targets AML.T0040 sub-threshold extraction reconnaissance'
+    - 'H3 targets coordinated multi-user campaign (no current ATLAS technique ID)'
+    - 'H4 targets AML.T0051 multi-turn accumulated injection variant'
+    - 'H5 targets LLM06 output exfiltration (pending Ch14 output logs)'
+  word_count_estimate: 4700
+  deliverables_count: 2
+  common_mistakes_count: 5
