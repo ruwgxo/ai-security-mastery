@@ -1,0 +1,1328 @@
+# section_12_06_sequence_models.yaml
+
+---
+document_info:
+  title: 'Sequence Models: LSTM and GRU for Multi-Turn Conversation Threat Detection'
+  chapter: 12
+  section: 6
+  section_code: '1206'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-06'
+  estimated_pages: 7
+  estimated_reading_time: '55-65 minutes'
+
+section_overview:
+  one_line_summary: 'Sequence models close the multi-turn blind spot: a GRU reading the full conversation history detects the escalation arc that single-turn classifiers cannot see because each individual turn looks benign.'
+  why_this_section_exists: |
+    Random Forest and XGBoost from Section 12.05 classify each API request in isolation.
+    They receive a feature vector for turn N and return an attack probability for turn N.
+    They have no access to turns N-1, N-2, or the pattern of how the conversation has
+    evolved. This is sufficient for single-turn attacks -- a prompt injection payload
+    that arrives in one message. It is insufficient for the multi-turn attack patterns
+    documented in Chapter 7 Sections 7.07 and 7.08.
+
+    Multi-turn jailbreak attacks exploit the sequential context that the LLM accumulates
+    across turns. An adversary who wants to extract harmful content does not always send
+    a single high-confidence jailbreak that a single-turn classifier can flag. Instead,
+    they build context over multiple turns: an early turn establishes a fictional frame,
+    a middle turn introduces a character who operates without restrictions, a later turn
+    makes the actual harmful request inside the established fictional context. Each turn,
+    scored independently by the Section 12.05 classifier, produces a low attack probability.
+    The conversation arc, scored as a sequence, produces a high attack probability.
+
+    Section 12.06 builds the sequence detectors that close this coverage gap. LSTM and
+    GRU both read the full conversation history as a variable-length sequence of per-turn
+    feature vectors from Section 12.02 and classify the conversation, not the individual
+    turn. The GRU adds an attention mechanism that weights each turn by its contribution
+    to the final classification decision, providing analyst-readable evidence of which
+    turns triggered the detection.
+  position_in_chapter: |
+    Section 12.06 is the third ML detector in Chapter 12, following the anomaly detector
+    (12.03) and the supervised classifiers (12.05). It is the first detector that requires
+    conversation-level labelled data rather than single-turn examples. Its deliverables --
+    specifically gru_sequence_detector.py and conversation_dataset_builder.py -- are
+    imported by the Section 12.15 ensemble and the Section 12.17 gateway capstone.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain why single-turn classifiers miss multi-turn attacks and describe three specific attack patterns that require sequential context to detect'
+    - 'Describe the LSTM gating mechanism: how the input gate, forget gate, and output gate control what information is written to, erased from, and read from the cell state across turns'
+    - 'Explain the GRU update and reset gates and state why GRU trains faster than LSTM on conversation sequences shorter than 20 turns'
+    - 'Describe the attention mechanism over conversation turns and explain how per-turn attention weights provide analyst-readable detection evidence'
+    - 'State the data requirement for conversation-level sequence model training and explain why it is harder to accumulate than single-turn labelled examples'
+    - 'Explain how variable-length conversation sequences are handled in production inference and what padding and masking do'
+
+  skills:
+    - 'Construct a conversation-level dataset from single-turn labelled examples using conversation_dataset_builder.py'
+    - 'Train an LSTM conversation detector with variable-length sequence handling and a binary classification head on the final hidden state'
+    - 'Train a GRU conversation detector with additive attention over turns and produce per-turn attention weight output for analyst review'
+    - 'Implement the training loop with gradient clipping, early stopping, and learning rate scheduling for sequence models'
+    - 'Profile sequence model inference latency with variable-length batching and verify it fits within the gateway budget'
+
+  security_mindset:
+    - 'Recognise that the absence of multi-turn attack examples in the labelled dataset is not evidence that multi-turn attacks do not occur -- it may mean the anomaly detector and single-turn classifiers are missing them entirely'
+    - 'Understand that the conversation dataset is harder to collect than single-turn data because the full conversation must be stored, not just the individual turn that triggered an alert'
+    - 'Treat attention weights as evidence, not just explainability: when the GRU flags a conversation and the attention concentrates on turns 3 and 7, the analyst review should focus on those turns and the narrative arc between them'
+    - 'Accept that sequence models are the last ML family deployed, not the first -- their data requirements and inference complexity are justified only when multi-turn attack patterns are documented in the production threat model'
+
+prerequisites:
+  - 'Section 12.05: supervised classification -- security_evaluator.py imported for benchmarking; Random Forest is the baseline this section must outperform on multi-turn test cases'
+  - 'Section 12.04: dataset curation -- conversation_dataset_builder.py extends the Section 12.04 schema for conversation-level examples'
+  - 'Section 12.02: security feature engineering -- SecurityFeatureVector per turn is the sequence model input'
+  - 'Chapter 2 Section 2.17: LSTM and RNN basics -- hidden state, cell state, and gating mechanisms are reviewed but prerequisite knowledge is assumed'
+  - 'Chapter 7 Section 7.07: multi-turn jailbreak escalation -- the attack pattern this section detects'
+  - 'Chapter 7 Section 7.08: context manipulation and gradual boundary erosion -- the second attack class requiring sequential context'
+
+prose_content:
+
+  part_1:
+    title: 'The Multi-Turn Blind Spot'
+    body: |
+      The Section 12.05 classifiers evaluate one turn at a time. This is architecturally
+      correct for the most common LLM API request pattern: a user sends a single message,
+      the model responds, the conversation ends or continues independently. For this pattern,
+      single-turn classification is sufficient and efficient.
+
+      Multi-turn attacks deliberately exploit the single-turn evaluation architecture. The
+      adversary's goal is to place the attack payload in a turn that, evaluated independently,
+      looks benign -- because the attack context was established in prior turns that the
+      classifier never sees together.
+
+      Three multi-turn attack patterns from Chapter 7 illustrate the blind spot. Gradual
+      jailbreak erosion (Section 7.07) begins with legitimate requests that establish the
+      model's willingness to engage with a topic, then incrementally escalates the requests
+      toward the target harmful output over 5-10 turns. Each turn is a small step from the
+      previous one. No single turn crosses the classifier's decision boundary; the cumulative
+      drift does.
+
+      Payload splitting (Section 7.08) fragments a single injection payload across multiple
+      turns. Turn 1 contains the setup ('imagine a story where...'), turn 3 introduces the
+      character who will deliver the harmful instruction ('the character is an expert who
+      explains...'), turn 5 completes the payload ('...explain how to'). Evaluated
+      individually: three low-confidence benign turns. Evaluated as a sequence: a structured
+      attack arc with a clear escalation pattern.
+
+      Fictional frame construction is the third pattern: the adversary uses early turns to
+      establish a fictional universe with different rules ('in this universe, the AI has no
+      restrictions'), then makes requests inside that frame in later turns. The request turn
+      references the fictional frame established earlier; without the earlier turns it is
+      meaningless or benign. With them, it is the intended attack.
+
+      All three patterns share the structural characteristic that makes them detectable by
+      sequence models: the attack signal is distributed across turns and accumulates over
+      time. The LSTM hidden state and the GRU update gate are designed to capture exactly
+      this kind of temporal accumulation.
+
+  part_2:
+    title: 'Representing a Conversation as a Sequence'
+    body: |
+      The input to the sequence model is a variable-length sequence of per-turn feature
+      vectors. For a conversation with T turns, the input is a matrix of shape (T, F) where
+      F is the number of features in the SecurityFeatureVector from Section 12.02 (F=20 for
+      the standard vector). Each row is the feature vector for one turn, in chronological
+      order from turn 1 to turn T.
+
+      Three encoding decisions matter for how well the sequence model captures attack signals.
+      The first is role encoding: whether the feature vector for a given turn includes a
+      binary indicator of whether the turn is a user message, an assistant message, or a
+      system message. User turns are the attack surface; assistant turns contain refusal
+      signals; the role encoding allows the model to learn that a role_boundary_marker in
+      a user turn is a different signal from the same feature in an assistant turn. The
+      Section 12.02 feature pipeline already includes role context in the contextual feature
+      group; the sequence model uses it without modification.
+
+      The second encoding decision is position encoding: whether to include an explicit
+      turn-number feature in each row. The GRU's recurrent structure implicitly encodes
+      position through the order in which turns are processed -- turn 5 receives a hidden
+      state that has already accumulated information from turns 1-4. Explicit position
+      encoding (adding a normalised turn number as an additional feature dimension) can
+      improve detection of attacks that target specific positions in a conversation
+      (e.g., attacks that always arrive in turn 3 after two rapport-building turns).
+
+      The third decision is sequence length normalisation. The maximum conversation length
+      in the training set determines the padding length used in production inference. Setting
+      the maximum too short truncates long conversations; too long wastes computation on
+      padding tokens. The 95th percentile of conversation lengths in the training set is
+      the correct maximum: it covers almost all real conversations without excessive padding.
+
+  part_3:
+    title: 'LSTM Architecture Applied to Conversation Sequences'
+    body: |
+      The LSTM (Long Short-Term Memory, Hochreiter and Schmidhuber 1997) processes the
+      conversation sequence one turn at a time. At each turn t, it receives the current
+      turn's feature vector x_t and the previous hidden state h_{t-1} and cell state c_{t-1},
+      and produces a new hidden state h_t and cell state c_t.
+
+      Three gating mechanisms control the information flow. The forget gate f_t determines
+      what fraction of the previous cell state to discard: it is a sigmoid applied to a
+      linear combination of h_{t-1} and x_t, producing values between 0 (forget completely)
+      and 1 (retain completely). For conversation security detection, the forget gate learns
+      to retain escalation signals from earlier turns while discarding irrelevant conversation
+      content.
+
+      The input gate i_t determines what new information to write to the cell state: a
+      sigmoid gate controlling the magnitude and a tanh gate generating the candidate
+      content. When a high-signal attack indicator arrives (a role boundary marker in turn
+      3 of a fictional frame sequence), the input gate writes this signal into the cell
+      state where it persists through subsequent turns.
+
+      The output gate o_t determines what fraction of the cell state to expose as the
+      current hidden state h_t. At the final turn T, the hidden state h_T encodes a
+      compressed representation of the entire conversation history, weighted toward the
+      signals the model has learned to associate with multi-turn attacks. A linear
+      classification head applied to h_T produces the binary attack probability.
+
+      For conversation sequences with strong temporal dependencies over many turns (15+),
+      LSTM outperforms GRU because its separate cell state provides a longer-range memory
+      path than the GRU's single update gate. For the typical production conversation length
+      of 3-10 turns, the advantage is marginal and GRU's computational efficiency dominates.
+
+  part_4:
+    title: 'GRU with Attention: Faster Training and Interpretable Turn Weights'
+    body: |
+      The GRU (Gated Recurrent Unit, Cho et al. 2014) simplifies the LSTM by combining
+      the cell state and hidden state into a single state vector and replacing the three
+      LSTM gates with two: the update gate z_t and the reset gate r_t.
+
+      The update gate z_t controls how much of the previous hidden state to carry forward
+      versus how much to replace with new content from the current turn. Values near 1
+      preserve the previous state (the model ignores the current turn); values near 0
+      replace the state with content from the current turn (the model attends to this turn).
+      For conversation security detection, the update gate learns to set low values for
+      rapport-building turns that carry no attack signal and high values for turns that
+      introduce escalation markers.
+
+      The reset gate r_t determines how much of the previous hidden state influences the
+      candidate new state. When r_t is near 0, the candidate new state is computed
+      entirely from the current turn's features, ignoring prior context. This is appropriate
+      for turns that introduce a completely new topic and should be evaluated somewhat
+      independently.
+
+      GRU trains faster than LSTM because it has fewer parameters (no separate cell state,
+      two gates instead of three). On conversation sequences of 3-15 turns with a 20-feature
+      input, GRU typically converges in 20-30% fewer epochs than LSTM and produces accuracy
+      within 1-2 percentage points.
+
+      The attention mechanism added to the GRU in deliverable_2 computes a scalar weight
+      for each turn based on how much that turn contributes to the final classification.
+      Additive attention (Bahdanau et al. 2015) applies a learned linear transformation
+      to each turn's hidden state, passes it through a tanh activation and another linear
+      layer to produce a scalar score, then normalises across all turns with a softmax.
+      The weighted average of hidden states (rather than just the final hidden state) is
+      passed to the classification head. The attention weights over turns are output
+      alongside the classification decision, giving the analyst a ranked list of which
+      turns in the flagged conversation carried the most detection signal.
+
+  part_5:
+    title: 'Training on Conversation-Level Data'
+    body: |
+      The conversation dataset is structurally different from the single-turn dataset
+      in Section 12.04. A single-turn example is one (text, label) pair. A conversation
+      example is a sequence of (text, label) pairs per turn, plus a conversation-level
+      label: is this conversation an attack conversation or a benign conversation?
+
+      The conversation_dataset_builder.py in deliverable_3 constructs conversation-level
+      training examples from three sources. The first source is the production session
+      log: full conversation histories from the anomaly alert labeller (Section 12.03) where
+      at least one turn was flagged and confirmed as a true positive. These are labelled
+      as attack conversations. Sessions where all turns were benign are labelled as benign
+      conversations. This requires storing the full session history, not just the flagged
+      turn -- the first operational requirement that distinguishes the sequence model
+      deployment from the single-turn classifier deployment.
+
+      The second source is constructed attack conversations: taking single-turn attack
+      examples from the Section 12.04 labelled dataset and prepending synthetically
+      generated benign conversation context to simulate the multi-turn attack setup.
+      These synthetic conversations are lower fidelity than real production sessions but
+      allow the training set to be populated before sufficient real multi-turn attack
+      examples have been collected.
+
+      The third source is the red team exercise designed for multi-turn patterns: security
+      engineers deliberately execute gradual erosion, payload splitting, and fictional frame
+      attacks against the production integration, with all turns captured as labelled
+      training examples.
+
+      The data imbalance in conversation datasets is typically more severe than in single-
+      turn datasets: attack conversations are rarer than attack turns because a full attack
+      conversation requires multiple turns to accumulate, while a single-turn attack produces
+      an example immediately. SMOTE does not apply directly to variable-length conversation
+      sequences; the imbalance treatment for conversation data is class weighting applied
+      to the conversation-level cross-entropy loss.
+
+  part_6:
+    title: 'Production Inference: Variable-Length Batching Within the Latency Budget'
+    body: |
+      Sequence model inference in production differs from single-turn classifier inference
+      in one structural way: the input length varies with conversation length. Turn 1 of a
+      conversation produces a sequence of length 1; turn 10 produces a sequence of length
+      10. The model must handle both without padding every inference call to the maximum
+      training sequence length.
+
+      Variable-length sequence batching groups concurrent inference requests by conversation
+      length and pads within each batch to the maximum length in that batch, not the global
+      maximum. This reduces the computational waste from padding a 3-turn conversation to
+      the 20-turn maximum. The sequence_inference_optimizer.py in deliverable_5 implements
+      length-sorted batching for the production gateway.
+
+      The GRU processes sequences sequentially on CPU but parallelises across the batch
+      dimension. For batch size 1 (the common case when a single user's turn arrives), the
+      GRU inference time scales with conversation length: a 3-turn conversation takes
+      approximately 3ms; a 15-turn conversation approximately 8ms. Both are within the
+      gateway's 50ms budget when the GRU runs in parallel with other detectors via the
+      async scoring architecture from Section 12.12.
+
+      The practical latency constraint for production deployment of sequence models is
+      memory: storing the full conversation history for every active session requires a
+      session store (Redis or equivalent) that maintains the per-turn feature vectors until
+      the session ends. The memory budget per session is 20 features * 4 bytes * max_turns
+      = 1600 bytes for a 20-turn maximum, which is negligible. The infrastructure requirement
+      is that the session store is available and the conversation history is fetched before
+      the sequence model inference call.
+
+reference_materials:
+
+  table_1:
+    title: 'Multi-Turn Attack Patterns and Their Sequential Detection Signals'
+    description: 'Three multi-turn attack families from Chapter 7 with the sequential feature pattern each produces and which model layer detects it'
+    columns: ['Attack Pattern', 'Chapter 7 Reference', 'Sequential Signal', 'Detecting Layer']
+    rows:
+      - ['Gradual jailbreak erosion', 'Section 7.07', 'Monotonically increasing instruction_keyword_freq over turns; refusal count rising then resetting', 'GRU update gate learns to accumulate escalation gradient; attention peaks at boundary-crossing turn']
+      - ['Payload splitting across turns', 'Section 7.08', 'Low per-turn attack signal; combined sequence produces high cumulative hidden state activation', 'LSTM cell state preserves fragment signals across the forget gate; GRU hidden state accumulates them']
+      - ['Fictional frame construction', 'Section 7.08', 'Early turns: benign but high role_boundary_marker lookalikes; later turns: attack payload referencing established frame', 'Attention weights concentrate on frame-establishment turns and payload turn simultaneously']
+      - ['Boundary probing with refusals', 'Section 7.07', 'prior_refusal_count increments over session; turn content systematically varies around refusal threshold', 'prior_refusal_count in contextual features drives hidden state; GRU detects the probing pattern']
+
+  table_2:
+    title: 'LSTM vs GRU Selection Guide for Conversation Security Detection'
+    description: 'Five-dimension comparison for choosing between LSTM and GRU given conversation length, dataset size, and latency requirements'
+    columns: ['Dimension', 'LSTM', 'GRU', 'Recommended When']
+    rows:
+      - ['Conversation length', 'Better for long sequences (15+ turns) -- separate cell state preserves longer-range dependencies', 'Matches LSTM for short sequences (< 15 turns) -- single state vector sufficient', 'GRU for typical production conversations (3-10 turns)']
+      - ['Training speed', 'Slower -- three gates, separate cell and hidden state', '20-30% faster -- two gates, single state vector', 'GRU for fast iteration during data collection phase']
+      - ['Parameter count', 'Higher -- ~4x input_size*hidden_size parameters', 'Lower -- ~3x input_size*hidden_size parameters', 'GRU under memory constraints or small datasets']
+      - ['Interpretability', 'Hidden state only for final classification', 'Attention weights over turns -- identifies which turns triggered detection', 'GRU when analyst-readable turn attribution is required']
+      - ['Accuracy (3-10 turns)', 'Within 1-2% of GRU -- marginal advantage does not justify extra parameters', 'Matches LSTM with fewer resources', 'GRU is the correct production default for security conversation detection']
+
+  table_3:
+    title: 'Conversation Dataset Construction Requirements'
+    description: 'Minimum requirements for training a reliable GRU conversation detector with data sources and collection timeline'
+    columns: ['Requirement', 'Minimum Value', 'Source', 'Collection Timeline']
+    rows:
+      - ['Labelled attack conversations', '500+ attack conversations', 'Production session logs (TP sessions from Section 12.03) + red team exercises', 'Month 3-6 of production operation']
+      - ['Labelled benign conversations', '1000+ benign conversations', 'Production session logs (sessions with no flagged turns)', 'Available immediately from production traffic']
+      - ['Conversation length distribution', 'Covers 1-20 turns at representative frequencies', 'Production logs give real distribution', 'Derived from production logs at any time']
+      - ['Multi-turn attack coverage', 'At least 3 attack pattern families represented', 'Red team exercises for synthetic examples if production data is sparse', 'Red team exercises can supplement before month 3']
+      - ['Session history storage', 'Full turn-by-turn feature vectors per session', 'Session store (Redis) with TTL covering conversation duration', 'Infrastructure requirement before sequence model deployment']
+
+  table_4:
+    title: 'Sequence Model Training Configuration Reference'
+    description: 'Recommended training configuration for GRU and LSTM conversation detectors on the Chapter 12 security dataset'
+    columns: ['Parameter', 'Recommended Value', 'Effect of Too Low', 'Effect of Too High']
+    rows:
+      - ['hidden_size', '64-128', 'Underfitting -- cannot represent attack patterns', 'Overfitting on small conversation datasets']
+      - ['num_layers', '1-2', 'Underfitting for complex multi-step patterns', 'Overfitting; slower inference']
+      - ['dropout', '0.3-0.5 (between layers)', 'Overfitting', 'Underfitting; gradient issues']
+      - ['learning_rate', '1e-3 (with scheduler)', 'Slow convergence', 'Divergence or oscillation']
+      - ['gradient_clip_norm', '1.0', 'Gradient explosion on long sequences', 'Excessive gradient suppression; slow learning']
+      - ['batch_size', '32-64 (conversation-level)', 'High variance; noisy updates', 'GPU memory constraint; less benefit beyond 64']
+      - ['max_epochs', '50-100 with early stopping', 'Underfitting', 'Overfitting without early stopping']
+
+deliverables:
+
+  deliverable_1:
+    title: 'LSTM Sequence Detector'
+    filename: 'lstm_sequence_detector.py'
+    description: 'LSTM conversation threat detector with variable-length sequence handling and a binary classification head on the final hidden state. Processes sequences of per-turn SecurityFeatureVectors and returns a conversation-level attack probability.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: torch, numpy. Imports SecurityFeatureVector from security_feature_extractor.py (Section 12.02).'
+    code: |
+      # lstm_sequence_detector.py
+      # Section 12.06: LSTM Conversation Threat Detector
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import time
+      from dataclasses import dataclass
+      from typing import List, Optional, Tuple
+
+      import numpy as np
+      import torch
+      import torch.nn as nn
+      from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
+
+
+      @dataclass
+      class ConversationPrediction:
+          attack_probability: float
+          is_attack: bool
+          threshold: float
+          n_turns: int
+          inference_ms: float
+
+
+      class LSTMSecurityDetector(nn.Module):
+          '''
+          LSTM conversation threat detector.
+          Input: variable-length sequence of per-turn feature vectors.
+          Output: binary attack probability for the full conversation.
+          '''
+
+          def __init__(
+              self,
+              input_size: int = 20,
+              hidden_size: int = 64,
+              num_layers: int = 2,
+              dropout: float = 0.3,
+              bidirectional: bool = False,
+          ) -> None:
+              super().__init__()
+              self.hidden_size = hidden_size
+              self.num_layers = num_layers
+              self.bidirectional = bidirectional
+              directions = 2 if bidirectional else 1
+
+              self.lstm = nn.LSTM(
+                  input_size=input_size,
+                  hidden_size=hidden_size,
+                  num_layers=num_layers,
+                  batch_first=True,
+                  dropout=dropout if num_layers > 1 else 0.0,
+                  bidirectional=bidirectional,
+              )
+              self.dropout = nn.Dropout(dropout)
+              self.classifier = nn.Sequential(
+                  nn.Linear(hidden_size * directions, 32),
+                  nn.ReLU(),
+                  nn.Dropout(dropout),
+                  nn.Linear(32, 1),
+                  nn.Sigmoid(),
+              )
+
+          def forward(
+              self,
+              sequences: torch.Tensor,
+              lengths: torch.Tensor,
+          ) -> torch.Tensor:
+              '''
+              sequences: (batch, max_len, input_size) -- padded
+              lengths:   (batch,) -- actual length per sequence
+              returns:   (batch,) -- attack probability per conversation
+              '''
+              packed = pack_padded_sequence(
+                  sequences, lengths.cpu(), batch_first=True, enforce_sorted=False,
+              )
+              _, (h_n, _) = self.lstm(packed)
+              # h_n: (num_layers * directions, batch, hidden_size)
+              # Take the last layer's hidden state
+              if self.bidirectional:
+                  h_last = torch.cat([h_n[-2], h_n[-1]], dim=1)
+              else:
+                  h_last = h_n[-1]
+              h_last = self.dropout(h_last)
+              return self.classifier(h_last).squeeze(1)
+
+
+      class LSTMDetectorWrapper:
+          '''Wrapper around LSTMSecurityDetector for training and inference.'''
+
+          def __init__(
+              self,
+              input_size: int = 20,
+              hidden_size: int = 64,
+              num_layers: int = 2,
+              dropout: float = 0.3,
+              operating_threshold: float = 0.5,
+              device: str = 'cpu',
+          ) -> None:
+              self.device = torch.device(device)
+              self.operating_threshold = operating_threshold
+              self.model = LSTMSecurityDetector(
+                  input_size=input_size,
+                  hidden_size=hidden_size,
+                  num_layers=num_layers,
+                  dropout=dropout,
+              ).to(self.device)
+              self._trained = False
+
+          def predict_conversation(
+              self,
+              turn_features: List[np.ndarray],
+          ) -> ConversationPrediction:
+              '''
+              turn_features: list of feature arrays, one per turn (chronological order).
+              Returns a ConversationPrediction with attack probability.
+              '''
+              assert self._trained
+              t0 = time.time()
+              self.model.eval()
+              with torch.no_grad():
+                  seq = torch.tensor(
+                      np.array(turn_features), dtype=torch.float32,
+                  ).unsqueeze(0).to(self.device)
+                  lengths = torch.tensor([len(turn_features)])
+                  prob = float(self.model(seq, lengths).item())
+              return ConversationPrediction(
+                  attack_probability=prob,
+                  is_attack=prob >= self.operating_threshold,
+                  threshold=self.operating_threshold,
+                  n_turns=len(turn_features),
+                  inference_ms=(time.time() - t0) * 1000,
+              )
+
+          def save(self, path: str) -> None:
+              torch.save({'model_state': self.model.state_dict(),
+                          'threshold': self.operating_threshold}, path)
+              print(f'Saved LSTMDetector -> {path}')
+
+          def load(self, path: str) -> None:
+              ckpt = torch.load(path, map_location=self.device)
+              self.model.load_state_dict(ckpt['model_state'])
+              self.operating_threshold = ckpt['threshold']
+              self._trained = True
+
+
+      if __name__ == '__main__':
+          wrapper = LSTMDetectorWrapper(input_size=20, hidden_size=64)
+          wrapper._trained = True  # skip training for smoke test
+          rng = np.random.default_rng(42)
+          benign_turns = [rng.normal(0.1, 0.05, 20) for _ in range(5)]
+          attack_turns = [rng.normal(0.1, 0.05, 20) for _ in range(4)]
+          attack_turns.append(rng.normal(0.8, 0.1, 20))  # attack in final turn
+          for label, turns in [('benign', benign_turns), ('attack', attack_turns)]:
+              pred = wrapper.predict_conversation(turns)
+              print(f'[{label}] n_turns={pred.n_turns}  '
+                    f'prob={pred.attack_probability:.3f}  '
+                    f'is_attack={pred.is_attack}  '
+                    f'latency={pred.inference_ms:.1f}ms')
+
+  deliverable_2:
+    title: 'GRU Sequence Detector with Attention'
+    filename: 'gru_sequence_detector.py'
+    description: 'GRU conversation detector with additive attention mechanism. Produces per-turn attention weights alongside the attack probability, identifying which turns in the flagged conversation carried the most detection signal for analyst review.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: torch, numpy.'
+    code: |
+      # gru_sequence_detector.py
+      # Section 12.06: GRU Conversation Detector with Attention
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import time
+      from dataclasses import dataclass
+      from typing import Dict, List, Optional, Tuple
+
+      import numpy as np
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+
+      @dataclass
+      class GRUConversationPrediction:
+          attack_probability: float
+          is_attack: bool
+          threshold: float
+          n_turns: int
+          attention_weights: List[float]   # per-turn weights, sum to 1.0
+          top_signal_turns: List[int]      # 1-indexed turn numbers with highest attention
+          inference_ms: float
+
+
+      class AdditiveAttention(nn.Module):
+          def __init__(self, hidden_size: int) -> None:
+              super().__init__()
+              self.W = nn.Linear(hidden_size, hidden_size, bias=False)
+              self.v = nn.Linear(hidden_size, 1, bias=False)
+
+          def forward(
+              self,
+              hidden_states: torch.Tensor,   # (batch, seq_len, hidden_size)
+              mask: Optional[torch.Tensor],  # (batch, seq_len) -- True for padding
+          ) -> Tuple[torch.Tensor, torch.Tensor]:
+              '''Returns (context_vector, attention_weights).'''
+              scores = self.v(torch.tanh(self.W(hidden_states))).squeeze(-1)
+              if mask is not None:
+                  scores = scores.masked_fill(mask, float('-inf'))
+              weights = F.softmax(scores, dim=1)             # (batch, seq_len)
+              context = (weights.unsqueeze(-1) * hidden_states).sum(dim=1)
+              return context, weights
+
+
+      class GRUSecurityDetector(nn.Module):
+          def __init__(
+              self,
+              input_size: int = 20,
+              hidden_size: int = 64,
+              num_layers: int = 2,
+              dropout: float = 0.3,
+          ) -> None:
+              super().__init__()
+              self.hidden_size = hidden_size
+              self.gru = nn.GRU(
+                  input_size=input_size,
+                  hidden_size=hidden_size,
+                  num_layers=num_layers,
+                  batch_first=True,
+                  dropout=dropout if num_layers > 1 else 0.0,
+              )
+              self.attention = AdditiveAttention(hidden_size)
+              self.dropout = nn.Dropout(dropout)
+              self.classifier = nn.Sequential(
+                  nn.Linear(hidden_size, 32),
+                  nn.ReLU(),
+                  nn.Dropout(dropout),
+                  nn.Linear(32, 1),
+                  nn.Sigmoid(),
+              )
+
+          def forward(
+              self,
+              sequences: torch.Tensor,
+              lengths: torch.Tensor,
+          ) -> Tuple[torch.Tensor, torch.Tensor]:
+              '''
+              Returns (attack_probabilities, attention_weights).
+              attack_probabilities: (batch,)
+              attention_weights:    (batch, max_len)
+              '''
+              packed = pack_padded_sequence(
+                  sequences, lengths.cpu(), batch_first=True, enforce_sorted=False,
+              )
+              packed_out, _ = self.gru(packed)
+              hidden_states, _ = pad_packed_sequence(packed_out, batch_first=True)
+
+              # Build padding mask: True where padded
+              batch, max_len, _ = hidden_states.shape
+              mask = torch.zeros(batch, max_len, dtype=torch.bool, device=sequences.device)
+              for i, length in enumerate(lengths):
+                  mask[i, length:] = True
+
+              context, attention_weights = self.attention(hidden_states, mask)
+              context = self.dropout(context)
+              probs = self.classifier(context).squeeze(1)
+              return probs, attention_weights
+
+
+      class GRUDetectorWrapper:
+          def __init__(
+              self,
+              input_size: int = 20,
+              hidden_size: int = 64,
+              num_layers: int = 2,
+              dropout: float = 0.3,
+              operating_threshold: float = 0.5,
+              device: str = 'cpu',
+              top_k_turns: int = 3,
+          ) -> None:
+              self.device = torch.device(device)
+              self.operating_threshold = operating_threshold
+              self.top_k_turns = top_k_turns
+              self.model = GRUSecurityDetector(
+                  input_size=input_size,
+                  hidden_size=hidden_size,
+                  num_layers=num_layers,
+                  dropout=dropout,
+              ).to(self.device)
+              self._trained = False
+
+          def predict_conversation(
+              self,
+              turn_features: List[np.ndarray],
+          ) -> GRUConversationPrediction:
+              assert self._trained
+              t0 = time.time()
+              self.model.eval()
+              with torch.no_grad():
+                  seq = torch.tensor(
+                      np.array(turn_features), dtype=torch.float32,
+                  ).unsqueeze(0).to(self.device)
+                  lengths = torch.tensor([len(turn_features)])
+                  probs, attn = self.model(seq, lengths)
+                  prob = float(probs[0].item())
+                  weights = attn[0, :len(turn_features)].cpu().numpy().tolist()
+
+              top_turns = sorted(
+                  range(len(weights)),
+                  key=lambda i: weights[i],
+                  reverse=True,
+              )[:self.top_k_turns]
+              top_turns_1indexed = [t + 1 for t in top_turns]
+
+              return GRUConversationPrediction(
+                  attack_probability=prob,
+                  is_attack=prob >= self.operating_threshold,
+                  threshold=self.operating_threshold,
+                  n_turns=len(turn_features),
+                  attention_weights=weights,
+                  top_signal_turns=top_turns_1indexed,
+                  inference_ms=(time.time() - t0) * 1000,
+              )
+
+          def save(self, path: str) -> None:
+              torch.save({'model_state': self.model.state_dict(),
+                          'threshold': self.operating_threshold}, path)
+              print(f'Saved GRUDetector -> {path}')
+
+          def load(self, path: str) -> None:
+              ckpt = torch.load(path, map_location=self.device)
+              self.model.load_state_dict(ckpt['model_state'])
+              self.operating_threshold = ckpt['threshold']
+              self._trained = True
+
+
+      if __name__ == '__main__':
+          wrapper = GRUDetectorWrapper(input_size=20, hidden_size=64, top_k_turns=3)
+          wrapper._trained = True
+          rng = np.random.default_rng(42)
+          # Simulate gradual escalation: turns 1-4 benign, turn 5 attack
+          turns = [rng.normal(0.1, 0.05, 20) for _ in range(4)]
+          turns.append(rng.normal(0.8, 0.1, 20))
+          turns[-1][6] = 1.0  # role_boundary_marker set in final turn
+          pred = wrapper.predict_conversation(turns)
+          print(f'attack_prob={pred.attack_probability:.3f}  '
+                f'is_attack={pred.is_attack}')
+          print(f'Top signal turns: {pred.top_signal_turns}')
+          print(f'Attention weights: {[f"{w:.3f}" for w in pred.attention_weights]}')
+          print(f'Inference: {pred.inference_ms:.1f}ms')
+
+  deliverable_3:
+    title: 'Conversation Dataset Builder'
+    filename: 'conversation_dataset_builder.py'
+    description: 'Builds conversation-level training datasets for sequence models from three sources: production session logs with TP turns, synthetically constructed conversations from single-turn examples, and red team multi-turn exercise captures. Outputs padded tensor datasets for PyTorch DataLoader consumption.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: torch, numpy, pandas.'
+    code: |
+      # conversation_dataset_builder.py
+      # Section 12.06: Conversation-Level Dataset Builder
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import json
+      from dataclasses import dataclass, field
+      from pathlib import Path
+      from typing import List, Optional, Tuple
+
+      import numpy as np
+      import torch
+      from torch.utils.data import Dataset
+      from torch.nn.utils.rnn import pad_sequence
+
+
+      @dataclass
+      class ConversationExample:
+          session_id: str
+          turns: List[np.ndarray]   # list of feature vectors, one per turn
+          label: int                 # 1 = attack conversation, 0 = benign
+          source: str                # production / synthetic / red_team
+          attack_turn_indices: List[int] = field(default_factory=list)
+
+
+      class ConversationDataset(Dataset):
+          def __init__(self, examples: List[ConversationExample]) -> None:
+              self.examples = examples
+
+          def __len__(self) -> int:
+              return len(self.examples)
+
+          def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int, int]:
+              ex = self.examples[idx]
+              seq = torch.tensor(np.array(ex.turns), dtype=torch.float32)
+              return seq, ex.label, len(ex.turns)
+
+
+      def collate_fn(
+          batch: List[Tuple[torch.Tensor, int, int]],
+      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+          '''
+          Pads sequences to the max length in the batch.
+          Returns (padded_sequences, labels, lengths).
+          '''
+          seqs, labels, lengths = zip(*batch)
+          padded = pad_sequence(seqs, batch_first=True, padding_value=0.0)
+          return padded, torch.tensor(labels, dtype=torch.float32), torch.tensor(lengths)
+
+
+      class ConversationDatasetBuilder:
+          '''
+          Builds labelled conversation datasets from three sources:
+          1. Production session logs with at least one confirmed TP turn
+          2. Synthetic conversations: benign prefix + single-turn attack suffix
+          3. Red team multi-turn exercises
+          '''
+
+          def __init__(self, max_turns: int = 20, feature_size: int = 20) -> None:
+              self.max_turns = max_turns
+              self.feature_size = feature_size
+              self._examples: List[ConversationExample] = []
+
+          def ingest_session_logs(self, session_log_path: str) -> int:
+              '''
+              Ingest production session logs. Each line is a JSON record with:
+              session_id, turns (list of feature dicts), label (0/1), attack_turn_indices.
+              '''
+              path = Path(session_log_path)
+              if not path.exists():
+                  print(f'  Session log not found: {session_log_path}')
+                  return 0
+              added = 0
+              with open(path) as f:
+                  for line in f:
+                      r = json.loads(line.strip())
+                      turns = [np.array(t, dtype=np.float32) for t in r['turns']]
+                      if not turns or len(turns) > self.max_turns:
+                          continue
+                      self._examples.append(ConversationExample(
+                          session_id=r['session_id'],
+                          turns=turns,
+                          label=int(r['label']),
+                          source='production',
+                          attack_turn_indices=r.get('attack_turn_indices', []),
+                      ))
+                      added += 1
+              print(f'  Ingested {added} conversations from session logs.')
+              return added
+
+          def ingest_synthetic(
+              self,
+              attack_feature_vectors: List[np.ndarray],
+              benign_feature_vectors: List[np.ndarray],
+              n_benign_prefix_turns: int = 3,
+              rng_seed: int = 42,
+          ) -> int:
+              '''
+              Constructs synthetic attack conversations:
+              n_benign_prefix_turns of benign context + 1 attack turn.
+              '''
+              rng = np.random.default_rng(rng_seed)
+              added = 0
+              for i, attack_fv in enumerate(attack_feature_vectors):
+                  prefix_indices = rng.choice(
+                      len(benign_feature_vectors),
+                      size=min(n_benign_prefix_turns, len(benign_feature_vectors)),
+                      replace=False,
+                  )
+                  turns = [benign_feature_vectors[j] for j in prefix_indices] + [attack_fv]
+                  self._examples.append(ConversationExample(
+                      session_id=f'synthetic_{i}',
+                      turns=turns,
+                      label=1,
+                      source='synthetic',
+                      attack_turn_indices=[len(turns) - 1],
+                  ))
+                  added += 1
+              # Add pure benign conversations
+              for i in range(len(attack_feature_vectors)):
+                  n = rng.integers(2, min(8, len(benign_feature_vectors) + 1))
+                  idx = rng.choice(len(benign_feature_vectors), size=n, replace=False)
+                  self._examples.append(ConversationExample(
+                      session_id=f'benign_synth_{i}',
+                      turns=[benign_feature_vectors[j] for j in idx],
+                      label=0,
+                      source='synthetic',
+                  ))
+              print(f'  Built {added} synthetic attack conversations.')
+              return added
+
+          def build_splits(
+              self,
+              train_frac: float = 0.70,
+              val_frac: float = 0.15,
+          ) -> Tuple[ConversationDataset, ConversationDataset, ConversationDataset]:
+              '''Temporal split: earlier conversations in train, later in test.'''
+              n = len(self._examples)
+              train_end = int(n * train_frac)
+              val_end = train_end + int(n * val_frac)
+              train = ConversationDataset(self._examples[:train_end])
+              val = ConversationDataset(self._examples[train_end:val_end])
+              test = ConversationDataset(self._examples[val_end:])
+              n_atk_train = sum(1 for e in self._examples[:train_end] if e.label == 1)
+              print(f'  Conversation splits: train={len(train)} ({n_atk_train} attack)  '
+                    f'val={len(val)}  test={len(test)}')
+              return train, val, test
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(42)
+          benign_fvs = [rng.normal(0.1, 0.05, 20) for _ in range(100)]
+          attack_fvs = [rng.normal(0.7, 0.1, 20) for _ in range(30)]
+
+          builder = ConversationDatasetBuilder(max_turns=20, feature_size=20)
+          builder.ingest_synthetic(attack_fvs, benign_fvs, n_benign_prefix_turns=3)
+          train_ds, val_ds, test_ds = builder.build_splits()
+
+          from torch.utils.data import DataLoader
+          loader = DataLoader(train_ds, batch_size=8, collate_fn=collate_fn, shuffle=True)
+          batch = next(iter(loader))
+          seqs, labels, lengths = batch
+          print(f'Batch: seqs={seqs.shape}  labels={labels.shape}  lengths={lengths}')
+
+  deliverable_4:
+    title: 'Sequence Model Trainer'
+    filename: 'sequence_model_trainer.py'
+    description: 'Training loop for LSTM and GRU conversation detectors with gradient clipping, early stopping based on validation recall, and cosine annealing learning rate scheduling.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: torch, numpy, sklearn.'
+    code: |
+      # sequence_model_trainer.py
+      # Section 12.06: Sequence Model Training Loop
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      from typing import Callable, List, Optional, Tuple
+
+      import numpy as np
+      import torch
+      import torch.nn as nn
+      from torch.optim import Adam
+      from torch.optim.lr_scheduler import CosineAnnealingLR
+      from torch.utils.data import DataLoader
+
+      from conversation_dataset_builder import collate_fn, ConversationDataset
+
+
+      def train_sequence_model(
+          model: nn.Module,
+          train_dataset: ConversationDataset,
+          val_dataset: ConversationDataset,
+          forward_fn: Callable,
+          max_epochs: int = 80,
+          batch_size: int = 32,
+          learning_rate: float = 1e-3,
+          gradient_clip_norm: float = 1.0,
+          early_stopping_patience: int = 10,
+          pos_weight: Optional[float] = None,
+          device: str = 'cpu',
+      ) -> List[dict]:
+          '''
+          Generic training loop for LSTM or GRU security detectors.
+
+          forward_fn: callable(model, sequences, lengths) -> (probabilities, ...)
+          Returns list of per-epoch metric dicts.
+          '''
+          dev = torch.device(device)
+          model = model.to(dev)
+
+          pw = torch.tensor([pos_weight], device=dev) if pos_weight else None
+          criterion = nn.BCELoss(weight=None) if pw is None else nn.BCEWithLogitsLoss(pos_weight=pw)
+
+          optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+          scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=1e-5)
+
+          train_loader = DataLoader(train_dataset, batch_size=batch_size,
+                                    collate_fn=collate_fn, shuffle=True)
+          val_loader = DataLoader(val_dataset, batch_size=batch_size,
+                                  collate_fn=collate_fn, shuffle=False)
+
+          history = []
+          best_val_recall = 0.0
+          patience_counter = 0
+          best_state = None
+
+          for epoch in range(1, max_epochs + 1):
+              # Train
+              model.train()
+              train_loss = 0.0
+              for seqs, labels, lengths in train_loader:
+                  seqs, labels, lengths = seqs.to(dev), labels.to(dev), lengths
+                  optimizer.zero_grad()
+                  out = forward_fn(model, seqs, lengths)
+                  probs = out[0] if isinstance(out, tuple) else out
+                  loss = criterion(probs, labels)
+                  loss.backward()
+                  nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+                  optimizer.step()
+                  train_loss += loss.item()
+              scheduler.step()
+
+              # Validate
+              model.eval()
+              all_probs, all_labels = [], []
+              with torch.no_grad():
+                  for seqs, labels, lengths in val_loader:
+                      seqs, lengths = seqs.to(dev), lengths
+                      out = forward_fn(model, seqs, lengths)
+                      probs = out[0] if isinstance(out, tuple) else out
+                      all_probs.extend(probs.cpu().numpy().tolist())
+                      all_labels.extend(labels.numpy().tolist())
+
+              all_probs = np.array(all_probs)
+              all_labels = np.array(all_labels)
+              preds = (all_probs >= 0.5).astype(int)
+              tp = ((preds == 1) & (all_labels == 1)).sum()
+              fn = ((preds == 0) & (all_labels == 1)).sum()
+              fp = ((preds == 1) & (all_labels == 0)).sum()
+              recall = tp / max(tp + fn, 1)
+              precision = tp / max(tp + fp, 1)
+
+              history.append({
+                  'epoch': epoch,
+                  'train_loss': train_loss / max(len(train_loader), 1),
+                  'val_recall': float(recall),
+                  'val_precision': float(precision),
+              })
+
+              if recall > best_val_recall:
+                  best_val_recall = recall
+                  best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                  patience_counter = 0
+              else:
+                  patience_counter += 1
+
+              if epoch % 10 == 0:
+                  print(f'  Epoch {epoch:>3}: loss={train_loss/len(train_loader):.4f}  '
+                        f'val_recall={recall:.3f}  val_precision={precision:.3f}')
+
+              if patience_counter >= early_stopping_patience:
+                  print(f'  Early stopping at epoch {epoch} (best_val_recall={best_val_recall:.3f})')
+                  break
+
+          if best_state is not None:
+              model.load_state_dict(best_state)
+          return history
+
+
+      if __name__ == '__main__':
+          from gru_sequence_detector import GRUSecurityDetector
+          from conversation_dataset_builder import ConversationDatasetBuilder
+
+          rng = np.random.default_rng(42)
+          benign = [rng.normal(0.1, 0.05, 20) for _ in range(80)]
+          attack = [rng.normal(0.7, 0.1, 20) for _ in range(20)]
+          builder = ConversationDatasetBuilder()
+          builder.ingest_synthetic(attack, benign)
+          train_ds, val_ds, _ = builder.build_splits()
+
+          model = GRUSecurityDetector(input_size=20, hidden_size=64)
+          n_b = sum(1 for e in train_ds.examples if e.label == 0)
+          n_a = sum(1 for e in train_ds.examples if e.label == 1)
+          pos_w = n_b / max(n_a, 1)
+
+          def gru_forward(m, seqs, lengths):
+              return m(seqs, lengths)
+
+          history = train_sequence_model(
+              model, train_ds, val_ds,
+              forward_fn=gru_forward,
+              max_epochs=30, batch_size=16,
+              pos_weight=pos_w,
+          )
+          print(f'Final val_recall: {history[-1]["val_recall"]:.3f}')
+
+  deliverable_5:
+    title: 'Sequence Inference Optimiser'
+    filename: 'sequence_inference_optimizer.py'
+    description: 'Variable-length sequence batching for production GRU inference within the 50ms gateway budget. Implements length-sorted batching to minimise padding waste, async session history retrieval, and latency profiling across conversation lengths.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: torch, numpy, asyncio.'
+    code: |
+      # sequence_inference_optimizer.py
+      # Section 12.06: Sequence Model Production Inference Optimiser
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import asyncio
+      import time
+      from dataclasses import dataclass
+      from typing import Dict, List, Optional, Tuple
+
+      import numpy as np
+      import torch
+
+      from gru_sequence_detector import GRUDetectorWrapper, GRUConversationPrediction
+
+
+      # Simple in-memory session store (replace with Redis in production).
+      _SESSION_STORE: Dict[str, List[np.ndarray]] = {}
+
+
+      def store_turn(session_id: str, turn_features: np.ndarray) -> None:
+          if session_id not in _SESSION_STORE:
+              _SESSION_STORE[session_id] = []
+          _SESSION_STORE[session_id].append(turn_features)
+
+
+      def get_conversation(session_id: str) -> List[np.ndarray]:
+          return _SESSION_STORE.get(session_id, [])
+
+
+      def clear_session(session_id: str) -> None:
+          _SESSION_STORE.pop(session_id, None)
+
+
+      async def score_conversation_async(
+          detector: GRUDetectorWrapper,
+          session_id: str,
+          current_turn_features: np.ndarray,
+          timeout_ms: float = 15.0,
+      ) -> Optional[GRUConversationPrediction]:
+          '''
+          Async wrapper: appends current turn to session history and scores.
+          Returns None if the conversation history is not yet available
+          or inference exceeds timeout_ms.
+          '''
+          store_turn(session_id, current_turn_features)
+          turns = get_conversation(session_id)
+          if not turns:
+              return None
+
+          loop = asyncio.get_event_loop()
+          try:
+              pred = await asyncio.wait_for(
+                  loop.run_in_executor(None, detector.predict_conversation, turns),
+                  timeout=timeout_ms / 1000.0,
+              )
+              return pred
+          except asyncio.TimeoutError:
+              print(f'  WARN: GRU inference timeout for session {session_id}')
+              return None
+
+
+      def length_sorted_batch_inference(
+          detector: GRUDetectorWrapper,
+          conversations: List[List[np.ndarray]],
+      ) -> List[GRUConversationPrediction]:
+          '''
+          Sort conversations by length, batch by similar lengths, infer.
+          Reduces padding waste relative to batching in arbitrary order.
+          '''
+          indexed = sorted(enumerate(conversations), key=lambda x: len(x[1]))
+          results: List[Optional[GRUConversationPrediction]] = [None] * len(conversations)
+          for orig_idx, turns in indexed:
+              results[orig_idx] = detector.predict_conversation(turns)
+          return results
+
+
+      def profile_latency(
+          detector: GRUDetectorWrapper,
+          max_turns: int = 20,
+          n_samples: int = 50,
+      ) -> Dict[int, float]:
+          '''
+          Measures median inference latency (ms) for conversation lengths 1..max_turns.
+          Returns {turn_count: median_latency_ms}.
+          '''
+          rng = np.random.default_rng(42)
+          detector._trained = True  # allow inference on untrained model for profiling
+          latencies: Dict[int, List[float]] = {}
+          for n_turns in range(1, max_turns + 1):
+              times = []
+              for _ in range(n_samples):
+                  turns = [rng.normal(0.1, 0.05, 20) for _ in range(n_turns)]
+                  t0 = time.time()
+                  detector.predict_conversation(turns)
+                  times.append((time.time() - t0) * 1000)
+              latencies[n_turns] = float(np.median(times))
+          return latencies
+
+
+      if __name__ == '__main__':
+          detector = GRUDetectorWrapper(input_size=20, hidden_size=64)
+
+          print('Latency profile (GRU, CPU):')
+          latencies = profile_latency(detector, max_turns=15, n_samples=20)
+          budget_ok = all(v <= 15.0 for v in latencies.values())
+          for n_turns, lat in latencies.items():
+              flag = '' if lat <= 15.0 else '  OVER BUDGET'
+              print(f'  {n_turns:>2} turns: {lat:.2f}ms{flag}')
+          print(f'\nAll within 15ms async budget: {budget_ok}')
+
+          # Async session scoring demo
+          async def demo():
+              rng = np.random.default_rng(42)
+              session = 'session_001'
+              for i in range(5):
+                  fv = rng.normal(0.1 if i < 4 else 0.8, 0.05, 20)
+                  pred = await score_conversation_async(detector, session, fv)
+                  if pred:
+                      print(f'  Turn {i+1}: prob={pred.attack_probability:.3f}  '
+                            f'top_signal={pred.top_signal_turns}')
+
+          asyncio.run(demo())
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Training the sequence model before the conversation-level dataset has 500+ attack conversations, producing an overfit detector with near-zero generalisation'
+    why_it_happens: |
+      After the single-turn dataset crosses 500 examples, the engineer proceeds to sequence
+      model training expecting similar data requirements. The conversation dataset has only
+      80 attack conversations from the first month of session log collection. Training on
+      80 examples with a 64-hidden-unit GRU produces a model that memorises the 80
+      conversations and achieves 98% training accuracy, 55% validation recall.
+    consequence: |
+      The overfit GRU is deployed alongside the Random Forest. On production traffic it
+      detects only conversations that closely resemble the 80 training examples -- primarily
+      the red team exercise patterns. Novel gradual erosion attacks from real adversaries
+      are missed because they do not match the specific turn-by-turn patterns the model
+      memorised.
+    correct_approach: |
+      Do not train the GRU until 500+ labelled attack conversations are available. Before
+      this threshold, use the conversation_dataset_builder.py synthetic conversation
+      construction to pad the training set with constructed examples, and evaluate
+      performance specifically on real production session examples in the held-out test
+      set. If the real-session test recall is below 0.70, collect more real data before
+      deploying.
+
+  mistake_2:
+    description: 'Storing only the turn that triggered the anomaly alert rather than the full conversation history, making conversation-level labelling impossible retroactively'
+    why_it_happens: |
+      The Section 12.03 anomaly alert labeller stores the request_text of the flagged
+      turn. The engineer does not modify it to store the full session history because
+      session history storage was not required for the single-turn classifiers. By the
+      time sequence model training is planned, months of production data have been
+      collected with only single-turn records.
+    consequence: |
+      The conversation dataset can only be constructed from red team exercises and synthetic
+      examples. Production attack conversations -- the highest-fidelity training source --
+      are unavailable because the session history was not stored. The sequence model trains
+      on a dataset that does not represent the real production attack distribution. Its
+      detection performance is lower than it would be if session histories had been stored
+      from the start.
+    correct_approach: |
+      Add session history storage to the production infrastructure at the same time as
+      the anomaly detector deployment (Section 12.03), not when sequence model training
+      is planned. The infrastructure cost is negligible (Redis with 24h TTL, 1600 bytes
+      per 20-turn session). The data loss from not storing session histories is
+      irreversible -- there is no way to reconstruct conversation context for alerts
+      that were stored as single turns.
+
+  mistake_3:
+    description: 'Not applying gradient clipping and experiencing gradient explosion on long conversation sequences during training'
+    why_it_happens: |
+      The training loop from a standard RNN tutorial does not include gradient clipping.
+      The engineer copies the tutorial loop. For short sequences (3-5 turns) in early
+      training epochs, gradients are well-behaved. As the model processes longer
+      conversations (10+ turns) and the loss surface becomes non-convex in later epochs,
+      gradients through the BPTT chain occasionally explode to NaN.
+    consequence: |
+      Model parameters become NaN after a gradient explosion event. Training loss becomes
+      NaN. The model produces NaN outputs for all subsequent inference calls. The training
+      run must be restarted from a checkpoint if one was saved, or from scratch if not.
+      Without gradient clipping, the LSTM training is non-reproducibly unstable.
+    correct_approach: |
+      Always apply nn.utils.clip_grad_norm_(model.parameters(), 1.0) after loss.backward()
+      and before optimizer.step() for any recurrent model. The sequence_model_trainer.py
+      in deliverable_4 applies this unconditionally. The clip norm of 1.0 is the standard
+      recommendation for security conversation lengths; reduce to 0.5 if instability
+      persists on very long sequences.
+
+  mistake_4:
+    description: 'Using attention weights as a precision score rather than as a turn-attribution signal, misinterpreting low attention on the payload turn as low confidence'
+    why_it_happens: |
+      The GRU produces attention weights over turns. In a 5-turn gradual erosion attack,
+      turns 1-3 establish the fictional frame (high attention because they carry the context
+      that makes turn 5 meaningful) and turn 5 is the payload turn (lower attention because
+      the payload itself is short). The analyst sees low attention on turn 5 and concludes
+      the payload turn is not the attack signal.
+    consequence: |
+      The analyst dismisses the alert or misidentifies turn 2 (the fictional frame setup)
+      as the attack, leading to an incorrect annotation in the training queue. The
+      mislabelled turn accumulates into the training set and introduces noise into the
+      single-turn classifier's decision boundary.
+    correct_approach: |
+      Attention weights show which turns the model used most to make its decision, not
+      which turns are the attack payload. For gradual erosion attacks, the model may
+      attend to the context-building turns because they are collectively more informative
+      for predicting attack than the final payload turn in isolation. Document this
+      interpretation in the analyst annotation guidelines for conversation-level alerts.
+      The top_signal_turns output is evidence of model reasoning, not ground truth about
+      attack location.
+
+  mistake_5:
+    description: 'Deploying the sequence model as a replacement for the single-turn classifiers rather than as an additional layer, losing single-turn detection coverage'
+    why_it_happens: |
+      The GRU reaches higher accuracy than the Random Forest on the conversation-level
+      test set. The engineer concludes that the GRU is simply better and routes all
+      detection traffic through the GRU, disabling the Random Forest to reduce latency.
+    consequence: |
+      Single-turn attacks -- a direct injection in a single message with no prior context
+      -- must wait for the GRU to process the single-turn conversation sequence. The GRU
+      processes a sequence of length 1; its attention mechanism has nothing to attend over;
+      it defaults to a near-baseline prediction for short conversations. Single-turn
+      injection accuracy drops from the Random Forest's 90%+ to the GRU's near-baseline
+      performance on length-1 sequences.
+    correct_approach: |
+      The sequence model detects multi-turn patterns; the single-turn classifiers detect
+      single-turn attacks. Both run in parallel in the Section 12.15 ensemble. The GRU
+      is added to the ensemble alongside the Random Forest and XGBoost, not in place of
+      them. A conversation-level attack triggers the GRU; a single-turn attack triggers
+      the Random Forest. The coverage profiles are complementary.
+
+section_summary:
+
+  compact: |
+    Sequence models close the multi-turn blind spot that single-turn classifiers cannot
+    cover. LSTM and GRU both process the full conversation history as a variable-length
+    sequence of per-turn SecurityFeatureVectors and classify the conversation, not the
+    individual turn. GRU is the correct production default for conversations under 15
+    turns: two gates instead of three, faster training, matched accuracy, and an attention
+    mechanism that produces per-turn weights for analyst-readable detection evidence.
+    The conversation dataset requires 500+ labelled attack conversations and full session
+    history storage from day one -- the infrastructure that makes this section possible
+    must be deployed alongside the Section 12.03 anomaly detector, not when sequence
+    model training is planned. Sequence models are the last ML family deployed because
+    their data requirements are the hardest to meet; they are justified only when
+    multi-turn attack patterns are documented in the production threat model.
+
+  key_takeaways:
+    - 'Single-turn classifiers have a structural blind spot for multi-turn attacks: gradual jailbreak erosion, payload splitting, and fictional frame construction all require sequential context to detect -- context that the Section 12.05 classifiers never see'
+    - 'GRU is the correct production default over LSTM for conversations under 15 turns: two gates instead of three, 20-30% faster training, matched accuracy, and attention weights for turn attribution'
+    - 'Attention weights show which turns the model used most to make its decision -- not which turns are the attack payload; analysts must understand this distinction to avoid mislabelling context-building turns as the attack'
+    - 'Session history storage must be deployed alongside the Section 12.03 anomaly detector, not when sequence model training is planned -- the data loss from missing session histories is irreversible'
+    - 'The sequence model is added to the ensemble alongside the Random Forest and XGBoost, not in place of them -- it covers multi-turn patterns; the single-turn classifiers cover single-turn attacks'
+    - 'Do not train the GRU until 500+ labelled attack conversations are available; training on fewer examples produces a memorising detector that fails on novel attack patterns from real adversaries'
+
+preview_section_12_07:
+  title: 'Section 12.07: Embedding-Based Detection -- Sentence Transformers and Semantic Similarity'
+  summary: |
+    Section 12.07 addresses the paraphrase evasion problem that neither the supervised
+    classifiers nor the sequence model fully solves: an adversary who rewrites the attack
+    payload to avoid known vocabulary and structural markers while preserving the attack
+    intent. Embedding-based detection measures semantic distance from known attack cluster
+    centroids in a 768-dimensional embedding space. A paraphrase that preserves attack
+    intent maps to a point near the original embedding regardless of surface token changes
+    and registers as semantically close to the attack cluster centroid. The Sentence
+    Transformer inference chain uses all-MiniLM-L6 via ONNX Runtime for 2-4ms per
+    request on CPU. Attack cluster centroids are pre-computed from confirmed positive
+    examples using HDBSCAN clustering, stored in the cluster library, and updated
+    incrementally as new attack families are confirmed.
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 2 Section 2.17: LSTM and RNN basics -- gating mechanisms reviewed in prose; prerequisite knowledge assumed'
+    - 'Chapter 7 Section 7.07: multi-turn jailbreak escalation -- the gradual erosion attack pattern this section detects'
+    - 'Chapter 7 Section 7.08: context manipulation -- payload splitting and fictional frame attacks'
+    - 'Section 12.02: security feature engineering -- SecurityFeatureVector per turn is the sequence input'
+    - 'Section 12.04: dataset curation -- conversation_dataset_builder.py extends the Section 12.04 schema'
+    - 'Section 12.05: supervised classification -- security_evaluator.py imported for benchmarking'
+  forward_references:
+    - 'Section 12.07: embedding detection -- imports security_evaluator.py; complements sequence model coverage'
+    - 'Section 12.12: inference optimisation -- async parallel scoring runs GRU alongside other detectors'
+    - 'Section 12.15: four-detector ensemble -- GRU is the third of the four ensemble components'
+    - 'Section 12.17: production gateway capstone -- GRU assigned to Tracks 2-4 (multi-turn jailbreak)'
+  tags:
+    - sequence-models
+    - lstm
+    - gru
+    - multi-turn-detection
+    - conversation-threat-detection
+    - attention-mechanism
+    - variable-length-sequences
+    - gradient-clipping
+    - early-stopping
+    - session-history-storage
+    - payload-splitting
+    - gradual-jailbreak-erosion
+    - fictional-frame-attack
+    - atlas-aml-t0040
+    - atlas-aml-t0051
+    - owasp-llm01
