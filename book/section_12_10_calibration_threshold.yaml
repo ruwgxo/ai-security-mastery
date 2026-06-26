@@ -1,0 +1,1166 @@
+# section_12_10_calibration_threshold.yaml
+
+---
+document_info:
+  title: 'Calibration and Threshold Tuning: Setting Detection Operating Points'
+  chapter: 12
+  section: 10
+  section_code: '1210'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-06'
+  estimated_pages: 6
+  estimated_reading_time: '45-55 minutes'
+
+section_overview:
+  one_line_summary: 'Calibration and threshold tuning are the last mile from a trained classifier to a production detector: an uncalibrated model with a default 0.5 threshold either floods the analyst queue or silently misses attacks.'
+  why_this_section_exists: |
+    The five detectors built in Sections 12.03 through 12.09 each produce a probability
+    or score. The Random Forest outputs a probability between 0 and 1. The XGBoost outputs
+    a probability. The GRU, DistilBERT, embedding detector, and PII scanner each produce a
+    confidence score. Every section so far has used a default decision threshold of 0.5:
+    if the score exceeds 0.5, flag the input as an attack.
+
+    Both of these defaults are wrong for production. First, the raw probabilities are not
+    calibrated -- a Random Forest that outputs 0.9 is not correct 90% of the time, because
+    tree ensembles produce probability estimates that systematically deviate from the true
+    likelihood. Second, the 0.5 threshold is not the correct operating point -- the correct
+    threshold is determined by the deployment's tolerance for false positives, which is
+    set by the analyst review capacity, not by the arbitrary midpoint of the probability
+    range.
+
+    Section 12.10 fixes both. Probability calibration maps the raw classifier scores to
+    calibrated probabilities that match the actual attack rate, so that a calibrated 0.9
+    means a 90% chance the input is an attack. Threshold tuning selects the operating point
+    on the precision-recall curve that achieves the deployment's required false positive
+    rate at maximum recall. Per-threat-class threshold differentiation recognises that
+    different detectors warrant different operating points: the PII scanner favours recall
+    (catch all leakage), the anomaly detector favours precision (avoid alert fatigue).
+
+    This is the section that makes the detector confidence scores operationally meaningful.
+    Before calibration, a score of 0.7 from the Random Forest and a score of 0.7 from the
+    XGBoost mean different things and cannot be combined. After calibration, both are
+    calibrated probabilities on the same scale, and the Section 12.15 ensemble can combine
+    them coherently.
+  position_in_chapter: |
+    Section 12.10 is the first of the operational infrastructure sections (12.10 through
+    12.14). It runs after all five detectors are built and before they are combined in
+    the Section 12.15 ensemble. Calibration is a prerequisite for ensemble combination:
+    the ensemble's weighted voting and stacking meta-learner require that the detector
+    outputs are calibrated probabilities on a common scale. The model_calibrator.py and
+    threshold_tuner.py are imported by Sections 12.13 (registry stage gates) and 12.15
+    (ensemble).
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain why raw classifier probabilities are not reliable attack probability estimates and describe the specific way tree ensembles produce miscalibrated probabilities'
+    - 'Describe Platt scaling: how a logistic regression fitted to the raw scores maps them to calibrated probabilities, and why it is the correct method for tree classifiers'
+    - 'Explain isotonic regression calibration and state when it is preferred over Platt scaling'
+    - 'Interpret a reliability diagram and compute the Expected Calibration Error from binned predictions'
+    - 'Explain why the operating threshold is not 0.5 for security classifiers and describe how the analyst false positive capacity determines the correct threshold'
+    - 'Explain why different threat classes warrant different operating thresholds and give the contrasting examples of the PII scanner and the anomaly detector'
+
+  skills:
+    - 'Calibrate a Random Forest and XGBoost classifier with Platt scaling and isotonic regression and compare the calibration quality'
+    - 'Produce a reliability diagram and compute ECE before and after calibration'
+    - 'Select the operating threshold from the precision-recall curve at a target false positive rate'
+    - 'Translate a business constraint (analyst capacity, acceptable FPR, required TPR) into a calibrated detection threshold'
+    - 'Monitor threshold performance over time and detect threshold drift as the attack distribution shifts'
+
+  security_mindset:
+    - 'Treat calibration as a prerequisite for ensemble combination, not an optional refinement: uncalibrated detector scores cannot be coherently combined because they are not on a common probability scale'
+    - 'Set the operating threshold from the analyst capacity constraint, not the default 0.5: a threshold that produces more alerts than the team can review is worse than a higher threshold that produces a reviewable volume'
+    - 'Differentiate thresholds by threat class consequence: the cost of missing a PII leak (privacy breach) differs from the cost of missing an anomaly alert (one of many signals), and the thresholds should reflect this'
+    - 'Monitor threshold performance continuously: a threshold calibrated at deployment becomes incorrect as the attack distribution shifts, and threshold drift is an early warning that recalibration is needed'
+
+prerequisites:
+  - 'Section 12.05: supervised classification -- the Random Forest and XGBoost that produce the uncalibrated probabilities; security_evaluator.py imported'
+  - 'Section 12.03: anomaly detection -- the anomaly score that needs threshold calibration'
+  - 'Section 12.08: neural classifier -- DistilBERT calibration; ECE was introduced in neural_model_evaluator.py'
+  - 'Section 12.09: PII scanner -- the PII confidence scores that need per-threat-class threshold differentiation'
+  - 'Chapter 1 Section 1.11: evaluation metrics -- precision, recall, ROC, and the precision-recall curve'
+  - 'Chapter 11 Section 11.09: false positive management -- the FP budget that drives threshold selection'
+
+prose_content:
+
+  part_1:
+    title: 'Why Raw Probabilities Are Not Probabilities'
+    body: |
+      A classifier that outputs 0.9 for an input is implicitly making a claim: there is a
+      90% chance this input is an attack. For this claim to be true, the classifier must be
+      calibrated -- across all the inputs it scores at 0.9, exactly 90% must actually be
+      attacks. Most classifiers do not satisfy this property out of the box.
+
+      Tree ensembles are systematically miscalibrated. A Random Forest computes its
+      probability as the fraction of trees that vote for the attack class. This fraction
+      is pushed toward the extremes: because individual trees are decision trees that make
+      hard splits, the ensemble rarely produces probabilities in the middle of the range,
+      and the probabilities it does produce do not correspond to true likelihoods. A Random
+      Forest that outputs 0.9 may be correct only 70% of the time; one that outputs 0.6 may
+      be correct 80% of the time. The ordering is usually preserved -- higher scores do mean
+      more likely attacks -- but the absolute values are unreliable.
+
+      XGBoost is similarly miscalibrated, though in a different pattern: gradient boosting
+      tends to produce overconfident probabilities near the extremes because the sequential
+      boosting drives the training examples toward 0 and 1. Neural classifiers from modern
+      deep learning frameworks are better calibrated by default than tree ensembles but
+      still benefit from calibration, especially after the aggressive fine-tuning used for
+      DistilBERT in Section 12.08.
+
+      The consequence of miscalibration is twofold. First, the confidence scores cannot be
+      interpreted directly: an analyst who sees a 0.85 attack probability cannot conclude
+      that there is an 85% chance of attack, because the model is not calibrated. Second,
+      and more importantly for the ensemble, the scores from different detectors cannot be
+      combined coherently. The Random Forest's 0.8 and the XGBoost's 0.8 mean different
+      things when both are uncalibrated, so averaging them or feeding them to a meta-learner
+      produces a meaningless combination. Calibration puts all detector outputs on a common
+      probability scale, which is the prerequisite for the Section 12.15 ensemble.
+
+  part_2:
+    title: 'Platt Scaling: Logistic Calibration for Tree Classifiers'
+    body: |
+      Platt scaling (Platt 1999) calibrates a classifier by fitting a logistic regression
+      to its raw scores. The logistic regression takes the raw score as input and outputs
+      a calibrated probability, learning the sigmoid transformation that maps the raw scores
+      to true likelihoods. The logistic regression is fitted on a held-out calibration set
+      -- not the training set used for the classifier, because using the training set would
+      produce an optimistically biased calibration.
+
+      Platt scaling is the correct calibration method for tree classifiers because their
+      miscalibration follows a sigmoid-shaped distortion that the logistic transformation
+      corrects well. The method has two parameters (the slope and intercept of the logistic
+      function), which makes it data-efficient: it can be fitted reliably on a calibration
+      set of a few hundred examples, which is appropriate for the security datasets in
+      Chapter 12 where labelled data is scarce.
+
+      The calibration set requirement is the key operational detail. The Section 12.04
+      temporal split produced train, validation, and test sets. The classifier is trained
+      on train. The Platt scaling logistic regression is fitted on validation. The test set
+      remains held out for the final evaluation of the calibrated classifier. Using the
+      validation set for calibration rather than the training set ensures the calibration
+      generalises -- the classifier's scores on the validation set reflect its scores on
+      future data, while its scores on the training set are optimistically confident because
+      it was trained on those examples.
+
+      Scikit-learn's CalibratedClassifierCV wraps a base classifier with Platt scaling (the
+      'sigmoid' method) or isotonic regression (the 'isotonic' method) and handles the
+      calibration set splitting internally via cross-validation. For the Chapter 12 detectors,
+      the model_calibrator.py in deliverable_1 applies CalibratedClassifierCV with explicit
+      control over the calibration set to respect the temporal split.
+
+  part_3:
+    title: 'Isotonic Regression: Non-Parametric Calibration'
+    body: |
+      Isotonic regression is a non-parametric calibration method that fits a monotonically
+      increasing step function mapping raw scores to calibrated probabilities. Unlike Platt
+      scaling, which assumes the miscalibration follows a sigmoid shape, isotonic regression
+      makes no parametric assumption -- it only requires that higher raw scores map to higher
+      or equal calibrated probabilities, which is the minimal sensible constraint.
+
+      The flexibility of isotonic regression is both its strength and its weakness. It can
+      correct any monotonic miscalibration pattern, including the non-sigmoid distortions
+      that Platt scaling cannot. But this flexibility requires more calibration data: with
+      a small calibration set, isotonic regression overfits the calibration examples and
+      produces a step function with many small steps that do not generalise. The rule of
+      thumb is that isotonic regression requires at least 1,000 calibration examples to be
+      reliable, while Platt scaling works with a few hundred.
+
+      For the Chapter 12 detectors, the choice between Platt scaling and isotonic regression
+      depends on the calibration set size. With the typical security dataset where the
+      validation split has a few hundred examples, Platt scaling is the correct default --
+      isotonic regression would overfit. When the dataset grows large enough that the
+      validation split exceeds 1,000 examples, isotonic regression becomes viable and may
+      produce better calibration if the miscalibration is non-sigmoid. The model_calibrator.py
+      in deliverable_1 applies both and selects the method that produces lower ECE on a
+      held-out portion of the calibration set.
+
+  part_4:
+    title: 'Reliability Diagrams and Expected Calibration Error'
+    body: |
+      The reliability diagram is the standard visualisation for calibration quality. It
+      bins the predictions by their predicted probability (typically 10 bins from 0 to 1),
+      and for each bin plots the mean predicted probability against the observed fraction of
+      positives in that bin. A perfectly calibrated classifier produces a diagonal line:
+      in the bin where the mean predicted probability is 0.7, exactly 70% of the examples
+      are positives. Deviations from the diagonal show miscalibration: points above the
+      diagonal indicate underconfidence (the model predicts lower than the true rate),
+      points below indicate overconfidence.
+
+      Expected Calibration Error (ECE) quantifies the reliability diagram into a single
+      number. It is the weighted average of the absolute difference between the predicted
+      probability and the observed fraction across all bins, weighted by the number of
+      examples in each bin. An ECE of 0 indicates perfect calibration; an ECE of 0.1
+      indicates that, on average, the predicted probabilities deviate from the true rate
+      by 10 percentage points. For security classifiers, an ECE below 0.05 after calibration
+      is the target.
+
+      The reliability diagram and ECE are computed before and after calibration to verify
+      that calibration improved the probability estimates. The before-calibration diagram
+      for a Random Forest typically shows the characteristic tree-ensemble distortion: a
+      sigmoid deviation from the diagonal. The after-calibration diagram should lie much
+      closer to the diagonal, with a correspondingly lower ECE. If calibration does not
+      reduce ECE, the calibration set may be too small or not representative of the test
+      distribution, and the calibration should not be deployed.
+
+      The reliability_diagram.py in deliverable_2 produces the diagram and computes ECE for
+      any classifier, and supports the before-and-after comparison that validates the
+      calibration step.
+
+  part_5:
+    title: 'Threshold Selection: From Precision-Recall Curve to Operating Point'
+    body: |
+      Calibration fixes the probability scale; threshold selection chooses where on that
+      scale to draw the attack/benign decision boundary. The default threshold of 0.5 is
+      rarely correct for security detection because it implicitly assumes that the cost of
+      a false positive equals the cost of a false negative, which is not true.
+
+      The precision-recall curve plots the precision and recall achievable at every possible
+      threshold. As the threshold decreases from 1.0 to 0.0, recall increases (more attacks
+      are caught) and precision decreases (more false positives are admitted). The correct
+      operating point is the threshold that maximises recall subject to the false positive
+      rate constraint set by the deployment.
+
+      The false positive rate constraint comes from the analyst review capacity. If the
+      deployment processes 10,000 requests per day and the analyst team can review 50 alerts
+      per day, the false positive rate must be at most 0.5% (50 alerts out of 10,000 requests)
+      to keep the alert volume within capacity. The threshold is selected as the lowest value
+      that keeps the false positive rate at or below 0.5%, which maximises recall within the
+      capacity constraint.
+
+      The threshold selection is per-detector, not global. Each detector has its own
+      precision-recall curve and its own calibrated threshold. The Random Forest's threshold
+      may be 0.42, the XGBoost's 0.38, the embedding detector's 0.55, each selected
+      independently to achieve the per-detector false positive contribution that sums to
+      the overall analyst capacity. The threshold_tuner.py in deliverable_3 computes the
+      precision-recall curve and selects the operating point for each detector at a specified
+      false positive target.
+
+  part_6:
+    title: 'Per-Threat-Class Differentiation and Threshold Drift Monitoring'
+    body: |
+      Different detectors address different threat classes with different consequences, and
+      the operating thresholds should reflect this. The PII scanner from Section 12.09
+      addresses a privacy threat where the cost of a missed leak is high (a privacy breach
+      that may have regulatory consequences) and the cost of a false positive is moderate
+      (an over-redacted response). For the PII scanner, the threshold should favour recall:
+      set it low to catch all potential leakage, accepting a higher false positive rate.
+      Conversely, the anomaly detector from Section 12.03 produces many alerts of which a
+      large fraction are false positives, and the cost of a missed anomaly is low (it is one
+      of many signals, and a genuine attack is likely caught by other detectors too). For
+      the anomaly detector, the threshold should favour precision: set it high to avoid
+      flooding the analyst queue with low-value alerts.
+
+      This per-threat-class differentiation is captured by the business_constraint_mapper.py
+      in deliverable_4, which translates a per-detector business requirement (the acceptable
+      false positive rate and the required true positive rate for that threat class) into a
+      calibrated threshold. The mapper takes the consequence framing -- how bad is a miss,
+      how bad is a false positive -- and produces the threshold that balances them
+      appropriately for each detector.
+
+      Threshold performance is not static. A threshold calibrated at deployment assumes a
+      fixed relationship between the calibrated probability and the true attack rate. As the
+      attack distribution shifts -- adversaries adapt, new attack families emerge -- this
+      relationship changes, and the threshold that achieved a 0.5% false positive rate at
+      deployment may achieve a 2% rate three months later. Threshold drift monitoring tracks
+      the realised false positive rate and recall over time and alerts when they deviate from
+      the calibration targets. The threshold_monitor.py in deliverable_5 implements this,
+      connecting to the Section 12.14 retraining trigger when drift exceeds the tolerance.
+
+reference_materials:
+
+  table_1:
+    title: 'Calibration Method Selection Guide'
+    description: 'When to use Platt scaling versus isotonic regression based on classifier type and calibration set size'
+    columns: ['Method', 'Calibration Set Size', 'Assumption', 'Best For', 'Risk']
+    rows:
+      - ['Platt scaling (sigmoid)', '100+ examples', 'Miscalibration follows a sigmoid shape', 'Tree classifiers (RF, XGBoost); small calibration sets', 'Cannot correct non-sigmoid miscalibration patterns']
+      - ['Isotonic regression', '1,000+ examples', 'Only monotonicity (higher score = higher probability)', 'Large calibration sets; non-sigmoid miscalibration', 'Overfits on small calibration sets; produces unreliable step functions']
+      - ['No calibration', 'N/A', 'Raw scores are usable as-is', 'Already well-calibrated neural models with abundant data', 'Tree ensemble probabilities are unreliable; cannot combine in ensemble']
+
+  table_2:
+    title: 'Calibration Quality Metrics'
+    description: 'Metrics for assessing calibration quality with interpretation and target values for security classifiers'
+    columns: ['Metric', 'Computation', 'Interpretation', 'Target']
+    rows:
+      - ['Expected Calibration Error (ECE)', 'Weighted mean of |predicted - observed| across probability bins', 'Average deviation of predicted probability from true rate', '< 0.05 after calibration']
+      - ['Reliability diagram', 'Predicted probability vs observed positive fraction, binned', 'Visual: how close predictions are to the diagonal', 'Points near the diagonal across all bins']
+      - ['Maximum Calibration Error (MCE)', 'Max |predicted - observed| across bins', 'Worst-case calibration deviation', '< 0.10; flags individual bins with poor calibration']
+      - ['Brier score', 'Mean squared difference between predicted probability and outcome', 'Combined measure of calibration and discrimination', 'Lower is better; compare before/after calibration']
+
+  table_3:
+    title: 'Threshold Selection by Analyst Capacity Constraint'
+    description: 'Worked examples translating analyst review capacity into the maximum false positive rate and the resulting threshold selection'
+    columns: ['Daily Traffic', 'Analyst Capacity (alerts/day)', 'Max FPR', 'Threshold Strategy', 'Outcome']
+    rows:
+      - ['10,000 requests', '50 alerts', '0.5%', 'Lowest threshold with FPR <= 0.5%', 'Maximises recall within review capacity']
+      - ['100,000 requests', '50 alerts', '0.05%', 'Higher threshold; tighter FPR constraint', 'Lower recall; may need a second-tier triage filter']
+      - ['10,000 requests', '200 alerts', '2%', 'Lower threshold; relaxed FPR constraint', 'Higher recall; more analyst time required']
+      - ['1,000 requests', '50 alerts', '5%', 'Low threshold; generous FPR constraint', 'High recall; low-traffic deployment can afford it']
+
+  table_4:
+    title: 'Per-Threat-Class Threshold Differentiation'
+    description: 'How operating thresholds differ by detector based on the consequence of a miss versus a false positive'
+    columns: ['Detector', 'Miss Cost', 'FP Cost', 'Threshold Bias', 'Rationale']
+    rows:
+      - ['PII scanner (12.09)', 'High -- privacy breach, regulatory risk', 'Moderate -- over-redacted response', 'Favour recall (lower threshold)', 'Catch all leakage; accept some over-redaction']
+      - ['Anomaly detector (12.03)', 'Low -- one of many signals; other detectors likely catch it', 'High -- alert fatigue from many FPs', 'Favour precision (higher threshold)', 'Avoid flooding the queue with low-value alerts']
+      - ['DistilBERT injection (12.08)', 'High -- successful injection', 'Moderate -- analyst review', 'Balanced toward recall', 'Catch injections; tolerate moderate FP for review']
+      - ['Random Forest (12.05)', 'Moderate -- caught by ensemble', 'Moderate -- analyst review', 'Balanced', 'Standard precision-recall balance at analyst capacity']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Model Calibrator'
+    filename: 'model_calibrator.py'
+    description: 'Platt scaling and isotonic regression calibration for Random Forest and XGBoost classifiers. Fits calibration on the held-out validation set (respecting the temporal split), selects the method that produces lower ECE, and wraps the base classifier with the calibration transform.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: scikit-learn, numpy. Imports from security_evaluator.py (Section 12.05) for evaluation.'
+    code: |
+      # model_calibrator.py
+      # Section 12.10: Probability Calibration for Security Classifiers
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      from dataclasses import dataclass
+      from typing import Optional, Tuple
+
+      import numpy as np
+      from sklearn.calibration import CalibratedClassifierCV
+      from sklearn.isotonic import IsotonicRegression
+      from sklearn.linear_model import LogisticRegression
+
+
+      def expected_calibration_error(
+          y_true: np.ndarray,
+          y_prob: np.ndarray,
+          n_bins: int = 10,
+      ) -> float:
+          '''Weighted mean absolute difference between predicted and observed across bins.'''
+          bin_edges = np.linspace(0, 1, n_bins + 1)
+          ece = 0.0
+          for i in range(n_bins):
+              lo, hi = bin_edges[i], bin_edges[i + 1]
+              mask = (y_prob >= lo) & (y_prob < hi) if i < n_bins - 1 else (y_prob >= lo) & (y_prob <= hi)
+              if mask.sum() == 0:
+                  continue
+              avg_conf = float(y_prob[mask].mean())
+              avg_acc = float(y_true[mask].mean())
+              ece += (mask.sum() / len(y_true)) * abs(avg_conf - avg_acc)
+          return ece
+
+
+      @dataclass
+      class CalibrationResult:
+          method: str               # 'sigmoid' (Platt) or 'isotonic'
+          ece_before: float
+          ece_after: float
+          improved: bool
+
+
+      class PlattScaler:
+          '''Logistic-regression Platt scaling fitted on a held-out calibration set.'''
+
+          def __init__(self) -> None:
+              self._lr = LogisticRegression()
+              self._fitted = False
+
+          def fit(self, raw_scores: np.ndarray, y_true: np.ndarray) -> 'PlattScaler':
+              self._lr.fit(raw_scores.reshape(-1, 1), y_true)
+              self._fitted = True
+              return self
+
+          def transform(self, raw_scores: np.ndarray) -> np.ndarray:
+              assert self._fitted
+              return self._lr.predict_proba(raw_scores.reshape(-1, 1))[:, 1]
+
+
+      class IsotonicScaler:
+          '''Non-parametric isotonic calibration. Requires 1000+ calibration examples.'''
+
+          def __init__(self) -> None:
+              self._iso = IsotonicRegression(out_of_bounds='clip')
+              self._fitted = False
+
+          def fit(self, raw_scores: np.ndarray, y_true: np.ndarray) -> 'IsotonicScaler':
+              self._iso.fit(raw_scores, y_true)
+              self._fitted = True
+              return self
+
+          def transform(self, raw_scores: np.ndarray) -> np.ndarray:
+              assert self._fitted
+              return self._iso.transform(raw_scores)
+
+
+      class ModelCalibrator:
+          '''
+          Calibrates a classifier's raw probabilities using Platt scaling or
+          isotonic regression, selecting the method that produces lower ECE.
+
+          Fit on the VALIDATION split (Section 12.04), never the training split.
+          '''
+
+          ISOTONIC_MIN_EXAMPLES = 1000
+
+          def __init__(self) -> None:
+              self._scaler = None
+              self._method: Optional[str] = None
+
+          def fit(
+              self,
+              val_raw_scores: np.ndarray,
+              val_y_true: np.ndarray,
+              eval_fraction: float = 0.3,
+          ) -> CalibrationResult:
+              '''
+              Fit calibration on validation scores. Splits the validation set into
+              a fit portion and an eval portion to compare calibration methods.
+              '''
+              n = len(val_raw_scores)
+              n_eval = int(n * eval_fraction)
+              # Temporal split within validation: fit on earlier, eval on later
+              fit_scores = val_raw_scores[:-n_eval]
+              fit_y = val_y_true[:-n_eval]
+              eval_scores = val_raw_scores[-n_eval:]
+              eval_y = val_y_true[-n_eval:]
+
+              ece_before = expected_calibration_error(eval_y, eval_scores)
+
+              # Always fit Platt; fit isotonic only if enough data
+              platt = PlattScaler().fit(fit_scores, fit_y)
+              platt_ece = expected_calibration_error(eval_y, platt.transform(eval_scores))
+
+              candidates = [('sigmoid', platt, platt_ece)]
+              if len(fit_scores) >= self.ISOTONIC_MIN_EXAMPLES:
+                  iso = IsotonicScaler().fit(fit_scores, fit_y)
+                  iso_ece = expected_calibration_error(eval_y, iso.transform(eval_scores))
+                  candidates.append(('isotonic', iso, iso_ece))
+
+              # Select method with lowest post-calibration ECE
+              best_method, best_scaler, best_ece = min(candidates, key=lambda c: c[2])
+
+              # Refit the selected method on the full validation set
+              if best_method == 'sigmoid':
+                  self._scaler = PlattScaler().fit(val_raw_scores, val_y_true)
+              else:
+                  self._scaler = IsotonicScaler().fit(val_raw_scores, val_y_true)
+              self._method = best_method
+
+              return CalibrationResult(
+                  method=best_method,
+                  ece_before=ece_before,
+                  ece_after=best_ece,
+                  improved=best_ece < ece_before,
+              )
+
+          def calibrate(self, raw_scores: np.ndarray) -> np.ndarray:
+              assert self._scaler is not None, 'Fit before calibrating.'
+              return self._scaler.transform(raw_scores)
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(42)
+          # Simulate miscalibrated tree-ensemble scores (pushed toward extremes)
+          n = 600
+          y_true = rng.binomial(1, 0.2, n)
+          # Overconfident scores: attacks scored high, benign scored low, but exaggerated
+          raw = np.where(y_true == 1,
+                         rng.beta(8, 2, n),
+                         rng.beta(2, 8, n))
+          # Add miscalibration distortion
+          raw = np.clip(raw ** 0.6, 0, 1)
+
+          calibrator = ModelCalibrator()
+          result = calibrator.fit(raw, y_true)
+          print(f'Calibration method: {result.method}')
+          print(f'ECE before: {result.ece_before:.4f}')
+          print(f'ECE after:  {result.ece_after:.4f}')
+          print(f'Improved:   {result.improved}')
+
+  deliverable_2:
+    title: 'Reliability Diagram'
+    filename: 'reliability_diagram.py'
+    description: 'Visualises calibration quality with reliability curves and computes ECE, MCE, and Brier score. Supports before-and-after comparison to validate the calibration step.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: numpy, matplotlib, scikit-learn.'
+    code: |
+      # reliability_diagram.py
+      # Section 12.10: Reliability Diagram and Calibration Metrics
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      from dataclasses import dataclass
+      from typing import List, Optional, Tuple
+
+      import numpy as np
+      import matplotlib.pyplot as plt
+      from sklearn.metrics import brier_score_loss
+
+
+      @dataclass
+      class CalibrationMetrics:
+          ece: float
+          mce: float
+          brier: float
+          n_bins: int
+
+
+      def compute_calibration_metrics(
+          y_true: np.ndarray,
+          y_prob: np.ndarray,
+          n_bins: int = 10,
+      ) -> CalibrationMetrics:
+          bin_edges = np.linspace(0, 1, n_bins + 1)
+          ece = 0.0
+          mce = 0.0
+          for i in range(n_bins):
+              lo, hi = bin_edges[i], bin_edges[i + 1]
+              mask = (y_prob >= lo) & (y_prob < hi) if i < n_bins - 1 else (y_prob >= lo) & (y_prob <= hi)
+              if mask.sum() == 0:
+                  continue
+              avg_conf = float(y_prob[mask].mean())
+              avg_acc = float(y_true[mask].mean())
+              gap = abs(avg_conf - avg_acc)
+              ece += (mask.sum() / len(y_true)) * gap
+              mce = max(mce, gap)
+          brier = float(brier_score_loss(y_true, y_prob))
+          return CalibrationMetrics(ece=ece, mce=mce, brier=brier, n_bins=n_bins)
+
+
+      def _bin_stats(
+          y_true: np.ndarray,
+          y_prob: np.ndarray,
+          n_bins: int,
+      ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+          bin_edges = np.linspace(0, 1, n_bins + 1)
+          mean_pred, frac_pos, counts = [], [], []
+          for i in range(n_bins):
+              lo, hi = bin_edges[i], bin_edges[i + 1]
+              mask = (y_prob >= lo) & (y_prob < hi) if i < n_bins - 1 else (y_prob >= lo) & (y_prob <= hi)
+              if mask.sum() == 0:
+                  continue
+              mean_pred.append(float(y_prob[mask].mean()))
+              frac_pos.append(float(y_true[mask].mean()))
+              counts.append(int(mask.sum()))
+          return np.array(mean_pred), np.array(frac_pos), np.array(counts)
+
+
+      def plot_reliability(
+          y_true: np.ndarray,
+          y_prob_before: np.ndarray,
+          y_prob_after: Optional[np.ndarray] = None,
+          classifier_name: str = 'Classifier',
+          n_bins: int = 10,
+          save_path: str = 'reliability_diagram.png',
+      ) -> None:
+          fig, ax = plt.subplots(figsize=(7, 6))
+          ax.plot([0, 1], [0, 1], 'k--', lw=1, label='Perfect calibration')
+
+          mp_b, fp_b, _ = _bin_stats(y_true, y_prob_before, n_bins)
+          ece_b = compute_calibration_metrics(y_true, y_prob_before, n_bins).ece
+          ax.plot(mp_b, fp_b, 'o-', color='#e03131', label=f'Before (ECE={ece_b:.3f})')
+
+          if y_prob_after is not None:
+              mp_a, fp_a, _ = _bin_stats(y_true, y_prob_after, n_bins)
+              ece_a = compute_calibration_metrics(y_true, y_prob_after, n_bins).ece
+              ax.plot(mp_a, fp_a, 's-', color='#2f9e44', label=f'After (ECE={ece_a:.3f})')
+
+          ax.set_xlabel('Mean predicted probability')
+          ax.set_ylabel('Observed fraction of positives')
+          ax.set_title(f'Reliability Diagram: {classifier_name}')
+          ax.legend()
+          ax.grid(alpha=0.3)
+          plt.tight_layout()
+          plt.savefig(save_path, dpi=150, bbox_inches='tight')
+          plt.close()
+          print(f'Saved reliability diagram: {save_path}')
+
+
+      def print_calibration_report(
+          name: str,
+          before: CalibrationMetrics,
+          after: Optional[CalibrationMetrics] = None,
+      ) -> None:
+          print(f'\nCalibration Metrics: {name}')
+          print(f'  {"":12} {"ECE":>8} {"MCE":>8} {"Brier":>8}')
+          print(f'  {"Before":12} {before.ece:>8.4f} {before.mce:>8.4f} {before.brier:>8.4f}')
+          if after:
+              print(f'  {"After":12} {after.ece:>8.4f} {after.mce:>8.4f} {after.brier:>8.4f}')
+              verdict = 'IMPROVED' if after.ece < before.ece else 'NO IMPROVEMENT'
+              print(f'  Calibration: {verdict}')
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(42)
+          n = 500
+          y_true = rng.binomial(1, 0.2, n)
+          raw = np.clip(np.where(y_true == 1, rng.beta(8, 2, n), rng.beta(2, 8, n)) ** 0.6, 0, 1)
+
+          from model_calibrator import ModelCalibrator
+          cal = ModelCalibrator()
+          cal.fit(raw, y_true)
+          calibrated = cal.calibrate(raw)
+
+          before = compute_calibration_metrics(y_true, raw)
+          after = compute_calibration_metrics(y_true, calibrated)
+          print_calibration_report('RandomForest (simulated)', before, after)
+          plot_reliability(y_true, raw, calibrated, 'RandomForest (simulated)')
+
+  deliverable_3:
+    title: 'Threshold Tuner'
+    filename: 'threshold_tuner.py'
+    description: 'Precision-recall curve analysis with operating point selection for each detector. Selects the lowest threshold that keeps the false positive rate at or below a target, maximising recall within the analyst capacity constraint.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: scikit-learn, numpy, matplotlib.'
+    code: |
+      # threshold_tuner.py
+      # Section 12.10: Operating Threshold Selection
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      from dataclasses import dataclass
+      from typing import List, Optional, Tuple
+
+      import numpy as np
+      import matplotlib.pyplot as plt
+      from sklearn.metrics import precision_recall_curve
+
+
+      @dataclass
+      class ThresholdSelection:
+          detector_name: str
+          threshold: float
+          precision: float
+          recall: float
+          fpr: float
+          target_fpr: float
+          target_met: bool
+
+
+      def select_threshold_at_fpr(
+          detector_name: str,
+          y_true: np.ndarray,
+          y_prob: np.ndarray,
+          target_fpr: float = 0.005,
+      ) -> ThresholdSelection:
+          '''
+          Select the lowest threshold whose FPR <= target_fpr, maximising recall.
+          '''
+          thresholds = np.unique(np.concatenate([
+              np.linspace(0.01, 0.99, 200),
+              np.percentile(y_prob, np.linspace(1, 99, 99)),
+          ]))
+          thresholds.sort()
+
+          best = None
+          for t in thresholds:
+              preds = (y_prob >= t).astype(int)
+              n_benign = (y_true == 0).sum()
+              fpr = (preds[y_true == 0] == 1).sum() / max(n_benign, 1)
+              if fpr <= target_fpr:
+                  recall = (preds[y_true == 1] == 1).mean() if (y_true == 1).any() else 0.0
+                  tp = ((preds == 1) & (y_true == 1)).sum()
+                  fp = ((preds == 1) & (y_true == 0)).sum()
+                  precision = tp / max(tp + fp, 1)
+                  cand = ThresholdSelection(
+                      detector_name=detector_name,
+                      threshold=float(t),
+                      precision=float(precision),
+                      recall=float(recall),
+                      fpr=float(fpr),
+                      target_fpr=target_fpr,
+                      target_met=True,
+                  )
+                  if best is None or cand.recall > best.recall:
+                      best = cand
+
+          if best is None:
+              # No threshold meets the FPR target; return the most precise option
+              t = float(np.percentile(y_prob, 99))
+              preds = (y_prob >= t).astype(int)
+              fpr = (preds[y_true == 0] == 1).mean() if (y_true == 0).any() else 0.0
+              recall = (preds[y_true == 1] == 1).mean() if (y_true == 1).any() else 0.0
+              tp = ((preds == 1) & (y_true == 1)).sum()
+              fp = ((preds == 1) & (y_true == 0)).sum()
+              best = ThresholdSelection(
+                  detector_name=detector_name,
+                  threshold=t,
+                  precision=tp / max(tp + fp, 1),
+                  recall=float(recall),
+                  fpr=float(fpr),
+                  target_fpr=target_fpr,
+                  target_met=False,
+              )
+          return best
+
+
+      def fpr_from_capacity(daily_traffic: int, analyst_capacity: int) -> float:
+          '''Translate analyst review capacity into the maximum acceptable FPR.'''
+          return analyst_capacity / max(daily_traffic, 1)
+
+
+      def plot_pr_with_operating_point(
+          y_true: np.ndarray,
+          y_prob: np.ndarray,
+          selection: ThresholdSelection,
+          save_path: str = 'threshold_pr.png',
+      ) -> None:
+          precision, recall, _ = precision_recall_curve(y_true, y_prob)
+          plt.figure(figsize=(7, 5))
+          plt.plot(recall, precision, lw=2, label='PR curve')
+          plt.plot(selection.recall, selection.precision, 'r*', markersize=15,
+                   label=f'Operating point (t={selection.threshold:.3f})')
+          plt.xlabel('Recall'); plt.ylabel('Precision')
+          plt.title(f'{selection.detector_name}: Operating Point at FPR<={selection.target_fpr:.1%}')
+          plt.legend(); plt.grid(alpha=0.3)
+          plt.tight_layout(); plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
+          print(f'Saved: {save_path}')
+
+
+      def print_selection(s: ThresholdSelection) -> None:
+          print(f'\nThreshold selection: {s.detector_name}')
+          print(f'  Threshold:  {s.threshold:.4f}')
+          print(f'  Precision:  {s.precision:.4f}')
+          print(f'  Recall:     {s.recall:.4f}')
+          print(f'  FPR:        {s.fpr:.4f} (target <= {s.target_fpr:.4f})')
+          print(f'  Target met: {s.target_met}')
+          if not s.target_met:
+              print('  WARN: No threshold meets the FPR target. Consider a second-tier triage '
+                    'filter or higher analyst capacity.')
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(42)
+          y_true = np.array([0] * 970 + [1] * 30)
+          y_prob = np.concatenate([rng.beta(1, 9, 970), rng.beta(7, 2, 30)])
+
+          target_fpr = fpr_from_capacity(daily_traffic=10000, analyst_capacity=50)
+          print(f'Analyst capacity 50/day on 10k traffic -> max FPR {target_fpr:.4f}')
+
+          selection = select_threshold_at_fpr('RandomForest', y_true, y_prob, target_fpr)
+          print_selection(selection)
+          plot_pr_with_operating_point(y_true, y_prob, selection)
+
+  deliverable_4:
+    title: 'Business Constraint Mapper'
+    filename: 'business_constraint_mapper.py'
+    description: 'Translates per-detector business requirements (analyst capacity, acceptable FPR, required TPR, miss/FP cost framing) into calibrated detection thresholds. Implements per-threat-class differentiation so each detector gets a threshold appropriate to its consequence profile.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: numpy. Imports from threshold_tuner.py.'
+    code: |
+      # business_constraint_mapper.py
+      # Section 12.10: Business Constraint to Threshold Mapping
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      from dataclasses import dataclass
+      from enum import Enum
+      from typing import Dict, List, Optional
+
+      import numpy as np
+
+      from threshold_tuner import select_threshold_at_fpr, ThresholdSelection, fpr_from_capacity
+
+
+      class ThresholdBias(Enum):
+          FAVOUR_RECALL = 'favour_recall'        # catch more attacks, tolerate FP
+          FAVOUR_PRECISION = 'favour_precision'  # avoid FP, tolerate some misses
+          BALANCED = 'balanced'
+
+
+      @dataclass
+      class DetectorConstraint:
+          detector_name: str
+          miss_cost: str       # 'high', 'moderate', 'low'
+          fp_cost: str         # 'high', 'moderate', 'low'
+          daily_traffic: int
+          analyst_capacity: int
+
+          def threshold_bias(self) -> ThresholdBias:
+              if self.miss_cost == 'high' and self.fp_cost != 'high':
+                  return ThresholdBias.FAVOUR_RECALL
+              if self.fp_cost == 'high' and self.miss_cost != 'high':
+                  return ThresholdBias.FAVOUR_PRECISION
+              return ThresholdBias.BALANCED
+
+          def effective_fpr_target(self) -> float:
+              '''Adjust the base capacity FPR by the threshold bias.'''
+              base = fpr_from_capacity(self.daily_traffic, self.analyst_capacity)
+              bias = self.threshold_bias()
+              if bias == ThresholdBias.FAVOUR_RECALL:
+                  return base * 2.0   # relax FPR to catch more
+              if bias == ThresholdBias.FAVOUR_PRECISION:
+                  return base * 0.5   # tighten FPR to reduce alerts
+              return base
+
+
+      def map_constraint_to_threshold(
+          constraint: DetectorConstraint,
+          y_true: np.ndarray,
+          y_prob: np.ndarray,
+      ) -> ThresholdSelection:
+          '''Map a detector's business constraint to a calibrated operating threshold.'''
+          target_fpr = constraint.effective_fpr_target()
+          selection = select_threshold_at_fpr(
+              constraint.detector_name, y_true, y_prob, target_fpr,
+          )
+          return selection
+
+
+      def print_constraint_mapping(
+          constraint: DetectorConstraint,
+          selection: ThresholdSelection,
+      ) -> None:
+          print(f'\n{constraint.detector_name}')
+          print(f'  Miss cost: {constraint.miss_cost}  FP cost: {constraint.fp_cost}')
+          print(f'  Threshold bias: {constraint.threshold_bias().value}')
+          print(f'  Effective FPR target: {constraint.effective_fpr_target():.4f}')
+          print(f'  Selected threshold: {selection.threshold:.4f}')
+          print(f'  -> recall={selection.recall:.3f}  precision={selection.precision:.3f}  fpr={selection.fpr:.4f}')
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(42)
+
+          constraints = [
+              DetectorConstraint('PII scanner', miss_cost='high', fp_cost='moderate',
+                                 daily_traffic=10000, analyst_capacity=50),
+              DetectorConstraint('Anomaly detector', miss_cost='low', fp_cost='high',
+                                 daily_traffic=10000, analyst_capacity=50),
+              DetectorConstraint('Random Forest', miss_cost='moderate', fp_cost='moderate',
+                                 daily_traffic=10000, analyst_capacity=50),
+          ]
+
+          for c in constraints:
+              y_true = np.array([0] * 970 + [1] * 30)
+              y_prob = np.concatenate([rng.beta(1, 9, 970), rng.beta(7, 2, 30)])
+              selection = map_constraint_to_threshold(c, y_true, y_prob)
+              print_constraint_mapping(c, selection)
+
+  deliverable_5:
+    title: 'Threshold Monitor'
+    filename: 'threshold_monitor.py'
+    description: 'Tracks the realised false positive rate and recall over time at the deployed threshold and alerts when they drift from the calibration targets. Connects to the Section 12.14 retraining trigger when threshold drift exceeds tolerance.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: numpy. In production, the rolling-window stats come from the live alert review outcomes rather than a static array.'
+    code: |
+      # threshold_monitor.py
+      # Section 12.10: Threshold Drift Monitoring
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      from collections import deque
+      from dataclasses import dataclass, field
+      from typing import Deque, Dict, List, Optional
+
+      import numpy as np
+
+
+      @dataclass
+      class ThresholdTarget:
+          detector_name: str
+          threshold: float
+          target_fpr: float
+          target_recall: float
+          fpr_tolerance: float = 0.5   # relative drift allowed before alert (50%)
+          recall_tolerance: float = 0.1  # absolute recall drop allowed before alert
+
+
+      @dataclass
+      class DriftAlert:
+          detector_name: str
+          metric: str          # 'fpr' or 'recall'
+          target: float
+          observed: float
+          severity: str        # 'investigate' or 'retrain'
+          message: str
+
+
+      class ThresholdMonitor:
+          '''
+          Tracks realised FPR and recall over a rolling window of reviewed alerts
+          and detects threshold drift. Each review outcome is (was_flagged, was_attack).
+          '''
+
+          def __init__(
+              self,
+              target: ThresholdTarget,
+              window_size: int = 1000,
+          ) -> None:
+              self.target = target
+              self.window_size = window_size
+              self._flagged: Deque[int] = deque(maxlen=window_size)
+              self._is_attack: Deque[int] = deque(maxlen=window_size)
+
+          def record(self, was_flagged: bool, was_attack: bool) -> None:
+              '''Record a reviewed outcome from the live alert queue.'''
+              self._flagged.append(int(was_flagged))
+              self._is_attack.append(int(was_attack))
+
+          def current_fpr(self) -> float:
+              flagged = np.array(self._flagged)
+              attack = np.array(self._is_attack)
+              n_benign = (attack == 0).sum()
+              if n_benign == 0:
+                  return 0.0
+              return float(((flagged == 1) & (attack == 0)).sum() / n_benign)
+
+          def current_recall(self) -> float:
+              flagged = np.array(self._flagged)
+              attack = np.array(self._is_attack)
+              n_attack = (attack == 1).sum()
+              if n_attack == 0:
+                  return 0.0
+              return float(((flagged == 1) & (attack == 1)).sum() / n_attack)
+
+          def check_drift(self) -> List[DriftAlert]:
+              if len(self._flagged) < self.window_size // 2:
+                  return []  # not enough data yet
+              alerts = []
+
+              fpr = self.current_fpr()
+              fpr_limit = self.target.target_fpr * (1 + self.target.fpr_tolerance)
+              if fpr > fpr_limit:
+                  severity = 'retrain' if fpr > self.target.target_fpr * 3 else 'investigate'
+                  alerts.append(DriftAlert(
+                      detector_name=self.target.detector_name,
+                      metric='fpr',
+                      target=self.target.target_fpr,
+                      observed=fpr,
+                      severity=severity,
+                      message=(f'FPR {fpr:.4f} exceeds limit {fpr_limit:.4f}. '
+                               f'Attack distribution may have shifted; recalibrate threshold.'),
+                  ))
+
+              recall = self.current_recall()
+              recall_floor = self.target.target_recall - self.target.recall_tolerance
+              if recall < recall_floor:
+                  severity = 'retrain' if recall < self.target.target_recall - 0.2 else 'investigate'
+                  alerts.append(DriftAlert(
+                      detector_name=self.target.detector_name,
+                      metric='recall',
+                      target=self.target.target_recall,
+                      observed=recall,
+                      severity=severity,
+                      message=(f'Recall {recall:.4f} below floor {recall_floor:.4f}. '
+                               f'Detector missing attacks; retrain or recalibrate.'),
+                  ))
+              return alerts
+
+
+      def print_drift_alerts(alerts: List[DriftAlert]) -> bool:
+          '''Returns True if any alert requires retraining.'''
+          if not alerts:
+              print('No threshold drift detected.')
+              return False
+          retrain = False
+          for a in alerts:
+              print(f'[{a.severity.upper()}] {a.detector_name} {a.metric}: '
+                    f'target={a.target:.4f} observed={a.observed:.4f}')
+              print(f'  {a.message}')
+              if a.severity == 'retrain':
+                  retrain = True
+          if retrain:
+              print('\n*** Connect to Section 12.14 retraining trigger ***')
+          return retrain
+
+
+      if __name__ == '__main__':
+          target = ThresholdTarget(
+              detector_name='RandomForest',
+              threshold=0.42,
+              target_fpr=0.005,
+              target_recall=0.90,
+          )
+          monitor = ThresholdMonitor(target, window_size=1000)
+
+          rng = np.random.default_rng(42)
+          # Simulate drift: FPR rising over time as attack distribution shifts
+          for i in range(1000):
+              is_attack = rng.random() < 0.03
+              if is_attack:
+                  flagged = rng.random() < 0.85   # recall ~0.85 (below 0.90 target)
+              else:
+                  drift = i / 1000 * 0.015          # FPR drifts up over the window
+                  flagged = rng.random() < (0.004 + drift)
+              monitor.record(flagged, is_attack)
+
+          print(f'Current FPR:    {monitor.current_fpr():.4f} (target {target.target_fpr})')
+          print(f'Current recall: {monitor.current_recall():.4f} (target {target.target_recall})')
+          alerts = monitor.check_drift()
+          print_drift_alerts(alerts)
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Fitting the calibration on the training set rather than a held-out validation set, producing optimistically biased calibration that does not generalise'
+    why_it_happens: |
+      The engineer has the trained classifier and wants to calibrate it. The training set
+      is the largest available dataset, so it is used for the calibration fit. The classifier
+      already produces near-perfect scores on the training set because it was trained on
+      those examples, so the calibration appears to work well.
+    consequence: |
+      The classifier produces overconfident scores on the training set because it memorised
+      those examples. The calibration fitted on these overconfident scores learns to map
+      them to high probabilities. On future data, where the classifier is less confident,
+      the calibration produces probabilities that are too low. The calibrated model is worse
+      calibrated on production traffic than the uncalibrated model would have been.
+    correct_approach: |
+      Fit the calibration on the validation split from Section 12.04, never the training
+      split. The model_calibrator.py fits on validation scores that reflect the classifier's
+      behaviour on unseen data. The test set remains held out for the final evaluation of
+      the calibrated classifier.
+
+  mistake_2:
+    description: 'Using isotonic regression on a small calibration set, overfitting the calibration to the calibration examples'
+    why_it_happens: |
+      Isotonic regression produces lower ECE than Platt scaling on the calibration set
+      because its flexibility lets it fit the calibration examples more closely. The engineer
+      observes the lower ECE and selects isotonic regression, not realising the ECE was
+      measured on the same data the isotonic regression was fitted on.
+    consequence: |
+      With a calibration set of a few hundred examples, isotonic regression produces a step
+      function with many small steps that fit the calibration examples but do not generalise.
+      On the test set, the isotonic calibration produces worse ECE than Platt scaling because
+      the step function was overfitted. The lower calibration-set ECE was misleading.
+    correct_approach: |
+      Use Platt scaling for calibration sets below 1,000 examples. The model_calibrator.py
+      enforces this with the ISOTONIC_MIN_EXAMPLES threshold and selects the method by ECE
+      on a held-out portion of the calibration set, not on the fit portion. Isotonic
+      regression is only considered when the calibration set is large enough for it to
+      generalise.
+
+  mistake_3:
+    description: 'Deploying every detector at the default 0.5 threshold and discovering the alert volume exceeds analyst capacity only after deployment'
+    why_it_happens: |
+      The default threshold of 0.5 is the sklearn convention and carries through training
+      and evaluation. The engineer evaluates the detector at 0.5, sees acceptable metrics,
+      and deploys at 0.5 without computing the alert volume the threshold produces on
+      production traffic.
+    consequence: |
+      At 0.5 threshold on a 1:30 imbalanced production traffic, the false positive rate may
+      produce 300 alerts per day against a 50-alert analyst capacity. The analyst queue
+      floods, analysts stop reviewing alerts within days, and the detection system is
+      effectively disabled. The 0.5 threshold was never appropriate for the deployment's
+      capacity constraint.
+    correct_approach: |
+      Compute the maximum acceptable FPR from the analyst capacity (fpr_from_capacity in
+      threshold_tuner.py) and select the threshold that achieves it (select_threshold_at_fpr).
+      Set the operating threshold before deployment based on the capacity constraint, never
+      leave it at the default 0.5.
+
+  mistake_4:
+    description: 'Using a single global threshold for all detectors rather than per-threat-class differentiation'
+    why_it_happens: |
+      Setting one threshold for all detectors is simpler than calibrating each independently.
+      The engineer computes a threshold that works on average across the detectors and applies
+      it uniformly to the PII scanner, anomaly detector, and supervised classifiers.
+    consequence: |
+      The single threshold is wrong for the threat classes at the extremes. The PII scanner,
+      which should favour recall (the cost of a missed privacy leak is high), uses a threshold
+      tuned for the average case and misses leaks. The anomaly detector, which should favour
+      precision (the cost of alert fatigue is high), uses the same threshold and floods the
+      queue with low-value alerts. Neither detector operates at its appropriate point.
+    correct_approach: |
+      Differentiate the threshold per detector based on the consequence profile. The
+      business_constraint_mapper.py translates the miss cost and FP cost of each threat
+      class into a threshold bias (favour recall, favour precision, or balanced) and adjusts
+      the FPR target accordingly. The PII scanner gets a recall-favouring threshold; the
+      anomaly detector gets a precision-favouring threshold.
+
+  mistake_5:
+    description: 'Calibrating once at deployment and never monitoring for threshold drift as the attack distribution shifts'
+    why_it_happens: |
+      Calibration and threshold selection feel like a one-time setup task completed before
+      deployment. The engineer calibrates the detectors, selects thresholds, deploys, and
+      moves on. The threshold monitoring infrastructure is not set up because the thresholds
+      appear correct at deployment.
+    consequence: |
+      The threshold calibrated against the deployment-time attack distribution becomes
+      incorrect as adversaries adapt. Three months later, the threshold that achieved a
+      0.5% false positive rate achieves 2% because the attack and benign distributions have
+      drifted. The alert volume quadruples without any change to the detector or the threshold,
+      and the drift is discovered only when analysts complain about the volume.
+    correct_approach: |
+      Deploy the threshold_monitor.py alongside every calibrated detector. It tracks the
+      realised FPR and recall over a rolling window of reviewed alert outcomes and alerts
+      when they drift from the calibration targets. When drift exceeds the retrain tolerance,
+      it connects to the Section 12.14 retraining trigger, which recalibrates the threshold
+      against the current distribution.
+
+section_summary:
+
+  compact: |
+    Calibration and threshold tuning convert trained classifiers into production detectors.
+    Raw classifier probabilities are not reliable attack probability estimates -- tree
+    ensembles in particular are systematically miscalibrated -- so the scores must be
+    calibrated before they can be interpreted or combined in the ensemble. Platt scaling
+    (logistic regression on the raw scores) is the correct method for tree classifiers and
+    small calibration sets; isotonic regression is preferred only when the calibration set
+    exceeds 1,000 examples. Calibration is fitted on the validation split, never the training
+    split. Threshold selection chooses the operating point on the precision-recall curve that
+    achieves the deployment's false positive rate constraint, which is set by the analyst
+    review capacity, not the default 0.5. Per-threat-class differentiation gives the PII
+    scanner a recall-favouring threshold and the anomaly detector a precision-favouring one,
+    reflecting their different consequence profiles. Threshold drift monitoring tracks the
+    realised FPR and recall over time and triggers recalibration when the attack distribution
+    shifts.
+
+  key_takeaways:
+    - 'Raw classifier probabilities are not calibrated -- a Random Forest that outputs 0.9 may be correct only 70% of the time; calibration is a prerequisite for interpreting scores and for combining detectors in the ensemble'
+    - 'Use Platt scaling for tree classifiers and small calibration sets (under 1,000 examples); isotonic regression overfits below this size and is preferred only for large calibration sets'
+    - 'Fit calibration on the validation split, never the training split -- training-set scores are overconfident because the classifier memorised those examples, producing calibration that does not generalise'
+    - 'The operating threshold is not 0.5 -- it is the lowest threshold whose false positive rate stays within the analyst review capacity, which maximises recall within the capacity constraint'
+    - 'Differentiate thresholds by threat-class consequence: the PII scanner favours recall (missed leak is costly), the anomaly detector favours precision (alert fatigue is costly); a single global threshold is wrong for both extremes'
+    - 'Calibration is not a one-time setup -- threshold drift monitoring tracks realised FPR and recall over time and triggers recalibration when the attack distribution shifts, because a deployment-time threshold becomes incorrect as adversaries adapt'
+
+preview_section_12_11:
+  title: 'Section 12.11: Production Feature Pipeline -- Extraction, Caching, and Latency Optimisation'
+  summary: |
+    Section 12.11 builds the production feature pipeline that all five calibrated detectors
+    depend on. The Section 12.02 feature design becomes a production-grade serving system:
+    feature extraction must complete in under 5ms to fit the 50ms gateway budget, must produce
+    features identical to those used at training time (avoiding training-serving skew), and
+    must be versioned so that each detector receives the feature schema it was trained on.
+    The section covers vectorised token-feature extraction, ONNX Runtime embedding inference
+    for the semantic features at sub-4ms, a Redis session cache for the contextual features
+    at sub-1ms, feature schema versioning that rejects mismatched requests, and feature drift
+    detection that monitors the live feature distributions against the training distributions.
+    The pipeline is the infrastructure that connects the feature design (12.02) to the
+    inference optimisation (12.12).
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 1 Section 1.11: evaluation metrics -- precision, recall, ROC, and the precision-recall curve'
+    - 'Chapter 11 Section 11.09: false positive management -- the FP budget that drives threshold selection'
+    - 'Section 12.03: anomaly detection -- the anomaly score needing threshold calibration'
+    - 'Section 12.05: supervised classification -- RF and XGBoost producing uncalibrated probabilities'
+    - 'Section 12.08: neural classifier -- DistilBERT calibration; ECE introduced in neural_model_evaluator.py'
+    - 'Section 12.09: PII scanner -- per-threat-class threshold differentiation example'
+  forward_references:
+    - 'Section 12.11: production feature pipeline -- calibrated detectors depend on the feature serving system'
+    - 'Section 12.13: model registry -- calibration and threshold are stage transition gate conditions'
+    - 'Section 12.14: live dataset curation -- threshold_monitor.py connects to the retraining trigger'
+    - 'Section 12.15: four-detector ensemble -- calibrated probabilities are the prerequisite for ensemble combination'
+  tags:
+    - calibration
+    - threshold-tuning
+    - platt-scaling
+    - isotonic-regression
+    - reliability-diagram
+    - expected-calibration-error
+    - operating-point
+    - precision-recall-tradeoff
+    - business-constraint-mapping
+    - per-threat-class-threshold
+    - threshold-drift
+    - analyst-capacity
+    - false-positive-management
+    - brier-score
