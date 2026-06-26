@@ -1,0 +1,1430 @@
+# section_12_09_pii_scanner.yaml
+
+---
+document_info:
+  title: 'PII Leakage Scanner: Regex, NER, and Ensemble Output Monitoring'
+  chapter: 12
+  section: 9
+  section_code: '1209'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-06'
+  estimated_pages: 6
+  estimated_reading_time: '45-55 minutes'
+
+section_overview:
+  one_line_summary: 'The PII scanner is the only output-side detector in Chapter 12: it scans what the model says, not what the user asks, catching OWASP LLM06 leakage that no input-side injection detector can prevent.'
+  why_this_section_exists: |
+    Every detector in Chapter 12 so far -- Isolation Forest, Random Forest, XGBoost, GRU,
+    DistilBERT, embedding similarity -- scans the input: the user's request, the conversation
+    history, the API parameters. They are designed to detect attacks before the model
+    processes them. They cannot detect what the model produces.
+
+    PII leakage is an output-side threat. The model receives a request that may be entirely
+    benign at the input level -- 'tell me about the customer named in the previous ticket',
+    'summarise this document' -- and produces a response that contains personal information:
+    an email address from the training data, a phone number from the system context, a
+    person's name extracted from a document that should have been redacted. No input-side
+    detector catches this, because the threat is not in the input. It is in what the model
+    generates in response.
+
+    OWASP LLM06 (Sensitive Information Disclosure) is the threat class. The PII scanner is
+    the control that addresses it. It runs as a post-inference gateway stage: after the model
+    produces a response and before that response reaches the client, the scanner checks for
+    personal information and either redacts it, blocks the response, or flags it for review.
+
+    Section 12.09 builds the PII scanner as an ensemble of three detection layers: a regex
+    layer for structured PII (email addresses, credit card numbers, SSNs), a spaCy NER layer
+    for unstructured PII (person names, organisations, locations), and the Microsoft Presidio
+    framework for context-aware scoring that distinguishes real PII from fictional and
+    example data. The false positive management is the hardest part: a model that writes
+    fiction, generates synthetic test data, or discusses examples will produce text that
+    triggers PII patterns without containing real personal information.
+  position_in_chapter: |
+    Section 12.09 is the fifth and final detector in Chapter 12, and the only output-side
+    one. It does not run in parallel with the four input-side detectors in the Section 12.15
+    ensemble -- it runs after model inference as a separate gateway stage (Track 5). Its
+    deliverables are integrated into the Section 12.17 production gateway capstone as the
+    output-side detection layer.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain why PII leakage is an output-side threat and why input-side detectors cannot address it'
+    - 'Describe the OWASP LLM06 threat model and give three concrete leakage scenarios that the PII scanner addresses'
+    - 'State which PII types are best detected by regex and which require NER, and explain the precision-recall tradeoff between the two approaches'
+    - 'Describe the Microsoft Presidio architecture: the recogniser registry, the analyser engine, and the context-aware confidence scoring'
+    - 'Explain the false positive problem for PII detection in model outputs and describe how context scoring distinguishes real PII from fictional and example data'
+    - 'Describe the three response options for detected PII -- redact, block, flag -- and state when each is appropriate'
+
+  skills:
+    - 'Build the three-layer PII scanner ensemble combining regex, spaCy NER, and Presidio with per-entity-type sensitivity configuration'
+    - 'Implement the PII redaction pipeline with type-preserving placeholder substitution'
+    - 'Implement context scoring to reduce false positives on fictional and example data without missing real PII'
+    - 'Integrate the PII scanner as an output-side gateway stage that runs after model inference and before response delivery'
+    - 'Measure PII scanner precision and recall per entity type using the test harness across all PII categories'
+
+  security_mindset:
+    - 'Recognise that output-side detection is a distinct control surface from input-side detection -- a complete detection system needs both, and the PII scanner is the output-side control'
+    - 'Treat PII false positives as a real cost: an over-aggressive scanner that redacts fictional names in creative writing or example data in technical documentation degrades the product experience and trains users to work around the control'
+    - 'Understand that PII scanning operates on a different latency profile from input-side detection: it runs after model inference, so it is not subject to the pre-inference latency budget, but it does add to total response latency'
+    - 'Accept that no PII scanner is perfect: the redact-block-flag decision must account for the consequence of both missing real PII (privacy breach) and over-redacting legitimate content (product degradation)'
+
+prerequisites:
+  - 'Section 12.05: supervised classification -- security_evaluator.py imported for per-entity-type precision and recall measurement'
+  - 'Section 12.02: security feature engineering -- contextual features inform the context scoring for false positive reduction'
+  - 'Chapter 6 Section 6.14: data exfiltration via injection -- the input-side attack that may trigger output-side PII leakage'
+  - 'Chapter 11 Section 11.13: seven-track gateway -- Track 5 is the output-side PII detection track'
+  - 'Chapter 4 Section 4.08: sensitive data handling -- the data classification framework that defines what constitutes PII'
+
+prose_content:
+
+  part_1:
+    title: 'Output-Side Detection: A Distinct Control Surface'
+    body: |
+      The detection system built in Sections 12.03 through 12.08 is entirely input-side.
+      It examines the user's request and the conversation context, decides whether the
+      input constitutes an attack, and blocks or flags accordingly. This is the correct
+      architecture for prompt injection, jailbreak, and abuse detection: the attack is
+      in the input, and the goal is to catch it before the model processes it.
+
+      PII leakage inverts this. The threat is not in the input -- it is in the output. A
+      benign-looking request can produce a response that leaks personal information through
+      several mechanisms. The model may surface PII from its training data when asked a
+      question that happens to match a memorised training example containing personal
+      details. The model may extract PII from a document provided in the context and include
+      it in a summary that was supposed to be anonymised. A successful prompt injection
+      (which the input-side detectors may have missed) may instruct the model to reveal
+      information from its system prompt or context that contains personal data. In all
+      these cases, the input-side detectors have no signal -- the input is benign or the
+      attack passed undetected -- and only an output-side control catches the leak.
+
+      The architectural consequence is that the PII scanner runs at a different point in
+      the request lifecycle. The input-side detectors run before model inference: their
+      latency consumes the pre-inference budget, and a detection blocks the request before
+      the model is invoked. The PII scanner runs after model inference: the model has
+      already produced the response, and the scanner examines that response before it is
+      delivered to the client. This means the PII scanner adds to the total response latency
+      but is not constrained by the same pre-inference budget -- the latency budget for
+      output-side scanning is separate and typically more generous because the user is
+      already waiting for the model's response.
+
+      The output-side position also changes the response options. An input-side detector
+      that flags an attack can block the request entirely -- the model is never invoked.
+      An output-side PII scanner that detects a leak in a response that has already been
+      generated has three options: redact the PII from the response and deliver the redacted
+      version, block the response entirely and return an error or a safe fallback, or
+      deliver the response but flag it for analyst review. The choice depends on the
+      severity of the leak and the product's tolerance for blocked responses.
+
+  part_2:
+    title: 'Regex Layer: Structured PII with Near-Perfect Precision'
+    body: |
+      Structured PII has a consistent, machine-recognisable format: email addresses follow
+      the local@domain pattern, credit card numbers are 13-19 digits matching specific
+      issuer prefixes with a Luhn checksum, US Social Security Numbers are nine digits in
+      a specific format, phone numbers follow country-specific patterns, IP addresses are
+      four octets. These formats are precisely describable by regular expressions, and
+      regex detection of structured PII achieves near-perfect precision: a string matching
+      the credit card regex and passing the Luhn check is almost certainly a credit card
+      number.
+
+      The regex layer is the fastest and most precise component of the PII scanner. It runs
+      in sub-millisecond time on a typical model response, requires no model inference, and
+      produces very few false positives for well-constructed patterns. The Luhn checksum
+      validation for credit card numbers is the key technique that eliminates most false
+      positives: a random 16-digit number has a 1-in-10 chance of passing the Luhn check,
+      so requiring the checksum reduces false positives by an order of magnitude relative
+      to matching digit patterns alone.
+
+      The regex layer's limitation is coverage. It detects only PII types with consistent
+      structured formats. It cannot detect a person's name (which has no fixed format), a
+      physical address in free-text form, or an organisation name. These unstructured PII
+      types require the NER layer. The regex layer is the first pass: it catches the
+      structured PII with high precision and low latency, leaving the unstructured PII for
+      the more expensive NER layer.
+
+      A subtle regex consideration for PII detection is the balance between pattern strictness
+      and recall. A strict email pattern that requires a valid TLD catches well-formed email
+      addresses but misses malformed ones that a human would still recognise as an email
+      address. For PII detection, the cost of missing a real email address (privacy breach)
+      is higher than the cost of a false positive (over-redaction), so the patterns should
+      err toward higher recall: catch anything that plausibly looks like the PII type, and
+      rely on the context scoring layer to filter false positives.
+
+  part_3:
+    title: 'NER Layer: Unstructured PII with Broader Coverage'
+    body: |
+      Named Entity Recognition detects PII types that have no fixed format: person names,
+      organisations, geographic locations, and dates. spaCy's transformer-based English
+      model (en_core_web_trf) is a production-grade NER model that identifies these entity
+      types with reasonable accuracy on natural language text.
+
+      The NER layer's coverage is broader than the regex layer -- it catches the unstructured
+      PII that regex cannot -- but its precision is lower. NER models make errors: they
+      misidentify common nouns as person names, miss names that are unusual or non-English,
+      and over-detect organisation names in technical text where product names and acronyms
+      resemble organisation entities. For PII detection in model outputs, the NER precision
+      is typically 80-90% depending on the entity type, compared to the regex layer's near-
+      100% precision for structured PII.
+
+      The entity types most relevant for PII detection are PERSON (person names), GPE
+      (geopolitical entities -- cities, countries, regions that may identify a location),
+      ORG (organisation names that may be sensitive in some contexts), and DATE (which may
+      be PII when combined with a name, such as a date of birth). The NER layer is configured
+      to detect these types and to ignore entity types that are not PII (such as CARDINAL
+      numbers or WORK_OF_ART titles).
+
+      The NER layer adds meaningful latency. A transformer-based NER model processing a
+      typical model response of 200-500 tokens takes 10-30ms on CPU. This is acceptable
+      for the output-side latency budget but means the NER layer should run only when the
+      regex layer and the response length warrant it -- there is no need to run NER on a
+      short response that the regex layer has already cleared, or on a response that is
+      purely numeric or code. A length and content gate before the NER layer reduces the
+      average output-side latency.
+
+  part_4:
+    title: 'Presidio: Context-Aware Ensemble Detection'
+    body: |
+      Microsoft Presidio is an open-source PII detection and anonymisation framework that
+      combines regex recognisers, NER recognisers, and context-aware confidence scoring
+      into a single configurable API. Rather than building the regex and NER layers from
+      scratch and combining them manually, Presidio provides a recogniser registry where
+      each PII type has a dedicated recogniser, an analyser engine that runs all recognisers
+      and aggregates their results, and a confidence scoring system that adjusts each
+      detection's confidence based on surrounding context.
+
+      The Presidio architecture has two main components. The analyser engine takes a text
+      and returns a list of detected PII entities, each with a type, a character span, and
+      a confidence score. The anonymiser engine takes the analyser's output and applies a
+      configurable anonymisation operator to each detected entity -- redaction, masking,
+      replacement with a placeholder, or encryption. For the PII scanner, the analyser
+      engine produces the detections and the anonymiser engine performs the redaction.
+
+      Presidio's context-aware confidence scoring is its key advantage over a naive
+      regex-plus-NER combination. Each recogniser can specify context words that, when
+      present near a detection, increase the confidence that the detection is real PII.
+      For example, a number that matches the SSN pattern receives higher confidence when
+      the words 'social security' or 'SSN' appear nearby, and lower confidence when the
+      surrounding text indicates it is an example or a product code. This context awareness
+      reduces false positives without a custom scoring implementation.
+
+      The recommendation for the Chapter 12 PII scanner is to use Presidio as the
+      production default rather than building a custom regex-plus-NER pipeline. Presidio's
+      recogniser registry covers the common PII types out of the box, its context scoring
+      is more sophisticated than a hand-built version, and its anonymiser engine handles
+      the redaction with type-preserving placeholders. Custom recognisers can be added to
+      the Presidio registry for deployment-specific PII types (internal employee IDs,
+      proprietary identifiers) without replacing the framework.
+
+  part_5:
+    title: 'False Positive Management: Fictional and Example Data'
+    body: |
+      The hardest problem in output-side PII detection is the false positive. A model that
+      is asked to write a short story will produce character names that the PERSON recogniser
+      flags as PII. A model that generates synthetic test data will produce email addresses
+      and phone numbers that the regex layer flags. A model that explains a concept with an
+      example may use a placeholder name or a sample SSN format. In all these cases, the
+      detected 'PII' is not real personal information about a real person -- it is fictional
+      or illustrative content that the model generated deliberately and appropriately.
+
+      Over-aggressive PII redaction degrades the product. A creative writing assistant that
+      redacts every character name produces unusable output. A coding assistant that redacts
+      the example email address in a code sample produces broken examples. A technical
+      documentation generator that redacts illustrative phone numbers produces confusing
+      documentation. Users who encounter over-redaction learn to work around the control --
+      rephrasing requests, using formats that evade the scanner -- which undermines the
+      control's effectiveness for the cases where it matters.
+
+      Context scoring is the primary false positive reduction technique. The context score
+      examines the text surrounding each detection to determine whether the context indicates
+      real PII or fictional/example content. Several signals contribute. The request itself
+      is a signal: a request to 'write a story' or 'generate test data' indicates that
+      detected PII in the response is likely fictional. Explicit framing in the response
+      ('for example', 'such as', 'a fictional character named') indicates illustrative
+      content. The structure of the response (a code block, a clearly labelled example
+      section) indicates non-real content. The pii_false_positive_analyser.py in deliverable_3
+      combines these signals into a context score that adjusts the detection confidence.
+
+      Context scoring is a reduction technique, not an elimination technique. It reduces
+      false positives on clearly fictional content but cannot perfectly distinguish all
+      cases. The residual false positives are handled by the response option choice: for
+      contexts with high false positive likelihood (creative writing, code generation),
+      the scanner flags rather than redacts, allowing an analyst or a secondary check to
+      make the final decision rather than automatically redacting potentially legitimate
+      content.
+
+  part_6:
+    title: 'Gateway Integration: The Output-Side Stage'
+    body: |
+      The PII scanner integrates into the seven-track gateway as an output-side stage on
+      Track 5. Unlike the input-side detectors, which run before model inference, the PII
+      scanner runs in the response path: model inference produces a response, the PII scanner
+      examines the response, and the gateway applies the redact-block-flag decision before
+      delivering the (possibly modified) response to the client.
+
+      The integration has three stages. The detection stage runs the three-layer ensemble
+      (regex, NER, Presidio) on the model response and produces a list of detected PII
+      entities with types, spans, and context-adjusted confidence scores. The decision
+      stage applies the redact-block-flag policy based on the detection severity and the
+      request context. The action stage executes the decision: redacting the detected
+      spans with type-preserving placeholders, blocking the response and returning a safe
+      fallback, or delivering the response and writing a flag to the analyst review queue.
+
+      The redact-block-flag policy is configurable per PII type and per deployment context.
+      For high-severity PII (credit card numbers, SSNs) detected with high confidence, the
+      policy is typically redact-or-block: the response cannot be delivered with the PII
+      intact. For lower-severity PII (a person name in a context that may be fictional),
+      the policy is typically flag: the response is delivered but logged for review. The
+      policy configuration is part of the deployment's data handling requirements and is
+      documented alongside the scanner configuration.
+
+      The latency contribution of the output-side scanner is the regex layer (sub-millisecond),
+      plus the NER layer when triggered (10-30ms), plus the Presidio analysis (which overlaps
+      with the NER since Presidio uses the same NER model). The total output-side latency
+      is typically 15-40ms depending on response length, added to the response delivery time
+      after model inference completes. This is acceptable for most deployments because the
+      user is already waiting for the model's response, and the scanner runs in parallel
+      with response streaming for streamed responses -- the scanner examines each chunk as
+      it is generated rather than waiting for the complete response.
+
+reference_materials:
+
+  table_1:
+    title: 'PII Types and Detection Layer Assignment'
+    description: 'PII types with the detection layer best suited to each, precision expectation, and detection technique'
+    columns: ['PII Type', 'Best Detection Layer', 'Precision', 'Detection Technique']
+    rows:
+      - ['Email address', 'Regex', 'Near-100%', 'local@domain pattern with TLD validation']
+      - ['Credit card number', 'Regex', 'Near-100%', 'Issuer prefix pattern + Luhn checksum validation']
+      - ['US SSN', 'Regex + context', 'High with context', 'Nine-digit format + nearby SSN context words']
+      - ['Phone number', 'Regex', 'High', 'Country-specific format patterns']
+      - ['IP address', 'Regex', 'Near-100%', 'Four-octet pattern with range validation']
+      - ['Person name', 'NER (spaCy PERSON)', '80-90%', 'Transformer NER; lower precision on unusual names']
+      - ['Physical address', 'NER + regex', '75-85%', 'NER GPE + regex for postal codes and street patterns']
+      - ['Organisation name', 'NER (spaCy ORG)', '70-85%', 'NER; over-detects product names and acronyms']
+      - ['Date of birth', 'NER + context', 'Context-dependent', 'DATE entity near a PERSON entity']
+
+  table_2:
+    title: 'Three-Layer Ensemble Architecture'
+    description: 'The three detection layers with their role, latency, and coverage in the PII scanner ensemble'
+    columns: ['Layer', 'Role', 'Latency', 'Coverage', 'When It Runs']
+    rows:
+      - ['Regex layer', 'Structured PII with high precision', '< 1ms', 'Email, credit card, SSN, phone, IP', 'Always -- first pass on every response']
+      - ['NER layer (spaCy)', 'Unstructured PII with broad coverage', '10-30ms', 'Person, location, organisation, date', 'When response length and content gate pass']
+      - ['Presidio engine', 'Context-aware ensemble with confidence scoring', 'Overlaps with NER', 'All types + custom recognisers', 'Production default -- wraps regex and NER with context scoring']
+      - ['Context scorer', 'False positive reduction for fictional/example data', '< 1ms', 'Adjusts confidence of all detections', 'After detection, before redact-block-flag decision']
+
+  table_3:
+    title: 'Redact-Block-Flag Decision Policy'
+    description: 'Response options for detected PII with the conditions under which each applies'
+    columns: ['Response Option', 'When Applied', 'Effect', 'Risk']
+    rows:
+      - ['Redact', 'High-confidence PII; response otherwise valuable; redaction preserves utility', 'PII spans replaced with type-preserving placeholders; redacted response delivered', 'Over-redaction degrades response if context scoring missed fictional content']
+      - ['Block', 'High-severity PII (credit card, SSN) with high confidence; redaction would not preserve utility', 'Response withheld; safe fallback or error returned', 'Blocks a potentially legitimate response; degrades product experience']
+      - ['Flag', 'Lower-severity PII or high false-positive-likelihood context (creative writing, code)', 'Response delivered unchanged; flag written to analyst review queue', 'Real PII may reach the client before analyst review']
+
+  table_4:
+    title: 'Context Scoring Signals for False Positive Reduction'
+    description: 'Signals that indicate detected PII is fictional or illustrative rather than real, with their effect on detection confidence'
+    columns: ['Signal', 'Source', 'Indicates', 'Confidence Adjustment']
+    rows:
+      - ['Request asks to write fiction or story', 'Input request', 'Character names are fictional', 'Reduce PERSON confidence']
+      - ['Request asks for test or synthetic data', 'Input request', 'Generated PII is synthetic', 'Reduce structured PII confidence']
+      - ['Response contains "for example", "such as", "e.g."', 'Response text near detection', 'Illustrative content', 'Reduce confidence for nearby detections']
+      - ['Detection inside a code block', 'Response structure', 'Sample data in code', 'Reduce confidence; code examples often use placeholder PII']
+      - ['Detection near "fictional", "placeholder", "sample"', 'Response text near detection', 'Explicitly non-real content', 'Strongly reduce confidence']
+      - ['Real PII context words ("my", "customer", "patient", "account holder")', 'Response text near detection', 'Likely real PII', 'Increase confidence']
+
+deliverables:
+
+  deliverable_1:
+    title: 'PII Scanner'
+    filename: 'pii_scanner.py'
+    description: 'Three-layer PII scanner ensemble combining regex (structured PII), spaCy NER (unstructured PII), and Microsoft Presidio (context-aware scoring) with per-entity-type sensitivity configuration. Returns detected PII entities with type, span, and confidence for the redact-block-flag decision.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: presidio-analyzer, spacy (en_core_web_lg or en_core_web_trf), re (stdlib). Falls back to regex-only when Presidio is unavailable.'
+    code: |
+      # pii_scanner.py
+      # Section 12.09: Three-Layer PII Scanner Ensemble
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import re
+      import time
+      from dataclasses import dataclass, field
+      from enum import Enum
+      from typing import Dict, List, Optional, Tuple
+
+
+      class PIISeverity(Enum):
+          HIGH = 'high'        # credit card, SSN -- block or redact
+          MEDIUM = 'medium'    # email, phone -- redact
+          LOW = 'low'          # person name -- flag
+
+
+      @dataclass
+      class PIIEntity:
+          entity_type: str
+          text: str
+          start: int
+          end: int
+          confidence: float
+          severity: PIISeverity
+          detection_layer: str   # 'regex', 'ner', 'presidio'
+
+
+      @dataclass
+      class PIIScanResult:
+          original_text: str
+          entities: List[PIIEntity]
+          has_high_severity: bool
+          max_confidence: float
+          scan_ms: float
+
+
+      # ---------------------------------------------------------------------------
+      # Regex patterns for structured PII
+      # ---------------------------------------------------------------------------
+
+      EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
+      PHONE_PATTERN = re.compile(r'\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b')
+      SSN_PATTERN = re.compile(r'\b\d{3}-\d{2}-\d{4}\b')
+      IP_PATTERN = re.compile(r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b')
+      CREDIT_CARD_PATTERN = re.compile(r'\b(?:\d[ -]*?){13,19}\b')
+
+      SEVERITY_MAP = {
+          'CREDIT_CARD': PIISeverity.HIGH,
+          'US_SSN': PIISeverity.HIGH,
+          'EMAIL_ADDRESS': PIISeverity.MEDIUM,
+          'PHONE_NUMBER': PIISeverity.MEDIUM,
+          'IP_ADDRESS': PIISeverity.MEDIUM,
+          'PERSON': PIISeverity.LOW,
+          'LOCATION': PIISeverity.LOW,
+          'ORGANIZATION': PIISeverity.LOW,
+          'DATE_TIME': PIISeverity.LOW,
+      }
+
+
+      def luhn_valid(number: str) -> bool:
+          '''Validate a credit card number with the Luhn checksum.'''
+          digits = [int(d) for d in re.sub(r'[ -]', '', number) if d.isdigit()]
+          if len(digits) < 13 or len(digits) > 19:
+              return False
+          checksum = 0
+          parity = len(digits) % 2
+          for i, d in enumerate(digits):
+              if i % 2 == parity:
+                  d *= 2
+                  if d > 9:
+                      d -= 9
+              checksum += d
+          return checksum % 10 == 0
+
+
+      class PIIScanner:
+          '''
+          Three-layer PII scanner: regex + spaCy NER + Presidio.
+          Output-side detector -- scans model RESPONSES, not user inputs.
+          '''
+
+          def __init__(
+              self,
+              enabled_types: Optional[List[str]] = None,
+              ner_length_gate: int = 20,
+              use_presidio: bool = True,
+          ) -> None:
+              self.enabled_types = enabled_types or list(SEVERITY_MAP.keys())
+              self.ner_length_gate = ner_length_gate
+              self._presidio_analyzer = None
+              self._spacy_nlp = None
+
+              if use_presidio:
+                  self._init_presidio()
+              if self._presidio_analyzer is None:
+                  self._init_spacy()
+
+          def _init_presidio(self) -> None:
+              try:
+                  from presidio_analyzer import AnalyzerEngine
+                  self._presidio_analyzer = AnalyzerEngine()
+                  print('PII scanner: Presidio analyzer initialised.')
+              except ImportError:
+                  print('WARN: presidio-analyzer not installed; using regex + spaCy fallback.')
+
+          def _init_spacy(self) -> None:
+              try:
+                  import spacy
+                  for model in ['en_core_web_trf', 'en_core_web_lg', 'en_core_web_sm']:
+                      try:
+                          self._spacy_nlp = spacy.load(model)
+                          print(f'PII scanner: spaCy {model} initialised.')
+                          break
+                      except OSError:
+                          continue
+              except ImportError:
+                  print('WARN: spaCy not installed; using regex-only detection.')
+
+          # ------------------------------------------------------------------
+          # Regex layer
+          # ------------------------------------------------------------------
+
+          def _scan_regex(self, text: str) -> List[PIIEntity]:
+              entities = []
+              for pii_type, pattern in [
+                  ('EMAIL_ADDRESS', EMAIL_PATTERN),
+                  ('PHONE_NUMBER', PHONE_PATTERN),
+                  ('US_SSN', SSN_PATTERN),
+                  ('IP_ADDRESS', IP_PATTERN),
+              ]:
+                  if pii_type not in self.enabled_types:
+                      continue
+                  for m in pattern.finditer(text):
+                      entities.append(PIIEntity(
+                          entity_type=pii_type,
+                          text=m.group(),
+                          start=m.start(),
+                          end=m.end(),
+                          confidence=0.95,
+                          severity=SEVERITY_MAP.get(pii_type, PIISeverity.MEDIUM),
+                          detection_layer='regex',
+                      ))
+
+              # Credit card with Luhn validation
+              if 'CREDIT_CARD' in self.enabled_types:
+                  for m in CREDIT_CARD_PATTERN.finditer(text):
+                      if luhn_valid(m.group()):
+                          entities.append(PIIEntity(
+                              entity_type='CREDIT_CARD',
+                              text=m.group(),
+                              start=m.start(),
+                              end=m.end(),
+                              confidence=0.98,
+                              severity=PIISeverity.HIGH,
+                              detection_layer='regex',
+                          ))
+              return entities
+
+          # ------------------------------------------------------------------
+          # NER layer
+          # ------------------------------------------------------------------
+
+          def _scan_ner(self, text: str) -> List[PIIEntity]:
+              if self._spacy_nlp is None or len(text) < self.ner_length_gate:
+                  return []
+              entities = []
+              type_map = {'PERSON': 'PERSON', 'GPE': 'LOCATION', 'LOC': 'LOCATION',
+                          'ORG': 'ORGANIZATION', 'DATE': 'DATE_TIME'}
+              doc = self._spacy_nlp(text)
+              for ent in doc.ents:
+                  mapped = type_map.get(ent.label_)
+                  if mapped and mapped in self.enabled_types:
+                      entities.append(PIIEntity(
+                          entity_type=mapped,
+                          text=ent.text,
+                          start=ent.start_char,
+                          end=ent.end_char,
+                          confidence=0.85,
+                          severity=SEVERITY_MAP.get(mapped, PIISeverity.LOW),
+                          detection_layer='ner',
+                      ))
+              return entities
+
+          # ------------------------------------------------------------------
+          # Presidio layer
+          # ------------------------------------------------------------------
+
+          def _scan_presidio(self, text: str) -> List[PIIEntity]:
+              if self._presidio_analyzer is None:
+                  return []
+              results = self._presidio_analyzer.analyze(text=text, language='en')
+              entities = []
+              for r in results:
+                  if r.entity_type in self.enabled_types:
+                      entities.append(PIIEntity(
+                          entity_type=r.entity_type,
+                          text=text[r.start:r.end],
+                          start=r.start,
+                          end=r.end,
+                          confidence=float(r.score),
+                          severity=SEVERITY_MAP.get(r.entity_type, PIISeverity.LOW),
+                          detection_layer='presidio',
+                      ))
+              return entities
+
+          # ------------------------------------------------------------------
+          # Deduplication
+          # ------------------------------------------------------------------
+
+          def _deduplicate(self, entities: List[PIIEntity]) -> List[PIIEntity]:
+              '''Merge overlapping detections, keeping the highest confidence.'''
+              entities.sort(key=lambda e: (e.start, -e.confidence))
+              deduped = []
+              for e in entities:
+                  overlap = False
+                  for kept in deduped:
+                      if e.start < kept.end and e.end > kept.start and e.entity_type == kept.entity_type:
+                          overlap = True
+                          break
+                  if not overlap:
+                      deduped.append(e)
+              return deduped
+
+          # ------------------------------------------------------------------
+          # Main scan
+          # ------------------------------------------------------------------
+
+          def scan(self, text: str) -> PIIScanResult:
+              t0 = time.time()
+              entities = self._scan_regex(text)
+
+              if self._presidio_analyzer is not None:
+                  entities += self._scan_presidio(text)
+              elif self._spacy_nlp is not None:
+                  entities += self._scan_ner(text)
+
+              entities = self._deduplicate(entities)
+
+              has_high = any(e.severity == PIISeverity.HIGH for e in entities)
+              max_conf = max((e.confidence for e in entities), default=0.0)
+
+              return PIIScanResult(
+                  original_text=text,
+                  entities=entities,
+                  has_high_severity=has_high,
+                  max_confidence=max_conf,
+                  scan_ms=(time.time() - t0) * 1000,
+              )
+
+
+      if __name__ == '__main__':
+          scanner = PIIScanner(use_presidio=False)  # regex + spaCy fallback for demo
+
+          test_responses = [
+              'The customer can be reached at john.doe@example.com or 555-123-4567.',
+              'Here is a sample credit card for testing: 4532015112830366.',
+              'The capital of France is Paris. The Eiffel Tower is a landmark.',
+              'No personal information in this technical response about sorting algorithms.',
+          ]
+          for resp in test_responses:
+              result = scanner.scan(resp)
+              print(f'\nResponse: {resp[:70]}')
+              print(f'  Scan time: {result.scan_ms:.2f}ms  High severity: {result.has_high_severity}')
+              for e in result.entities:
+                  print(f'    [{e.severity.value:>6}] {e.entity_type}: "{e.text}" '
+                        f'(conf={e.confidence:.2f}, layer={e.detection_layer})')
+
+  deliverable_2:
+    title: 'PII Redactor'
+    filename: 'pii_redactor.py'
+    description: 'PII substitution pipeline with type-preserving placeholder generation. Replaces detected PII spans with placeholders that preserve the type and approximate format, maintaining response readability while removing the personal information.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. No external dependencies beyond stdlib. Imports PIIEntity from pii_scanner.py.'
+    code: |
+      # pii_redactor.py
+      # Section 12.09: PII Redaction with Type-Preserving Placeholders
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      from dataclasses import dataclass
+      from typing import Dict, List, Optional
+
+      from pii_scanner import PIIEntity, PIIScanResult
+
+
+      # Type-preserving placeholders maintain readability while removing real PII.
+      PLACEHOLDER_MAP = {
+          'EMAIL_ADDRESS': '[EMAIL]',
+          'PHONE_NUMBER': '[PHONE]',
+          'US_SSN': '[SSN]',
+          'IP_ADDRESS': '[IP_ADDRESS]',
+          'CREDIT_CARD': '[CREDIT_CARD]',
+          'PERSON': '[NAME]',
+          'LOCATION': '[LOCATION]',
+          'ORGANIZATION': '[ORG]',
+          'DATE_TIME': '[DATE]',
+      }
+
+
+      @dataclass
+      class RedactionResult:
+          redacted_text: str
+          n_redactions: int
+          redacted_types: Dict[str, int]
+          original_length: int
+          redacted_length: int
+
+
+      class PIIRedactor:
+          '''
+          Replaces detected PII spans with type-preserving placeholders.
+          Processes spans in reverse order to preserve character offsets.
+          '''
+
+          def __init__(
+              self,
+              placeholder_map: Optional[Dict[str, str]] = None,
+              confidence_threshold: float = 0.5,
+              consistent_placeholders: bool = True,
+          ) -> None:
+              self.placeholder_map = placeholder_map or PLACEHOLDER_MAP
+              self.confidence_threshold = confidence_threshold
+              self.consistent_placeholders = consistent_placeholders
+
+          def redact(
+              self,
+              text: str,
+              entities: List[PIIEntity],
+          ) -> RedactionResult:
+              '''
+              Redact PII entities from text. Entities below confidence_threshold
+              are not redacted.
+
+              When consistent_placeholders is True, the same PII value gets the same
+              numbered placeholder (e.g. [NAME_1]), preserving referential consistency
+              within the response.
+              '''
+              to_redact = [e for e in entities if e.confidence >= self.confidence_threshold]
+              # Sort by start descending so earlier offsets are not invalidated
+              to_redact.sort(key=lambda e: e.start, reverse=True)
+
+              redacted = text
+              redacted_types: Dict[str, int] = {}
+              value_to_placeholder: Dict[str, str] = {}
+              type_counters: Dict[str, int] = {}
+
+              for e in to_redact:
+                  base_placeholder = self.placeholder_map.get(e.entity_type, '[REDACTED]')
+
+                  if self.consistent_placeholders:
+                      key = f'{e.entity_type}:{e.text.lower()}'
+                      if key not in value_to_placeholder:
+                          type_counters[e.entity_type] = type_counters.get(e.entity_type, 0) + 1
+                          n = type_counters[e.entity_type]
+                          value_to_placeholder[key] = base_placeholder[:-1] + f'_{n}]'
+                      placeholder = value_to_placeholder[key]
+                  else:
+                      placeholder = base_placeholder
+
+                  redacted = redacted[:e.start] + placeholder + redacted[e.end:]
+                  redacted_types[e.entity_type] = redacted_types.get(e.entity_type, 0) + 1
+
+              return RedactionResult(
+                  redacted_text=redacted,
+                  n_redactions=len(to_redact),
+                  redacted_types=redacted_types,
+                  original_length=len(text),
+                  redacted_length=len(redacted),
+              )
+
+          def redact_scan_result(self, scan_result: PIIScanResult) -> RedactionResult:
+              return self.redact(scan_result.original_text, scan_result.entities)
+
+
+      if __name__ == '__main__':
+          from pii_scanner import PIIScanner
+
+          scanner = PIIScanner(use_presidio=False)
+          redactor = PIIRedactor(consistent_placeholders=True)
+
+          text = (
+              'Contact John Smith at john.smith@example.com or call 555-123-4567. '
+              'John Smith is the account holder. Backup email: jsmith@work.com.'
+          )
+          scan = scanner.scan(text)
+          result = redactor.redact_scan_result(scan)
+          print('Original:')
+          print(f'  {text}')
+          print('\nRedacted:')
+          print(f'  {result.redacted_text}')
+          print(f'\nRedactions: {result.n_redactions}')
+          print(f'By type: {result.redacted_types}')
+
+  deliverable_3:
+    title: 'PII False Positive Analyser'
+    filename: 'pii_false_positive_analyser.py'
+    description: 'Context scoring to distinguish real PII from fictional and example data. Examines the request and the text surrounding each detection for signals that indicate non-real content, and adjusts detection confidence accordingly to reduce false positives without missing real PII.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. No external dependencies beyond stdlib re. Imports PIIEntity from pii_scanner.py.'
+    code: |
+      # pii_false_positive_analyser.py
+      # Section 12.09: PII Context Scoring for False Positive Reduction
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import re
+      from dataclasses import dataclass
+      from typing import List, Optional, Tuple
+
+      from pii_scanner import PIIEntity
+
+
+      # Signals that detected PII is fictional or illustrative (reduce confidence)
+      FICTIONAL_REQUEST_MARKERS = [
+          'write a story', 'write a poem', 'fictional', 'fiction',
+          'make up', 'invent a character', 'creative writing',
+      ]
+      SYNTHETIC_REQUEST_MARKERS = [
+          'test data', 'sample data', 'synthetic', 'example data',
+          'dummy', 'placeholder', 'mock data', 'fake',
+      ]
+      ILLUSTRATIVE_CONTEXT_MARKERS = [
+          'for example', 'such as', 'e.g.', 'for instance',
+          'sample', 'placeholder', 'fictional', 'imaginary',
+      ]
+      # Signals that detected PII is real (increase confidence)
+      REAL_PII_CONTEXT_MARKERS = [
+          'my', 'customer', 'patient', 'account holder', 'client',
+          'employee', 'user', 'contact', 'reach', 'call',
+      ]
+
+      CONTEXT_WINDOW = 60  # characters around the detection to examine
+
+
+      @dataclass
+      class ContextScore:
+          original_confidence: float
+          adjusted_confidence: float
+          fictional_signals: List[str]
+          real_signals: List[str]
+          in_code_block: bool
+
+
+      class PIIFalsePositiveAnalyser:
+          '''
+          Adjusts PII detection confidence based on context signals.
+          Reduces false positives on fictional and example data while
+          preserving detection of real PII.
+          '''
+
+          def __init__(
+              self,
+              fictional_penalty: float = 0.4,
+              illustrative_penalty: float = 0.3,
+              real_boost: float = 0.2,
+              code_block_penalty: float = 0.3,
+          ) -> None:
+              self.fictional_penalty = fictional_penalty
+              self.illustrative_penalty = illustrative_penalty
+              self.real_boost = real_boost
+              self.code_block_penalty = code_block_penalty
+
+          def _detect_code_blocks(self, text: str) -> List[Tuple[int, int]]:
+              spans = []
+              for m in re.finditer(r'```[\s\S]*?```', text):
+                  spans.append((m.start(), m.end()))
+              return spans
+
+          def _in_code_block(self, pos: int, code_spans: List[Tuple[int, int]]) -> bool:
+              return any(start <= pos < end for start, end in code_spans)
+
+          def _context_window(self, text: str, entity: PIIEntity) -> str:
+              start = max(0, entity.start - CONTEXT_WINDOW)
+              end = min(len(text), entity.end + CONTEXT_WINDOW)
+              return text[start:end].lower()
+
+          def score_entity(
+              self,
+              entity: PIIEntity,
+              response_text: str,
+              request_text: str = '',
+              code_spans: Optional[List[Tuple[int, int]]] = None,
+          ) -> ContextScore:
+              if code_spans is None:
+                  code_spans = self._detect_code_blocks(response_text)
+
+              context = self._context_window(response_text, entity)
+              request_lower = request_text.lower()
+
+              fictional_signals = []
+              real_signals = []
+              adjustment = 0.0
+
+              # Request-level signals
+              for marker in FICTIONAL_REQUEST_MARKERS:
+                  if marker in request_lower:
+                      fictional_signals.append(f'request:{marker}')
+                      adjustment -= self.fictional_penalty
+                      break
+              for marker in SYNTHETIC_REQUEST_MARKERS:
+                  if marker in request_lower:
+                      fictional_signals.append(f'request:{marker}')
+                      adjustment -= self.fictional_penalty
+                      break
+
+              # Context-level signals
+              for marker in ILLUSTRATIVE_CONTEXT_MARKERS:
+                  if marker in context:
+                      fictional_signals.append(f'context:{marker}')
+                      adjustment -= self.illustrative_penalty
+                      break
+
+              for marker in REAL_PII_CONTEXT_MARKERS:
+                  if marker in context:
+                      real_signals.append(f'context:{marker}')
+                      adjustment += self.real_boost
+                      break
+
+              # Code block signal
+              in_code = self._in_code_block(entity.start, code_spans)
+              if in_code:
+                  fictional_signals.append('in_code_block')
+                  adjustment -= self.code_block_penalty
+
+              adjusted = max(0.0, min(1.0, entity.confidence + adjustment))
+
+              return ContextScore(
+                  original_confidence=entity.confidence,
+                  adjusted_confidence=adjusted,
+                  fictional_signals=fictional_signals,
+                  real_signals=real_signals,
+                  in_code_block=in_code,
+              )
+
+          def adjust_entities(
+              self,
+              entities: List[PIIEntity],
+              response_text: str,
+              request_text: str = '',
+          ) -> List[PIIEntity]:
+              '''Returns entities with context-adjusted confidence scores.'''
+              code_spans = self._detect_code_blocks(response_text)
+              adjusted = []
+              for e in entities:
+                  score = self.score_entity(e, response_text, request_text, code_spans)
+                  adjusted.append(PIIEntity(
+                      entity_type=e.entity_type,
+                      text=e.text,
+                      start=e.start,
+                      end=e.end,
+                      confidence=score.adjusted_confidence,
+                      severity=e.severity,
+                      detection_layer=e.detection_layer,
+                  ))
+              return adjusted
+
+
+      if __name__ == '__main__':
+          from pii_scanner import PIIScanner
+
+          scanner = PIIScanner(use_presidio=False)
+          analyser = PIIFalsePositiveAnalyser()
+
+          cases = [
+              ('Write a short story about a character.',
+               'Once upon a time, Sarah Johnson lived in Paris.'),
+              ('Summarise the customer ticket.',
+               'The customer Sarah Johnson can be reached at sarah@example.com.'),
+              ('Generate sample test data.',
+               'Test user: john@test.com, phone 555-000-1111.'),
+          ]
+          for request, response in cases:
+              scan = scanner.scan(response)
+              adjusted = analyser.adjust_entities(scan.entities, response, request)
+              print(f'\nRequest: {request}')
+              print(f'Response: {response}')
+              for orig, adj in zip(scan.entities, adjusted):
+                  print(f'  {adj.entity_type}: "{adj.text}"  '
+                        f'conf {orig.confidence:.2f} -> {adj.confidence:.2f}')
+
+  deliverable_4:
+    title: 'PII Gateway Integration'
+    filename: 'pii_gateway_integration.py'
+    description: 'Integrates the PII scanner as an output-side gateway stage that runs after model inference. Implements the detection-decision-action pipeline with the redact-block-flag policy, supports streamed response scanning, and writes flags to the analyst review queue.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. No external dependencies beyond stdlib. Imports from pii_scanner.py, pii_redactor.py, and pii_false_positive_analyser.py.'
+    code: |
+      # pii_gateway_integration.py
+      # Section 12.09: PII Scanner Output-Side Gateway Integration
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import json
+      import time
+      from dataclasses import dataclass
+      from enum import Enum
+      from pathlib import Path
+      from typing import Dict, List, Optional
+
+      from pii_scanner import PIIScanner, PIIScanResult, PIIEntity, PIISeverity
+      from pii_redactor import PIIRedactor, RedactionResult
+      from pii_false_positive_analyser import PIIFalsePositiveAnalyser
+
+
+      class PIIAction(Enum):
+          PASS = 'pass'          # no PII detected; deliver unchanged
+          REDACT = 'redact'      # redact PII; deliver redacted response
+          BLOCK = 'block'        # withhold response; return fallback
+          FLAG = 'flag'          # deliver unchanged; log for review
+
+
+      @dataclass
+      class PIIGatewayDecision:
+          action: PIIAction
+          delivered_text: Optional[str]
+          original_text: str
+          entities_detected: int
+          high_severity_count: int
+          flagged: bool
+          total_ms: float
+
+
+      class PIIGateway:
+          '''
+          Output-side PII detection gateway stage.
+          Runs after model inference, before response delivery.
+
+          Pipeline:
+            1. Detection: three-layer ensemble scan
+            2. Context scoring: false positive reduction
+            3. Decision: redact-block-flag policy
+            4. Action: execute decision, log flags
+          '''
+
+          def __init__(
+              self,
+              scanner: Optional[PIIScanner] = None,
+              redactor: Optional[PIIRedactor] = None,
+              fp_analyser: Optional[PIIFalsePositiveAnalyser] = None,
+              redact_threshold: float = 0.6,
+              flag_queue_path: str = 'pii_flags.jsonl',
+              block_on_high_severity: bool = True,
+              fallback_message: str = '[Response withheld: contained sensitive information]',
+          ) -> None:
+              self.scanner = scanner or PIIScanner(use_presidio=False)
+              self.redactor = redactor or PIIRedactor()
+              self.fp_analyser = fp_analyser or PIIFalsePositiveAnalyser()
+              self.redact_threshold = redact_threshold
+              self.flag_queue_path = Path(flag_queue_path)
+              self.block_on_high_severity = block_on_high_severity
+              self.fallback_message = fallback_message
+
+          def process_response(
+              self,
+              response_text: str,
+              request_text: str = '',
+              session_id: str = '',
+          ) -> PIIGatewayDecision:
+              t0 = time.time()
+
+              # Stage 1: Detection
+              scan = self.scanner.scan(response_text)
+
+              if not scan.entities:
+                  return PIIGatewayDecision(
+                      action=PIIAction.PASS,
+                      delivered_text=response_text,
+                      original_text=response_text,
+                      entities_detected=0,
+                      high_severity_count=0,
+                      flagged=False,
+                      total_ms=(time.time() - t0) * 1000,
+                  )
+
+              # Stage 2: Context scoring
+              adjusted = self.fp_analyser.adjust_entities(
+                  scan.entities, response_text, request_text,
+              )
+
+              # Filter by adjusted confidence
+              significant = [e for e in adjusted if e.confidence >= self.redact_threshold]
+              high_sev = [e for e in significant if e.severity == PIISeverity.HIGH]
+
+              if not significant:
+                  # All detections fell below threshold after context scoring
+                  return PIIGatewayDecision(
+                      action=PIIAction.PASS,
+                      delivered_text=response_text,
+                      original_text=response_text,
+                      entities_detected=len(scan.entities),
+                      high_severity_count=0,
+                      flagged=False,
+                      total_ms=(time.time() - t0) * 1000,
+                  )
+
+              # Stage 3: Decision
+              if high_sev and self.block_on_high_severity:
+                  action = PIIAction.BLOCK
+              else:
+                  action = PIIAction.REDACT
+
+              # Stage 4: Action
+              delivered = None
+              flagged = False
+              if action == PIIAction.BLOCK:
+                  delivered = self.fallback_message
+                  self._write_flag(session_id, request_text, response_text, significant, 'block')
+                  flagged = True
+              elif action == PIIAction.REDACT:
+                  redaction = self.redactor.redact(response_text, significant)
+                  delivered = redaction.redacted_text
+                  self._write_flag(session_id, request_text, response_text, significant, 'redact')
+                  flagged = True
+
+              return PIIGatewayDecision(
+                  action=action,
+                  delivered_text=delivered,
+                  original_text=response_text,
+                  entities_detected=len(significant),
+                  high_severity_count=len(high_sev),
+                  flagged=flagged,
+                  total_ms=(time.time() - t0) * 1000,
+              )
+
+          def _write_flag(
+              self,
+              session_id: str,
+              request_text: str,
+              response_text: str,
+              entities: List[PIIEntity],
+              action: str,
+          ) -> None:
+              record = {
+                  'session_id': session_id,
+                  'action': action,
+                  'request_preview': request_text[:100],
+                  'entity_types': [e.entity_type for e in entities],
+                  'high_severity': any(e.severity == PIISeverity.HIGH for e in entities),
+                  'timestamp_ms': time.time() * 1000,
+              }
+              with open(self.flag_queue_path, 'a') as f:
+                  f.write(json.dumps(record) + '\n')
+
+
+      if __name__ == '__main__':
+          gateway = PIIGateway(flag_queue_path='/tmp/pii_flags.jsonl')
+
+          cases = [
+              ('Summarise the support ticket.',
+               'Customer John Smith (john@example.com) reported a login issue.'),
+              ('Write a story.',
+               'The hero, Alice Wonder, traveled far across the land.'),
+              ('Show me a payment record.',
+               'Card on file: 4532015112830366, exp 12/26.'),
+              ('Explain sorting.',
+               'Bubble sort compares adjacent elements repeatedly.'),
+          ]
+          for request, response in cases:
+              decision = gateway.process_response(response, request, 'sess_001')
+              print(f'\nRequest:  {request}')
+              print(f'Response: {response}')
+              print(f'Action:   {decision.action.value.upper()}  '
+                    f'({decision.entities_detected} entities, '
+                    f'{decision.high_severity_count} high-severity, '
+                    f'{decision.total_ms:.1f}ms)')
+              if decision.delivered_text != response:
+                  print(f'Delivered: {decision.delivered_text}')
+
+  deliverable_5:
+    title: 'PII Test Harness'
+    filename: 'pii_test_harness.py'
+    description: 'Test suite covering all PII entity types with labelled positive and negative cases. Measures per-entity-type precision and recall, validates the false positive reduction on fictional and example data, and produces a coverage report for the scanner configuration.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: numpy. Imports from pii_scanner.py and pii_false_positive_analyser.py.'
+    code: |
+      # pii_test_harness.py
+      # Section 12.09: PII Scanner Test Harness
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      from dataclasses import dataclass
+      from typing import Dict, List, Tuple
+
+      from pii_scanner import PIIScanner, PIIEntity
+      from pii_false_positive_analyser import PIIFalsePositiveAnalyser
+
+
+      @dataclass
+      class TestCase:
+          text: str
+          expected_types: List[str]   # PII types that should be detected
+          request: str = ''
+          is_fictional: bool = False  # if True, detections are false positives
+
+
+      @dataclass
+      class EntityTypeMetrics:
+          entity_type: str
+          true_positives: int
+          false_positives: int
+          false_negatives: int
+
+          @property
+          def precision(self) -> float:
+              denom = self.true_positives + self.false_positives
+              return self.true_positives / denom if denom else 0.0
+
+          @property
+          def recall(self) -> float:
+              denom = self.true_positives + self.false_negatives
+              return self.true_positives / denom if denom else 0.0
+
+          @property
+          def f1(self) -> float:
+              p, r = self.precision, self.recall
+              return 2 * p * r / (p + r) if (p + r) else 0.0
+
+
+      # Labelled test cases covering all PII types
+      TEST_CASES: List[TestCase] = [
+          TestCase('Contact me at alice@example.com', ['EMAIL_ADDRESS']),
+          TestCase('Call 555-123-4567 for support', ['PHONE_NUMBER']),
+          TestCase('SSN on file: 123-45-6789', ['US_SSN']),
+          TestCase('Server IP is 192.168.1.100', ['IP_ADDRESS']),
+          TestCase('Card: 4532015112830366', ['CREDIT_CARD']),
+          TestCase('Email alice@test.com and call 555-987-6543', ['EMAIL_ADDRESS', 'PHONE_NUMBER']),
+          TestCase('The capital of France is Paris', [], request='What is the capital of France?'),
+          TestCase('Bubble sort compares adjacent elements', []),
+          # Fictional cases -- detections should be suppressed by context scoring
+          TestCase('Once upon a time, Sarah lived in a castle.', [],
+                   request='Write a fairy tale.', is_fictional=True),
+          TestCase('Test data: user@test.com, 555-000-0000', [],
+                   request='Generate sample test data.', is_fictional=True),
+      ]
+
+
+      def run_test_harness(
+          scanner: PIIScanner,
+          fp_analyser: PIIFalsePositiveAnalyser,
+          confidence_threshold: float = 0.5,
+          test_cases: List[TestCase] = None,
+      ) -> Dict[str, EntityTypeMetrics]:
+          cases = test_cases or TEST_CASES
+          metrics: Dict[str, EntityTypeMetrics] = {}
+
+          def get_metrics(t: str) -> EntityTypeMetrics:
+              if t not in metrics:
+                  metrics[t] = EntityTypeMetrics(t, 0, 0, 0)
+              return metrics[t]
+
+          for case in cases:
+              scan = scanner.scan(case.text)
+              adjusted = fp_analyser.adjust_entities(scan.entities, case.text, case.request)
+              detected_types = {
+                  e.entity_type for e in adjusted
+                  if e.confidence >= confidence_threshold
+              }
+
+              expected = set(case.expected_types)
+
+              # For fictional cases, expected is empty; any detection is a FP
+              for t in detected_types:
+                  m = get_metrics(t)
+                  if t in expected:
+                      m.true_positives += 1
+                  else:
+                      m.false_positives += 1
+
+              # Missed expected types are false negatives
+              for t in expected - detected_types:
+                  get_metrics(t).false_negatives += 1
+
+          return metrics
+
+
+      def print_harness_report(metrics: Dict[str, EntityTypeMetrics]) -> None:
+          print('PII Scanner Test Harness Report')
+          print('=' * 70)
+          fmt = '{:<18} {:>5} {:>5} {:>5}  {:>9} {:>9} {:>9}'
+          print(fmt.format('Entity Type', 'TP', 'FP', 'FN', 'Precision', 'Recall', 'F1'))
+          print('-' * 70)
+          total_tp = total_fp = total_fn = 0
+          for t, m in sorted(metrics.items()):
+              print(fmt.format(
+                  t, m.true_positives, m.false_positives, m.false_negatives,
+                  f'{m.precision:.3f}', f'{m.recall:.3f}', f'{m.f1:.3f}',
+              ))
+              total_tp += m.true_positives
+              total_fp += m.false_positives
+              total_fn += m.false_negatives
+          print('-' * 70)
+          overall_p = total_tp / max(total_tp + total_fp, 1)
+          overall_r = total_tp / max(total_tp + total_fn, 1)
+          print(f'Overall: precision={overall_p:.3f}  recall={overall_r:.3f}')
+
+
+      if __name__ == '__main__':
+          scanner = PIIScanner(use_presidio=False)
+          fp_analyser = PIIFalsePositiveAnalyser()
+          metrics = run_test_harness(scanner, fp_analyser)
+          print_harness_report(metrics)
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Building the PII scanner as an input-side detector that runs alongside the injection classifiers, scanning the user request instead of the model response'
+    why_it_happens: |
+      The detection engineer has built five input-side detectors and treats the PII scanner
+      as the sixth, wiring it into the same pre-inference pipeline. It scans the user request
+      for PII, which catches users who submit personal information but does nothing for the
+      actual threat: the model leaking PII in its response.
+    consequence: |
+      The PII scanner runs on inputs and catches PII that users voluntarily submit, which
+      is occasionally useful but is not the OWASP LLM06 threat. The actual leakage -- the
+      model surfacing PII from training data, context, or a successful injection -- passes
+      undetected because nothing scans the output. The control provides a false sense of
+      PII protection while the real leakage vector is uncovered.
+    correct_approach: |
+      The PII scanner is an output-side detector. It runs after model inference, scanning
+      the model's response before delivery. The pii_gateway_integration.py in deliverable_4
+      implements the output-side pipeline. Input-side PII detection is a separate, optional
+      control with a different purpose; the LLM06 control is output-side.
+
+  mistake_2:
+    description: 'Setting the redaction confidence threshold so high that real PII passes through, or so low that fictional content is over-redacted'
+    why_it_happens: |
+      The engineer sets a single confidence threshold without measuring its effect on the
+      two error types. A threshold of 0.9 misses real PII detected at medium confidence by
+      the NER layer (which produces 0.85 confidence). A threshold of 0.3 redacts fictional
+      character names that the context scorer reduced to 0.4 confidence but not below 0.3.
+    consequence: |
+      At 0.9: the NER layer's person name detections (0.85 confidence) never trigger
+      redaction, so real names leak through. At 0.3: creative writing output has every
+      character name redacted, making the product unusable for fiction. Neither threshold
+      is correct because a single threshold cannot balance the two error types across all
+      content types.
+    correct_approach: |
+      Use the context scoring to adjust confidence before applying the threshold, and use
+      the redact-block-flag policy to differentiate by content type. For high-FP-likelihood
+      contexts (creative writing, code generation), flag rather than redact. For high-
+      severity PII (credit card, SSN), use a lower threshold because the cost of missing
+      it is high. The pii_test_harness.py in deliverable_5 measures precision and recall
+      per entity type so the threshold can be set with data rather than guessed.
+
+  mistake_3:
+    description: 'Omitting the Luhn checksum validation for credit card detection, producing false positives on any 16-digit number'
+    why_it_happens: |
+      The credit card regex matches 13-19 digit sequences. The engineer applies the regex
+      directly without the Luhn check because the regex alone appears to work on test
+      credit card numbers. Order numbers, tracking numbers, and other long digit sequences
+      in model responses also match the pattern.
+    consequence: |
+      Any 16-digit number in a model response -- an order confirmation number, a product
+      SKU, a tracking number -- is flagged as a credit card and triggers the high-severity
+      block policy. Legitimate responses containing long numbers are blocked or redacted.
+      The credit card detector has an unacceptably high false positive rate.
+    correct_approach: |
+      Always apply the Luhn checksum validation to credit card candidates. The luhn_valid()
+      function in pii_scanner.py reduces credit card false positives by an order of
+      magnitude: a random 16-digit number has only a 1-in-10 chance of passing the Luhn
+      check. Only digit sequences that match the pattern AND pass the checksum are flagged
+      as credit cards.
+
+  mistake_4:
+    description: 'Running the transformer NER model on every response including short and code-only responses, adding unnecessary latency'
+    why_it_happens: |
+      The scanner runs all three layers on every response for completeness. The transformer
+      NER model adds 10-30ms per response. On a high-throughput API where most responses
+      are short or contain no natural language (code, numeric data), this latency is
+      incurred unnecessarily on responses that have no unstructured PII to detect.
+    consequence: |
+      The average output-side latency is dominated by NER inference on responses that do
+      not need it. A response that is a three-line code snippet incurs the same 10-30ms
+      NER latency as a paragraph of natural language, even though the code snippet has no
+      person names or locations to detect. The aggregate latency cost across all responses
+      is significant.
+    correct_approach: |
+      Gate the NER layer with a length and content check. The ner_length_gate parameter
+      in pii_scanner.py skips NER for responses below a minimum length. Additionally, skip
+      NER for responses that are predominantly code or numeric content where the regex layer
+      is sufficient. Run NER only when the response contains enough natural language text
+      to plausibly contain unstructured PII.
+
+  mistake_5:
+    description: 'Treating the PII scanner as a complete privacy control and not combining it with input-side data exfiltration detection'
+    why_it_happens: |
+      The PII scanner catches PII in model responses. The engineer considers the privacy
+      threat addressed and does not connect it to the input-side detectors that catch the
+      attacks which cause leakage in the first place.
+    consequence: |
+      A successful prompt injection that instructs the model to reveal system context PII
+      reaches the model because the input-side injection detector missed it. The PII scanner
+      catches the leaked PII in the response and redacts it -- but the injection succeeded,
+      and the attacker learns that the injection worked (the response was redacted rather
+      than refused, signalling that the model complied). The output-side scanner mitigated
+      the immediate leak but the input-side detection gap remains, and the attacker iterates.
+    correct_approach: |
+      The PII scanner is one layer of a defence-in-depth privacy architecture, not the
+      complete control. Combine it with the input-side injection detection (Sections 12.05,
+      12.07, 12.08) that catches the attacks causing leakage, and with the Chapter 6 data
+      exfiltration detection. When the PII scanner triggers a redaction on a response to a
+      flagged-injection request, escalate: the combination of a near-miss injection and a
+      PII leak in the response indicates a successful attack that both layers should
+      have caught.
+
+section_summary:
+
+  compact: |
+    The PII scanner is the only output-side detector in Chapter 12: it scans model responses,
+    not user inputs, addressing OWASP LLM06 (Sensitive Information Disclosure) leakage that
+    no input-side detector can catch. The three-layer ensemble combines a regex layer for
+    structured PII (email, credit card with Luhn validation, SSN, phone, IP) at near-100%
+    precision, a spaCy NER layer for unstructured PII (person names, locations, organisations)
+    at 80-90% precision, and the Microsoft Presidio framework for context-aware confidence
+    scoring. The hardest problem is false positives on fictional and example data: a model
+    writing fiction or generating test data produces text that triggers PII patterns without
+    containing real personal information. Context scoring reduces these false positives by
+    examining the request and surrounding text for fictional, illustrative, and code-block
+    signals. The scanner integrates as an output-side gateway stage (Track 5) with a redact-
+    block-flag policy applied after model inference and before response delivery.
+
+  key_takeaways:
+    - 'The PII scanner is an output-side detector -- it scans model responses, not inputs; OWASP LLM06 leakage cannot be caught by any input-side detector because the threat is in what the model generates'
+    - 'Regex catches structured PII (email, credit card, SSN) at near-100% precision; NER catches unstructured PII (names, locations) at 80-90%; use both, with the Luhn checksum mandatory for credit cards'
+    - 'False positives on fictional and example data are the hardest problem -- context scoring examines the request and surrounding text for fictional, illustrative, and code-block signals to reduce over-redaction'
+    - 'Use the redact-block-flag policy to differentiate by content type and severity: redact valuable responses, block high-severity PII that cannot be safely redacted, flag high-FP-likelihood contexts like creative writing'
+    - 'Gate the NER layer with a length and content check -- running transformer NER on every short or code-only response adds unnecessary latency for responses that have no unstructured PII'
+    - 'The PII scanner is one layer of defence-in-depth privacy, not a complete control -- combine it with input-side injection detection that catches the attacks causing leakage in the first place'
+
+preview_section_12_10:
+  title: 'Section 12.10: Calibration and Threshold Tuning -- Setting Detection Operating Points'
+  summary: |
+    Section 12.10 addresses a problem that affects every classifier built in Chapter 12:
+    the raw probability outputs are not reliable attack probability estimates, and the
+    default 0.5 decision threshold is rarely the correct operating point. Probability
+    calibration -- Platt scaling for tree classifiers, isotonic regression for non-monotonic
+    score distributions -- maps raw classifier scores to calibrated probabilities that match
+    the actual attack rate. Reliability diagrams and Expected Calibration Error quantify
+    calibration quality. Threshold selection translates the precision-recall tradeoff into
+    a single operating point per detector, calibrated to the analyst false positive capacity
+    rather than left at the default midpoint. Per-threat-class threshold differentiation
+    recognises that the PII scanner may tolerate higher false positives (favouring recall)
+    than the anomaly detector (favouring precision to avoid alert fatigue). The section
+    establishes the calibrated operating points for all five Chapter 12 detectors before
+    they are combined in the Section 12.15 ensemble.
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 4 Section 4.08: sensitive data handling -- the data classification that defines what constitutes PII'
+    - 'Chapter 6 Section 6.14: data exfiltration via injection -- the input-side attack causing output-side leakage'
+    - 'Chapter 11 Section 11.13: seven-track gateway -- Track 5 is the output-side PII detection track'
+    - 'Section 12.05: supervised classification -- security_evaluator.py imported for per-entity-type metrics'
+    - 'Section 12.02: security feature engineering -- contextual features inform context scoring'
+  forward_references:
+    - 'Section 12.10: calibration -- the PII scanner confidence scores are calibrated alongside the other detectors'
+    - 'Section 12.15: four-detector ensemble -- PII scanner runs as a separate output-side stage, not in the input ensemble'
+    - 'Section 12.17: production gateway capstone -- PII scanner integrated as the output-side Track 5 stage'
+    - 'Chapter 14: production deployment -- streamed response scanning and full output-side pipeline'
+  tags:
+    - pii-scanner
+    - output-side-detection
+    - owasp-llm06
+    - sensitive-information-disclosure
+    - regex-pii-detection
+    - named-entity-recognition
+    - spacy-ner
+    - presidio
+    - luhn-checksum
+    - pii-redaction
+    - context-scoring
+    - false-positive-reduction
+    - redact-block-flag
+    - track-5-gateway
+    - data-leakage-prevention
