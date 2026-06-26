@@ -1,0 +1,1284 @@
+# section_12_12_inference_optimisation.yaml
+
+---
+document_info:
+  title: 'Inference Optimisation: Quantisation, Batching, and Async Scoring Within 50ms P99'
+  chapter: 12
+  section: 12
+  section_code: '1212'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-06'
+  estimated_pages: 6
+  estimated_reading_time: '45-55 minutes'
+
+section_overview:
+  one_line_summary: 'Inference optimisation is the production survival requirement: four detectors running sequentially consume 60ms and breach the 50ms SLO, so quantisation, async parallel scoring, and early exit are what make the ensemble deployable at all.'
+  why_this_section_exists: |
+    The four input-side detectors built in Chapter 12 have individual latencies that, summed,
+    exceed the gateway budget. The Isolation Forest at 1-3ms, the Random Forest at 1-3ms, the
+    GRU at 5-15ms, and the DistilBERT at 15ms in FP32 -- run sequentially, plus the feature
+    pipeline at 5ms, the total is around 40-60ms before any network or serialisation overhead.
+    The 50ms P99 gateway SLO is breached on the first day of deployment if the detectors run
+    naively.
+
+    This is not a problem that can be solved by accepting slightly higher latency. The
+    50ms P99 is a contract: it is the latency at which the product team committed the API
+    would respond, and exceeding it produces user-visible timeouts and triggers the operational
+    response of disabling the detection system to recover the SLO. A detection system that is
+    disabled under load provides no protection. Inference optimisation is therefore a security
+    requirement, not a performance nicety -- a detection system that cannot run within the
+    latency budget will be turned off, and a turned-off detector catches nothing.
+
+    Section 12.12 brings together the latency work distributed across Chapter 12 into the
+    complete optimisation that fits the four-detector ensemble within 50ms P99. Three techniques
+    do the work. INT8 quantisation reduces the DistilBERT inference from 15ms to 5-7ms and the
+    model size from 265MB to 65MB. Async parallel scoring runs all four detectors concurrently
+    so the ensemble latency is the maximum of the four (around 15ms) rather than the sum (around
+    35ms). Early exit blocks on the fastest decisive detector, returning a decision in 1-3ms
+    when a detector is highly confident rather than waiting for the slowest. The section
+    validates the result against a latency profiler that measures P99 rather than assuming the
+    optimisation worked.
+  position_in_chapter: |
+    Section 12.12 is the third operational infrastructure section. It consumes the feature
+    pipeline from Section 12.11 and the four detectors from Sections 12.03 through 12.08, and
+    produces the async scoring architecture that the Section 12.15 ensemble and the Section
+    12.17 gateway capstone depend on. The inference_optimizer.py and async_detector_runner.py
+    are the production execution layer for the ensemble.
+
+learning_objectives:
+
+  knowledge:
+    - 'State the 50ms P99 latency contract and explain why P99 rather than mean latency is the production SLO'
+    - 'Explain INT8 quantisation: how FP32 weights are converted to 8-bit integers, the resulting size and latency reduction, and the accuracy cost'
+    - 'Distinguish dynamic from static quantisation and state when each is appropriate for security classifiers'
+    - 'Explain async parallel scoring: how running detectors as concurrent coroutines reduces ensemble latency from the sum to the maximum of the individual latencies'
+    - 'Describe the early exit pattern and state the condition under which the gateway can decide without waiting for all detectors'
+    - 'Explain the cold start problem and why model warm-up is required before production traffic'
+
+  skills:
+    - 'Apply INT8 dynamic quantisation to DistilBERT and verify the accuracy regression is within tolerance'
+    - 'Implement async parallel detector execution with per-detector timeout and fallback'
+    - 'Implement the early exit pattern that blocks on the fastest decisive detector'
+    - 'Profile P50, P95, and P99 latency across all inference components and produce a budget allocation report'
+    - 'Implement model warm-up that pre-loads and warms all detectors before traffic is accepted'
+
+  security_mindset:
+    - 'Treat the latency budget as a security constraint: a detection system that breaches the SLO will be disabled under load, and a disabled detector provides zero protection'
+    - 'Optimise for P99, not mean: the worst-case 1% of requests determine whether the system stays within the SLO, and a low mean with a high P99 tail still triggers timeouts'
+    - 'Recognise that early exit trades completeness for latency: blocking on the fastest decisive detector is correct only when that detector is confident enough that the others would not change the decision'
+    - 'Validate the optimisation against the profiler rather than assuming it worked: an optimisation that reduces mean latency but increases P99 tail latency makes the SLO worse, and only the profiler reveals this'
+
+prerequisites:
+  - 'Section 12.11: production feature pipeline -- the sub-5ms feature extraction that this section budgets around'
+  - 'Section 12.08: neural classifier -- the DistilBERT INT8 quantisation introduced here and expanded in this section'
+  - 'Section 12.06: sequence models -- the GRU async scoring runs in the parallel detector set'
+  - 'Section 12.05: supervised classification -- the Random Forest and XGBoost in the parallel detector set'
+  - 'Chapter 11 Section 11.13: seven-track gateway -- the 50ms P99 budget allocated across the tracks'
+  - 'Chapter 11 Section 11.16: gateway performance -- the latency SLO and the operational consequence of breaching it'
+
+prose_content:
+
+  part_1:
+    title: 'The 50ms P99 Latency Contract'
+    body: |
+      The gateway latency budget is expressed as a P99 contract: 99% of requests must complete
+      detection within 50ms. The choice of P99 rather than mean latency is deliberate and
+      consequential. The mean latency hides the tail: a system with a 10ms mean and a 200ms
+      P99 has 1% of requests taking 200ms, and that 1% is enough to produce visible timeouts,
+      degrade the product experience, and trigger the operational response of disabling the
+      detection layer to recover the latency SLO.
+
+      For a high-traffic API, the 1% tail is a large absolute number of requests. At 1,000,000
+      requests per day, a 50ms P99 means 10,000 requests per day are allowed to exceed 50ms;
+      if the P99 is actually 200ms, those 10,000 slow requests are concentrated in the periods
+      of highest load, exactly when the product can least afford added latency. Optimising the
+      mean while ignoring the tail produces a system that looks fast on average and fails under
+      load.
+
+      The latency contract is a security constraint because the operational response to a
+      breach is to disable the detection. When the API latency SLO is breached and the
+      detection layer is identified as the cause, the pragmatic operational decision is to
+      turn off the slowest detector or the entire detection layer to recover the SLO. A
+      detection system that is disabled provides no protection. The detection engineer who
+      builds an accurate but slow detector has built a detector that will be turned off under
+      load, which is functionally equivalent to having no detector. Inference optimisation
+      is the work that keeps the detector running.
+
+      The budget breaks down across the request lifecycle. The feature pipeline consumes up
+      to 5ms (Section 12.11). The four detectors, run with async parallel scoring, consume
+      the maximum of their individual latencies, around 15ms. Network, serialisation, and
+      gateway overhead consume the remainder. The target is a P99 detection latency
+      comfortably under 50ms with headroom for load spikes, which the async architecture and
+      quantisation achieve.
+
+  part_2:
+    title: 'INT8 Quantisation: From 15ms to 7ms'
+    body: |
+      The DistilBERT classifier is the largest single latency cost in the detector set. In
+      FP32, its inference takes 12-15ms on CPU -- nearly a third of the entire 50ms budget for
+      a single detector. INT8 quantisation reduces this to 5-7ms while reducing the model size
+      from 265MB to 65MB.
+
+      INT8 quantisation converts the model's floating-point weights to 8-bit integers. A
+      32-bit float occupies four bytes; an 8-bit integer occupies one. The conversion uses a
+      scaling factor per weight tensor: the float range is mapped to the integer range -128 to
+      127, with the scaling factor recording the mapping so the integers can be interpreted as
+      approximate floats during inference. The integer arithmetic is faster than float
+      arithmetic on CPU, and the smaller weights reduce memory bandwidth, which is often the
+      bottleneck for transformer inference.
+
+      The accuracy cost is small for DistilBERT: under 0.5 percentage points on the security
+      test set. This is because the model has redundancy in its weight precision -- the
+      8-bit representation captures enough of the weight information to preserve the decision
+      boundary. The accuracy cost must be measured, not assumed: the quantiser.py in
+      deliverable_2 applies quantisation and runs the accuracy regression test on the temporal
+      test set, comparing the FP32 and INT8 predictions to verify the regression is within the
+      tolerance.
+
+      Dynamic quantisation is the correct default for security classifiers. It quantises the
+      linear layers (the dominant compute in the transformer) and computes the activation
+      scaling factors dynamically at inference time from the observed activation ranges. It
+      requires no calibration dataset and is applied with a single function call. Static
+      quantisation pre-computes the activation scaling factors from a calibration dataset,
+      producing marginally faster inference (6-7ms versus 7-10ms for dynamic) at the cost of
+      the calibration step. For the security classifier use case, dynamic quantisation is the
+      starting point; static quantisation is applied only when the marginal latency improvement
+      is needed to fit the budget. The Section 12.08 model card records which quantisation
+      method was applied.
+
+  part_3:
+    title: 'Async Parallel Scoring: Maximum, Not Sum'
+    body: |
+      The four detectors are independent: each takes the feature vector (or the raw text) and
+      produces a score without depending on the other detectors' outputs. This independence
+      is what makes the ensemble combination possible (Section 12.15) and also what makes
+      parallel execution possible. Run sequentially, the four detectors take the sum of their
+      latencies. Run in parallel, they take the maximum.
+
+      The async parallel scoring architecture runs each detector in a concurrent coroutine.
+      The gateway dispatches all four detector inference calls simultaneously and awaits their
+      completion. Because the detectors run concurrently, the total time to get all four scores
+      is determined by the slowest detector, not the sum. With the Isolation Forest at 2ms, the
+      Random Forest at 2ms, the GRU at 12ms, and the DistilBERT INT8 at 7ms, sequential
+      execution takes 23ms while parallel execution takes 12ms (the GRU, the slowest). The
+      parallel architecture nearly halves the detector latency.
+
+      The implementation uses Python's asyncio with the detectors running in a thread pool
+      executor, because the detector inference is CPU-bound and asyncio's cooperative
+      concurrency does not parallelise CPU work by itself. The run_in_executor pattern
+      dispatches each detector to a worker thread, and asyncio.gather awaits all of them. For
+      true CPU parallelism, the thread pool must have enough workers and the inference must
+      release the GIL during the numeric computation, which the numpy and ONNX Runtime
+      operations do.
+
+      Per-detector timeout and fallback are essential for the P99 guarantee. If one detector
+      occasionally takes much longer than its typical latency (a cold cache, a GC pause, a
+      contended CPU), the parallel scoring would wait for it and the P99 would spike. The
+      async_detector_runner.py in deliverable_3 applies a per-detector timeout: if a detector
+      exceeds its timeout, its result is treated as a fallback (typically a neutral score that
+      defers to the other detectors) and the ensemble proceeds with the detectors that completed.
+      This caps the worst-case latency at the timeout rather than the worst-case detector
+      latency, which is what keeps the P99 within the budget.
+
+  part_4:
+    title: 'Early Exit: Blocking on the Fastest Decisive Detector'
+    body: |
+      Async parallel scoring reduces the latency to the slowest detector. Early exit reduces
+      it further for the cases where a fast detector is decisive. When the Isolation Forest
+      produces an anomaly score of 0.98 in 2ms -- an extremely confident attack signal -- the
+      gateway does not need to wait for the GRU and DistilBERT to confirm. It can block the
+      request immediately on the strength of the high-confidence fast detector.
+
+      The early exit pattern dispatches the detectors with a priority order based on latency
+      and confidence. The fast detectors (Isolation Forest, Random Forest) are checked first.
+      If a fast detector produces a score above a high-certainty threshold (typically 0.95
+      calibrated probability), the gateway exits early with the block decision, cancelling the
+      slower detectors. If no fast detector is decisive, the gateway awaits the slower
+      detectors and combines all available scores in the ensemble.
+
+      The correctness condition for early exit is that the fast decisive detector is confident
+      enough that the slower detectors would not change the decision. This is true at the
+      extremes: a 0.98 anomaly score is unlikely to be overturned by the other detectors, so
+      exiting early on it is safe. It is not true in the uncertain middle: a 0.6 score from
+      the Random Forest could be confirmed or refuted by the DistilBERT, so exiting early on
+      it would discard information. The early exit threshold is set high precisely so that
+      early exit only triggers when the fast detector is confident enough that the decision is
+      robust.
+
+      Early exit also applies to the benign direction, though more cautiously. If all the fast
+      detectors produce very low scores (a clearly benign request), the gateway could exit
+      early with a pass decision without running the expensive DistilBERT. This is riskier than
+      early-exit-block because a missed attack is more costly than a false positive, so the
+      benign early exit uses a more conservative threshold and is often disabled in favour of
+      always running the full ensemble for pass decisions. The inference_optimizer.py in
+      deliverable_1 supports both directions with separate thresholds and a configuration to
+      disable benign early exit for high-security deployments.
+
+  part_5:
+    title: 'Cold Start and Model Warm-Up'
+    body: |
+      A model loaded into memory but not yet used has cold caches, uncompiled inference graphs,
+      and unallocated buffers. The first inference call after loading is slow -- often 5-10x
+      the warm latency -- because it triggers the lazy initialisation that subsequent calls
+      benefit from. For DistilBERT, the first inference may take 50-100ms while warm inference
+      takes 7ms. If the first production request hits a cold model, it experiences the cold
+      latency and may time out.
+
+      The cold start problem is acute during deployment and scaling. When a new gateway instance
+      starts, all its models are cold. If it starts accepting traffic immediately, the first
+      requests hit cold models and experience the cold latency spike. When the system scales up
+      under load -- adding instances to handle increased traffic -- the new instances are cold
+      exactly when the load is highest, producing latency spikes at the worst time.
+
+      Model warm-up solves this by running synthetic inference calls through every model before
+      the instance accepts production traffic. The warm-up calls trigger the lazy initialisation,
+      compile the inference graphs, allocate the buffers, and populate the caches, so that the
+      first production request hits a warm model. The warm_up_manager.py in deliverable_5 runs
+      a configurable number of warm-up inferences per model at startup and reports when all
+      models are warm and the instance is ready to accept traffic.
+
+      The warm-up must cover all the models and all the code paths. The DistilBERT warm-up
+      must run inference on a representative input. The embedding extractor warm-up must run
+      the ONNX inference and populate the LRU cache structure. The GRU warm-up must run a
+      sequence of representative length. The feature pipeline warm-up must exercise the early
+      exit and full paths. A warm-up that covers only some models leaves the uncovered ones
+      cold for the first production request that exercises them.
+
+  part_6:
+    title: 'Latency Profiling: Validating the Optimisation'
+    body: |
+      The optimisations -- quantisation, async scoring, early exit, warm-up -- are hypotheses
+      about what reduces latency. They must be validated against measurement, not assumed to
+      work. An optimisation that reduces the mean latency but increases the P99 tail makes the
+      SLO worse, and only the profiler reveals this.
+
+      The latency profiler measures P50, P95, and P99 latency across every inference component:
+      the feature pipeline (and its per-group breakdown from Section 12.11), each of the four
+      detectors, the async dispatch overhead, and the end-to-end detection latency. The
+      per-component breakdown identifies where the latency budget is consumed and where an
+      optimisation would have the most effect. If the P99 is dominated by the GRU, optimising
+      the DistilBERT does not help; the profiler directs the optimisation effort to the
+      component that actually constrains the budget.
+
+      The budget allocation report translates the profiler measurements into the budget
+      breakdown: how much of the 50ms each component consumes at P99, and how much headroom
+      remains. This report is the artefact that validates the SLO holds: if the P99 detection
+      latency is 22ms, there is 28ms of headroom for network and load spikes, and the SLO is
+      safe. If the P99 is 48ms, the SLO is at risk and further optimisation or load shedding
+      is needed before deployment.
+
+      The profiling must be done under representative load, not on an idle system. An idle
+      system shows the best-case latency; a loaded system shows the latency that production
+      will experience, including the contention effects (CPU scheduling, cache eviction, GC
+      pauses) that inflate the tail. The latency_profiler.py in deliverable_4 supports
+      load-testing mode that runs concurrent requests to measure the latency under realistic
+      contention, which is the measurement that validates the production SLO.
+
+reference_materials:
+
+  table_1:
+    title: '50ms P99 Budget Allocation Across Detection Components'
+    description: 'How the 50ms P99 detection budget is allocated across components with the async parallel architecture'
+    columns: ['Component', 'P99 Budget', 'Optimisation', 'Notes']
+    rows:
+      - ['Feature pipeline', '5ms', 'ONNX embedding + early exit (Section 12.11)', 'Sub-5ms with early exit on benign requests']
+      - ['Detector set (parallel)', '15ms', 'Async parallel scoring; latency = max not sum', 'GRU is typically the slowest detector']
+      - ['Async dispatch overhead', '2ms', 'Thread pool executor; minimise coroutine overhead', 'Overhead of gather and executor scheduling']
+      - ['Ensemble combination', '1ms', 'Weighted vote or stacking meta-learner (Section 12.15)', 'Cheap once all scores are available']
+      - ['Network + serialisation', '~25ms headroom', 'Outside detection control', 'Leaves margin for load spikes and gateway overhead']
+      - ['Total detection P99', '~23ms', 'Sum of detection components', 'Comfortable margin under the 50ms SLO']
+
+  table_2:
+    title: 'Quantisation Method Comparison'
+    description: 'Dynamic versus static INT8 quantisation for security classifier deployment'
+    columns: ['Aspect', 'Dynamic Quantisation', 'Static Quantisation', 'Recommendation']
+    rows:
+      - ['Calibration dataset', 'Not required', 'Required (200-500 examples)', 'Dynamic for simplicity; static when budget is tight']
+      - ['DistilBERT latency (CPU)', '7-10ms', '6-7ms', 'Both fit budget; static marginally faster']
+      - ['Accuracy regression', '< 0.5%', '< 0.3%', 'Both within tolerance for DistilBERT']
+      - ['Implementation', 'Single function call', 'Calibration step + export', 'Dynamic is the default starting point']
+      - ['Activation scaling', 'Computed at inference from observed ranges', 'Pre-computed from calibration data', 'Static avoids per-inference scaling overhead']
+
+  table_3:
+    title: 'Detector Latency Profile and Parallel Execution Impact'
+    description: 'Individual detector latencies and the effect of sequential versus parallel execution'
+    columns: ['Detector', 'Individual Latency', 'Sequential Contribution', 'Parallel Contribution']
+    rows:
+      - ['Isolation Forest', '1-3ms', 'Added to sum', 'Subsumed by max']
+      - ['Random Forest', '1-3ms', 'Added to sum', 'Subsumed by max']
+      - ['GRU (sequence)', '5-15ms', 'Added to sum', 'Often the max -- determines parallel latency']
+      - ['DistilBERT INT8', '5-7ms', 'Added to sum', 'Subsumed by max']
+      - ['Total (sequential)', '~35ms', 'Sum of all four', 'N/A']
+      - ['Total (parallel)', '~15ms', 'N/A', 'Maximum of the four detectors']
+
+  table_4:
+    title: 'Inference Backend Comparison'
+    description: 'Inference backend options for security classifier deployment with latency and deployment considerations'
+    columns: ['Backend', 'Best For', 'DistilBERT Latency', 'Deployment Consideration']
+    rows:
+      - ['ONNX Runtime', 'CPU inference; cross-framework consistency', '5-7ms (INT8, CPU)', 'Lightweight; same runtime as embedding model (Section 12.11)']
+      - ['TorchScript', 'PyTorch-native deployment without ONNX export', '8-12ms (INT8, CPU)', 'Keeps PyTorch dependency; no ONNX conversion step']
+      - ['TensorRT', 'GPU inference at very high throughput', '1-3ms (GPU)', 'GPU-only; complex build; for high-traffic GPU deployments']
+      - ['Native PyTorch', 'Development and offline analysis', '12-15ms (FP32, CPU)', 'Too slow for production; use only offline']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Inference Optimizer'
+    filename: 'inference_optimizer.py'
+    description: 'Complete inference optimisation orchestrator: combines INT8 quantisation, async parallel scoring, early exit, and the P99 latency benchmark into a single production inference path for the four-detector ensemble.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: asyncio, numpy. Integrates async_detector_runner.py, quantiser.py, and latency_profiler.py from this section.'
+    code: |
+      # inference_optimizer.py
+      # Section 12.12: Complete Inference Optimisation Orchestrator
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import asyncio
+      import time
+      from dataclasses import dataclass, field
+      from typing import Callable, Dict, List, Optional, Tuple
+
+      import numpy as np
+
+
+      @dataclass
+      class DetectorSpec:
+          name: str
+          predict_fn: Callable          # callable(input) -> calibrated probability
+          timeout_ms: float
+          priority: int                 # lower = checked first for early exit
+          fallback_score: float = 0.0   # neutral score on timeout
+
+
+      @dataclass
+      class EnsembleDecision:
+          is_attack: bool
+          combined_score: float
+          detector_scores: Dict[str, float]
+          early_exit: bool
+          early_exit_detector: Optional[str]
+          total_ms: float
+          detectors_completed: int
+
+
+      class InferenceOptimizer:
+          '''
+          Production inference orchestrator for the four-detector ensemble.
+
+          Combines:
+            - async parallel scoring (latency = max, not sum)
+            - early exit on high-confidence fast detectors
+            - per-detector timeout with fallback
+          '''
+
+          def __init__(
+              self,
+              detectors: List[DetectorSpec],
+              early_exit_block_threshold: float = 0.95,
+              early_exit_pass_threshold: float = 0.02,
+              enable_benign_early_exit: bool = False,
+              ensemble_threshold: float = 0.5,
+          ) -> None:
+              self.detectors = sorted(detectors, key=lambda d: d.priority)
+              self.early_exit_block_threshold = early_exit_block_threshold
+              self.early_exit_pass_threshold = early_exit_pass_threshold
+              self.enable_benign_early_exit = enable_benign_early_exit
+              self.ensemble_threshold = ensemble_threshold
+
+          async def _run_detector(
+              self,
+              spec: DetectorSpec,
+              model_input,
+          ) -> Tuple[str, float, bool]:
+              '''Run one detector with timeout. Returns (name, score, timed_out).'''
+              loop = asyncio.get_event_loop()
+              try:
+                  score = await asyncio.wait_for(
+                      loop.run_in_executor(None, spec.predict_fn, model_input),
+                      timeout=spec.timeout_ms / 1000.0,
+                  )
+                  return (spec.name, float(score), False)
+              except asyncio.TimeoutError:
+                  return (spec.name, spec.fallback_score, True)
+
+          async def score_async(self, model_input) -> EnsembleDecision:
+              t0 = time.perf_counter()
+              scores: Dict[str, float] = {}
+
+              # Phase 1: fast detectors for early exit (priority order, sequentially
+              # checked but each is fast)
+              fast = [d for d in self.detectors if d.priority <= 1]
+              slow = [d for d in self.detectors if d.priority > 1]
+
+              for spec in fast:
+                  name, score, _ = await self._run_detector(spec, model_input)
+                  scores[name] = score
+                  if score >= self.early_exit_block_threshold:
+                      return EnsembleDecision(
+                          is_attack=True,
+                          combined_score=score,
+                          detector_scores=scores,
+                          early_exit=True,
+                          early_exit_detector=name,
+                          total_ms=(time.perf_counter() - t0) * 1000,
+                          detectors_completed=len(scores),
+                      )
+
+              # Phase 2: remaining detectors in parallel
+              if slow:
+                  results = await asyncio.gather(
+                      *[self._run_detector(spec, model_input) for spec in slow]
+                  )
+                  for name, score, _ in results:
+                      scores[name] = score
+
+              combined = self._combine(scores)
+
+              # Optional benign early exit (conservative, often disabled)
+              if (self.enable_benign_early_exit
+                      and all(s <= self.early_exit_pass_threshold for s in scores.values())):
+                  return EnsembleDecision(
+                      is_attack=False,
+                      combined_score=combined,
+                      detector_scores=scores,
+                      early_exit=True,
+                      early_exit_detector='benign_consensus',
+                      total_ms=(time.perf_counter() - t0) * 1000,
+                      detectors_completed=len(scores),
+                  )
+
+              return EnsembleDecision(
+                  is_attack=combined >= self.ensemble_threshold,
+                  combined_score=combined,
+                  detector_scores=scores,
+                  early_exit=False,
+                  early_exit_detector=None,
+                  total_ms=(time.perf_counter() - t0) * 1000,
+                  detectors_completed=len(scores),
+              )
+
+          def _combine(self, scores: Dict[str, float]) -> float:
+              '''Simple mean combination; replaced by stacking meta-learner in Section 12.15.'''
+              if not scores:
+                  return 0.0
+              return float(np.mean(list(scores.values())))
+
+          def score(self, model_input) -> EnsembleDecision:
+              '''Synchronous wrapper around the async scoring.'''
+              return asyncio.run(self.score_async(model_input))
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(42)
+
+          def make_detector(name, base_latency_ms, attack_prob):
+              def predict(x):
+                  time.sleep(base_latency_ms / 1000.0)  # simulate inference latency
+                  return attack_prob
+              return predict
+
+          detectors = [
+              DetectorSpec('isolation_forest', make_detector('if', 2, 0.3), timeout_ms=10, priority=0),
+              DetectorSpec('random_forest', make_detector('rf', 2, 0.4), timeout_ms=10, priority=1),
+              DetectorSpec('gru', make_detector('gru', 12, 0.5), timeout_ms=30, priority=2),
+              DetectorSpec('distilbert', make_detector('bert', 7, 0.45), timeout_ms=20, priority=2),
+          ]
+
+          optimizer = InferenceOptimizer(detectors)
+
+          # Normal case: all detectors run in parallel
+          decision = optimizer.score('benign-looking request')
+          print(f'Decision: attack={decision.is_attack}  '
+                f'score={decision.combined_score:.3f}  '
+                f'early_exit={decision.early_exit}  '
+                f'total={decision.total_ms:.1f}ms  '
+                f'completed={decision.detectors_completed}/4')
+
+          # Early exit case: high-confidence fast detector
+          detectors_ee = [
+              DetectorSpec('isolation_forest', make_detector('if', 2, 0.98), timeout_ms=10, priority=0),
+              DetectorSpec('random_forest', make_detector('rf', 2, 0.4), timeout_ms=10, priority=1),
+              DetectorSpec('gru', make_detector('gru', 12, 0.5), timeout_ms=30, priority=2),
+              DetectorSpec('distilbert', make_detector('bert', 7, 0.45), timeout_ms=20, priority=2),
+          ]
+          opt_ee = InferenceOptimizer(detectors_ee)
+          ee_decision = opt_ee.score('clear attack')
+          print(f'Early exit: attack={ee_decision.is_attack}  '
+                f'detector={ee_decision.early_exit_detector}  '
+                f'total={ee_decision.total_ms:.1f}ms  '
+                f'completed={ee_decision.detectors_completed}/4')
+
+  deliverable_2:
+    title: 'Quantiser'
+    filename: 'quantiser.py'
+    description: 'Post-training INT8 quantisation for DistilBERT with an accuracy regression test. Applies dynamic or static quantisation, compares FP32 and INT8 predictions on the temporal test set, and verifies the accuracy regression is within tolerance before approving the quantised model for deployment.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: torch, numpy. Static quantisation requires a calibration dataset; dynamic requires none.'
+    code: |
+      # quantiser.py
+      # Section 12.12: INT8 Quantisation with Accuracy Regression Test
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import time
+      from dataclasses import dataclass
+      from typing import Callable, List, Optional, Tuple
+
+      import numpy as np
+
+      try:
+          import torch
+          TORCH_AVAILABLE = True
+      except ImportError:
+          TORCH_AVAILABLE = False
+
+
+      @dataclass
+      class QuantisationReport:
+          method: str
+          fp32_size_mb: float
+          int8_size_mb: float
+          size_reduction: float
+          fp32_latency_ms: float
+          int8_latency_ms: float
+          latency_speedup: float
+          accuracy_regression: float
+          within_tolerance: bool
+
+
+      def quantise_dynamic(model):
+          '''Apply INT8 dynamic quantisation to the linear layers.'''
+          assert TORCH_AVAILABLE
+          return torch.quantization.quantize_dynamic(
+              model.cpu(),
+              {torch.nn.Linear},
+              dtype=torch.qint8,
+          )
+
+
+      def model_size_mb(model) -> float:
+          '''Estimate model size in MB from parameter count and dtype.'''
+          assert TORCH_AVAILABLE
+          import io
+          buf = io.BytesIO()
+          torch.save(model.state_dict(), buf)
+          return buf.tell() / (1024 * 1024)
+
+
+      def measure_latency(
+          predict_fn: Callable,
+          sample_inputs: List,
+          n_warmup: int = 5,
+          n_measure: int = 50,
+      ) -> float:
+          '''Returns median latency in ms.'''
+          for x in sample_inputs[:n_warmup]:
+              predict_fn(x)
+          latencies = []
+          for i in range(n_measure):
+              x = sample_inputs[i % len(sample_inputs)]
+              t0 = time.perf_counter()
+              predict_fn(x)
+              latencies.append((time.perf_counter() - t0) * 1000)
+          return float(np.median(latencies))
+
+
+      def accuracy_regression(
+          fp32_predict: Callable,
+          int8_predict: Callable,
+          test_inputs: List,
+          test_labels: np.ndarray,
+          threshold: float = 0.5,
+      ) -> Tuple[float, float, float]:
+          '''
+          Returns (fp32_accuracy, int8_accuracy, regression).
+          Regression is fp32_accuracy - int8_accuracy.
+          '''
+          fp32_preds = np.array([fp32_predict(x) >= threshold for x in test_inputs]).astype(int)
+          int8_preds = np.array([int8_predict(x) >= threshold for x in test_inputs]).astype(int)
+          fp32_acc = float((fp32_preds == test_labels).mean())
+          int8_acc = float((int8_preds == test_labels).mean())
+          return fp32_acc, int8_acc, fp32_acc - int8_acc
+
+
+      def quantise_and_validate(
+          fp32_model,
+          fp32_predict: Callable,
+          int8_predict_factory: Callable,
+          test_inputs: List,
+          test_labels: np.ndarray,
+          sample_inputs: List,
+          tolerance: float = 0.01,
+      ) -> QuantisationReport:
+          '''
+          Quantise the model, measure size and latency, run the accuracy regression test.
+          Returns a QuantisationReport with within_tolerance flag.
+          '''
+          assert TORCH_AVAILABLE, 'Install torch for quantisation.'
+
+          fp32_size = model_size_mb(fp32_model)
+          int8_model = quantise_dynamic(fp32_model)
+          int8_size = model_size_mb(int8_model)
+
+          int8_predict = int8_predict_factory(int8_model)
+
+          fp32_lat = measure_latency(fp32_predict, sample_inputs)
+          int8_lat = measure_latency(int8_predict, sample_inputs)
+
+          fp32_acc, int8_acc, regression = accuracy_regression(
+              fp32_predict, int8_predict, test_inputs, test_labels,
+          )
+
+          return QuantisationReport(
+              method='dynamic_int8',
+              fp32_size_mb=fp32_size,
+              int8_size_mb=int8_size,
+              size_reduction=1.0 - int8_size / max(fp32_size, 1e-9),
+              fp32_latency_ms=fp32_lat,
+              int8_latency_ms=int8_lat,
+              latency_speedup=fp32_lat / max(int8_lat, 1e-9),
+              accuracy_regression=regression,
+              within_tolerance=regression <= tolerance,
+          )
+
+
+      def print_quantisation_report(report: QuantisationReport) -> None:
+          print('Quantisation Report')
+          print('=' * 50)
+          print(f'  Method:             {report.method}')
+          print(f'  Size:               {report.fp32_size_mb:.0f}MB -> {report.int8_size_mb:.0f}MB '
+                f'({report.size_reduction:.0%} reduction)')
+          print(f'  Latency:            {report.fp32_latency_ms:.1f}ms -> {report.int8_latency_ms:.1f}ms '
+                f'({report.latency_speedup:.1f}x speedup)')
+          print(f'  Accuracy regression: {report.accuracy_regression:.4f}')
+          print(f'  Within tolerance:   {report.within_tolerance}')
+          if not report.within_tolerance:
+              print('  WARN: Accuracy regression exceeds tolerance. Do not deploy this quantised model.')
+
+
+      if __name__ == '__main__':
+          if not TORCH_AVAILABLE:
+              print('torch not installed; quantisation requires PyTorch.')
+              # Mock report for demonstration
+              report = QuantisationReport(
+                  method='dynamic_int8',
+                  fp32_size_mb=265.0, int8_size_mb=65.0, size_reduction=0.755,
+                  fp32_latency_ms=14.2, int8_latency_ms=6.8, latency_speedup=2.1,
+                  accuracy_regression=0.004, within_tolerance=True,
+              )
+              print_quantisation_report(report)
+          else:
+              print('Use quantise_and_validate() with a fine-tuned DistilBERT from Section 12.08.')
+
+  deliverable_3:
+    title: 'Async Detector Runner'
+    filename: 'async_detector_runner.py'
+    description: 'asyncio-based parallel detector execution with configurable per-detector timeout and fallback. Runs the detectors as concurrent coroutines in a thread pool executor so the ensemble latency is the maximum rather than the sum, and caps worst-case latency at the timeout.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: asyncio, concurrent.futures, numpy. Detector inference must release the GIL (numpy/ONNX operations do) for true parallelism.'
+    code: |
+      # async_detector_runner.py
+      # Section 12.12: Async Parallel Detector Execution
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import asyncio
+      import time
+      from concurrent.futures import ThreadPoolExecutor
+      from dataclasses import dataclass
+      from typing import Callable, Dict, List, Optional, Tuple
+
+
+      @dataclass
+      class DetectorResult:
+          name: str
+          score: float
+          latency_ms: float
+          timed_out: bool
+
+
+      @dataclass
+      class ParallelScoringResult:
+          results: List[DetectorResult]
+          total_ms: float
+          n_completed: int
+          n_timed_out: int
+
+          def scores(self) -> Dict[str, float]:
+              return {r.name: r.score for r in self.results}
+
+
+      class AsyncDetectorRunner:
+          '''
+          Runs detectors as concurrent coroutines in a thread pool.
+          Ensemble latency = max(detector latencies), capped at each detector's timeout.
+
+          The thread pool size must accommodate all detectors running concurrently.
+          Detector inference must release the GIL during numeric computation
+          (numpy and ONNX Runtime operations do) for true CPU parallelism.
+          '''
+
+          def __init__(self, max_workers: int = 8) -> None:
+              self._executor = ThreadPoolExecutor(max_workers=max_workers)
+
+          async def _run_one(
+              self,
+              name: str,
+              predict_fn: Callable,
+              model_input,
+              timeout_ms: float,
+              fallback_score: float,
+          ) -> DetectorResult:
+              loop = asyncio.get_event_loop()
+              t0 = time.perf_counter()
+              try:
+                  score = await asyncio.wait_for(
+                      loop.run_in_executor(self._executor, predict_fn, model_input),
+                      timeout=timeout_ms / 1000.0,
+                  )
+                  return DetectorResult(
+                      name=name,
+                      score=float(score),
+                      latency_ms=(time.perf_counter() - t0) * 1000,
+                      timed_out=False,
+                  )
+              except asyncio.TimeoutError:
+                  return DetectorResult(
+                      name=name,
+                      score=fallback_score,
+                      latency_ms=timeout_ms,
+                      timed_out=True,
+                  )
+
+          async def run_parallel(
+              self,
+              detectors: List[Tuple[str, Callable, float, float]],
+              model_input,
+          ) -> ParallelScoringResult:
+              '''
+              detectors: list of (name, predict_fn, timeout_ms, fallback_score).
+              Runs all detectors concurrently and returns when all complete or time out.
+              '''
+              t0 = time.perf_counter()
+              results = await asyncio.gather(*[
+                  self._run_one(name, fn, model_input, timeout, fallback)
+                  for name, fn, timeout, fallback in detectors
+              ])
+              n_timed_out = sum(1 for r in results if r.timed_out)
+              return ParallelScoringResult(
+                  results=results,
+                  total_ms=(time.perf_counter() - t0) * 1000,
+                  n_completed=len(results) - n_timed_out,
+                  n_timed_out=n_timed_out,
+              )
+
+          def shutdown(self) -> None:
+              self._executor.shutdown(wait=False)
+
+
+      if __name__ == '__main__':
+          import numpy as np
+
+          def make_predict(latency_ms, score):
+              def predict(x):
+                  time.sleep(latency_ms / 1000.0)
+                  return score
+              return predict
+
+          async def demo():
+              runner = AsyncDetectorRunner(max_workers=8)
+              detectors = [
+                  ('isolation_forest', make_predict(2, 0.3), 10.0, 0.0),
+                  ('random_forest', make_predict(2, 0.4), 10.0, 0.0),
+                  ('gru', make_predict(12, 0.5), 30.0, 0.0),
+                  ('distilbert', make_predict(7, 0.45), 20.0, 0.0),
+              ]
+              result = await runner.run_parallel(detectors, 'request')
+              print(f'Parallel total: {result.total_ms:.1f}ms '
+                    f'(sum would be ~23ms)')
+              print(f'Completed: {result.n_completed}, timed out: {result.n_timed_out}')
+              for r in result.results:
+                  flag = ' [TIMEOUT]' if r.timed_out else ''
+                  print(f'  {r.name:18} score={r.score:.3f}  {r.latency_ms:.1f}ms{flag}')
+
+              # Demonstrate timeout: a slow detector
+              slow_detectors = [
+                  ('isolation_forest', make_predict(2, 0.3), 10.0, 0.0),
+                  ('slow_detector', make_predict(50, 0.9), 15.0, 0.0),  # exceeds timeout
+              ]
+              result2 = await runner.run_parallel(slow_detectors, 'request')
+              print(f'\nWith slow detector: {result2.total_ms:.1f}ms (capped at timeout)')
+              for r in result2.results:
+                  flag = ' [TIMEOUT -> fallback]' if r.timed_out else ''
+                  print(f'  {r.name:18} score={r.score:.3f}{flag}')
+              runner.shutdown()
+
+          asyncio.run(demo())
+
+  deliverable_4:
+    title: 'Latency Profiler'
+    filename: 'latency_profiler.py'
+    description: 'P50/P95/P99 latency profiling across all inference components with a budget allocation report. Supports load-testing mode that runs concurrent requests to measure latency under realistic contention, validating the 50ms P99 SLO.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: asyncio, numpy.'
+    code: |
+      # latency_profiler.py
+      # Section 12.12: Latency Profiling and Budget Allocation
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import asyncio
+      import time
+      from dataclasses import dataclass, field
+      from typing import Callable, Dict, List, Optional
+
+      import numpy as np
+
+
+      @dataclass
+      class ComponentLatency:
+          name: str
+          p50_ms: float
+          p95_ms: float
+          p99_ms: float
+          mean_ms: float
+          n_samples: int
+
+
+      @dataclass
+      class BudgetReport:
+          components: List[ComponentLatency]
+          total_p99_ms: float
+          budget_ms: float
+          headroom_ms: float
+          slo_met: bool
+
+
+      class LatencyProfiler:
+          '''
+          Profiles P50/P95/P99 latency across inference components.
+          Load-testing mode runs concurrent requests for realistic contention measurement.
+          '''
+
+          def __init__(self, budget_ms: float = 50.0) -> None:
+              self.budget_ms = budget_ms
+              self._samples: Dict[str, List[float]] = {}
+
+          def record(self, component: str, latency_ms: float) -> None:
+              self._samples.setdefault(component, []).append(latency_ms)
+
+          def profile_component(
+              self,
+              name: str,
+              fn: Callable,
+              inputs: List,
+              n_warmup: int = 5,
+              n_measure: int = 200,
+          ) -> ComponentLatency:
+              for x in inputs[:n_warmup]:
+                  fn(x)
+              latencies = []
+              for i in range(n_measure):
+                  x = inputs[i % len(inputs)]
+                  t0 = time.perf_counter()
+                  fn(x)
+                  latencies.append((time.perf_counter() - t0) * 1000)
+              return self._summarise(name, latencies)
+
+          async def load_test(
+              self,
+              name: str,
+              async_fn: Callable,
+              model_input,
+              concurrency: int = 20,
+              n_requests: int = 500,
+          ) -> ComponentLatency:
+              '''Run concurrent requests to measure latency under contention.'''
+              latencies: List[float] = []
+              semaphore = asyncio.Semaphore(concurrency)
+
+              async def one_request():
+                  async with semaphore:
+                      t0 = time.perf_counter()
+                      await async_fn(model_input)
+                      latencies.append((time.perf_counter() - t0) * 1000)
+
+              await asyncio.gather(*[one_request() for _ in range(n_requests)])
+              return self._summarise(name, latencies)
+
+          def _summarise(self, name: str, latencies: List[float]) -> ComponentLatency:
+              arr = np.array(latencies)
+              return ComponentLatency(
+                  name=name,
+                  p50_ms=float(np.percentile(arr, 50)),
+                  p95_ms=float(np.percentile(arr, 95)),
+                  p99_ms=float(np.percentile(arr, 99)),
+                  mean_ms=float(arr.mean()),
+                  n_samples=len(arr),
+              )
+
+          def budget_report(self, components: List[ComponentLatency]) -> BudgetReport:
+              # For parallel components, the end-to-end P99 is measured separately;
+              # here we report the dominant components and the measured end-to-end.
+              total_p99 = max((c.p99_ms for c in components), default=0.0)
+              return BudgetReport(
+                  components=components,
+                  total_p99_ms=total_p99,
+                  budget_ms=self.budget_ms,
+                  headroom_ms=self.budget_ms - total_p99,
+                  slo_met=total_p99 <= self.budget_ms,
+              )
+
+          def print_report(self, report: BudgetReport) -> None:
+              print(f'\nLatency Budget Report (SLO: {report.budget_ms:.0f}ms P99)')
+              print('=' * 70)
+              fmt = '{:<22} {:>8} {:>8} {:>8} {:>8}'
+              print(fmt.format('Component', 'P50', 'P95', 'P99', 'Mean'))
+              print('-' * 70)
+              for c in report.components:
+                  print(fmt.format(
+                      c.name,
+                      f'{c.p50_ms:.1f}', f'{c.p95_ms:.1f}',
+                      f'{c.p99_ms:.1f}', f'{c.mean_ms:.1f}',
+                  ))
+              print('-' * 70)
+              print(f'  End-to-end P99: {report.total_p99_ms:.1f}ms')
+              print(f'  Headroom:       {report.headroom_ms:.1f}ms')
+              print(f'  SLO met:        {report.slo_met}')
+              if not report.slo_met:
+                  print('  WARN: P99 exceeds the budget. Optimise the dominant component '
+                        'or add load shedding.')
+
+
+      if __name__ == '__main__':
+          profiler = LatencyProfiler(budget_ms=50.0)
+
+          def feature_pipeline(x):
+              time.sleep(0.003)
+              return None
+
+          def detector_parallel(x):
+              time.sleep(0.013)  # max of parallel detectors
+              return None
+
+          components = [
+              profiler.profile_component('feature_pipeline', feature_pipeline, ['req'], n_measure=100),
+              profiler.profile_component('detector_set_parallel', detector_parallel, ['req'], n_measure=100),
+          ]
+          # Approximate end-to-end as the sum of sequential stages (feature + detector)
+          e2e = ComponentLatency(
+              name='end_to_end',
+              p50_ms=sum(c.p50_ms for c in components),
+              p95_ms=sum(c.p95_ms for c in components),
+              p99_ms=sum(c.p99_ms for c in components),
+              mean_ms=sum(c.mean_ms for c in components),
+              n_samples=100,
+          )
+          report = profiler.budget_report(components + [e2e])
+          profiler.print_report(report)
+
+  deliverable_5:
+    title: 'Warm-Up Manager'
+    filename: 'warm_up_manager.py'
+    description: 'Model pre-loading and warm-up for cold start prevention. Runs synthetic inference through every detector and the feature pipeline at startup, triggering lazy initialisation and graph compilation, and reports when all models are warm and the instance is ready to accept traffic.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: numpy. Run at instance startup before the readiness probe passes.'
+    code: |
+      # warm_up_manager.py
+      # Section 12.12: Model Warm-Up for Cold Start Prevention
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import time
+      from dataclasses import dataclass, field
+      from typing import Callable, Dict, List, Optional
+
+      import numpy as np
+
+
+      @dataclass
+      class WarmUpResult:
+          model_name: str
+          n_warmup_calls: int
+          cold_latency_ms: float
+          warm_latency_ms: float
+          speedup: float
+
+
+      @dataclass
+      class WarmUpReport:
+          results: List[WarmUpResult]
+          total_warmup_ms: float
+          all_warm: bool
+
+
+      class WarmUpManager:
+          '''
+          Pre-loads and warms all detectors and the feature pipeline before the
+          instance accepts production traffic.
+
+          Run at startup. The readiness probe must not pass until warm-up completes,
+          so that the first production request hits warm models.
+          '''
+
+          def __init__(self, n_warmup_calls: int = 10, warm_threshold_ratio: float = 2.0) -> None:
+              self.n_warmup_calls = n_warmup_calls
+              self.warm_threshold_ratio = warm_threshold_ratio
+              self._registered: List[tuple] = []  # (name, warmup_fn, sample_input)
+
+          def register(self, name: str, warmup_fn: Callable, sample_input) -> None:
+              '''Register a model to warm up. warmup_fn(sample_input) runs one inference.'''
+              self._registered.append((name, warmup_fn, sample_input))
+
+          def warm_up_one(
+              self,
+              name: str,
+              warmup_fn: Callable,
+              sample_input,
+          ) -> WarmUpResult:
+              # First (cold) call
+              t0 = time.perf_counter()
+              warmup_fn(sample_input)
+              cold_latency = (time.perf_counter() - t0) * 1000
+
+              # Subsequent (warming) calls
+              warm_latencies = []
+              for _ in range(self.n_warmup_calls - 1):
+                  t = time.perf_counter()
+                  warmup_fn(sample_input)
+                  warm_latencies.append((time.perf_counter() - t) * 1000)
+
+              warm_latency = float(np.median(warm_latencies)) if warm_latencies else cold_latency
+              return WarmUpResult(
+                  model_name=name,
+                  n_warmup_calls=self.n_warmup_calls,
+                  cold_latency_ms=cold_latency,
+                  warm_latency_ms=warm_latency,
+                  speedup=cold_latency / max(warm_latency, 1e-9),
+              )
+
+          def warm_up_all(self) -> WarmUpReport:
+              t0 = time.perf_counter()
+              results = []
+              for name, fn, sample in self._registered:
+                  result = self.warm_up_one(name, fn, sample)
+                  results.append(result)
+                  print(f'  Warmed {name}: cold={result.cold_latency_ms:.1f}ms '
+                        f'-> warm={result.warm_latency_ms:.1f}ms '
+                        f'({result.speedup:.1f}x)')
+
+              # All warm if the final warm latency is stable (no remaining cold effect)
+              all_warm = all(r.warm_latency_ms <= r.cold_latency_ms for r in results)
+              return WarmUpReport(
+                  results=results,
+                  total_warmup_ms=(time.perf_counter() - t0) * 1000,
+                  all_warm=all_warm,
+              )
+
+          def is_ready(self) -> bool:
+              '''Readiness probe: returns True after warm-up completes.'''
+              report = self.warm_up_all()
+              return report.all_warm
+
+
+      if __name__ == '__main__':
+          manager = WarmUpManager(n_warmup_calls=10)
+
+          # Simulate models with cold-start penalty
+          class MockModel:
+              def __init__(self, cold_ms, warm_ms):
+                  self.calls = 0
+                  self.cold_ms = cold_ms
+                  self.warm_ms = warm_ms
+              def predict(self, x):
+                  latency = self.cold_ms if self.calls == 0 else self.warm_ms
+                  self.calls += 1
+                  time.sleep(latency / 1000.0)
+                  return 0.5
+
+          bert = MockModel(cold_ms=60, warm_ms=7)
+          gru = MockModel(cold_ms=30, warm_ms=12)
+          embed = MockModel(cold_ms=20, warm_ms=3)
+
+          manager.register('distilbert', bert.predict, 'sample input')
+          manager.register('gru', gru.predict, 'sample input')
+          manager.register('embedding', embed.predict, 'sample input')
+
+          print('Warming up models...')
+          report = manager.warm_up_all()
+          print(f'\nTotal warm-up: {report.total_warmup_ms:.0f}ms')
+          print(f'All models warm: {report.all_warm}')
+          print('Instance ready to accept traffic.' if report.all_warm
+                else 'WARN: warm-up incomplete; do not accept traffic.')
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Optimising for mean latency and ignoring the P99 tail, deploying a system that looks fast on average but breaches the SLO under load'
+    why_it_happens: |
+      The engineer measures the mean inference latency, observes 12ms, and concludes the
+      system is well within the 50ms budget. The mean is the most intuitive metric and the
+      first one most profilers report. The P99 is not measured because the mean looks fine.
+    consequence: |
+      The mean of 12ms hides a P99 of 80ms caused by occasional GC pauses, cold caches, and
+      CPU contention under load. The 1% of requests at 80ms exceed the SLO and produce
+      timeouts, concentrated during peak load. The product team observes the SLO breach and
+      disables the detection layer to recover it, leaving the system unprotected during exactly
+      the high-load periods when attacks are most likely.
+    correct_approach: |
+      Measure and optimise for P99, not mean. The latency_profiler.py reports P50, P95, and
+      P99, and the budget report validates against the P99 SLO. Profile under load (the
+      load_test mode) to capture the contention effects that inflate the tail. A low mean with
+      a high P99 is worse than a slightly higher mean with a controlled P99.
+
+  mistake_2:
+    description: 'Running the four detectors sequentially instead of in parallel, summing their latencies and exceeding the budget'
+    why_it_happens: |
+      The straightforward implementation calls each detector in turn: score the Isolation
+      Forest, then the Random Forest, then the GRU, then the DistilBERT, accumulating the
+      results. This is the obvious way to write the code and it works correctly -- just slowly.
+    consequence: |
+      The sequential execution takes the sum of the detector latencies, around 35ms, plus the
+      5ms feature pipeline, for 40ms before network overhead. Under load with the contention
+      effects, the P99 exceeds 50ms and the SLO is breached. The detectors are individually
+      fast enough but their sequential composition is not.
+    correct_approach: |
+      Run the detectors in parallel with the async_detector_runner.py. The detectors are
+      independent, so they can run concurrently, and the ensemble latency becomes the maximum
+      (around 15ms) rather than the sum (around 35ms). The thread pool executor provides true
+      CPU parallelism for the numeric inference that releases the GIL.
+
+  mistake_3:
+    description: 'Applying early exit on the benign direction with an aggressive threshold, skipping detectors and missing attacks'
+    why_it_happens: |
+      Early exit on the block direction works well, so the engineer extends it to the benign
+      direction: if the fast detectors produce low scores, skip the expensive DistilBERT and
+      pass the request. The benign early exit threshold is set at the same level as the block
+      threshold for symmetry.
+    consequence: |
+      A subtle attack that the fast detectors score low but the DistilBERT would have caught
+      is passed without the DistilBERT check, because the benign early exit fired. The asymmetry
+      of the costs is ignored: a missed attack is more costly than a false positive, so skipping
+      detectors on the benign direction trades away detection coverage for latency that the
+      block-direction early exit already provided.
+    correct_approach: |
+      Use a conservative benign early exit threshold, or disable benign early exit entirely for
+      high-security deployments. The inference_optimizer.py defaults enable_benign_early_exit
+      to False. Block-direction early exit is safe because a high-confidence attack signal is
+      robust; benign early exit risks missing attacks the fast detectors underscore.
+
+  mistake_4:
+    description: 'Not warming up the models before accepting traffic, so the first production requests hit cold models and time out'
+    why_it_happens: |
+      The deployment loads the models and immediately marks the instance ready. The models are
+      cold -- uncompiled graphs, unallocated buffers, empty caches. The readiness probe passes
+      as soon as the models are loaded, not when they are warm.
+    consequence: |
+      The first production requests hit cold models and experience the 50-100ms cold latency,
+      exceeding the SLO and timing out. This is worst during scale-up under load: new instances
+      added to handle increased traffic are cold exactly when the load is highest, producing
+      latency spikes when the system can least afford them.
+    correct_approach: |
+      Run the warm_up_manager.py at startup and gate the readiness probe on warm-up completion.
+      The instance accepts traffic only after every model has been warmed with synthetic
+      inference calls that trigger the lazy initialisation. The first production request then
+      hits a warm model. Warm-up must cover all models and all code paths.
+
+  mistake_5:
+    description: 'Assuming the optimisation worked without profiling, deploying an optimisation that reduces mean latency but increases the P99 tail'
+    why_it_happens: |
+      The engineer applies an optimisation (a caching layer, a batching change) that intuitively
+      should reduce latency. The change is deployed without profiling because it is obviously
+      an improvement. The optimisation reduces the mean but introduces variance that inflates
+      the tail.
+    consequence: |
+      A caching layer that reduces the mean latency (cache hits are fast) but produces a slow
+      tail (cache misses trigger a slow recomputation, and cache contention under load adds
+      variance) makes the P99 worse even as the mean improves. The optimisation is deployed
+      believing it helped, but the SLO is now at greater risk than before, and the regression
+      is discovered only when the SLO breaches under load.
+    correct_approach: |
+      Validate every optimisation against the latency_profiler.py before and after, comparing
+      the P99 specifically. An optimisation is an improvement only if it reduces or maintains
+      the P99, not just the mean. Profile under load to capture the variance effects. The
+      profiler is the gate that catches optimisations that trade tail latency for mean latency.
+
+section_summary:
+
+  compact: |
+    Inference optimisation is the production survival requirement for ML-based detection: four
+    detectors run sequentially consume around 40ms, breaching the 50ms P99 SLO, and a detection
+    system that breaches the SLO is disabled under load. Three techniques fit the ensemble within
+    budget. INT8 quantisation reduces DistilBERT from 15ms to 5-7ms and 265MB to 65MB with under
+    0.5% accuracy regression; dynamic quantisation is the default, static when the marginal latency
+    matters. Async parallel scoring runs the four detectors as concurrent coroutines so the
+    ensemble latency is the maximum (around 15ms) rather than the sum (around 35ms), with
+    per-detector timeout and fallback capping the worst case. Early exit blocks on the fastest
+    decisive detector when its calibrated score exceeds a high-certainty threshold, returning a
+    decision in 1-3ms; benign early exit is conservative or disabled because a missed attack is
+    costlier than a false positive. Model warm-up prevents cold-start latency spikes by triggering
+    lazy initialisation before traffic. Every optimisation is validated against the P99 profiler,
+    not assumed to work, because an optimisation that reduces the mean but inflates the tail makes
+    the SLO worse.
+
+  key_takeaways:
+    - 'The latency budget is a security constraint: a detection system that breaches the 50ms P99 SLO is disabled under load, and a disabled detector provides zero protection -- inference optimisation keeps the detector running'
+    - 'Optimise for P99, not mean -- the worst-case 1% of requests determine whether the SLO holds, and a low mean with a high P99 tail still triggers timeouts under load'
+    - 'Async parallel scoring makes the ensemble latency the maximum of the four detectors (around 15ms) rather than the sum (around 35ms); per-detector timeout and fallback cap the worst case'
+    - 'INT8 quantisation reduces DistilBERT from 15ms to 5-7ms with under 0.5% accuracy regression -- but measure the regression with the accuracy test rather than assuming it is negligible'
+    - 'Block-direction early exit is safe (a high-confidence attack signal is robust); benign early exit is conservative or disabled because a missed attack is costlier than a false positive'
+    - 'Validate every optimisation against the P99 profiler before and after -- an optimisation that reduces the mean but inflates the tail makes the SLO worse, and only profiling reveals this'
+
+preview_section_12_13:
+  title: 'Section 12.13: Model Registry and Versioning -- Staging, Production, and Rollback'
+  summary: |
+    Section 12.13 builds the model registry that governs the lifecycle of every detector in
+    Chapter 12. A trained, calibrated, optimised model is not production-ready until it passes
+    the registry stage gates: the model card from Section 12.08, the calibration and threshold
+    from Section 12.10, the schema version from Section 12.11, and the latency validation from
+    Section 12.12 are all stage transition gate conditions. The registry tracks model versions
+    through Staging, Production, and Archived stages, stores the full lineage (training code,
+    dataset version, feature schema) needed to reproduce any model, and supports the canary
+    promotion and instant rollback that make model updates safe. Shadow mode runs a candidate
+    model alongside the production model without affecting decisions, validating the candidate
+    on live traffic before promotion. The registry is the control plane that prevents an untested
+    or regressed model from reaching production.
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 11 Section 11.13: seven-track gateway -- the 50ms P99 budget allocated across tracks'
+    - 'Chapter 11 Section 11.16: gateway performance -- the latency SLO and the consequence of breaching it'
+    - 'Section 12.05: supervised classification -- the Random Forest and XGBoost in the parallel detector set'
+    - 'Section 12.06: sequence models -- the GRU in the parallel detector set'
+    - 'Section 12.08: neural classifier -- the DistilBERT INT8 quantisation expanded in this section'
+    - 'Section 12.11: production feature pipeline -- the sub-5ms feature extraction budgeted around here'
+  forward_references:
+    - 'Section 12.13: model registry -- latency validation is a stage transition gate condition'
+    - 'Section 12.15: four-detector ensemble -- the async scoring architecture is the ensemble execution layer'
+    - 'Section 12.16: benchmarking -- the latency profiler measures cross-detector comparisons'
+    - 'Section 12.17: production gateway capstone -- the full optimised inference path integrated'
+  tags:
+    - inference-optimisation
+    - int8-quantisation
+    - async-parallel-scoring
+    - early-exit
+    - p99-latency
+    - latency-budget
+    - model-warmup
+    - cold-start
+    - onnx-runtime
+    - dynamic-quantisation
+    - static-quantisation
+    - latency-profiling
+    - thread-pool-executor
+    - timeout-fallback
