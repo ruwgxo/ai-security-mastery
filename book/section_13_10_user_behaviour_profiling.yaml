@@ -1,0 +1,785 @@
+# section_13_10_user_behaviour_profiling.yaml
+
+---
+document_info:
+  title: 'User Behaviour Profiling: Entity Fingerprints and Persistent Risk Scoring'
+  chapter: 13
+  section: 10
+  section_code: '1310'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-21'
+  estimated_pages: 6
+  estimated_reading_time: '45-55 minutes'
+
+section_overview:
+  one_line_summary: 'A request scored in isolation throws away its most informative context -- the requester history; Section 13.10 builds the persistent entity profile, behavioural fingerprint, and decaying risk score that make history a first-class input, detect account compromise as fingerprint divergence, and bridge the session family to the graph family.'
+  why_this_section_exists: |
+    Every detector so far has scored an entity's current activity -- this session, this window, this
+    rate. None has made the entity's accumulated history a first-class input. Section 13.10 builds that.
+    The argument is that a request scored in isolation discards the single most informative piece of
+    context available: who is making it and what they have done before. The same request from an entity
+    with a clean year-long history and from an entity flagged for enumeration last week is not the same
+    request, and a detector that scores both identically is throwing away the history that distinguishes
+    them.
+
+    The persistent entity profile is the structure that retains that history. It aggregates the session
+    and window signals of the preceding sections into a durable per-entity record: the entity's
+    baselines, its history of risk events, and its behavioural fingerprint -- the stable signature of how
+    it normally uses the service. This profile turns the many transient per-session signals into a
+    persistent entity-level risk score that the rate limiter of 13.08 reads inline and the gateway of
+    13.11 incorporates into every verdict.
+
+    The profile also enables a detection that no current-activity detector can make: account compromise
+    as fingerprint divergence. A compromised account's requests may be individually plausible, but
+    collectively they no longer match how that specific entity has always behaved. The divergence from
+    the entity's own established fingerprint -- not from a global norm -- is the compromise signal, and
+    it is distinct from an account that was always malicious. Building this requires entity resolution to
+    link the same actor across credentials, sessions, and sources, and the profile is the bridge from
+    session-level detection to the graph-level detection of 13.11, which operates on the entities this
+    section defines.
+  position_in_chapter: |
+    Section 13.10 is the culmination of the entity family, aggregating the signals of every preceding
+    detector -- session threat from 13.09, rate abuse from 13.07, injection success from 13.06, temporal
+    anomalies from 13.04 -- into a persistent entity risk score and behavioural fingerprint. It produces
+    the risk score that the smart rate limiter of 13.08 reads inline and closes the feedback loop with
+    it. It is the bridge to the graph family: graph-based detection in 13.11 operates on entities and
+    their relationships, and the entity profile and entity resolution built here define those entities.
+    It precedes the graph detection and capstone of 13.11 that consume it.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain why a request scored in isolation discards its most informative context -- the requester history'
+    - 'Describe entity-level behavioural fingerprinting and the stable signature of normal entity use'
+    - 'Describe the persistent entity profile schema: aggregated baselines, historical risk events, and fingerprint'
+    - 'Explain cross-session risk scoring and how signals from many sessions integrate into one persistent score'
+    - 'Explain risk-score decay and reinforcement and why both are required for fairness and effectiveness'
+    - 'Describe account-compromise detection through fingerprint divergence and how it differs from an always-malicious account'
+    - 'Explain entity resolution and why it links the same actor across credentials, sessions, and sources'
+
+  skills:
+    - 'Build a persistent entity profile aggregating session, rate, and temporal signals'
+    - 'Compute a behavioural fingerprint for an entity from its stable usage signature'
+    - 'Maintain a cross-session risk score with decay and reinforcement dynamics'
+    - 'Detect account compromise through divergence from the entity own fingerprint'
+    - 'Resolve the same actor across credentials, sessions, and sources'
+
+  security_mindset:
+    - 'Internalise that entity history is the most informative discarded context and that profiling recovers it as a first-class input'
+    - 'Recognise that account compromise is divergence from the entity own fingerprint, distinct from an account that was always malicious'
+    - 'Understand that risk-score decay is a fairness requirement: a clean entity must be able to recover from a false positive'
+    - 'Treat the entity profile as the bridge to graph detection: graph analysis operates on the entities and links this section defines'
+
+prerequisites:
+  - 'Chapter 13 Section 13.03: statistical baselines -- the per-entity baselines the profile aggregates'
+  - 'Chapter 13 Section 13.04: time-series anomaly detection -- the temporal signals folded into the profile'
+  - 'Chapter 13 Section 13.06: model behaviour monitoring -- the injection-success signal that elevates entity risk'
+  - 'Chapter 13 Section 13.07: rate-based detection -- the rate-abuse signal folded into the profile'
+  - 'Chapter 13 Section 13.09: multi-turn context analysis -- the session threat signal folded into the profile'
+
+prose_content:
+
+  part_1:
+    title: 'History Is the Most Informative Discarded Context'
+    body: |
+      A per-request detector scores a request from its content and immediate context. A session detector
+      scores a session from its turns. Each is bounded to the current activity, and each discards the same
+      thing: the requester's accumulated history. This is the most informative context available about a
+      request, and scoring without it is scoring with less information than the system has.
+
+      Consider two entities making the identical request. One has a year-long clean history: consistent
+      legitimate use, no risk events, a stable fingerprint. The other was flagged last week for systematic
+      enumeration and carries a history of rate-abuse signals. The request itself is identical, so any
+      detector that scores only the request scores both identically. But they are not the same situation:
+      the request from the flagged entity is far more likely to be part of a continuing campaign, and the
+      request from the clean entity is far more likely to be legitimate. The history is exactly what
+      distinguishes them, and a detector that ignores it cannot make the distinction the available
+      information supports.
+
+      User behaviour profiling makes the history a first-class input. It maintains a persistent record of
+      each entity's behaviour -- baselines, risk events, fingerprint -- and exposes a current risk score
+      that every other detector and the gateway can read. The same request is then scored in the context
+      of the requester: elevated for an entity with a suspicious history, given more benefit of the doubt
+      for an entity with a clean one. This is not a new detector for a new attack class; it is the
+      mechanism that lets every existing detector incorporate the history that sharpens its verdict, and
+      it is the entity family's central contribution -- the persistence that turns transient signals into a
+      durable understanding of each actor.
+
+  part_2:
+    title: 'The Behavioural Fingerprint'
+    body: |
+      The behavioural fingerprint is the stable signature of how an entity normally uses the service: the
+      characteristic pattern that distinguishes this entity from others and remains consistent over time
+      for a given legitimate entity. It is built from the same behavioural features the rest of the chapter
+      produces, aggregated into a stable per-entity signature: typical request rate and its rhythm, usual
+      endpoints and their mix, characteristic session length and structure, typical time-of-day activity,
+      usual topics and request types, the regularity or irregularity of timing.
+
+      The fingerprint is distinct from the baseline in its purpose. The baseline of 13.03 captures the
+      normal range of each metric for deviation scoring; the fingerprint captures the entity's overall
+      behavioural identity as a stable whole, for the purpose of recognising when an entity stops behaving
+      like itself. A legitimate entity's fingerprint is stable: it uses the service in a characteristic way
+      that persists across sessions and weeks. Two legitimate entities have different fingerprints -- a
+      batch integration and an interactive user behave differently -- and each is consistent with its own
+      fingerprint over time.
+
+      The fingerprint's stability is what makes it useful for compromise detection in Part 5. Because a
+      legitimate entity behaves consistently with its fingerprint, a sudden, broad divergence from the
+      fingerprint is anomalous in a way that a deviation in any single metric is not. The fingerprint
+      captures the entity's behavioural identity across many dimensions at once, so a compromise that
+      changes the entity's behaviour across several dimensions -- different endpoints, different timing,
+      different request types -- shows as a fingerprint divergence even if no single dimension's deviation
+      is extreme. Building the fingerprint requires aggregating the entity's behaviour into a stable
+      multi-dimensional signature and tracking how consistently current behaviour matches it.
+
+  part_3:
+    title: 'The Persistent Profile and Cross-Session Risk Scoring'
+    body: |
+      The persistent entity profile is the durable record that holds everything the system knows about an
+      entity across all of its activity. Its schema has three parts. The aggregated baselines are the
+      entity's per-metric baselines from 13.03, persisted so they survive across sessions and inform every
+      future verdict. The historical risk events are the record of the entity's flagged behaviour: the
+      sessions that crossed the threat accumulator, the rate-abuse signals, the injection-success
+      detections, each with a timestamp and severity. The behavioural fingerprint is the stable signature
+      of Part 2. Together these constitute a persistent, queryable understanding of the entity that
+      accumulates over its lifetime.
+
+      The cross-session risk score integrates the entity's risk signals from across all its sessions into a
+      single number. Each session and each window contributes risk signals -- a high session threat
+      accumulator, a rate-abuse detection, an injection success, a temporal anomaly -- and the cross-
+      session risk score combines them into a persistent measure of how suspicious the entity is overall.
+      This integration is what the smart rate limiter reads to weight its limit and what the gateway reads
+      to inform its verdict. A single suspicious session contributes to the score but does not by itself
+      determine it; an entity with a pattern of suspicious sessions across weeks accumulates a high score
+      that reflects the sustained pattern, not any single event.
+
+      The cross-session risk score is computed off the request hot path and exposed as a compact inline
+      value, per the 13.01 state-latency coupling. The persistent profile -- baselines, risk-event history,
+      fingerprint -- is large state that cannot be queried at full depth on the request path, so it is
+      updated asynchronously as sessions close and signals arrive, and it is summarised into the single
+      risk score that the hot path reads cheaply. This is the same pattern as every entity-family detector:
+      the expensive analysis runs off the hot path, and the request path reads a precomputed summary. The
+      risk score is the entity family's contribution to the inline verdict, the distilled output of the
+      whole persistent profile.
+
+  part_4:
+    title: 'Decay and Reinforcement: Fairness and Effectiveness'
+    body: |
+      A risk score that only ever rises is both unfair and ineffective, and the dynamics of how the score
+      changes over time -- decay and reinforcement -- are as important as how it is computed. Both are
+      required, and for distinct reasons.
+
+      Decay is a fairness requirement. False positives are inevitable: every detector occasionally flags a
+      legitimate entity, and a legitimate entity occasionally behaves in a way that looks suspicious. If a
+      single false-positive risk event permanently elevated an entity's risk score, the entity would be
+      treated as suspicious forever -- tighter rate limits, more scrutiny -- for a one-time anomaly that was
+      not actually an attack. This is unfair to legitimate entities and degrades their experience
+      indefinitely. Decay resolves this: risk contributions fade over time, so an isolated risk event
+      raises the score temporarily and then decays away as the entity returns to normal behaviour. A clean
+      entity recovers from a false positive, which it must be able to do.
+
+      Reinforcement is an effectiveness requirement. A repeat offender -- an entity that exhibits suspicious
+      behaviour repeatedly across time -- should accumulate a high, durable risk score that reflects the
+      sustained pattern, not have each event decay independently as if unrelated. Reinforcement makes
+      repeated risk events compound: an entity flagged again while still carrying decayed risk from a prior
+      event accumulates faster and reaches a higher, more persistent score than the events would produce in
+      isolation. The pattern of repeated suspicion is itself a signal, stronger than any single event, and
+      reinforcement captures it.
+
+      The two dynamics together produce the desired behaviour: an isolated event decays and the entity
+      recovers, while a sustained pattern reinforces and the entity accumulates durable risk. The
+      calibration between them is the tuning decision -- how fast decay erodes an isolated event versus how
+      strongly reinforcement compounds a repeated one -- and it is set so that a genuinely reformed or
+      false-flagged entity recovers within a reasonable window while a persistent offender does not escape
+      its history by simply waiting. This is the same fairness-effectiveness balance that governs any
+      reputation system, applied to the behavioural risk score.
+
+  part_5:
+    title: 'Account Compromise as Fingerprint Divergence'
+    body: |
+      The fingerprint enables a detection that no current-activity detector can make: account compromise.
+      When a legitimate account is compromised -- credentials stolen, session hijacked -- the attacker's use
+      of it is often not individually anomalous. Each request the attacker makes may be plausible, within
+      normal rate, on normal endpoints. What is anomalous is that the account is no longer behaving like
+      itself: the attacker uses it differently than the legitimate owner always has, across multiple
+      dimensions, even if each dimension's deviation is modest.
+
+      Fingerprint-divergence detection catches this. The legitimate account has a stable fingerprint built
+      over its history, and a compromise produces a broad divergence from that fingerprint: different
+      endpoints, different timing, different request types, a different rhythm -- the attacker's behavioural
+      identity rather than the owner's. The divergence is measured against the entity's own fingerprint, not
+      a global norm, which is what makes it specific: the attacker's behaviour might be perfectly normal for
+      some other entity, but it is anomalous for this entity, whose established fingerprint it does not
+      match. The signal is the gap between current behaviour and the entity's own historical identity.
+
+      This is distinct from detecting an account that was always malicious, which is a different problem. An
+      always-malicious account has no clean fingerprint to diverge from -- it was suspicious from the start,
+      and the rate, coverage, and session detectors catch it on its current behaviour. Fingerprint
+      divergence specifically catches the takeover of a previously-legitimate account, where the account's
+      own clean history is the reference that makes the new behaviour stand out. It is the highest-value
+      use of the persistent fingerprint, because account takeover is otherwise hard to detect: the attacker
+      inherits the account's accumulated trust and clean history, and only the divergence from that history
+      reveals that the account is no longer driven by its legitimate owner. A sharp, broad fingerprint
+      divergence is the account-compromise alert, and it sharply elevates the entity's risk score.
+
+  part_6:
+    title: 'Entity Resolution and the Bridge to Graph Detection'
+    body: |
+      All of the profiling above assumes the system can attribute activity to an entity, but the same actor
+      can operate through multiple credentials, sessions, and sources, and a naive per-credential view
+      fragments one actor into many partial profiles. Entity resolution links these together: it recognises
+      that several credentials, sessions, or sources belong to the same underlying actor, and consolidates
+      their activity into one profile.
+
+      Entity resolution matters for both profiling and the graph bridge. For profiling, fragmenting one
+      actor across many partial identities means each partial profile has too little history to be useful,
+      and an actor can evade accumulated risk by spreading activity across identities so no single one
+      accumulates a high score -- the same distributed evasion from 13.07, applied to the profile. Resolving
+      the identities into one actor consolidates the history so the actor's full behaviour and accumulated
+      risk are scored together. The resolution uses shared attributes -- common source, credential family,
+      behavioural fingerprint similarity, session linkage -- to link identities, with the fingerprint itself
+      being a strong linker because the same actor tends to have a similar behavioural signature across its
+      identities.
+
+      Entity resolution is also the bridge from the entity family to the graph family. Graph-based detection
+      in 13.11 operates on entities and the relationships between them, and those entities are exactly the
+      resolved actors this section defines, with the linking attributes -- shared source, credential,
+      fingerprint similarity, timing -- being the edges the graph detector analyses. The entity profile
+      provides the nodes; entity resolution provides the first-order edges; and the graph detector develops
+      these into the full relationship analysis that catches coordinated networks. Where entity resolution
+      links identities that are clearly the same actor, the graph detector finds the looser coordination
+      between distinct actors that share infrastructure or synchronise behaviour without being the same
+      actor. The persistent profile, the fingerprint, and entity resolution are thus both the culmination of
+      the entity family and the foundation the graph family is built on -- the entity risk score feeds the
+      inline verdict, and the entity definitions and links feed the graph. The profile's risk score flows to
+      the rate limiter of 13.08 and the gateway of 13.11, the fingerprint divergence feeds the compromise
+      alert, and the resolved entities and their links become the graph that 13.11 analyses.
+
+reference_materials:
+
+  table_1:
+    title: 'Why History Sharpens the Verdict'
+    description: 'How the same request is scored differently by entity history, showing why profiling recovers the discarded context'
+    columns: ['Entity History', 'The Same Request Is', 'Profiling Effect']
+    rows:
+      - ['Year-long clean record', 'Likely legitimate', 'Benefit of the doubt; looser limit']
+      - ['Flagged for enumeration last week', 'Likely campaign continuation', 'Elevated scrutiny; tighter limit']
+      - ['No history (new entity)', 'Unknown', 'Scored against cohort prior (13.03 cold start)']
+      - ['Sharp fingerprint divergence', 'Possible account takeover', 'Compromise alert; sharply elevated risk']
+
+  table_2:
+    title: 'Persistent Entity Profile Schema'
+    description: 'The three components of the persistent entity profile and what each contributes'
+    columns: ['Component', 'Contents', 'Source', 'Used For']
+    rows:
+      - ['Aggregated baselines', 'Per-metric baselines persisted across sessions', 'Section 13.03', 'Deviation scoring; adaptive limits']
+      - ['Historical risk events', 'Timestamped flagged behaviour with severity', 'Sections 13.04/13.06/13.07/13.09', 'Cross-session risk score']
+      - ['Behavioural fingerprint', 'Stable multi-dimensional usage signature', 'Aggregated behaviour', 'Compromise detection; entity resolution']
+
+  table_3:
+    title: 'Decay vs Reinforcement'
+    description: 'The two risk-score dynamics, what each is required for, and the behaviour each produces'
+    columns: ['Dynamic', 'Required For', 'Applies To', 'Behaviour Produced']
+    rows:
+      - ['Decay', 'Fairness', 'Isolated risk events', 'Clean entity recovers from a false positive']
+      - ['Reinforcement', 'Effectiveness', 'Repeated risk events', 'Repeat offender accumulates durable risk']
+      - ['Calibration', 'Balance', 'The rate of each', 'Reformed entity recovers; persistent offender does not escape history']
+
+  table_4:
+    title: 'Fingerprint Divergence vs Always-Malicious Account'
+    description: 'How account-compromise detection through fingerprint divergence differs from detecting an account that was always malicious'
+    columns: ['Property', 'Account Compromise', 'Always-Malicious Account']
+    rows:
+      - ['Prior history', 'Clean, stable fingerprint', 'Suspicious from the start']
+      - ['Detection signal', 'Divergence from own fingerprint', 'Current rate/coverage/session behaviour']
+      - ['Reference', 'The entity own history', 'Global norms and current activity']
+      - ['Detected by', 'Fingerprint-divergence (this section)', 'Rate (13.07), session (13.09), etc.']
+      - ['Difficulty', 'High -- attacker inherits clean history', 'Lower -- behaviour is suspicious directly']
+
+deliverables:
+
+  deliverable_1:
+    title: 'User Behaviour Profiler'
+    filename: 'user_behaviour_profiler.py'
+    description: 'Maintains the persistent entity profile -- aggregated baselines, historical risk events, and behavioural fingerprint -- and computes the cross-session risk score from accumulated signals. Implements the persistent profile and cross-session scoring from Section 13.10 Parts 2 and 3.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # user_behaviour_profiler.py
+      # Section 13.10: User Behaviour Profiler (Persistent Entity Profile)
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import Dict, List, Tuple
+
+
+      @dataclass
+      class RiskEvent:
+          timestamp: float
+          kind: str
+          severity: float   # in [0, 1]
+
+
+      @dataclass
+      class Fingerprint:
+          # stable multi-dimensional usage signature
+          mean_rate_per_min: float = 0.0
+          endpoint_mix: Dict[str, float] = field(default_factory=dict)
+          mean_session_len: float = 0.0
+          active_hours: Tuple[int, int] = (9, 18)
+
+
+      @dataclass
+      class EntityProfile:
+          entity_id: str
+          fingerprint: Fingerprint = field(default_factory=Fingerprint)
+          risk_events: List[RiskEvent] = field(default_factory=list)
+          baseline_rate_per_min: float = 0.0
+
+          def add_risk_event(self, event: RiskEvent) -> None:
+              self.risk_events.append(event)
+
+
+      class UserBehaviourProfiler:
+          def __init__(self) -> None:
+              self.profiles: Dict[str, EntityProfile] = {}
+
+          def get(self, entity_id: str) -> EntityProfile:
+              if entity_id not in self.profiles:
+                  self.profiles[entity_id] = EntityProfile(entity_id)
+              return self.profiles[entity_id]
+
+          def cross_session_risk(self, entity_id: str, now: float, half_life_s: float = 604800.0) -> float:
+              # Decayed sum of risk-event severities (half-life default one week)
+              import math
+              p = self.get(entity_id)
+              score = 0.0
+              for ev in p.risk_events:
+                  age = max(0.0, now - ev.timestamp)
+                  decay = 0.5 ** (age / half_life_s)
+                  score += ev.severity * decay
+              # squash to [0, 1]
+              return round(1.0 - math.exp(-score), 3)
+
+
+      if __name__ == '__main__':
+          profiler = UserBehaviourProfiler()
+          now = 2_000_000.0
+          week = 604800.0
+
+          p = profiler.get('user_42')
+          # One isolated event a week ago
+          p.add_risk_event(RiskEvent(now - week, 'rate_abuse', 0.6))
+          print('Isolated event (1 week old) risk:', profiler.cross_session_risk('user_42', now))
+
+          # A repeat offender: several recent events
+          q = profiler.get('user_99')
+          for d in [0.5, 1, 2, 3]:
+              q.add_risk_event(RiskEvent(now - d * 86400, 'rate_abuse', 0.6))
+          print('Repeat offender (4 recent events) risk:', profiler.cross_session_risk('user_99', now))
+          print('The isolated week-old event has decayed; the repeat pattern accumulates.')
+
+  deliverable_2:
+    title: 'Behavioural Fingerprint and Divergence Detector'
+    filename: 'fingerprint_divergence_detector.py'
+    description: 'Builds an entity behavioural fingerprint from its stable usage signature and detects account compromise as a broad divergence of current behaviour from the entity own fingerprint, distinct from an always-malicious account. Implements the fingerprint and divergence detection from Section 13.10 Parts 2 and 5.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # fingerprint_divergence_detector.py
+      # Section 13.10: Behavioural Fingerprint and Divergence Detector
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import Dict
+
+
+      @dataclass
+      class Behaviour:
+          rate_per_min: float
+          endpoint_mix: Dict[str, float]   # proportions summing to ~1
+          mean_session_len: float
+          active_hour_centre: float        # 0-23
+
+
+      def _mix_distance(a: Dict[str, float], b: Dict[str, float]) -> float:
+          keys = set(a) | set(b)
+          return 0.5 * sum(abs(a.get(k, 0.0) - b.get(k, 0.0)) for k in keys)  # total variation
+
+
+      @dataclass
+      class DivergenceResult:
+          divergence: float
+          dimensions_diverged: int
+          compromise_suspected: bool
+          detail: str
+
+
+      class FingerprintDivergenceDetector:
+          def __init__(self, divergence_threshold: float = 0.5, min_dimensions: int = 3) -> None:
+              self.divergence_threshold = divergence_threshold
+              self.min_dimensions = min_dimensions
+
+          def compare(self, fingerprint: Behaviour, current: Behaviour) -> DivergenceResult:
+              dims = {}
+              # rate divergence (relative)
+              dims['rate'] = min(1.0, abs(current.rate_per_min - fingerprint.rate_per_min) / max(fingerprint.rate_per_min, 1e-6))
+              # endpoint mix divergence
+              dims['endpoints'] = _mix_distance(fingerprint.endpoint_mix, current.endpoint_mix)
+              # session length divergence (relative)
+              dims['session_len'] = min(1.0, abs(current.mean_session_len - fingerprint.mean_session_len) / max(fingerprint.mean_session_len, 1e-6))
+              # active-hour divergence (circular distance / 12)
+              hour_gap = abs(current.active_hour_centre - fingerprint.active_hour_centre)
+              hour_gap = min(hour_gap, 24 - hour_gap)
+              dims['active_hours'] = hour_gap / 12.0
+
+              diverged = sum(1 for v in dims.values() if v > self.divergence_threshold)
+              overall = sum(dims.values()) / len(dims)
+              # Compromise: BROAD divergence across multiple dimensions
+              suspected = diverged >= self.min_dimensions
+              detail = ', '.join(f'{k}={v:.2f}' for k, v in dims.items())
+              return DivergenceResult(round(overall, 3), diverged, suspected, detail)
+
+
+      if __name__ == '__main__':
+          det = FingerprintDivergenceDetector()
+          fingerprint = Behaviour(
+              rate_per_min=3.0,
+              endpoint_mix={'/v1/chat': 0.8, '/v1/embed': 0.2},
+              mean_session_len=12.0,
+              active_hour_centre=14.0,
+          )
+          # Normal day: matches the fingerprint
+          normal = Behaviour(3.2, {'/v1/chat': 0.78, '/v1/embed': 0.22}, 11.0, 13.0)
+          # Compromise: broad change across rate, endpoints, session, and hours
+          takeover = Behaviour(20.0, {'/v1/admin': 0.7, '/v1/export': 0.3}, 2.0, 3.0)
+
+          print('Normal day:  ', det.compare(fingerprint, normal))
+          print('Takeover day:', det.compare(fingerprint, takeover))
+          print('The takeover diverges broadly from the entity own fingerprint,')
+          print('which is the account-compromise signal -- measured against itself.')
+
+  deliverable_3:
+    title: 'Risk Score Engine with Decay and Reinforcement'
+    filename: 'risk_score_engine.py'
+    description: 'Maintains the entity cross-session risk score with decay so an isolated event fades and reinforcement so repeated events compound, balancing fairness for false positives against effectiveness against repeat offenders. Implements the decay and reinforcement dynamics from Section 13.10 Part 4.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # risk_score_engine.py
+      # Section 13.10: Risk Score Engine (Decay and Reinforcement)
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import Dict
+
+
+      @dataclass
+      class RiskState:
+          score: float = 0.0
+          last_update: float = 0.0
+          recent_event_count: int = 0
+
+
+      @dataclass
+      class RiskScoreEngine:
+          half_life_s: float = 604800.0      # one week decay
+          reinforce_window_s: float = 172800.0  # two days: events within reinforce
+          reinforce_factor: float = 1.5
+          states: Dict[str, RiskState] = field(default_factory=dict)
+
+          def _decay(self, st: RiskState, now: float) -> None:
+              if st.last_update == 0.0:
+                  st.last_update = now
+                  return
+              age = max(0.0, now - st.last_update)
+              st.score *= 0.5 ** (age / self.half_life_s)
+              st.last_update = now
+
+          def add_event(self, entity: str, severity: float, now: float) -> float:
+              st = self.states.setdefault(entity, RiskState())
+              self._decay(st, now)
+              # Reinforcement: if the entity already carries risk, a new event compounds
+              gain = severity
+              if st.score > 0.1:
+                  gain *= self.reinforce_factor
+                  st.recent_event_count += 1
+              st.score = min(2.0, st.score + gain)
+              return round(st.score, 3)
+
+          def current(self, entity: str, now: float) -> float:
+              st = self.states.get(entity)
+              if st is None:
+                  return 0.0
+              self._decay(st, now)
+              return round(st.score, 3)
+
+
+      if __name__ == '__main__':
+          eng = RiskScoreEngine()
+          now = 3_000_000.0
+          day = 86400.0
+
+          # Isolated false positive: one event, then time passes
+          eng.add_event('user_clean', 0.6, now)
+          recovered = eng.current('user_clean', now + 14 * day)
+          print(f'Clean entity after one event + 2 weeks: {recovered} (recovered)')
+
+          # Repeat offender: events close together reinforce
+          score = None
+          for d in range(4):
+              score = eng.add_event('user_repeat', 0.6, now + d * day)
+          print(f'Repeat offender after 4 events in 4 days: {score} (accumulated)')
+          print('Decay lets the clean entity recover; reinforcement compounds the')
+          print('repeat offender so a sustained pattern produces durable risk.')
+
+  deliverable_4:
+    title: 'Entity Resolver'
+    filename: 'entity_resolver.py'
+    description: 'Links the same underlying actor across credentials, sessions, and sources using shared attributes and fingerprint similarity, consolidating fragmented partial profiles and producing the resolved entities and first-order links that the graph detector of 13.11 consumes. Implements the entity resolution from Section 13.10 Part 6.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only; union-find consolidates linked identities'
+    code: |
+      # entity_resolver.py
+      # Section 13.10: Entity Resolver (Cross-Identity Linkage)
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import Dict, List, Set, Tuple
+
+
+      @dataclass
+      class Identity:
+          identity_id: str
+          source_ip: str
+          credential_family: str
+          fingerprint_bucket: str   # coarse fingerprint signature
+
+
+      class UnionFind:
+          def __init__(self) -> None:
+              self.parent: Dict[str, str] = {}
+
+          def find(self, x: str) -> str:
+              self.parent.setdefault(x, x)
+              while self.parent[x] != x:
+                  self.parent[x] = self.parent[self.parent[x]]
+                  x = self.parent[x]
+              return x
+
+          def union(self, a: str, b: str) -> None:
+              ra, rb = self.find(a), self.find(b)
+              if ra != rb:
+                  self.parent[ra] = rb
+
+
+      class EntityResolver:
+          def __init__(self) -> None:
+              self.uf = UnionFind()
+
+          def resolve(self, identities: List[Identity]) -> Dict[str, Set[str]]:
+              # Link identities that share a strong attribute
+              by_source: Dict[str, List[str]] = {}
+              by_cred: Dict[str, List[str]] = {}
+              by_fp: Dict[str, List[str]] = {}
+              for idn in identities:
+                  self.uf.find(idn.identity_id)  # ensure present
+                  by_source.setdefault(idn.source_ip, []).append(idn.identity_id)
+                  by_cred.setdefault(idn.credential_family, []).append(idn.identity_id)
+                  by_fp.setdefault(idn.fingerprint_bucket, []).append(idn.identity_id)
+
+              # Link within each shared attribute group
+              for groups in (by_source, by_cred, by_fp):
+                  for members in groups.values():
+                      for other in members[1:]:
+                          self.uf.union(members[0], other)
+
+              # Collect resolved actors
+              actors: Dict[str, Set[str]] = {}
+              for idn in identities:
+                  root = self.uf.find(idn.identity_id)
+                  actors.setdefault(root, set()).add(idn.identity_id)
+              return actors
+
+
+      if __name__ == '__main__':
+          identities = [
+              Identity('cred_1', '203.0.113.5', 'famA', 'fp_x'),
+              Identity('cred_2', '203.0.113.5', 'famB', 'fp_y'),   # same source as cred_1
+              Identity('cred_3', '198.51.100.9', 'famB', 'fp_y'),  # same cred family + fp as cred_2
+              Identity('cred_9', '192.0.2.7', 'famZ', 'fp_z'),     # unrelated
+          ]
+          resolver = EntityResolver()
+          actors = resolver.resolve(identities)
+          print(f'Resolved {len(actors)} actors from {len(identities)} identities:')
+          for root, members in actors.items():
+              print(f'  actor -> {sorted(members)}')
+          print('cred_1/2/3 resolve to one actor via shared source/cred/fingerprint;')
+          print('these resolved actors and their links become the graph nodes for 13.11.')
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Scoring every request in isolation and never incorporating the requester accumulated history'
+    why_it_happens: |
+      Per-request and per-session detectors are self-contained and stateless with respect to history,
+      which makes them simple to build and scale. Adding entity history as an input introduces persistent
+      state and a dependency on the profile, and a stateless detector that scores the current activity
+      feels complete on its own.
+    consequence: |
+      The requester's history is the most informative context available, and ignoring it scores with less
+      information than the system has. The identical request from an entity flagged for enumeration last
+      week and from an entity with a year-long clean record is scored identically, even though the history
+      makes them very different situations. The detector cannot make the distinction the available
+      information supports, missing campaign continuations and over-scrutinising clean entities equally.
+    correct_approach: |
+      Maintain a persistent entity profile and expose a cross-session risk score that every detector and the
+      gateway reads, so the same request is scored in the context of the requester -- elevated for a
+      suspicious history, given benefit of the doubt for a clean one. user_behaviour_profiler.py provides the
+      persistent profile and risk score.
+
+  mistake_2:
+    description: 'Letting the risk score only ever rise, with no decay, so a false positive elevates an entity forever'
+    why_it_happens: |
+      A monotonically rising risk score is simpler -- just add to it on each event -- and it feels safer to
+      never reduce an entity's risk, since reducing it could let a real offender off. Decay looks like
+      forgiving behaviour the system should avoid.
+    consequence: |
+      False positives are inevitable, and a score that only rises treats a legitimate entity as suspicious
+      forever for a one-time anomaly that was not an attack -- permanently tighter limits and more scrutiny
+      for a false flag. This is unfair to legitimate entities, degrades their experience indefinitely, and
+      makes the risk score accumulate noise over time until most entities carry elevated risk and the signal
+      is meaningless.
+    correct_approach: |
+      Decay risk contributions over time so an isolated event raises the score temporarily and then fades,
+      letting a clean entity recover from a false positive, while reinforcement compounds repeated events so
+      a sustained pattern still accumulates durable risk. risk_score_engine.py implements both decay and
+      reinforcement with a calibrated balance.
+
+  mistake_3:
+    description: 'Detecting account compromise against a global norm instead of the entity own fingerprint'
+    why_it_happens: |
+      A global behavioural norm is easier to build than a per-entity fingerprint -- one reference for
+      everyone -- and comparing an account's behaviour to the global norm seems like a reasonable anomaly
+      check that would catch a compromised account behaving oddly.
+    consequence: |
+      A compromised account's new behaviour may be perfectly normal against the global norm -- the attacker
+      uses it within ordinary rates, on ordinary endpoints -- while being completely unlike how this specific
+      account has always behaved. Comparing to the global norm misses the compromise because the attacker's
+      behaviour is globally normal, just not normal for this entity. The signal that reveals takeover is the
+      divergence from the account's own history, which the global comparison discards.
+    correct_approach: |
+      Detect compromise as divergence from the entity's own established fingerprint, not a global norm, so
+      the attacker's behaviour is anomalous specifically because it does not match this entity's history even
+      if it would be normal for some other entity. fingerprint_divergence_detector.py measures divergence
+      against the entity own fingerprint.
+
+  mistake_4:
+    description: 'Fragmenting one actor across many partial per-credential profiles, letting them evade accumulated risk'
+    why_it_happens: |
+      Profiling per credential or per session is the natural unit -- each credential has its own activity --
+      and resolving multiple identities to one actor requires extra linkage logic. A per-credential profile
+      is straightforward and seems sufficient when each credential is treated as a distinct entity.
+    consequence: |
+      The same actor operating through many credentials is fragmented into many partial profiles, each with
+      too little history to be useful, and the actor can spread activity across identities so no single
+      profile accumulates a high risk score -- the distributed evasion of 13.07 applied to the profile. The
+      actor escapes accumulated risk by fragmentation, and the system never sees the full behaviour or full
+      risk of the underlying actor.
+    correct_approach: |
+      Resolve identities to the underlying actor using shared attributes and fingerprint similarity, and
+      consolidate their activity into one profile so the actor's full behaviour and accumulated risk are
+      scored together. entity_resolver.py links identities by shared source, credential, and fingerprint into
+      resolved actors.
+
+  mistake_5:
+    description: 'Treating the entity profile as an endpoint rather than the foundation for graph detection'
+    why_it_happens: |
+      The entity profile produces a useful risk score that the rate limiter and gateway consume, so it looks
+      like a complete, self-contained deliverable. Once the risk score is feeding enforcement, the profiling
+      work feels finished, and the connection to graph detection is easy to overlook.
+    consequence: |
+      Graph-based detection in 13.11 operates on entities and the relationships between them, and those
+      entities are exactly the resolved actors the profile defines, with the linking attributes being the
+      edges. Treating the profile as an endpoint and not exposing the resolved entities and their links
+      leaves the graph detector without its nodes and first-order edges, so the coordinated-network detection
+      that depends on them cannot be built. The profile's role as the graph foundation is lost.
+    correct_approach: |
+      Build the profile and entity resolution to also produce the resolved entities and their linking
+      attributes as the nodes and first-order edges the graph detector consumes, so the entity family bridges
+      cleanly into the graph family. entity_resolver.py emits resolved actors and links for exactly this
+      handoff to 13.11.
+
+section_summary:
+
+  compact: |
+    A request scored in isolation discards its most informative context -- the requester history -- and
+    Section 13.10 builds the persistent entity profile that makes that history a first-class input. The
+    profile holds three things: aggregated per-entity baselines, a timestamped history of risk events from
+    every preceding detector, and a behavioural fingerprint -- the stable multi-dimensional signature of how
+    the entity normally uses the service. From these it computes a cross-session risk score that integrates
+    signals across all the entity sessions, computed off the hot path and read inline by the rate limiter of
+    13.08 and the gateway of 13.11. The score's dynamics matter as much as its value: decay is a fairness
+    requirement that lets a clean entity recover from an inevitable false positive, while reinforcement is an
+    effectiveness requirement that compounds repeated events so a repeat offender accumulates durable risk.
+    The fingerprint enables account-compromise detection as divergence: a compromised account behaves unlike
+    its own established fingerprint across multiple dimensions even when each deviation is modest and the
+    behaviour would be normal for some other entity -- distinct from an always-malicious account that has no
+    clean history to diverge from. Entity resolution links the same actor across credentials, sessions, and
+    sources to consolidate fragmented profiles and prevent fragmentation evasion, and it is the bridge to the
+    graph family: the resolved entities are the graph nodes and their linking attributes the first-order
+    edges that 13.11 develops into coordinated-network detection.
+
+  key_takeaways:
+    - 'A request scored in isolation discards the most informative context available -- the requester history -- and the persistent entity profile makes that history a first-class input so the same request is scored in the context of who makes it'
+    - 'The persistent profile holds aggregated baselines, a history of risk events, and a behavioural fingerprint, and computes a cross-session risk score read inline by the rate limiter and gateway'
+    - 'Risk-score decay is a fairness requirement letting a clean entity recover from an inevitable false positive, while reinforcement is an effectiveness requirement compounding repeated events into durable risk for a repeat offender'
+    - 'Account compromise is detected as broad divergence from the entity own fingerprint -- behaviour unlike how this specific entity has always behaved -- distinct from an always-malicious account with no clean history to diverge from'
+    - 'Entity resolution links the same actor across credentials, sessions, and sources to consolidate fragmented profiles and prevent the fragmentation evasion that spreads activity to escape accumulated risk'
+    - 'The entity profile is the bridge to the graph family: the resolved entities are the graph nodes and their linking attributes the first-order edges that the graph detector of 13.11 develops into coordinated-network detection'
+
+preview_section_13_11:
+  title: 'Section 13.11: Graph-Based Detection and the Behavioural Monitoring Capstone'
+  summary: |
+    Section 13.11 closes Chapter 13 with the graph family and the behavioural monitoring capstone. It builds
+    the entity-relationship graph from the resolved entities and linking attributes of 13.10 -- shared
+    infrastructure, credentials, synchronised timing, and behavioural similarity as edges -- and detects the
+    coordinated abuse network that no single-entity detector reveals, because each account behaves acceptably
+    alone and the attack is the structure between accounts. It covers coordinated-network signatures, graph
+    anomaly detection through community detection and structural-outlier methods, and Sybil and bot-network
+    detection through graph structure rather than per-account behaviour. The capstone integrates the whole
+    behavioural layer -- session scoring, baselines, drift, rate limiting, profiling, and graph analysis --
+    into the Chapter 12 seven-track gateway as the fourth detection layer, with inline detectors on the
+    request path and batch detectors on a schedule, completing the detection system that sees the individual
+    request, the session, the entity, and the relationships between entities, and that Chapter 14 deploys to
+    production.
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 13 Section 13.03: statistical baselines -- the per-entity baselines the profile aggregates'
+    - 'Chapter 13 Section 13.04: time-series anomaly detection -- the temporal signals folded into the profile'
+    - 'Chapter 13 Section 13.06: model behaviour monitoring -- the injection-success signal that elevates entity risk'
+    - 'Chapter 13 Section 13.07: rate-based detection -- the rate-abuse signal folded into the profile'
+    - 'Chapter 13 Section 13.09: multi-turn context analysis -- the session threat signal folded into the profile'
+  forward_references:
+    - 'Section 13.11: graph-based detection -- operates on the resolved entities and links this section defines'
+    - 'Section 13.08: smart rate limiting -- reads the entity risk score this section produces (feedback loop)'
+    - 'Section 13.12: chapter summary -- the behavioural monitoring architecture this profile anchors'
+  tags:
+    - user-behaviour-profiling
+    - entity-profile
+    - behavioural-fingerprint
+    - persistent-profile
+    - cross-session-risk
+    - risk-decay
+    - risk-reinforcement
+    - account-compromise
+    - fingerprint-divergence
+    - entity-resolution
+    - risk-score
+    - owasp-llm04
+    - owasp-llm10
+    - chapter-13-entity-family
