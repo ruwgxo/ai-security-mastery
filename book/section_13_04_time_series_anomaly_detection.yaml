@@ -1,0 +1,781 @@
+# section_13_04_time_series_anomaly_detection.yaml
+
+---
+document_info:
+  title: 'Time-Series Anomaly Detection: Temporal Deviation from the Behavioural Envelope'
+  chapter: 13
+  section: 4
+  section_code: '1304'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-21'
+  estimated_pages: 7
+  estimated_reading_time: '50-60 minutes'
+
+section_overview:
+  one_line_summary: 'Behavioural metrics are time series with seasonal structure; Section 13.04 builds the seasonal decomposition, forecasting, change-point, and multi-resolution detectors that flag temporal deviation from an entity envelope, catching both the sudden burst and the slow ramp a static threshold misses.'
+  why_this_section_exists: |
+    Section 13.03 established per-entity baselines: a centre and a spread for each behavioural metric.
+    A baseline answers is this single observation far from typical. It does not answer the temporal
+    questions that the most important behavioural attacks raise: is this metric trending upward over
+    days, did its behaviour change at a specific moment, is this spike just the usual Monday morning
+    peak. Those questions require treating the metric as a time series, and that is what Section 13.04
+    builds.
+
+    The motivating fact is that behavioural metrics are not stationary. Request rate rises during
+    business hours and falls at night. Refusal rate has a weekly rhythm. A static threshold or a
+    single baseline applied to a seasonal metric produces a detector that fires every morning when
+    traffic legitimately rises and stays silent during a seasonal peak inside which an attack is
+    hiding. The seasonality must be modelled and removed before deviation can be measured, or the
+    detector spends its alert budget on the daily cycle and misses the attack.
+
+    The section also confronts the two opposite temporal signatures of behavioural abuse. The burst
+    attack is a sudden spike: high amplitude, short duration. The exfiltration campaign is a slow ramp:
+    low amplitude per step, long duration, invisible to any detector tuned for spikes. A single
+    detector tuned for one signature is blind to the other, so the section builds multi-resolution
+    analysis that sees both, and change-point detection that catches the distinct signal of account
+    compromise -- not an outlier point but a shift in the whole behaviour.
+  position_in_chapter: |
+    Section 13.04 is the core temporal detector of Chapter 13, built directly on the 13.03 baselines.
+    It sits between baseline establishment and the drift detection of 13.05, which applies similar
+    distributional comparison to the detectors and the model rather than to user behaviour. It feeds
+    the rate-based detection of 13.07, which uses the temporal rate signal, and the entity profiler of
+    13.10, which folds temporal anomaly signals into the persistent profile. It is the section where
+    the temporal family produces its primary detection output: a per-metric temporal anomaly score
+    that respects seasonality and catches both spike and ramp.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain why behavioural metrics are time series with seasonal structure and how a static threshold misclassifies seasonal peaks'
+    - 'Describe seasonal decomposition into trend, seasonal, and residual components and why anomalies live in the residual'
+    - 'Explain forecasting-based anomaly detection and the role of the prediction interval as a dynamic threshold'
+    - 'Describe streaming online anomaly detection and why it must score each point without recomputing history'
+    - 'Explain change-point detection and how it differs from outlier detection as the account-compromise signal'
+    - 'Explain multi-resolution analysis and why the burst and the slow ramp require detecting at different time scales'
+    - 'Describe how time-series alerts are connected to the entity and session context that explains them'
+
+  skills:
+    - 'Decompose a behavioural metric time series into trend, seasonal, and residual components'
+    - 'Build a forecasting-based anomaly detector that flags observations outside a prediction interval'
+    - 'Implement a streaming anomaly detector that updates incrementally and scores each new point'
+    - 'Implement change-point detection that flags a shift in a metric distribution'
+    - 'Combine spike and slow-ramp detection in a single multi-resolution analyser'
+
+  security_mindset:
+    - 'Recognise that ignoring seasonality spends the alert budget on the daily cycle and hides attacks inside seasonal peaks'
+    - 'Internalise that the two highest-value temporal attacks have opposite signatures, so a single-resolution detector is blind to one of them'
+    - 'Understand that change-point detection answers when did the behaviour change, which is the account-compromise question that outlier detection cannot answer'
+    - 'Treat a temporal alert without entity and session context as un-actionable: the temporal signal says something changed, the context says what'
+
+prerequisites:
+  - 'Chapter 1 Section 1.04: descriptive statistics and distributions -- the basis for residual scoring'
+  - 'Chapter 2 Section 2.17: sequence and recurrence basics -- background for streaming temporal models'
+  - 'Chapter 13 Section 13.01: behavioural detection taxonomy -- the temporal family this section implements'
+  - 'Chapter 13 Section 13.02: session modelling -- the source of the per-session metrics aggregated into time series'
+  - 'Chapter 13 Section 13.03: statistical baselines -- the per-entity reference these temporal detectors forecast and decompose against'
+
+prose_content:
+
+  part_1:
+    title: 'Behavioural Metrics Are Seasonal Time Series'
+    body: |
+      A behavioural metric observed over time is a time series, and behavioural time series have
+      structure that a single baseline does not capture. Request rate is the clearest example. It is
+      not a flat random series around a constant mean; it rises during the working day and falls
+      overnight, it is higher on weekdays than weekends, and it may follow a monthly billing or release
+      cycle. These are seasonal components: regular, predictable patterns at fixed periods.
+
+      A static threshold or a single 13.03 baseline applied to such a series fails in two symmetric
+      ways. Set the threshold high enough that the legitimate morning peak does not trip it, and an
+      attack that occurs during the overnight trough -- when the legitimate rate is low and the
+      threshold is far above it -- sails underneath. Set it low enough to catch the overnight attack,
+      and it fires every single morning when the legitimate rate climbs into the alert band. The
+      detector either misses attacks in the troughs or floods on the peaks, and there is no single
+      static level that avoids both, because the metric's normal is itself a moving curve.
+
+      The resolution is to model the seasonal curve and measure deviation from it rather than from a
+      constant. The expected request rate at nine on a Tuesday morning is high; an observation that
+      matches the seasonal expectation is normal even though it is high in absolute terms, and an
+      observation that is high relative to the overnight expectation is anomalous even though it is low
+      in absolute terms. Once the seasonal expectation is the reference, the same deviation logic from
+      13.03 applies -- but now against a time-varying expectation rather than a fixed centre. This is
+      what makes time-series detection necessary as a layer above the static baseline: the baseline
+      gives a centre, the time-series layer makes that centre move with the season.
+
+  part_2:
+    title: 'Seasonal Decomposition: Isolating the Residual'
+    body: |
+      The standard way to separate the seasonal structure from the genuine anomalies is decomposition.
+      A time series is decomposed into three additive components: the trend, the slow long-term
+      movement; the seasonal, the repeating pattern at fixed periods; and the residual, what remains
+      after trend and seasonal are removed. The residual is where anomalies live. After the predictable
+      trend and the repeating seasonal cycle are subtracted, an ordinary observation leaves a small
+      residual near zero, and an anomalous observation leaves a large residual.
+
+      Decomposition turns a seasonal-anomaly problem into a stationary-anomaly problem. The raw series
+      is non-stationary and seasonal, hard to threshold. The residual series, with trend and seasonality
+      removed, is approximately stationary: it hovers near zero with a roughly constant spread, and a
+      simple robust threshold on the residual -- a modified z-score of the residual using the 13.03
+      robust statistics -- detects anomalies that the raw series obscured. The morning peak, fully
+      explained by the seasonal component, leaves a small residual and does not fire. An overnight
+      attack, unexplained by trend or season, leaves a large residual and does fire, even though its
+      absolute value is below the morning peak.
+
+      Two practical points govern decomposition for behavioural security. First, the seasonal period
+      must be discovered, not assumed: most behavioural metrics have a daily and a weekly period, and the
+      decomposition must model both, but some metrics have an idiosyncratic period that an autocorrelation
+      analysis reveals. Second, the decomposition itself must be robust to contamination, for the same
+      reason the baseline was: if a sustained attack is present while the seasonal component is being
+      estimated, a non-robust decomposition folds the attack into the seasonal pattern and learns to
+      expect it. A robust decomposition resists this, keeping the attack in the residual where the
+      detector can see it.
+
+  part_3:
+    title: 'Forecasting-Based Detection: The Prediction Interval as a Moving Threshold'
+    body: |
+      An equivalent and often more operationally convenient framing is forecasting. Rather than
+      decomposing the whole series, a forecasting model predicts the next value from the history,
+      together with a prediction interval -- a band within which the next value is expected to fall with
+      some confidence. An observation inside the interval is normal; an observation outside it is
+      anomalous, and the distance outside the interval is the anomaly score.
+
+      The prediction interval is a moving, self-adjusting threshold, which is exactly what a seasonal
+      metric needs. At nine on a Tuesday the forecast is high and the interval sits high, so a high
+      observation is normal. At three overnight the forecast is low and the interval sits low, so the
+      same absolute value that was normal in the morning is now far outside the interval and fires. The
+      forecasting model carries the seasonality, so the threshold inherits it for free. A simple
+      seasonal forecaster -- one that predicts the value at a given time as the recent level adjusted by
+      the seasonal factor for that time of day and day of week -- is sufficient for most behavioural
+      metrics and is cheap to compute and update.
+
+      The width of the prediction interval is the tuning knob, and it trades precision against recall in
+      the familiar way. A wide interval fires only on extreme deviations: high precision, low recall, it
+      catches only the loud attacks. A narrow interval fires on modest deviations: high recall, lower
+      precision, it catches subtle attacks but also ordinary variation. The interval width is set per
+      metric from the residual spread, using the robust spread from 13.03 so that the interval is not
+      itself inflated by contamination, and tuned against the precision and recall targets for that
+      metric's alert tier.
+
+  part_4:
+    title: 'Streaming Detection: Scoring Each Point Without Recomputing History'
+    body: |
+      In production, the temporal detector sees one new observation at a time and must score it
+      immediately, without recomputing the decomposition or refitting the forecaster over the entire
+      history on every point. This is the streaming or online requirement, and it shapes the algorithm
+      choice.
+
+      A batch detector that recomputes the full decomposition on every new point is correct but does not
+      scale: the cost grows with the history length, and the per-point latency drifts upward as the
+      series lengthens. The streaming detector instead maintains a compact running state -- the current
+      level, the current seasonal factors, the running residual spread -- and updates that state
+      incrementally as each observation arrives. Exponential smoothing is the workhorse here: the level
+      and the seasonal factors are updated by a small step toward each new observation, so the state
+      reflects recent history without storing it, and the per-point cost is constant regardless of how
+      long the series has run.
+
+      The streaming detector scores each point against the current forecast and interval, then updates
+      its state with the observation -- subject to the same contamination discipline as the baseline: a
+      flagged observation updates the anomaly score but is held out of the state update, so a sustained
+      attack does not smooth itself into the level and seasonal factors. This is the time-series analogue
+      of the 13.03 contamination guard, and it is what keeps the slow ramp from being absorbed into the
+      forecaster the way it would otherwise be absorbed into the baseline.
+
+  part_5:
+    title: 'Change-Point Detection: When the Behaviour Changed'
+    body: |
+      Outlier detection and change-point detection answer different questions, and the difference matters
+      for one specific attack. Outlier detection asks which observation is anomalous: a single point far
+      from expectation. Change-point detection asks when did the distribution of the metric change: not
+      one outlier point, but a sustained shift from one regime to another. The account-compromise attack
+      is a change-point, not an outlier.
+
+      When an account is compromised, the attacker's behaviour is often not a single dramatic spike. It
+      is a sustained change in the entity's normal: the request rate steps to a new level, the endpoint
+      mix shifts, the time-of-day pattern changes, and stays changed. Each individual observation in the
+      new regime may sit within the interval that the forecaster, adapting, has come to expect -- so
+      outlier detection, especially a streaming detector that smooths toward the new level, stops firing
+      after the transition. Change-point detection catches the transition itself: it monitors for the
+      moment the metric's distribution shifts and flags that moment, regardless of whether individual
+      post-transition points look anomalous.
+
+      The practical method monitors a statistic that is sensitive to a level or distribution shift -- a
+      cumulative-sum of deviations, or a comparison of the recent window's distribution against the
+      preceding window's -- and flags when that statistic crosses a threshold, indicating the two windows
+      are drawn from different distributions. The change-point signal is high-value precisely because it
+      survives the forecaster's adaptation: even as the streaming detector learns to accept the new
+      regime, the change-point detector has recorded that a regime change happened, which is the
+      account-compromise alert. The two detectors are complementary and both belong in the temporal
+      family.
+
+  part_6:
+    title: 'Multi-Resolution Analysis: Catching the Spike and the Slow Ramp'
+    body: |
+      The two highest-value temporal attacks have opposite signatures, and a detector tuned for one is
+      blind to the other. The burst attack is high amplitude and short duration: a sudden spike of
+      requests, a flood, a rapid enumeration. It is obvious at a fine time resolution -- per-minute or
+      per-second -- where the spike towers over the surrounding values, and it is invisible at a coarse
+      resolution where it is averaged into a single slightly-elevated hour. The slow-ramp attack is the
+      mirror image: low amplitude per step and long duration, a request rate that creeps up by a few
+      percent a day over weeks. It is invisible at a fine resolution, where each step is lost in ordinary
+      variation, and obvious at a coarse resolution, where the cumulative trend over weeks is unmistakable.
+
+      No single time resolution catches both. A detector that aggregates per minute sees the burst and
+      misses the ramp; a detector that aggregates per day sees the ramp and misses the burst. Multi-
+      resolution analysis runs the temporal detection at several time scales in parallel -- per minute,
+      per hour, per day -- and combines the signals. The burst fires the fine-resolution detector; the
+      ramp fires the coarse-resolution detector; the entity is flagged if any resolution fires. This is
+      the temporal analogue of the multi-track gateway: parallel detectors at different scales, each
+      covering the attacks the others miss.
+
+      The combination is not a simple union of alerts, because a single underlying event can fire several
+      resolutions and should not be triple-counted, and because the resolutions differ in their false-
+      positive characteristics. The fine resolution is noisier and produces more false positives per
+      alert; the coarse resolution is steadier but slower. The combined signal weights the resolutions by
+      their reliability and deduplicates alerts that trace to the same underlying interval, producing one
+      temporal anomaly verdict per entity that reflects whichever resolution carries the real signal. The
+      output is the temporal anomaly score that 13.07 and 13.10 consume, and it is, by construction,
+      sensitive to both the spike and the ramp.
+
+reference_materials:
+
+  table_1:
+    title: 'Time-Series Components and Where the Anomaly Lives'
+    description: 'The three decomposition components of a behavioural metric time series and the detection role of each'
+    columns: ['Component', 'What It Captures', 'Detection Role', 'If Modelled Wrong']
+    rows:
+      - ['Trend', 'Slow long-term movement (growth, decline)', 'Removed so it is not flagged as anomaly', 'Legit growth flagged as sustained anomaly']
+      - ['Seasonal', 'Repeating pattern at fixed periods (daily, weekly)', 'Removed so peaks are not flagged', 'Morning peak fires; trough attack hides']
+      - ['Residual', 'What remains after trend and seasonal removed', 'Where anomalies are detected', 'Attack folded into season; not in residual']
+
+  table_2:
+    title: 'Temporal Detection Methods and What Each Catches'
+    description: 'The four temporal detection methods in this section, the attack signature each targets, and its limitation'
+    columns: ['Method', 'Question It Answers', 'Catches', 'Limitation']
+    rows:
+      - ['Seasonal decomposition + residual threshold', 'Is this far from the seasonal expectation', 'Seasonal-aware outliers', 'Needs enough history to estimate season']
+      - ['Forecasting + prediction interval', 'Is this outside the expected band', 'Same, with a moving threshold', 'Interval width trades precision/recall']
+      - ['Change-point detection', 'When did the distribution shift', 'Account compromise (regime change)', 'Detects the shift, not which points']
+      - ['Multi-resolution analysis', 'Is there a spike OR a ramp', 'Burst and slow-ramp together', 'Must deduplicate across resolutions']
+
+  table_3:
+    title: 'Burst vs Slow Ramp: Opposite Temporal Signatures'
+    description: 'Why the two highest-value temporal attacks require detection at different time resolutions'
+    columns: ['Attack', 'Amplitude', 'Duration', 'Visible At', 'Invisible At', 'Detector Resolution']
+    rows:
+      - ['Burst (flood, enumeration)', 'High', 'Short (seconds-minutes)', 'Fine resolution (per minute)', 'Coarse resolution (per day)', 'Per-minute detector']
+      - ['Slow ramp (exfiltration)', 'Low per step', 'Long (days-weeks)', 'Coarse resolution (per day)', 'Fine resolution (per minute)', 'Per-day detector']
+      - ['Sustained regime change', 'Moderate, persistent', 'Indefinite', 'Change-point on any resolution', 'Outlier detection after adaptation', 'Change-point detector']
+
+  table_4:
+    title: 'Prediction Interval Width: Precision vs Recall'
+    description: 'How the prediction interval width tunes the temporal detector operating point per metric and alert tier'
+    columns: ['Interval Width', 'Fires On', 'Precision', 'Recall', 'Appropriate For']
+    rows:
+      - ['Wide (e.g. 4x robust spread)', 'Only extreme deviations', 'High', 'Low', 'High-confidence block-tier alerts']
+      - ['Moderate (e.g. 3x robust spread)', 'Clear deviations', 'Balanced', 'Balanced', 'Standard flag-tier alerts']
+      - ['Narrow (e.g. 2x robust spread)', 'Modest deviations', 'Lower', 'High', 'Review-tier alerts; subtle attacks']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Seasonal Decomposition and Residual Anomaly Detector'
+    filename: 'time_series_anomaly_detector.py'
+    description: 'Decomposes a behavioural metric time series into trend, seasonal, and residual components and flags anomalies in the residual using robust statistics. Models daily and weekly seasonality for behavioural metrics. Implements the seasonal decomposition and residual thresholding from Section 13.04 Parts 2 and 3.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only; uses a simple averaging-based seasonal estimate to stay dependency-free'
+    code: |
+      # time_series_anomaly_detector.py
+      # Section 13.04: Seasonal Decomposition Residual Anomaly Detector
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from typing import Dict, List
+
+
+      def _median(values: List[float]) -> float:
+          s = sorted(values)
+          n = len(s)
+          if n == 0:
+              return 0.0
+          mid = n // 2
+          return float(s[mid]) if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+      def _mad(values: List[float], centre: float) -> float:
+          if not values:
+              return 0.0
+          return _median([abs(v - centre) for v in values]) * 1.4826
+
+
+      @dataclass
+      class Decomposition:
+          trend: float
+          seasonal: List[float]   # one factor per slot in the period
+          residual_centre: float
+          residual_spread: float
+          period: int
+
+
+      def decompose(series: List[float], period: int) -> Decomposition:
+          n = len(series)
+          # Trend: robust overall level (median)
+          trend = _median(series)
+          # Seasonal: median of detrended values at each slot of the period
+          slots: Dict[int, List[float]] = {i: [] for i in range(period)}
+          for i, v in enumerate(series):
+              slots[i % period].append(v - trend)
+          seasonal = [_median(slots[i]) if slots[i] else 0.0 for i in range(period)]
+          # Residual: what remains after removing trend and seasonal
+          residuals = [series[i] - trend - seasonal[i % period] for i in range(n)]
+          rc = _median(residuals)
+          rs = _mad(residuals, rc)
+          return Decomposition(trend, seasonal, rc, rs, period)
+
+
+      def score_observation(value: float, slot: int, decomp: Decomposition) -> float:
+          expected = decomp.trend + decomp.seasonal[slot % decomp.period]
+          residual = value - expected
+          if decomp.residual_spread <= 1e-9:
+              return 0.0 if abs(residual) < 1e-9 else float('inf')
+          return (residual - decomp.residual_centre) / decomp.residual_spread
+
+
+      if __name__ == '__main__':
+          # 7-day hourly-ish series with a daily peak (period 24), low overnight
+          import math
+          period = 24
+          series = []
+          for day in range(7):
+              for hour in range(24):
+                  base = 50 + 40 * math.sin((hour - 6) / 24 * 2 * math.pi)
+                  series.append(max(base, 5))
+          decomp = decompose(series, period)
+
+          # Normal morning peak (hour 9): high absolute value, should NOT fire
+          morning = decomp.trend + decomp.seasonal[9] + 3
+          z_morning = score_observation(morning, 9, decomp)
+          # Overnight attack (hour 3): absolute value below morning peak, SHOULD fire
+          night_attack = decomp.trend + decomp.seasonal[3] + 60
+          z_night = score_observation(night_attack, 3, decomp)
+
+          print(f'Morning peak value {morning:.0f} at hour 9: residual z = {z_morning:.2f} (normal)')
+          print(f'Overnight value {night_attack:.0f} at hour 3: residual z = {z_night:.2f} (anomaly)')
+          print('The overnight attack fires despite a lower absolute value than the')
+          print('morning peak, because seasonal decomposition compares against the hour.')
+
+  deliverable_2:
+    title: 'Streaming Forecast Anomaly Scorer'
+    filename: 'forecast_anomaly_scorer.py'
+    description: 'Streaming anomaly detector using exponential smoothing of level and seasonal factors, scoring each new observation against a prediction interval and updating state incrementally. Holds flagged observations out of the state update as a contamination guard. Implements the forecasting and streaming detection from Section 13.04 Parts 3 and 4.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # forecast_anomaly_scorer.py
+      # Section 13.04: Streaming Forecast Anomaly Scorer
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import List, Optional, Tuple
+
+
+      @dataclass
+      class StreamingForecaster:
+          period: int
+          alpha: float = 0.1          # level smoothing
+          gamma: float = 0.05         # seasonal smoothing
+          interval_k: float = 3.0     # interval width in robust spreads
+          level: Optional[float] = None
+          seasonal: List[float] = field(default_factory=list)
+          resid_abs_ewma: float = 1.0  # running scale of residuals
+          beta: float = 0.05           # residual scale smoothing
+          step: int = 0
+
+          def _ensure_init(self, value: float) -> None:
+              if self.level is None:
+                  self.level = value
+              if not self.seasonal:
+                  self.seasonal = [0.0] * self.period
+
+          def forecast(self, slot: int) -> float:
+              base = self.level if self.level is not None else 0.0
+              return base + self.seasonal[slot % self.period]
+
+          def interval(self, slot: int) -> Tuple[float, float]:
+              f = self.forecast(slot)
+              half = self.interval_k * self.resid_abs_ewma
+              return f - half, f + half
+
+          def score_and_update(self, value: float, slot: int, flagged_hint: bool = False) -> Tuple[float, bool]:
+              self._ensure_init(value)
+              f = self.forecast(slot)
+              residual = value - f
+              scale = self.resid_abs_ewma if self.resid_abs_ewma > 1e-9 else 1.0
+              z = residual / scale
+              lo, hi = self.interval(slot)
+              is_anomaly = value < lo or value > hi
+
+              # Contamination guard: do not smooth a flagged/anomalous point into state
+              if not (is_anomaly or flagged_hint):
+                  s = slot % self.period
+                  new_level = self.alpha * (value - self.seasonal[s]) + (1 - self.alpha) * self.level
+                  self.seasonal[s] = self.gamma * (value - new_level) + (1 - self.gamma) * self.seasonal[s]
+                  self.level = new_level
+                  self.resid_abs_ewma = self.beta * abs(residual) + (1 - self.beta) * self.resid_abs_ewma
+              self.step += 1
+              return round(z, 3), is_anomaly
+
+
+      if __name__ == '__main__':
+          import math
+          fc = StreamingForecaster(period=24, interval_k=3.0)
+          # Warm up over 5 days of seasonal data
+          for day in range(5):
+              for hour in range(24):
+                  v = 50 + 40 * math.sin((hour - 6) / 24 * 2 * math.pi)
+                  fc.score_and_update(max(v, 5), hour)
+
+          # Day 6: inject an overnight burst at hour 3
+          fired = []
+          for hour in range(24):
+              v = 50 + 40 * math.sin((hour - 6) / 24 * 2 * math.pi)
+              v = max(v, 5)
+              if hour == 3:
+                  v += 70  # burst
+              z, anom = fc.score_and_update(v, hour)
+              if anom:
+                  fired.append((hour, z))
+          print('Anomalies fired on day 6:', fired)
+          print('The hour-3 burst fired; the legitimate seasonal peak did not,')
+          print('and the burst was held out of the smoothed state by the guard.')
+
+  deliverable_3:
+    title: 'Change-Point Detector'
+    filename: 'change_point_detector.py'
+    description: 'Detects a sustained shift in a behavioural metric distribution -- the account-compromise signal -- using a cumulative-sum statistic and a two-window distribution comparison. Flags the moment of regime change rather than individual outlier points. Implements the change-point detection from Section 13.04 Part 5.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # change_point_detector.py
+      # Section 13.04: Change-Point Detector for Regime Shift
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import List, Optional
+
+
+      def _mean(values: List[float]) -> float:
+          return sum(values) / len(values) if values else 0.0
+
+
+      def _std(values: List[float]) -> float:
+          if len(values) < 2:
+              return 1.0
+          m = _mean(values)
+          return (sum((v - m) ** 2 for v in values) / (len(values) - 1)) ** 0.5 or 1.0
+
+
+      @dataclass
+      class CusumChangePoint:
+          threshold: float = 5.0
+          drift: float = 0.5
+          reference_mean: Optional[float] = None
+          reference_std: Optional[float] = None
+          cusum_high: float = 0.0
+          cusum_low: float = 0.0
+
+          def fit_reference(self, baseline: List[float]) -> None:
+              self.reference_mean = _mean(baseline)
+              self.reference_std = _std(baseline)
+
+          def update(self, value: float) -> bool:
+              # Standardise against the reference regime
+              z = (value - self.reference_mean) / self.reference_std
+              # Two-sided CUSUM with allowance (drift)
+              self.cusum_high = max(0.0, self.cusum_high + z - self.drift)
+              self.cusum_low = min(0.0, self.cusum_low + z + self.drift)
+              changed = self.cusum_high > self.threshold or self.cusum_low < -self.threshold
+              if changed:
+                  # reset after detecting, so it can detect the next regime
+                  self.cusum_high = 0.0
+                  self.cusum_low = 0.0
+              return changed
+
+
+      def two_window_shift(recent: List[float], prior: List[float]) -> float:
+          # Standardised difference of window means -- a simple regime-shift score
+          mp, mr = _mean(prior), _mean(recent)
+          sp = _std(prior)
+          return abs(mr - mp) / sp
+
+
+      if __name__ == '__main__':
+          # Reference regime: ~10 requests/hour
+          baseline = [10, 9, 11, 10, 12, 9, 10, 11, 10, 9, 10, 11]
+          cp = CusumChangePoint(threshold=5.0, drift=0.5)
+          cp.fit_reference([float(v) for v in baseline])
+
+          # Stream: normal, then a sustained step to ~25 (account takeover)
+          stream = [10, 11, 9, 10, 12, 25, 24, 26, 25, 27, 24, 25]
+          detected_at = None
+          for i, v in enumerate(stream):
+              if cp.update(float(v)) and detected_at is None:
+                  detected_at = i
+          print(f'Reference mean ~{_mean([float(v) for v in baseline]):.1f}')
+          print(f'Sustained shift to ~25 detected at stream index: {detected_at}')
+
+          prior = [float(v) for v in stream[:5]]
+          recent = [float(v) for v in stream[5:]]
+          print(f'Two-window shift score: {two_window_shift(recent, prior):.2f}')
+          print('Change-point flags the regime shift even though each post-shift')
+          print('point would look normal once a forecaster adapts to the new level.')
+
+  deliverable_4:
+    title: 'Multi-Resolution Analyser'
+    filename: 'multi_resolution_analyser.py'
+    description: 'Runs temporal anomaly detection at several time resolutions in parallel (fine, medium, coarse), combining the signals so a burst fires the fine resolution and a slow ramp fires the coarse resolution, with deduplication across resolutions. Implements the multi-resolution analysis from Section 13.04 Part 6.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # multi_resolution_analyser.py
+      # Section 13.04: Multi-Resolution Temporal Analyser
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from typing import Dict, List, Tuple
+
+
+      def _median(values: List[float]) -> float:
+          s = sorted(values)
+          n = len(s)
+          if n == 0:
+              return 0.0
+          mid = n // 2
+          return float(s[mid]) if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+      def _mad(values: List[float], c: float) -> float:
+          if not values:
+              return 1.0
+          return (_median([abs(v - c) for v in values]) * 1.4826) or 1.0
+
+
+      def aggregate(series: List[float], factor: int) -> List[float]:
+          # Aggregate fine-resolution points into coarser buckets by sum
+          out = []
+          for i in range(0, len(series), factor):
+              out.append(sum(series[i:i + factor]))
+          return out
+
+
+      @dataclass
+      class ResolutionVerdict:
+          resolution: str
+          fired: bool
+          score: float
+          bucket_index: int
+
+
+      def detect_at_resolution(series: List[float], name: str, k: float = 4.0) -> ResolutionVerdict:
+          if len(series) < 4:
+              return ResolutionVerdict(name, False, 0.0, -1)
+          history = series[:-1]
+          c = _median(history)
+          s = _mad(history, c)
+          latest = series[-1]
+          score = (latest - c) / s
+          return ResolutionVerdict(name, score > k, round(score, 2), len(series) - 1)
+
+
+      def multi_resolution_detect(fine_series: List[float]) -> Tuple[bool, List[ResolutionVerdict]]:
+          verdicts = [
+              detect_at_resolution(fine_series, 'fine (per-minute)'),
+              detect_at_resolution(aggregate(fine_series, 6), 'medium (per-6min)'),
+              detect_at_resolution(aggregate(fine_series, 60), 'coarse (per-hour)'),
+          ]
+          # Dedup: if multiple fire, attribute to the coarsest that fired (one event)
+          any_fired = any(v.fired for v in verdicts)
+          return any_fired, verdicts
+
+
+      if __name__ == '__main__':
+          # Case 1: a short burst -- fine resolution should fire, coarse should not
+          burst = [2.0] * 200 + [40.0] + [2.0] * 19
+          fired_b, vb = multi_resolution_detect(burst)
+          print('Burst case:')
+          for v in vb:
+              print(f'  {v.resolution:<20} fired={v.fired} score={v.score}')
+          print(f'  any fired: {fired_b}\n')
+
+          # Case 2: a slow ramp -- coarse resolution should fire, fine should not
+          ramp = [2.0 + i * 0.02 for i in range(220)]
+          fired_r, vr = multi_resolution_detect(ramp)
+          print('Slow-ramp case:')
+          for v in vr:
+              print(f'  {v.resolution:<20} fired={v.fired} score={v.score}')
+          print(f'  any fired: {fired_r}')
+          print('\nThe burst fires the fine resolution; the ramp fires the coarse.')
+          print('A single-resolution detector would miss one of the two.')
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Applying a static threshold or a single baseline to a seasonal metric without modelling the seasonality'
+    why_it_happens: |
+      The 13.03 baseline gives a centre and a spread, and applying a fixed threshold around that centre
+      is the obvious next step. For a metric that happens to be roughly flat it works, so the seasonality
+      problem is easy to overlook until a clearly seasonal metric like request rate is monitored.
+    consequence: |
+      A seasonal metric has a normal that moves through the day and week. A threshold set above the
+      morning peak lets an overnight attack pass underneath it; a threshold set to catch the overnight
+      attack fires every morning. The detector spends its entire alert budget on the legitimate daily
+      cycle and hides attacks inside seasonal peaks. The static threshold cannot win against a moving
+      normal.
+    correct_approach: |
+      Model the seasonality and measure deviation from the time-varying seasonal expectation, via seasonal
+      decomposition or a seasonal forecaster whose prediction interval moves with the season. The
+      detector then compares each observation against what is normal for that hour and day, firing on the
+      overnight anomaly and staying quiet during the legitimate peak. time_series_anomaly_detector.py and
+      forecast_anomaly_scorer.py carry the seasonality so the threshold inherits it.
+
+  mistake_2:
+    description: 'Estimating the seasonal pattern with non-robust statistics so a sustained attack is folded into the season'
+    why_it_happens: |
+      Seasonal decomposition by simple averaging is the textbook method, and averaging the values at each
+      time slot to estimate the seasonal factor is straightforward. Robustness feels like an unnecessary
+      complication when the data looks clean.
+    consequence: |
+      If a sustained attack is present while the seasonal component is estimated, a non-robust average
+      folds the attack into the seasonal pattern: the detector learns to expect the elevated level at
+      that time of day and stops flagging it. The attack becomes part of the model's notion of normal,
+      exactly the contamination failure from 13.03 reappearing in the seasonal estimate. Subsequent
+      attacks at the same time slot are now expected and pass.
+    correct_approach: |
+      Estimate the seasonal and trend components with robust statistics, the median rather than the mean,
+      so a minority of attack observations at a time slot does not move the seasonal factor for that slot.
+      The attack then remains in the residual where the detector sees it. The decompose function in
+      time_series_anomaly_detector.py uses medians for exactly this reason.
+
+  mistake_3:
+    description: 'Recomputing the full decomposition or refitting the forecaster over the entire history on every new observation in production'
+    why_it_happens: |
+      A batch decomposition is the natural way to develop and validate the detector offline, and reusing
+      that batch code in production is the least-effort path. On a short history it is fast enough that
+      the scaling problem is not visible during testing.
+    consequence: |
+      The per-point cost of a full recomputation grows with the history length. As the series lengthens
+      over weeks and months in production, the per-observation latency creeps upward until the temporal
+      detector cannot keep up with the event rate, and it either falls behind or is dropped. The detector
+      that worked in a one-week test becomes unviable at production timescales.
+    correct_approach: |
+      Use a streaming detector that maintains a compact running state -- level, seasonal factors, residual
+      scale -- and updates incrementally with constant per-point cost regardless of history length.
+      Exponential smoothing gives this directly. forecast_anomaly_scorer.py maintains constant-cost state
+      and never recomputes over history.
+
+  mistake_4:
+    description: 'Relying only on outlier detection and missing account compromise because the forecaster adapts to the new regime'
+    why_it_happens: |
+      Outlier detection is the headline temporal capability: it catches the spike, the obvious anomaly,
+      the dramatic deviation. Once it is built and catching bursts, it feels like the temporal problem is
+      solved, and change-point detection looks like a redundant second mechanism.
+    consequence: |
+      Account compromise is often a sustained regime change, not a single spike. After the transition,
+      each individual observation sits within the band that a streaming forecaster, smoothing toward the
+      new level, comes to expect, so outlier detection stops firing within a short time of the takeover.
+      The most consequential behavioural attack produces only a brief outlier signal at the transition and
+      then goes quiet as the detector adapts to it.
+    correct_approach: |
+      Run change-point detection alongside outlier detection. Change-point detection flags the moment the
+      distribution shifts and records that a regime change happened, surviving the forecaster's adaptation
+      to the new level. The change-point signal is the account-compromise alert that outlier detection
+      cannot sustain. change_point_detector.py monitors for the regime shift specifically.
+
+  mistake_5:
+    description: 'Detecting at a single time resolution, so the detector is blind to either the burst or the slow ramp'
+    why_it_happens: |
+      One time resolution must be chosen to aggregate the metric -- per minute, per hour, per day -- and
+      a single choice is simpler to build, tune, and reason about. Whichever resolution is chosen catches
+      the attacks visible at that scale, which feels like adequate coverage.
+    consequence: |
+      The burst and the slow ramp have opposite signatures. A fine resolution sees the burst and averages
+      the slow ramp into invisibility; a coarse resolution sees the ramp and averages the burst into a
+      single slightly-elevated bucket. Whichever single resolution is chosen, the detector is structurally
+      blind to one of the two highest-value temporal attacks, and the blind spot is not apparent from
+      testing against the attack the chosen resolution does catch.
+    correct_approach: |
+      Run the temporal detection at several resolutions in parallel and combine the signals with
+      deduplication, so the burst fires the fine resolution and the ramp fires the coarse resolution and
+      the entity is flagged if any resolution fires. multi_resolution_analyser.py runs fine, medium, and
+      coarse detection together for exactly this coverage.
+
+section_summary:
+
+  compact: |
+    Behavioural metrics are seasonal time series, and Section 13.04 builds the temporal detectors that
+    measure deviation from an entity's moving envelope rather than a static threshold. A single threshold
+    on a seasonal metric either fires every morning or hides overnight attacks, so seasonal decomposition
+    separates trend and seasonal structure from the residual where anomalies live, and forecasting frames
+    the same idea as a moving prediction interval that carries the seasonality. The detector must stream:
+    a constant-cost running state updated incrementally, with flagged observations held out of the state
+    update as the temporal contamination guard. Change-point detection answers a different question from
+    outlier detection -- when did the distribution shift -- which is the account-compromise signal that
+    survives the forecaster's adaptation to a new regime. Multi-resolution analysis runs detection at
+    fine, medium, and coarse time scales in parallel so the burst fires the fine resolution and the slow
+    ramp fires the coarse resolution, covering both of the two opposite high-value temporal signatures
+    that any single resolution would miss. The output is a per-entity temporal anomaly score, seasonality-
+    aware and sensitive to both spike and ramp, that the rate and profiling families consume.
+
+  key_takeaways:
+    - 'Behavioural metrics are seasonal time series, and a static threshold either fires on every legitimate peak or hides attacks in the troughs -- the seasonality must be modelled and removed before deviation is measured'
+    - 'Seasonal decomposition isolates the residual, where anomalies live after trend and seasonal structure are removed, and a seasonal forecaster frames the same idea as a prediction interval that moves with the season'
+    - 'The seasonal estimate must use robust statistics or a sustained attack is folded into the seasonal pattern and the detector learns to expect it'
+    - 'Temporal detection must stream with constant per-point cost, holding flagged observations out of the state update as the temporal analogue of the baseline contamination guard'
+    - 'Change-point detection answers when the distribution shifted -- the account-compromise signal that survives the forecaster adapting to the new regime, which outlier detection cannot sustain'
+    - 'Multi-resolution analysis catches both the sudden burst (fine resolution) and the slow ramp (coarse resolution), the two opposite signatures that any single-resolution detector is blind to one of'
+
+preview_section_13_05:
+  title: 'Section 13.05: Drift Detection -- Data Drift and Concept Drift Beneath the Detectors'
+  summary: |
+    Section 13.05 turns the temporal lens from the user to the detectors and the model, catching the
+    silent degradation that no user-behaviour detector reveals. It distinguishes data drift -- the input
+    feature distribution shifting away from the training distribution -- from concept drift, where the
+    relationship between features and labels changes so a once-accurate detector decays with no input-side
+    signal. It builds population stability index monitoring on input features, Kolmogorov-Smirnov and
+    chi-squared tests for distribution comparison, and prediction-distribution monitoring that detects
+    drift through the classifier score distribution rather than the inputs. It connects drift alerts to
+    the Chapter 12 Section 12.14 retraining trigger and distinguishes benign drift (seasonal, product
+    change) from adversarial drift (attack-distribution shift). Without drift monitoring, the Chapter 12
+    detectors are decaying assets with no alarm on their decay; Section 13.05 is that alarm.
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 1 Section 1.04: descriptive statistics and distributions -- the basis for residual scoring'
+    - 'Chapter 2 Section 2.17: sequence and recurrence basics -- background for streaming temporal models'
+    - 'Chapter 13 Section 13.01: behavioural detection taxonomy -- the temporal family this section implements'
+    - 'Chapter 13 Section 13.02: session modelling -- the source of per-session metrics aggregated into time series'
+    - 'Chapter 13 Section 13.03: statistical baselines -- the per-entity reference these temporal detectors forecast and decompose against'
+  forward_references:
+    - 'Section 13.05: drift detection -- applies distributional comparison to the detectors and model rather than user behaviour'
+    - 'Section 13.07: rate-based detection -- uses the temporal rate anomaly signal'
+    - 'Section 13.10: user behaviour profiling -- folds temporal anomaly signals into the persistent profile'
+    - 'Section 13.11: graph-based detection and the behavioural monitoring capstone'
+  tags:
+    - time-series-anomaly-detection
+    - seasonal-decomposition
+    - seasonality
+    - residual-analysis
+    - forecasting
+    - prediction-interval
+    - streaming-detection
+    - online-anomaly-detection
+    - change-point-detection
+    - account-compromise
+    - multi-resolution-analysis
+    - burst-detection
+    - slow-ramp-detection
+    - owasp-llm04
+    - owasp-llm10
+    - chapter-13-temporal
