@@ -1,0 +1,793 @@
+# section_13_06_model_behaviour_monitoring.yaml
+
+---
+document_info:
+  title: 'Model Behavioural Monitoring: Output Distribution Shift as Injection-Success Signal'
+  chapter: 13
+  section: 6
+  section_code: '1306'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-21'
+  estimated_pages: 7
+  estimated_reading_time: '50-60 minutes'
+
+section_overview:
+  one_line_summary: 'Detecting an injection attempt on the input and detecting injection success on the output are different problems; Section 13.06 monitors the model output distribution -- refusal rate, persona, format conformance, canary emission -- to confirm whether an injection took control, catching the successes the input-side classifiers scored low.'
+  why_this_section_exists: |
+    The Chapter 12 classifiers and the input-side behavioural detectors all answer one question: is
+    this input an attack. None of them answers the question that ultimately matters: did the attack
+    succeed. An injection attempt that the input classifier scored as low risk -- because it was
+    cleverly framed, novel, or disguised -- may nonetheless have taken control of the model. The
+    evidence of that success is not in the input, where the classifier already looked and found
+    little. It is in the output, where the model's behaviour reveals whether the injected
+    instructions took hold.
+
+    This is the gap Section 13.06 fills. It monitors the model's own behaviour -- its output
+    distribution -- for the shift that signals a successful injection. A model under normal operation
+    has a characteristic output behaviour: a typical refusal rate for sensitive requests, a
+    consistent persona, reliable adherence to its system-prompt constraints and output format. When an
+    injection succeeds, that behaviour shifts: the refusal rate drops because the model is now
+    following the attacker's instructions instead of its guardrails, the persona breaks, the format
+    is abandoned, or the model emits content it was explicitly instructed never to produce. Monitoring
+    the output for these shifts detects the success that the input-side layer could not confirm.
+
+    The section's organising principle is that input detection and output detection are complementary,
+    not redundant. The input layer is necessary -- it blocks the attempts it recognises before they
+    reach the model. The output layer is necessary too -- it catches the attempts that got through and
+    succeeded. A system with only input detection knows what it blocked and is blind to what it missed;
+    adding output monitoring closes that blind spot by measuring outcomes, not just attempts.
+  position_in_chapter: |
+    Section 13.06 sits at the boundary of the temporal family, applying the output-distribution
+    monitoring concept from 13.05 to the model rather than to the detectors. Where 13.05 watched the
+    detectors' score distribution for decay, 13.06 watches the model's output distribution for
+    injection success. It complements the input-side Chapter 12 classifiers and the Section 12.09 PII
+    output scanning, and it produces an injection-success signal that feeds the entity profiler of
+    13.10 and the gateway integration of 13.11. It is the section that completes the injection-
+    detection picture from attempt to outcome.
+
+learning_objectives:
+
+  knowledge:
+    - 'Distinguish detecting an injection attempt on the input from detecting injection success on the output'
+    - 'Explain why successful injection manifests as a shift in the model output distribution'
+    - 'Name the output distribution features that reveal injection success: refusal rate, response length, format conformance, persona consistency, sentiment'
+    - 'Explain the role of a per-endpoint and per-task output baseline as the reference for shift detection'
+    - 'Describe canary and honeytoken signals and why they give a high-confidence binary injection-success detection'
+    - 'Explain self-consistency monitoring and how intra-session behavioural contradiction signals a takeover'
+    - 'Describe how output monitoring runs post-inference without blocking the response path and complements Section 12.09 PII scanning'
+
+  skills:
+    - 'Extract output distribution features from a model response: refusal, length, format conformance, persona, sentiment'
+    - 'Establish a per-endpoint and per-task output baseline and score a response against it'
+    - 'Detect output anomalies that violate the system-prompt constraints the model normally honours'
+    - 'Implement canary and honeytoken monitoring for high-confidence injection-success detection'
+    - 'Implement self-consistency monitoring that flags intra-session behavioural contradiction'
+
+  security_mindset:
+    - 'Internalise that the input classifier scoring an attempt low does not mean the attack failed -- success is an output-side fact the input layer cannot see'
+    - 'Recognise that the model output distribution is a behavioural baseline like any other, with the same baseline-before-anomaly discipline'
+    - 'Understand that a canary the model was instructed never to emit turns injection success into a near-certain binary signal'
+    - 'Treat output monitoring as post-inference analysis that must not block the response path, complementing rather than replacing input detection'
+
+prerequisites:
+  - 'Chapter 4 Section 4.07: prompt injection mechanics -- the attack whose success this section detects'
+  - 'Chapter 12 Section 12.09: PII output scanning -- the output-side scanning this section complements'
+  - 'Chapter 13 Section 13.03: statistical baselines -- the baseline-before-anomaly discipline applied to output'
+  - 'Chapter 13 Section 13.04: time-series anomaly detection -- distribution-shift detection over output metrics'
+  - 'Chapter 13 Section 13.05: drift detection -- output-distribution monitoring concept turned here on the model'
+
+prose_content:
+
+  part_1:
+    title: 'Attempt Versus Success: Two Different Detection Problems'
+    body: |
+      Every input-side detector in this book answers the same question in different ways: is this input
+      an attack. The Chapter 12 injection classifier scores the prompt; the jailbreak classifier scores
+      the framing; the heuristic and signature layers match known patterns. All of them operate on the
+      input, before the model has responded, and all of them are making a prediction about intent. They
+      answer the attempt question: is someone trying to attack.
+
+      The success question is different and is not answerable from the input. Did the attack work. An
+      injection attempt can be scored as low risk by the input classifier for several legitimate
+      reasons: it is a novel technique the classifier never saw, it is framed to look benign, it is
+      buried in a long context, or it arrives through an indirect channel like a retrieved document that
+      the input classifier did not scrutinise as adversarial. The input layer looked at this input and
+      found little cause for alarm. Whether the model then followed the injected instructions is a fact
+      about the model's behaviour, established only after the model responds, and visible only in the
+      response.
+
+      This is why output monitoring is not redundant with input detection. The two layers answer
+      different questions and catch different failures. Input detection catches the attempts it
+      recognises and blocks them before they reach the model -- a necessary first line. Output
+      monitoring catches the attempts that input detection scored low and that then succeeded -- the
+      failures of the input layer, measured by their outcome. A system with only input detection has a
+      structural blind spot exactly the size of its input-layer false-negative rate: every attack the
+      input layer misses succeeds invisibly. Output monitoring measures that blind spot by watching what
+      the model actually did, turning an unmeasured false-negative rate into a detectable signal.
+
+  part_2:
+    title: 'Why Success Shows in the Output Distribution'
+    body: |
+      A successful injection changes what the model produces, and that change is detectable because the
+      model has a characteristic output behaviour to deviate from. Under normal operation, constrained
+      by its system prompt and training, the model exhibits stable output tendencies: it refuses a
+      characteristic fraction of sensitive requests, maintains a consistent persona and tone, adheres to
+      its output format, and stays within its instructed scope. This stable behaviour is a distribution,
+      and like any behavioural distribution it can serve as a baseline.
+
+      When an injection succeeds, the injected instructions override some of these tendencies, and the
+      output distribution shifts in characteristic ways. The refusal rate drops: a model now following
+      the attacker's instructions stops declining the requests it would normally refuse, because it is
+      no longer applying its guardrails. The persona breaks: a model instructed to be a helpful
+      assistant suddenly adopts a different voice, ignores its name, or contradicts its stated role. The
+      format conformance fails: a model that reliably returns structured output starts emitting free text
+      or the attacker's preferred format. The response may shift in length -- injections that extract
+      hidden content or system prompts often produce unusually long responses -- or in sentiment, as the
+      model is steered into a tone it does not normally take. And in the clearest case, the model emits
+      content it was explicitly instructed never to produce.
+
+      None of these shifts is visible on the input side, because each is a property of the response. The
+      input classifier scored the prompt and moved on; the shift happens in what the model says next.
+      Monitoring the output distribution for these characteristic shifts is therefore the natural way to
+      detect injection success, and it inherits the entire baseline-and-anomaly machinery of the temporal
+      family: establish what normal output behaviour is, then detect deviation from it. The difference
+      from 13.03 through 13.05 is only the subject -- the model's behaviour rather than the user's or the
+      detector's -- and the principle is identical: no baseline, no anomaly.
+
+  part_3:
+    title: 'The Per-Endpoint, Per-Task Output Baseline'
+    body: |
+      Output behaviour is not uniform across the application. A customer-support endpoint refuses
+      rarely and maintains a warm persona; a code-generation endpoint almost never refuses and returns
+      structured output; a content-moderation endpoint refuses often by design. A single global output
+      baseline would call the moderation endpoint's high refusal rate anomalous and the code endpoint's
+      near-zero refusal rate normal, getting both backwards. The output baseline must be established per
+      endpoint and, within an endpoint, per task type, exactly as the user baseline of 13.03 was
+      established per entity.
+
+      The per-endpoint output baseline captures the characteristic output distribution for that
+      endpoint: its typical refusal rate, its persona-consistency level, its format-conformance rate,
+      its response-length distribution, its sentiment range. A response is scored against the baseline
+      for its endpoint and task, so a refusal-rate drop is measured relative to what that endpoint
+      normally refuses, not a global constant. A code endpoint that suddenly starts refusing, or a
+      moderation endpoint that suddenly stops, is anomalous relative to its own baseline even though the
+      absolute rates are opposite.
+
+      Establishing this baseline requires the same robustness discipline as every other baseline in the
+      chapter. The output baseline is computed from live model responses, which include the responses
+      to successful attacks. If a sustained injection campaign succeeds during the baseline estimation
+      window, a non-robust baseline learns the attacked behaviour as normal -- it comes to expect the
+      lowered refusal rate -- and stops flagging the success. Robust statistics and the contamination
+      guard from 13.03 apply unchanged: the baseline is built with robust statistics, and responses
+      already flagged as anomalous are held out of the baseline update so a successful campaign cannot
+      train the output baseline to accept it. The output baseline is the reference for everything in
+      this section, so its integrity matters as much as that of the user baseline.
+
+  part_4:
+    title: 'Canaries and Honeytokens: Turning Success into a Binary Signal'
+    body: |
+      The output-distribution features of the previous parts are statistical: a refusal-rate drop or a
+      persona shift is a probabilistic signal that something may have gone wrong. Canaries and
+      honeytokens provide a complementary signal of a completely different character: a near-certain,
+      binary indication that an injection succeeded.
+
+      The technique places a secret in the model's context or instructions that the model is told never
+      to reveal -- a canary string in the system prompt, a honeytoken in a retrieved document, a marker
+      that has no legitimate reason to appear in any output. Under normal operation, the model honours
+      the instruction and the secret never appears in a response. If the secret does appear in an
+      output, the only explanation is that an injection overrode the instruction to keep it hidden: the
+      attacker successfully instructed the model to reveal its context, dump its system prompt, or
+      ignore its constraints, and the canary came out with everything else. The appearance of a canary
+      in output is therefore a high-confidence binary detection of injection success, with almost no
+      false-positive ambiguity, because there is no benign path by which the secret reaches the output.
+
+      Canary monitoring is operationally cheap and powerful, and it covers exactly the attack class that
+      is hardest to detect otherwise: system-prompt extraction and context exfiltration, where the
+      attacker's goal is to make the model reveal what it was told to conceal. It does have limits. It
+      detects only injections that cause the canary to surface, so an injection that achieves a different
+      goal -- making the model produce harmful content without touching the canary -- is not caught by
+      the canary, which is why canaries complement rather than replace the statistical output features. A
+      layered output monitor uses both: the statistical features catch the broad class of behavioural
+      shifts, and the canaries catch the extraction class with near-certainty. The two together give the
+      output monitor both breadth and a high-confidence anchor.
+
+  part_5:
+    title: 'Self-Consistency Monitoring: The Model Contradicting Itself'
+    body: |
+      A further output-side signal comes from within a session: the model contradicting its own earlier
+      behaviour. A multi-turn injection often produces a detectable inconsistency -- the model that
+      refused a request on turn three complies with an equivalent request on turn eight after the
+      attacker has manipulated the context, or the model that maintained a persona for the first half of
+      the conversation abandons it in the second half. The contradiction itself is the signal,
+      independent of whether any single response looks anomalous against the static baseline.
+
+      Self-consistency monitoring tracks the model's behaviour across the turns of a session and flags
+      when later behaviour contradicts earlier behaviour in a way that suggests the model's constraints
+      have been altered mid-session. The clearest case is a refusal reversal: the model refused a class
+      of request earlier and now complies with the same class, which under normal operation should not
+      happen within a session, because the model's constraints are stable. A refusal reversal within a
+      session is a strong signal that the intervening turns successfully relaxed the model's guardrails
+      -- the multi-turn injection worked. Persona drift across a session, where the model's voice and
+      stated role shift from the opening, is a softer version of the same signal.
+
+      Self-consistency monitoring connects directly to the session model of 13.02 and the multi-turn
+      analysis of 13.09: it reads the session trajectory and adds the output-side behavioural-consistency
+      dimension to the input-side trajectory features those sections produce. Where 13.09 watches the
+      user's escalating requests, self-consistency watches the model's response to that escalation, and a
+      session where the user escalates and the model's refusals reverse is a near-unambiguous successful
+      multi-turn injection -- the attack and its success observed together. This pairing of the input-side
+      escalation signal with the output-side reversal signal is the strongest evidence the behavioural
+      layer can produce for a multi-turn injection.
+
+  part_6:
+    title: 'Post-Inference Placement and the Complement to Input Detection'
+    body: |
+      Output monitoring operates on the model's response, which means it necessarily runs after
+      inference, and this placement has an important operational consequence: it must not block the
+      response path. Input detection sits inline before the model and can block an attempt before it
+      reaches the model, paying its latency on the request path. Output monitoring sits after the model
+      has already produced a response, and adding a heavy synchronous analysis between the model and the
+      user would add latency to every response. The standard placement is therefore post-inference and
+      asynchronous: the response is returned to the user while the output monitor analyses it in
+      parallel, raising an alert, adjusting the entity risk score, or triggering a session intervention
+      when it detects a success, rather than holding the response.
+
+      There is a tension here worth naming. If the output monitor runs asynchronously, the harmful
+      response may already have been delivered to the user by the time the monitor detects the success.
+      For the highest-risk endpoints, a synchronous output check on a fast subset of signals -- canary
+      detection in particular, which is a cheap string search -- can run inline before the response is
+      released, blocking a response that contains a canary while the slower statistical analysis runs
+      asynchronously. The placement is thus tiered: the cheap, high-confidence canary check can gate the
+      response on sensitive endpoints, while the broader statistical monitoring runs post-inference and
+      feeds the behavioural layer.
+
+      Output monitoring complements the Section 12.09 PII output scanning, which is itself an output-side
+      check for a specific content class. The two share the post-inference output-analysis placement and
+      can share the response-scanning pipeline: PII scanning looks for leaked personal data, canary
+      monitoring looks for leaked secrets, and the statistical output features look for behavioural
+      shift, all on the same response. Together with the input-side classifiers, they complete the
+      injection-detection picture: the input layer detects and blocks the attempts it recognises, and the
+      output layer -- PII scanning, canary monitoring, statistical behavioural monitoring, and self-
+      consistency -- detects the successes that got through, measuring the outcome the input layer could
+      only predict. The injection-success signal this section produces flows to the entity profiler of
+      13.10, where a confirmed success sharply elevates the entity's risk, and to the gateway of 13.11,
+      where it becomes part of the behavioural verdict.
+
+reference_materials:
+
+  table_1:
+    title: 'Input Attempt Detection vs Output Success Detection'
+    description: 'The complementary roles of input-side and output-side detection in the injection-detection picture'
+    columns: ['Property', 'Input Attempt Detection', 'Output Success Detection']
+    rows:
+      - ['Question answered', 'Is this input an attack', 'Did the attack succeed']
+      - ['Operates on', 'The prompt, before inference', 'The response, after inference']
+      - ['Placement', 'Inline, blocks before the model', 'Post-inference, mostly asynchronous']
+      - ['Misses', 'Novel, disguised, indirect attempts', 'Attacks that change no output feature']
+      - ['Implemented by', 'Chapter 12 classifiers, heuristics, signatures', 'This section + Section 12.09 PII scanning']
+
+  table_2:
+    title: 'Output Distribution Features and the Injection-Success Signal Each Carries'
+    description: 'The output features monitored for injection success and how each shifts when an injection takes control'
+    columns: ['Output Feature', 'Normal Behaviour', 'Shift on Injection Success', 'Signal Strength']
+    rows:
+      - ['Refusal rate', 'Characteristic per endpoint', 'Drops -- guardrails no longer applied', 'High']
+      - ['Persona consistency', 'Stable voice and role', 'Breaks -- different voice or role', 'Medium-high']
+      - ['Format conformance', 'Reliable structured output', 'Fails -- free text or attacker format', 'Medium-high']
+      - ['Response length', 'Typical per task', 'Often long -- context/prompt extraction', 'Medium']
+      - ['Sentiment', 'Within a normal range', 'Steered outside the range', 'Low-medium']
+      - ['Canary emission', 'Secret never appears', 'Secret appears -- extraction succeeded', 'Very high (binary)']
+
+  table_3:
+    title: 'Output Monitoring Signal Types: Statistical vs Binary vs Consistency'
+    description: 'The three kinds of output-side signal, their confidence, and the attack class each best detects'
+    columns: ['Signal Type', 'Example', 'Confidence', 'Best Detects', 'Limitation']
+    rows:
+      - ['Statistical distribution shift', 'Refusal-rate drop vs baseline', 'Probabilistic', 'Broad behavioural override', 'Needs a baseline; noisy on single responses']
+      - ['Binary canary/honeytoken', 'Canary string appears in output', 'Near-certain', 'System-prompt and context extraction', 'Only catches injections that surface the secret']
+      - ['Self-consistency', 'Refusal reversal within a session', 'High in context', 'Multi-turn injection success', 'Needs session state; persona drift is softer']
+
+  table_4:
+    title: 'Output Monitoring Placement Tiers'
+    description: 'How output checks are placed relative to the response path by cost and confidence'
+    columns: ['Check', 'Cost', 'Placement', 'Can Gate Response', 'Rationale']
+    rows:
+      - ['Canary string search', 'Very low', 'Inline on sensitive endpoints', 'Yes', 'Cheap, near-certain, blocks extraction']
+      - ['PII output scan (12.09)', 'Low-medium', 'Inline or fast async', 'Yes for high-risk', 'Prevents personal-data leak']
+      - ['Statistical output features', 'Medium', 'Post-inference async', 'No (alerts/adjusts)', 'Too slow to gate every response']
+      - ['Self-consistency monitoring', 'Medium (session state)', 'Post-inference async', 'No (session intervention)', 'Needs cross-turn comparison']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Output Distribution Feature Extractor and Baseline'
+    filename: 'output_baseline.py'
+    description: 'Extracts output distribution features from a model response (refusal, length, format conformance, persona markers, sentiment proxy) and maintains a per-endpoint per-task output baseline using robust statistics with a contamination guard. Implements the output features and baseline from Section 13.06 Parts 2 and 3.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only; refusal and persona detection use simple marker heuristics as stand-ins for production classifiers'
+    code: |
+      # output_baseline.py
+      # Section 13.06: Output Distribution Features and Per-Endpoint Baseline
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from collections import deque
+      from dataclasses import dataclass, field
+      from typing import Deque, Dict, Tuple
+
+
+      REFUSAL_MARKERS = ('i cannot', 'i can not', 'i am unable', 'i will not', 'i am not able')
+      PERSONA_MARKERS = ('as an assistant', 'happy to help', 'i am here to help')
+
+
+      def _median(values) -> float:
+          s = sorted(values)
+          n = len(s)
+          if n == 0:
+              return 0.0
+          mid = n // 2
+          return float(s[mid]) if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+      def _mad(values, c) -> float:
+          if not values:
+              return 0.0
+          return _median([abs(v - c) for v in values]) * 1.4826
+
+
+      @dataclass
+      class OutputFeatures:
+          refused: float          # 1.0 if response is a refusal
+          length: float           # token-ish length
+          format_ok: float        # 1.0 if expected format present
+          persona_ok: float       # 1.0 if persona markers present
+
+
+      def extract_output_features(response: str, expects_json: bool = False) -> OutputFeatures:
+          low = response.lower()
+          refused = 1.0 if any(m in low for m in REFUSAL_MARKERS) else 0.0
+          length = float(len(response.split()))
+          if expects_json:
+              format_ok = 1.0 if response.strip().startswith('{') and response.strip().endswith('}') else 0.0
+          else:
+              format_ok = 1.0
+          persona_ok = 1.0 if any(m in low for m in PERSONA_MARKERS) else 0.0
+          return OutputFeatures(refused, length, format_ok, persona_ok)
+
+
+      @dataclass
+      class OutputBaseline:
+          max_len: int = 300
+          refusals: Deque[float] = field(default_factory=deque)
+          lengths: Deque[float] = field(default_factory=deque)
+          format_oks: Deque[float] = field(default_factory=deque)
+
+          def update(self, feats: OutputFeatures, flagged: bool = False) -> None:
+              # Contamination guard: flagged responses do not update the baseline
+              if flagged:
+                  return
+              for dq, v in ((self.refusals, feats.refused), (self.lengths, feats.length), (self.format_oks, feats.format_ok)):
+                  dq.append(v)
+                  while len(dq) > self.max_len:
+                      dq.popleft()
+
+          def refusal_rate(self) -> float:
+              return sum(self.refusals) / len(self.refusals) if self.refusals else 0.0
+
+          def length_centre_spread(self) -> Tuple[float, float]:
+              vals = list(self.lengths)
+              c = _median(vals)
+              return c, _mad(vals, c)
+
+
+      class OutputBaselineStore:
+          def __init__(self) -> None:
+              self.baselines: Dict[Tuple[str, str], OutputBaseline] = {}
+
+          def get(self, endpoint: str, task: str) -> OutputBaseline:
+              key = (endpoint, task)
+              if key not in self.baselines:
+                  self.baselines[key] = OutputBaseline()
+              return self.baselines[key]
+
+
+      if __name__ == '__main__':
+          store = OutputBaselineStore()
+          bl = store.get('/v1/chat', 'sensitive')
+          # Normal: refuses ~40% of sensitive requests
+          for i in range(50):
+              resp = 'I cannot help with that request.' if i % 5 < 2 else 'Here is some general information.'
+              bl.update(extract_output_features(resp))
+          print(f'Baseline refusal rate (sensitive endpoint): {bl.refusal_rate():.2f}')
+          c, s = bl.length_centre_spread()
+          print(f'Baseline length centre={c:.0f}, spread={s:.1f}')
+          print('A sudden drop in refusal rate vs this baseline signals possible')
+          print('injection success on the sensitive endpoint.')
+
+  deliverable_2:
+    title: 'Model Behaviour Monitor'
+    filename: 'model_behaviour_monitor.py'
+    description: 'Scores a model response against its per-endpoint output baseline, detecting injection-success shifts: refusal-rate drop, length anomaly, format failure, persona break. Produces an injection-success likelihood from the combined output-distribution signals. Implements the output-anomaly detection from Section 13.06 Part 2.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only; consumes the baseline concept from output_baseline.py but is self-contained for the example'
+    code: |
+      # model_behaviour_monitor.py
+      # Section 13.06: Model Behaviour Monitor -- Output Shift Scoring
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from typing import Dict, List
+
+
+      @dataclass
+      class OutputObservation:
+          refused: bool
+          length: float
+          format_ok: bool
+          persona_ok: bool
+
+
+      @dataclass
+      class EndpointOutputBaseline:
+          refusal_rate: float
+          length_centre: float
+          length_spread: float
+          format_ok_rate: float
+          persona_ok_rate: float
+
+
+      @dataclass
+      class SuccessSignal:
+          score: float
+          contributors: List[str]
+
+
+      def score_injection_success(obs: OutputObservation, bl: EndpointOutputBaseline) -> SuccessSignal:
+          contributors = []
+          score = 0.0
+
+          # Refusal drop: a non-refusal where the endpoint usually refuses often
+          if not obs.refused and bl.refusal_rate > 0.25:
+              weight = bl.refusal_rate  # the more it normally refuses, the stronger the signal
+              score += 0.5 * weight
+              contributors.append(f'no-refusal on endpoint that refuses {bl.refusal_rate:.0%}')
+
+          # Length anomaly: unusually long response (extraction signature)
+          if bl.length_spread > 0:
+              z = (obs.length - bl.length_centre) / bl.length_spread
+              if z > 4:
+                  score += 0.3
+                  contributors.append(f'length z={z:.1f} (possible extraction)')
+
+          # Format failure where format is normally reliable
+          if not obs.format_ok and bl.format_ok_rate > 0.8:
+              score += 0.3
+              contributors.append('format conformance failed')
+
+          # Persona break where persona is normally consistent
+          if not obs.persona_ok and bl.persona_ok_rate > 0.7:
+              score += 0.2
+              contributors.append('persona markers absent')
+
+          return SuccessSignal(round(min(score, 1.0), 3), contributors)
+
+
+      if __name__ == '__main__':
+          baseline = EndpointOutputBaseline(
+              refusal_rate=0.40,
+              length_centre=60.0,
+              length_spread=20.0,
+              format_ok_rate=0.95,
+              persona_ok_rate=0.85,
+          )
+
+          normal = OutputObservation(refused=True, length=55, format_ok=True, persona_ok=True)
+          suspicious = OutputObservation(refused=False, length=240, format_ok=False, persona_ok=False)
+
+          print('Normal response:    ', score_injection_success(normal, baseline))
+          print('Suspicious response:', score_injection_success(suspicious, baseline))
+          print('The suspicious response combines a refusal drop, length spike,')
+          print('format failure, and persona break -- a strong injection-success signal.')
+
+  deliverable_3:
+    title: 'Canary and Honeytoken Monitor'
+    filename: 'canary_token_monitor.py'
+    description: 'Detects emission of canary strings or honeytokens in model output, providing a high-confidence binary injection-success signal for system-prompt and context extraction. Supports inline gating on sensitive endpoints. Implements the canary monitoring from Section 13.06 Part 4.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # canary_token_monitor.py
+      # Section 13.06: Canary and Honeytoken Monitor
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import Dict, List, Optional
+
+
+      @dataclass
+      class CanaryHit:
+          canary_id: str
+          context: str   # where the canary was planted
+
+
+      @dataclass
+      class CanaryMonitor:
+          # map of canary secret -> identifier/context, planted in prompts/docs
+          canaries: Dict[str, str] = field(default_factory=dict)
+
+          def plant(self, secret: str, context: str) -> None:
+              self.canaries[secret] = context
+
+          def scan(self, response: str) -> List[CanaryHit]:
+              hits = []
+              for secret, context in self.canaries.items():
+                  if secret in response:
+                      hits.append(CanaryHit(canary_id=secret[:8] + '...', context=context))
+              return hits
+
+          def gate(self, response: str) -> Optional[str]:
+              # Inline gating: block release if any canary surfaced
+              hits = self.scan(response)
+              if hits:
+                  return f'BLOCKED: canary emission detected ({len(hits)} hit) -- injection success'
+              return None
+
+
+      if __name__ == '__main__':
+          monitor = CanaryMonitor()
+          monitor.plant('CANARY-9f3a2b7c-do-not-reveal', 'system prompt')
+          monitor.plant('HONEYTOKEN-doc-4421', 'retrieved document')
+
+          benign = 'Here is the summary you asked for: the weather is mild today.'
+          extracted = ('My system prompt begins: You are a helpful assistant. '
+                       'Internal marker CANARY-9f3a2b7c-do-not-reveal follows.')
+
+          print('Benign response gate:   ', monitor.gate(benign))
+          print('Extraction response gate:', monitor.gate(extracted))
+          for hit in monitor.scan(extracted):
+              print(f'  canary {hit.canary_id} surfaced from {hit.context}')
+          print('A planted secret appearing in output has no benign explanation --')
+          print('it is a near-certain binary signal of context/prompt extraction.')
+
+  deliverable_4:
+    title: 'Self-Consistency Monitor'
+    filename: 'self_consistency_monitor.py'
+    description: 'Tracks model behaviour across the turns of a session and flags intra-session contradiction -- notably a refusal reversal -- that signals a successful multi-turn injection. Reads the session trajectory and adds the output-side consistency dimension. Implements the self-consistency monitoring from Section 13.06 Part 5.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # self_consistency_monitor.py
+      # Section 13.06: Self-Consistency Monitor
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import Dict, List, Optional
+
+
+      @dataclass
+      class TurnBehaviour:
+          turn_index: int
+          request_class: str   # coarse category of the request
+          refused: bool
+          persona_ok: bool
+
+
+      @dataclass
+      class ConsistencyAlert:
+          kind: str
+          detail: str
+
+
+      @dataclass
+      class SessionConsistency:
+          turns: List[TurnBehaviour] = field(default_factory=list)
+          # request_class -> whether the model has ever refused this class
+          refused_classes: Dict[str, bool] = field(default_factory=dict)
+
+          def observe(self, turn: TurnBehaviour) -> List[ConsistencyAlert]:
+              alerts = []
+              # Refusal reversal: refused this class earlier, now complies
+              if self.refused_classes.get(turn.request_class) and not turn.refused:
+                  alerts.append(ConsistencyAlert(
+                      kind='refusal_reversal',
+                      detail=f'class \'{turn.request_class}\' refused earlier, complied at turn {turn.turn_index}',
+                  ))
+              if turn.refused:
+                  self.refused_classes[turn.request_class] = True
+
+              # Persona drift: persona was consistent, now broken
+              if self.turns and self.turns[-1].persona_ok and not turn.persona_ok:
+                  alerts.append(ConsistencyAlert(
+                      kind='persona_drift',
+                      detail=f'persona consistent then broken at turn {turn.turn_index}',
+                  ))
+
+              self.turns.append(turn)
+              return alerts
+
+
+      if __name__ == '__main__':
+          session = SessionConsistency()
+          stream = [
+              TurnBehaviour(1, 'sensitive_synthesis', refused=True,  persona_ok=True),
+              TurnBehaviour(2, 'general_info',        refused=False, persona_ok=True),
+              TurnBehaviour(3, 'sensitive_synthesis', refused=True,  persona_ok=True),
+              # attacker manipulates context across turns 4-7...
+              TurnBehaviour(8, 'sensitive_synthesis', refused=False, persona_ok=False),
+          ]
+          for turn in stream:
+              alerts = session.observe(turn)
+              for a in alerts:
+                  print(f'Turn {turn.turn_index} ALERT [{a.kind}]: {a.detail}')
+          print('\nThe refusal reversal on turn 8 -- complying with a class refused')
+          print('on turns 1 and 3 -- is a strong successful multi-turn injection signal.')
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Treating a low input-classifier score as proof the attack failed and never checking the output'
+    why_it_happens: |
+      The input classifier is the primary, most-trusted detection layer, and when it scores an input as
+      low risk it is natural to treat that as the verdict and move on. The pipeline is built around the
+      input score, and adding an output check feels like second-guessing a layer that is supposed to be
+      authoritative.
+    consequence: |
+      The input classifier scores intent, not outcome, and it has a false-negative rate: novel,
+      disguised, indirect, or context-buried injections score low and reach the model anyway. Whether
+      such an attempt succeeded is an output-side fact the input score cannot contain. Trusting the low
+      input score as proof of failure means every attack the input layer misses succeeds invisibly, and
+      the system's blind spot is exactly the size of the input layer's false-negative rate, unmeasured.
+    correct_approach: |
+      Monitor the output independently of the input score. A low input score means the attempt was not
+      recognised as an attack, not that it failed; success is measured by watching what the model
+      actually produced. model_behaviour_monitor.py scores the response against the output baseline
+      regardless of what the input layer concluded, closing the false-negative blind spot.
+
+  mistake_2:
+    description: 'Using a single global output baseline instead of per-endpoint, per-task baselines'
+    why_it_happens: |
+      A single output baseline is simpler to maintain, and output behaviour can seem uniform enough --
+      the model is the same model on every endpoint -- that one baseline appears to suffice. The
+      per-entity baseline lesson from 13.03 is easy to forget when the subject changes from users to the
+      model.
+    consequence: |
+      Output behaviour varies sharply by endpoint and task. A code endpoint almost never refuses; a
+      moderation endpoint refuses constantly; a support endpoint maintains a warm persona a code endpoint
+      does not. A global output baseline calls the moderation endpoint's high refusal rate anomalous and
+      the code endpoint's near-zero refusal rate normal, getting the injection-success signal backwards
+      on both -- it would flag the moderation endpoint behaving normally and miss the code endpoint
+      suddenly refusing.
+    correct_approach: |
+      Establish the output baseline per endpoint and per task type, so each response is scored against
+      what is normal for its context. A refusal-rate drop is measured relative to what that endpoint
+      normally refuses, making the same absolute behaviour anomalous on one endpoint and normal on
+      another. output_baseline.py keys baselines on endpoint and task.
+
+  mistake_3:
+    description: 'Building the output baseline from live responses without a contamination guard, so a successful campaign trains the baseline to accept it'
+    why_it_happens: |
+      The output baseline is naturally built from live model responses, since those define normal
+      behaviour. Feeding every response into the baseline is the obvious approach, and the contamination
+      problem from the user baseline does not obviously transfer to the model's own output.
+    consequence: |
+      The live responses include the responses to successful attacks. If a sustained injection campaign
+      succeeds during the baseline window, a non-guarded baseline learns the attacked behaviour as normal
+      -- it comes to expect the lowered refusal rate or the broken persona -- and stops flagging the
+      ongoing success. The very attack the output monitor exists to catch trains the baseline to ignore
+      it, exactly as a slow-ramp attack trains an unguarded user baseline.
+    correct_approach: |
+      Apply the 13.03 robustness and contamination discipline to the output baseline: build it with
+      robust statistics and hold responses already flagged as anomalous out of the baseline update, so a
+      successful campaign cannot fold itself into the model's notion of normal output. output_baseline.py
+      skips flagged responses in its update.
+
+  mistake_4:
+    description: 'Running all output monitoring synchronously inline and blocking every response on the full analysis'
+    why_it_happens: |
+      Output monitoring detects harmful responses, so blocking a response until it is cleared feels like
+      the safe, thorough choice -- analogous to the inline input layer that blocks attempts before the
+      model. Running the full statistical and consistency analysis inline seems like maximum protection.
+    consequence: |
+      The full output analysis -- statistical feature scoring, baseline comparison, cross-turn
+      consistency -- is too slow to run synchronously on every response. Placing it inline adds its
+      latency to every response the user sees, degrading the product for all traffic to defend against
+      the small fraction that is attacked. The output monitor gets disabled for being slow, and its
+      coverage is lost.
+    correct_approach: |
+      Tier the placement by cost and confidence. Run the cheap, near-certain canary string search inline
+      on sensitive endpoints, where it can gate a response containing a canary at negligible latency, and
+      run the broader statistical and consistency analysis post-inference and asynchronously, raising
+      alerts and adjusting risk rather than blocking. canary_token_monitor.py supports inline gating while
+      the heavier monitors run async.
+
+  mistake_5:
+    description: 'Relying only on statistical output features and omitting canaries, missing the extraction attacks that produce no statistical shift'
+    why_it_happens: |
+      The statistical output features -- refusal rate, persona, format -- cover a broad range of
+      behavioural overrides and feel comprehensive. Canaries seem like a narrow, special-case addition
+      once the statistical monitor is catching the obvious behavioural shifts.
+    consequence: |
+      A system-prompt extraction attack can succeed while producing a response that looks statistically
+      ordinary: the model reveals its hidden context in a normally-formatted, normally-toned response
+      that does not trip the refusal, persona, or format features. The statistical monitor sees nothing
+      anomalous because the behavioural distribution did not shift -- only the content changed to include
+      the secret. The hardest-to-detect extraction class slips past a statistics-only output monitor.
+    correct_approach: |
+      Plant canaries and honeytokens and monitor for their emission, which gives a near-certain binary
+      detection of extraction precisely when the statistical features show nothing. The statistical
+      features give breadth across behavioural overrides and the canaries give a high-confidence anchor on
+      the extraction class, and a layered output monitor uses both. canary_token_monitor.py provides the
+      extraction-class coverage that the statistical features miss.
+
+section_summary:
+
+  compact: |
+    Detecting an injection attempt and detecting injection success are different problems: the Chapter 12
+    classifiers score intent on the input, while whether the attack succeeded is an output-side fact
+    established only after the model responds. Section 13.06 monitors the model's output distribution for
+    the shift that signals success -- a refusal-rate drop, a persona break, a format failure, an unusual
+    length, or emission of content the model was instructed never to produce. The output is a behavioural
+    distribution like any other, scored against a per-endpoint, per-task baseline built with the same
+    robust-statistics and contamination discipline as the user baseline, so a successful campaign cannot
+    train the baseline to accept it. Three signal types compose: statistical distribution shift gives broad
+    probabilistic coverage; canaries and honeytokens give a near-certain binary detection of system-prompt
+    and context extraction, the class that produces no statistical shift; and self-consistency monitoring
+    catches the refusal reversal within a session that signals a successful multi-turn injection. Output
+    monitoring runs post-inference and mostly asynchronous so it does not block the response path, with the
+    cheap canary check able to gate sensitive endpoints inline. Together with the input classifiers and the
+    Section 12.09 PII scanning, it completes the injection-detection picture from attempt to outcome, and
+    the injection-success signal feeds the entity profiler and the gateway.
+
+  key_takeaways:
+    - 'Detecting an injection attempt (input, intent) and detecting injection success (output, outcome) are different problems, and a low input-classifier score means the attempt was not recognised, not that it failed'
+    - 'Successful injection shifts the model output distribution: refusal rate drops, persona breaks, format conformance fails, length spikes, or content the model was told never to produce appears'
+    - 'The output baseline must be per-endpoint and per-task and built with robust statistics and a contamination guard, or a successful campaign trains the baseline to accept the attacked behaviour'
+    - 'Canaries and honeytokens turn injection success into a near-certain binary signal for system-prompt and context extraction -- the class that produces no statistical output shift'
+    - 'Self-consistency monitoring catches the refusal reversal within a session, which paired with the input-side escalation signal is the strongest evidence of a successful multi-turn injection'
+    - 'Output monitoring runs post-inference and mostly asynchronous so it does not block the response path, with the cheap canary check able to gate sensitive endpoints inline, complementing input detection and Section 12.09 PII scanning'
+
+preview_section_13_07:
+  title: 'Section 13.07: Rate-Based Detection -- Abuse Patterns Invisible Per Request'
+  summary: |
+    Section 13.07 turns to the entity family and the abuse that has no per-request signal at all:
+    exfiltration and enumeration campaigns where every individual query is benign and the entire signal
+    is in the aggregate rate and pattern over time. It builds request-rate, periodicity, and acceleration
+    detection across the per-request event stream, coverage-pattern detection for an entity systematically
+    sweeping an input space rather than using the service, distributed-abuse detection for a campaign
+    spread across many accounts to stay under per-account limits, and periodicity analysis that separates
+    the regular interval signature of an automated script from the irregularity of human use. These
+    rate-based features feed the user profile of 13.10 and the graph detector of 13.11, and they produce
+    the signal that the adaptive smart rate limiter of 13.08 acts on -- detection sets the adaptive
+    threshold, enforcement applies it.
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 4 Section 4.07: prompt injection mechanics -- the attack whose success this section detects'
+    - 'Chapter 12 Section 12.09: PII output scanning -- the output-side scanning this section complements'
+    - 'Chapter 13 Section 13.03: statistical baselines -- the baseline-before-anomaly discipline applied to output'
+    - 'Chapter 13 Section 13.04: time-series anomaly detection -- distribution-shift detection over output metrics'
+    - 'Chapter 13 Section 13.05: drift detection -- output-distribution monitoring concept turned here on the model'
+  forward_references:
+    - 'Section 13.07: rate-based detection -- the next entity-family detector'
+    - 'Section 13.09: multi-turn context analysis -- pairs with self-consistency for multi-turn injection success'
+    - 'Section 13.10: user behaviour profiling -- a confirmed injection success sharply elevates entity risk'
+    - 'Section 13.11: graph-based detection and the behavioural monitoring capstone integrating output monitoring into the gateway'
+  tags:
+    - model-behaviour-monitoring
+    - injection-success
+    - output-distribution
+    - refusal-rate
+    - persona-consistency
+    - format-conformance
+    - output-baseline
+    - canary-token
+    - honeytoken
+    - system-prompt-extraction
+    - self-consistency
+    - refusal-reversal
+    - post-inference-monitoring
+    - owasp-llm01
+    - owasp-llm06
+    - chapter-13-output-monitoring
