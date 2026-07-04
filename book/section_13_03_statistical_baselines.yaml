@@ -1,0 +1,794 @@
+# section_13_03_statistical_baselines.yaml
+
+---
+document_info:
+  title: 'Statistical Baselines: Defining Normal Per User and Per Endpoint'
+  chapter: 13
+  section: 3
+  section_code: '1303'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-21'
+  estimated_pages: 7
+  estimated_reading_time: '50-60 minutes'
+
+section_overview:
+  one_line_summary: 'Anomaly detection is undefined without an explicit baseline; Section 13.03 builds the per-user and per-endpoint baselines -- with robust statistics, cold-start backoff, and a contamination guard -- that every temporal detector in Chapter 13 measures deviation against.'
+  why_this_section_exists: |
+    Section 13.01 placed the temporal family in the taxonomy and Section 13.02 produced the session
+    features that the temporal detectors consume. Section 13.03 builds the missing foundation those
+    detectors need before they can fire: the baseline. A deviation is only meaningful relative to a
+    reference, and the reference is the baseline. Without it, time-series anomaly detection (13.04),
+    drift detection (13.05), and rate-based detection (13.07) have nothing to measure against.
+
+    The central argument of the section is that normal is per-entity. A request rate of five hundred
+    per hour is an attack for a casual user and an ordinary afternoon for a heavy integration. A
+    refusal rate of thirty percent is alarming for a user who never gets refused and unremarkable for
+    one whose work sits near a content boundary. A single global threshold cannot serve both: set high
+    enough not to flag the heavy user, it is too high to catch the compromised light user; set low
+    enough to catch the light user, it floods on every heavy user. The baseline must be established per
+    entity and per endpoint so deviation is measured against the right reference.
+
+    The section also confronts the failure mode that makes naive baselines worse than useless in a
+    security setting: contamination. The baseline is computed from the same traffic stream that
+    contains the attacks it is meant to detect. A patient adversary who ramps slowly enough is absorbed
+    into the baseline -- the baseline learns to call the attack normal -- and the deviation it should
+    have produced shrinks to zero. Robust statistics and a contamination guard are not refinements
+    here; they are what separate a baseline that detects from one that is quietly trained by the
+    adversary to ignore them.
+  position_in_chapter: |
+    Section 13.03 is the foundation of the temporal family, the way Section 13.02 was the foundation of
+    the session family. It sits between session modelling and the temporal detectors that consume
+    baselines: 13.04 (time-series anomaly detection) scores deviation from the baseline envelope, 13.05
+    (drift) compares distributions against a reference baseline, and 13.07 (rate-based detection)
+    thresholds rate against the per-entity baseline. It parallels Section 12.03 in Chapter 12: where
+    12.03 built the zero-label anomaly detector that establishes a statistical baseline of normal
+    traffic, 13.03 builds the explicit per-entity behavioural baseline that the temporal detectors
+    score against.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain why anomaly detection is undefined without an explicit baseline and what role the baseline plays as a reference distribution'
+    - 'Explain why per-entity and per-endpoint baselines are required and how a global threshold fails on both power users and compromised low-volume accounts'
+    - 'Describe rolling-window baseline statistics and the trade-off between window length, adaptivity, and stability'
+    - 'Explain why robust statistics (median, MAD) are mandatory for security baselines and how mean and standard deviation are contaminated by attack traffic'
+    - 'Describe the cold-start problem and the population-prior backoff that solves it for new entities'
+    - 'Explain baseline contamination and how a slow-ramp attack poisons the baseline that is meant to detect it'
+    - 'Describe deviation scoring by modified z-score and percentile rank and how per-metric deviations compose into an entity deviation score'
+
+  skills:
+    - 'Establish per-user and per-endpoint baselines from a rolling window of session features using robust statistics'
+    - 'Compute deviation scores with the modified z-score and percentile rank against an established baseline'
+    - 'Implement a population-prior backoff that scores new entities against a cohort until a personal baseline accrues'
+    - 'Implement a contamination guard that excludes flagged traffic from baseline updates'
+    - 'Compose per-metric deviations into a single entity deviation score for downstream detectors'
+
+  security_mindset:
+    - 'Internalise that a baseline computed from contaminated traffic learns to call the attack normal -- the adversary trains the baseline if you let them'
+    - 'Recognise that robust statistics are a security requirement, not a statistical nicety, because the contamination is adversarial and targeted'
+    - 'Understand that the baseline is the single point of dependency for the whole temporal family -- its quality bounds every temporal detector downstream'
+    - 'Treat the cold-start window as an exposure: a new entity with no baseline is scored against a cohort, and that cohort choice is a security decision'
+
+prerequisites:
+  - 'Chapter 1 Section 1.04: descriptive statistics, mean, variance, percentiles -- the statistics the baseline is built from'
+  - 'Chapter 1 Section 1.11: evaluation metrics -- used to tune baseline deviation thresholds against precision and recall'
+  - 'Chapter 12 Section 12.03: anomaly detection -- the zero-label baseline of normal traffic this section makes explicit and per-entity'
+  - 'Chapter 13 Section 13.01: behavioural detection taxonomy -- the temporal family this baseline founds'
+  - 'Chapter 13 Section 13.02: session modelling -- the session features the baseline is computed over'
+
+prose_content:
+
+  part_1:
+    title: 'No Baseline, No Anomaly: The Reference Distribution'
+    body: |
+      An anomaly is a deviation from normal, which means the word anomaly has no meaning until normal
+      is defined. This is not a philosophical point; it is the operational core of the temporal family.
+      Every temporal detector in Chapter 13 produces a score of the form how far is this from expected,
+      and expected is the baseline. Build the baseline wrong and every detector that reads it is wrong
+      in the same way, silently, because each is faithfully reporting deviation from a reference that
+      does not represent normal.
+
+      The baseline is a reference distribution for a behavioural metric. For request rate, it is the
+      distribution of an entity's hourly request counts over some history: a centre (what is typical)
+      and a spread (how much variation is ordinary). A new hour's count is scored by how far it sits
+      from that centre relative to that spread. The same construction applies to every metric the
+      session and event pipelines produce: refusal rate, session length, endpoint mix, inter-request
+      interval, error rate. Each gets a baseline, and each new observation is scored against it.
+
+      The reason to make the baseline explicit -- rather than letting a detector learn normal
+      implicitly -- is control and inspectability. An explicit baseline can be examined: an analyst can
+      ask what this entity's typical request rate is and read the answer. It can be guarded: the update
+      rule can be made to exclude attack traffic. It can be backed off: a new entity with no baseline
+      can be scored against a cohort. An implicit normal buried inside a model offers none of these.
+      The temporal family is built on explicit baselines precisely so that the reference is a first-class
+      object that can be inspected, guarded, and reasoned about.
+
+  part_2:
+    title: 'Normal Is Per-Entity: Why the Global Threshold Fails'
+    body: |
+      The single most consequential design decision in this section is the scope of the baseline:
+      global, per-endpoint, or per-entity. The answer is that the behavioural metrics that matter are
+      per-entity, and a global threshold on them fails in both directions.
+
+      Consider request rate. A global threshold must be set at one number for all entities. Pick a high
+      number so the heavy integration that legitimately makes thousands of requests an hour is not
+      flagged: now a compromised casual user, whose normal is ten requests an hour, can be driven to
+      five hundred requests an hour by an attacker and still sit far below the global threshold. The
+      attack on the light user is invisible. Pick a low number to catch that attack: now the heavy
+      integration trips the threshold on every ordinary hour, and the alert stream is flooded with
+      false positives that train the analysts to ignore it. There is no single number that catches the
+      attack on the light user without flooding on the heavy one, because their normals differ by two
+      orders of magnitude.
+
+      Per-entity baselines resolve this. The heavy integration is scored against its own history, where
+      thousands of requests an hour is normal and a deviation would be a change from its own pattern.
+      The casual user is scored against their own history, where the jump from ten to five hundred is an
+      enormous deviation that fires immediately. The same absolute rate is normal for one and a glaring
+      anomaly for the other, and only a per-entity baseline encodes that.
+
+      Per-endpoint baselines add the second axis. The same entity behaves differently across endpoints:
+      a batch endpoint sees high steady volume, an interactive endpoint sees bursty low volume. A
+      baseline keyed on entity-and-endpoint captures normal at the granularity where it is actually
+      stable. The practical structure is a baseline per entity per metric, with a per-endpoint baseline
+      where the endpoint materially changes the entity's normal, and a population baseline as the
+      backoff for entities with insufficient history.
+
+  part_3:
+    title: 'Robust Statistics: Why Mean and Standard Deviation Fail Under Attack'
+    body: |
+      The natural way to summarise a baseline is the mean and the standard deviation: centre on the
+      mean, scale by the standard deviation, score by the z-score. In a security setting this is the
+      wrong choice, and the reason is specific and important.
+
+      The baseline is computed from the same traffic that contains the attacks. Mean and standard
+      deviation are not robust: a small number of extreme values pulls the mean toward them and inflates
+      the standard deviation. When an attacker sends a burst of very high request-rate hours, those
+      hours enter the window from which the baseline is computed. The mean rises toward the attack
+      values and the standard deviation widens to accommodate them. The baseline, computed with
+      non-robust statistics, moves toward the attack. The next attack hour is now scored against an
+      inflated baseline and produces a smaller z-score than it should. The attacker has degraded the
+      detector by the very act of attacking.
+
+      Robust statistics resist this. The median is the centre value: adding a few extreme values barely
+      moves it, because it depends on the rank of values, not their magnitude. The median absolute
+      deviation -- the median of the absolute deviations from the median -- is a robust scale that, like
+      the median, is barely moved by a minority of extreme values. A baseline built on the median and
+      the MAD does not drift toward an attack burst, because the burst is a minority of the window and
+      robust statistics ignore the minority. The deviation score built on robust statistics is the
+      modified z-score: the deviation from the median, scaled by the MAD. It produces a large score for
+      the attack hour and is not inflated by the presence of attack hours in the baseline window.
+
+      The rule that follows is unconditional for security baselines: use the median and the MAD, never
+      the mean and the standard deviation. The contamination that robust statistics resist is not
+      hypothetical noise; it is the adversary's traffic in the baseline window, and resisting it is the
+      whole point.
+
+  part_4:
+    title: 'Rolling Windows: Adaptivity Versus Stability'
+    body: |
+      A baseline must adapt. An entity's normal genuinely changes -- a user takes on a new project, an
+      integration scales up, a seasonal pattern shifts. A baseline frozen at the entity's first week
+      will flag every legitimate growth as an anomaly. So the baseline is computed over a rolling
+      window: the recent history, updated as new observations arrive and old ones age out. The window
+      length is the central tuning decision, and it trades adaptivity against stability.
+
+      A short window adapts quickly: the baseline tracks recent behaviour closely, so a legitimate
+      change in normal is absorbed within days. The cost is instability and exposure to contamination.
+      A short window has few observations, so even with robust statistics a sustained attack that fills
+      a meaningful fraction of a short window can shift the baseline. And a short window is noisy: small
+      sample sizes produce a jittery baseline that fires on ordinary variation.
+
+      A long window is stable: many observations, a steady baseline, and strong resistance to
+      contamination because an attack must dominate a large window to move a robust statistic. The cost
+      is slow adaptation: a legitimate change in normal takes a long time to be absorbed, so a user who
+      genuinely scales up is flagged as anomalous for as long as the window remembers their old normal.
+
+      The production resolution is a window long enough that a plausible attack cannot fill a dominant
+      fraction of it, combined with robust statistics so that even a substantial minority of attack
+      observations does not move the baseline, and combined with the contamination guard of the next
+      part so that flagged traffic does not enter the window at all. The window length is set per metric
+      based on how quickly that metric's normal legitimately changes and how much history an entity
+      typically has -- not a single global window for all metrics and all entities.
+
+  part_5:
+    title: 'The Contamination Guard: Do Not Let the Adversary Train the Baseline'
+    body: |
+      Robust statistics resist contamination by a minority of attack observations. They do not resist a
+      patient adversary who ramps slowly enough that, at every step, the increase looks like legitimate
+      growth. This is the central attack against baselines, and it requires a specific defence beyond
+      robust statistics.
+
+      The attack works like this. The adversary does not spike; spiking produces a large deviation that
+      fires. Instead they increase their request rate by a small amount each day -- small enough that
+      each day's increase is within the baseline's expected variation. Each day, the new slightly-higher
+      rate enters the rolling window and nudges the baseline up. The next day's slightly-higher rate is
+      scored against the slightly-raised baseline and again looks normal. Over weeks, the adversary walks
+      the baseline from ten requests an hour to ten thousand, and at no point does any single day produce
+      a deviation large enough to fire. The baseline has been trained by the adversary to accept the
+      attack. This is the slow-ramp or boiling-frog attack, and robust statistics do not stop it because
+      the attack is never a minority of the window -- it is the whole recent trend.
+
+      The defence is the contamination guard: flagged traffic does not update the baseline. The baseline
+      is updated only from observations that were not themselves flagged as anomalous or blocked. When an
+      observation deviates enough to be flagged, it is excluded from the window that computes future
+      baselines, so it cannot nudge the baseline toward itself. This breaks the slow ramp: as soon as the
+      adversary's increase is large enough to flag, that observation stops feeding the baseline, and the
+      baseline stops following the ramp. The adversary can only move the baseline with observations that
+      look normal, and observations that look normal are not the attack.
+
+      The guard has a tension to manage. Excluding all flagged traffic from the baseline means a
+      legitimate change that initially looks anomalous is slow to be accepted, because its early
+      observations are excluded. The resolution is to exclude confirmed and high-confidence flags from
+      baseline updates while allowing low-confidence, unconfirmed deviations to update the baseline after
+      a delay, so that genuine shifts are eventually absorbed while a sustained attack is held out. The
+      guard is the difference between a baseline that the adversary trains and one that the adversary
+      cannot.
+
+  part_6:
+    title: 'Deviation Scoring and Composition into an Entity Deviation Score'
+    body: |
+      The baseline produces, for each metric, a centre and a spread. Scoring a new observation against it
+      yields a per-metric deviation. Two deviation measures are used together. The modified z-score --
+      the deviation from the median scaled by the MAD -- is the robust analogue of the z-score and gives
+      a signed, scale-free measure of how far the observation sits from typical. The percentile rank --
+      where the observation falls in the baseline distribution -- is a complementary measure that is
+      bounded and interpretable, answering this observation is higher than ninety-nine percent of this
+      entity's history. The two agree on clear cases and provide a cross-check on borderline ones.
+
+      A single entity has many metrics, each with its own baseline and its own per-metric deviation. The
+      temporal detectors and the entity profiler need a composed signal: a single entity deviation score
+      that integrates the per-metric deviations. Composition is not a simple sum, because the metrics are
+      correlated and differ in signal value. The robust composition weights each metric by its
+      independent detection value -- determined the way 13.02 determined feature importance -- and
+      aggregates in a way that is driven by the strongest deviations rather than diluted by the many
+      metrics sitting at normal. An entity with one enormous deviation on a high-value metric should
+      score high even if every other metric is ordinary, so the composition is closer to a weighted
+      maximum-plus-evidence than to an average.
+
+      The composed entity deviation score is the output of this section that the rest of the temporal
+      family consumes. Time-series anomaly detection in 13.04 reads the per-metric baselines to build
+      forecasts. Drift detection in 13.05 reads the baseline distributions as references. Rate-based
+      detection in 13.07 thresholds rate against the per-entity rate baseline. The entity profiler in
+      13.10 folds the composed deviation score into the persistent profile. The baseline built here is
+      the reference the whole temporal family stands on, which is why its robustness and its
+      contamination guard matter so much: a weakness here propagates to every detector downstream.
+
+reference_materials:
+
+  table_1:
+    title: 'Baseline Scope: Global, Per-Endpoint, Per-Entity'
+    description: 'The three baseline scopes with what each captures, the failure mode of using it alone, and when each is appropriate'
+    columns: ['Scope', 'Captures', 'Failure Mode Alone', 'Appropriate Use']
+    rows:
+      - ['Global', 'One normal for all entities', 'Floods on heavy users, misses attacks on light users', 'Never alone; only as a last-resort prior']
+      - ['Per-endpoint', 'Normal per API endpoint', 'Ignores that entities differ within an endpoint', 'Modifier on per-entity where endpoint changes normal']
+      - ['Per-entity', 'Normal per individual actor', 'Cold start: new entities have no history', 'Primary scope for all behavioural metrics']
+      - ['Per-entity per-endpoint', 'Normal per actor per endpoint', 'Most state; sparse for low-volume pairs', 'Where the endpoint materially changes the entity normal']
+      - ['Population prior', 'Normal for a cohort of similar entities', 'Coarse; not personalised', 'Cold-start backoff until a personal baseline accrues']
+
+  table_2:
+    title: 'Robust vs Non-Robust Statistics Under Attack'
+    description: 'Why median and MAD are mandatory for security baselines, contrasted with mean and standard deviation under adversarial contamination'
+    columns: ['Property', 'Mean and Std Dev', 'Median and MAD']
+    rows:
+      - ['Sensitivity to extreme values', 'High -- pulled by outliers', 'Low -- depends on rank, not magnitude']
+      - ['Effect of an attack burst in the window', 'Baseline drifts toward the attack', 'Baseline barely moves']
+      - ['Resulting deviation score for next attack', 'Deflated -- attacker degraded the detector', 'Preserved -- attack still scores high']
+      - ['Deviation measure', 'z-score (deviation / std dev)', 'Modified z-score (deviation / MAD)']
+      - ['Suitability for security baselines', 'Unsuitable -- contamination is adversarial', 'Required -- resists adversarial contamination']
+
+  table_3:
+    title: 'Rolling Window Length: Adaptivity vs Stability vs Contamination'
+    description: 'How window length trades the speed of adapting to legitimate change against stability and resistance to slow-ramp contamination'
+    columns: ['Window Length', 'Adapts to Legit Change', 'Stability', 'Contamination Resistance', 'Risk']
+    rows:
+      - ['Short (days)', 'Fast', 'Low (noisy)', 'Low (attack fills a large fraction)', 'Jittery; vulnerable to slow ramp']
+      - ['Medium (weeks)', 'Moderate', 'Moderate', 'Moderate (with robust stats and guard)', 'Balanced -- common production choice']
+      - ['Long (months)', 'Slow', 'High', 'High (attack cannot dominate)', 'Legit growth flagged for a long time']
+
+  table_4:
+    title: 'Baseline Attacks and Their Defences'
+    description: 'The attacks against a behavioural baseline and the specific defence each requires'
+    columns: ['Attack', 'Mechanism', 'Defeats Naive Baseline By', 'Defence']
+    rows:
+      - ['Burst contamination', 'Spike of extreme observations', 'Inflating mean and std dev', 'Robust statistics (median, MAD)']
+      - ['Slow ramp (boiling frog)', 'Tiny daily increases over weeks', 'Walking the baseline up under the radar', 'Contamination guard: exclude flagged traffic']
+      - ['Cold-start abuse', 'Attack a brand-new entity with no baseline', 'No personal reference to deviate from', 'Population-prior backoff for new entities']
+      - ['Off-hours establishment', 'Build a high baseline during a quiet seed period', 'Setting a permissive personal normal early', 'Seasonal baselines; minimum-history before trust']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Statistical Baseline with Robust Rolling-Window Statistics'
+    filename: 'statistical_baseline.py'
+    description: 'Maintains per-entity per-metric baselines over a rolling window using robust statistics (median and MAD). Supports incremental update from new observations and exposes the centre and spread used by deviation scoring. Implements the rolling-window robust baseline from Section 13.03 Parts 3 and 4.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # statistical_baseline.py
+      # Section 13.03: Per-Entity Robust Rolling-Window Baseline
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from collections import deque
+      from dataclasses import dataclass, field
+      from typing import Deque, Dict, Optional, Tuple
+
+
+      def _median(values) -> float:
+          s = sorted(values)
+          n = len(s)
+          if n == 0:
+              return 0.0
+          mid = n // 2
+          if n % 2 == 1:
+              return float(s[mid])
+          return (s[mid - 1] + s[mid]) / 2.0
+
+
+      def _mad(values, centre: float) -> float:
+          # Median absolute deviation, scaled to be a consistent estimator of std dev
+          if not values:
+              return 0.0
+          abs_dev = [abs(v - centre) for v in values]
+          mad = _median(abs_dev)
+          return mad * 1.4826  # consistency constant for normal data
+
+
+      @dataclass
+      class MetricBaseline:
+          window: Deque[float] = field(default_factory=deque)
+          max_len: int = 200
+          min_history: int = 20
+
+          def update(self, value: float) -> None:
+              self.window.append(value)
+              while len(self.window) > self.max_len:
+                  self.window.popleft()
+
+          def is_ready(self) -> bool:
+              return len(self.window) >= self.min_history
+
+          def centre_spread(self) -> Tuple[float, float]:
+              vals = list(self.window)
+              centre = _median(vals)
+              spread = _mad(vals, centre)
+              return centre, spread
+
+
+      class BaselineStore:
+          def __init__(self, max_len: int = 200, min_history: int = 20) -> None:
+              self.max_len = max_len
+              self.min_history = min_history
+              # keyed by (entity_id, metric_name)
+              self.baselines: Dict[Tuple[str, str], MetricBaseline] = {}
+
+          def _get(self, entity_id: str, metric: str) -> MetricBaseline:
+              key = (entity_id, metric)
+              if key not in self.baselines:
+                  self.baselines[key] = MetricBaseline(max_len=self.max_len, min_history=self.min_history)
+              return self.baselines[key]
+
+          def update(self, entity_id: str, metric: str, value: float) -> None:
+              self._get(entity_id, metric).update(value)
+
+          def ready(self, entity_id: str, metric: str) -> bool:
+              return self._get(entity_id, metric).is_ready()
+
+          def centre_spread(self, entity_id: str, metric: str) -> Optional[Tuple[float, float]]:
+              b = self._get(entity_id, metric)
+              if not b.is_ready():
+                  return None
+              return b.centre_spread()
+
+
+      if __name__ == '__main__':
+          store = BaselineStore(max_len=100, min_history=20)
+          # Build a baseline for a light user: ~10 requests/hour
+          for _ in range(40):
+              store.update('user_light', 'requests_per_hour', 10.0)
+          # Inject a few attack bursts INTO the window to show robustness
+          for v in [500.0, 480.0, 520.0]:
+              store.update('user_light', 'requests_per_hour', v)
+          cs = store.centre_spread('user_light', 'requests_per_hour')
+          print(f'Light user baseline after 3 attack bursts in window: centre={cs[0]:.1f}, spread={cs[1]:.1f}')
+          print('Robust median ignores the minority bursts -- centre stays near 10,')
+          print('so the next attack hour still scores as a large deviation.')
+
+  deliverable_2:
+    title: 'Baseline Deviation Scorer'
+    filename: 'baseline_deviation_scorer.py'
+    description: 'Scores a new observation against an established baseline using the modified z-score (deviation from median scaled by MAD) and the percentile rank within the baseline window. Composes per-metric deviations into a single entity deviation score weighted by metric value. Implements the deviation scoring and composition from Section 13.03 Part 6.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only; consumes the BaselineStore from statistical_baseline.py conceptually but is self-contained for the runnable example'
+    code: |
+      # baseline_deviation_scorer.py
+      # Section 13.03: Baseline Deviation Scoring and Composition
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from typing import Dict, List, Tuple
+
+
+      def modified_z_score(value: float, centre: float, spread: float) -> float:
+          # spread is the scaled MAD; guard against zero spread
+          if spread <= 1e-9:
+              return 0.0 if value == centre else float('inf')
+          return (value - centre) / spread
+
+
+      def percentile_rank(value: float, window: List[float]) -> float:
+          if not window:
+              return 0.5
+          below = sum(1 for w in window if w < value)
+          return below / len(window)
+
+
+      @dataclass
+      class MetricDeviation:
+          metric: str
+          mod_z: float
+          pct_rank: float
+          weight: float
+
+
+      def compose_entity_deviation(devs: List[MetricDeviation]) -> float:
+          # Weighted maximum-plus-evidence: dominated by the strongest deviation,
+          # with secondary evidence from other elevated metrics, not a dilizing average.
+          if not devs:
+              return 0.0
+          weighted_abs = [(abs(d.mod_z) * d.weight, d) for d in devs]
+          weighted_abs.sort(reverse=True)
+          top = weighted_abs[0][0]
+          # secondary evidence: sum of remaining weighted deviations, dampened
+          secondary = sum(w for w, _ in weighted_abs[1:]) * 0.15
+          return round(top + secondary, 3)
+
+
+      if __name__ == '__main__':
+          # Light user baseline: requests/hour centre 10, spread 2 (scaled MAD)
+          # Refusal rate centre 0.05, spread 0.03
+          rph_window = [10.0] * 40
+          refusal_window = [0.05] * 40
+
+          # Observed attack hour: 500 requests, refusal rate 0.45
+          rph_dev = MetricDeviation(
+              metric='requests_per_hour',
+              mod_z=modified_z_score(500.0, 10.0, 2.0),
+              pct_rank=percentile_rank(500.0, rph_window),
+              weight=1.0,
+          )
+          refusal_dev = MetricDeviation(
+              metric='refusal_rate',
+              mod_z=modified_z_score(0.45, 0.05, 0.03),
+              pct_rank=percentile_rank(0.45, refusal_window),
+              weight=0.7,
+          )
+          session_dev = MetricDeviation(
+              metric='session_length',
+              mod_z=modified_z_score(12.0, 11.0, 4.0),  # ordinary
+              pct_rank=percentile_rank(12.0, [11.0] * 40),
+              weight=0.5,
+          )
+
+          devs = [rph_dev, refusal_dev, session_dev]
+          for d in devs:
+              print(f'{d.metric:<20} mod_z={d.mod_z:>8.1f}  pct={d.pct_rank:.2f}  weight={d.weight}')
+          composed = compose_entity_deviation(devs)
+          print(f'\nComposed entity deviation score: {composed}')
+          print('One enormous deviation on a high-weight metric drives the score,')
+          print('rather than being averaged away by the ordinary session_length metric.')
+
+  deliverable_3:
+    title: 'Cold-Start Population Prior'
+    filename: 'cold_start_prior.py'
+    description: 'Scores entities with insufficient personal history against a population prior built from a cohort of similar entities, and blends from the prior toward the personal baseline as history accrues. Implements the cold-start backoff from Section 13.03 Part 2 and Table 1.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # cold_start_prior.py
+      # Section 13.03: Cold-Start Population-Prior Backoff
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from typing import List, Tuple
+
+
+      def _median(values) -> float:
+          s = sorted(values)
+          n = len(s)
+          if n == 0:
+              return 0.0
+          mid = n // 2
+          return float(s[mid]) if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+      @dataclass
+      class BlendedBaseline:
+          personal_centre: float
+          personal_spread: float
+          personal_n: int
+          prior_centre: float
+          prior_spread: float
+          min_history: int = 20
+
+          def blend_weight(self) -> float:
+              # Linear blend: 0 personal weight at n=0, full personal weight at min_history
+              if self.personal_n >= self.min_history:
+                  return 1.0
+              return self.personal_n / self.min_history
+
+          def effective(self) -> Tuple[float, float]:
+              w = self.blend_weight()
+              centre = w * self.personal_centre + (1 - w) * self.prior_centre
+              spread = w * self.personal_spread + (1 - w) * self.prior_spread
+              return centre, spread
+
+
+      def build_population_prior(cohort_values: List[float]) -> Tuple[float, float]:
+          centre = _median(cohort_values)
+          abs_dev = [abs(v - centre) for v in cohort_values]
+          spread = _median(abs_dev) * 1.4826
+          return centre, spread
+
+
+      if __name__ == '__main__':
+          # Cohort of established casual users: requests/hour mostly 8-14
+          cohort = [8, 9, 10, 11, 12, 10, 9, 13, 11, 10, 14, 8, 12, 11, 10]
+          prior_centre, prior_spread = build_population_prior([float(v) for v in cohort])
+          print(f'Population prior: centre={prior_centre:.1f}, spread={prior_spread:.1f}')
+
+          for n in [0, 5, 10, 20]:
+              bb = BlendedBaseline(
+                  personal_centre=10.0,
+                  personal_spread=2.0,
+                  personal_n=n,
+                  prior_centre=prior_centre,
+                  prior_spread=prior_spread,
+                  min_history=20,
+              )
+              c, s = bb.effective()
+              print(f'  n={n:>2} history: blend_weight={bb.blend_weight():.2f}  effective centre={c:.1f}, spread={s:.1f}')
+          print('A brand-new entity is scored against the cohort prior,')
+          print('blending toward its personal baseline as history accrues.')
+
+  deliverable_4:
+    title: 'Baseline Contamination Guard'
+    filename: 'baseline_contamination_guard.py'
+    description: 'Wraps baseline updates so that flagged or blocked observations are excluded from the window that computes future baselines, defeating the slow-ramp attack. Allows low-confidence unconfirmed deviations to update after a delay so genuine shifts are eventually absorbed. Implements the contamination guard from Section 13.03 Part 5.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # baseline_contamination_guard.py
+      # Section 13.03: Baseline Contamination Guard
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from collections import deque
+      from dataclasses import dataclass, field
+      from typing import Deque, List
+
+
+      def _median(values) -> float:
+          s = sorted(values)
+          n = len(s)
+          if n == 0:
+              return 0.0
+          mid = n // 2
+          return float(s[mid]) if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+      @dataclass
+      class Observation:
+          value: float
+          flagged: bool          # deviated enough to be flagged
+          confirmed_attack: bool  # analyst-confirmed or high-confidence
+
+
+      @dataclass
+      class GuardedBaseline:
+          max_len: int = 100
+          window: Deque[float] = field(default_factory=deque)
+          excluded_count: int = 0
+
+          def offer(self, obs: Observation) -> bool:
+              # Confirmed/high-confidence flags never update the baseline
+              if obs.confirmed_attack:
+                  self.excluded_count += 1
+                  return False
+              # Unconfirmed flags are held out too (could be early attack) --
+              # they are eligible to be re-offered after confirmation as benign
+              if obs.flagged:
+                  self.excluded_count += 1
+                  return False
+              self.window.append(obs.value)
+              while len(self.window) > self.max_len:
+                  self.window.popleft()
+              return True
+
+          def centre(self) -> float:
+              return _median(list(self.window))
+
+
+      if __name__ == '__main__':
+          guard = GuardedBaseline(max_len=100)
+          # Seed a normal baseline at 10
+          for _ in range(40):
+              guard.offer(Observation(10.0, flagged=False, confirmed_attack=False))
+          print(f'Baseline centre after seeding: {guard.centre():.1f}')
+
+          # Slow-ramp attack: each step flagged as a deviation once it grows
+          ramp = [11, 13, 16, 20, 26, 34, 45, 60, 80, 110]
+          for v in ramp:
+              # Simulate the detector flagging the step as anomalous deviation
+              flagged = v > 12  # anything above near-baseline is flagged
+              guard.offer(Observation(float(v), flagged=flagged, confirmed_attack=False))
+
+          print(f'Baseline centre after slow-ramp attempt: {guard.centre():.1f}')
+          print(f'Observations excluded by the guard: {guard.excluded_count}')
+          print('The guard held the flagged ramp out of the window, so the baseline')
+          print('stayed near 10 and the adversary could not walk it upward.')
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Using a single global threshold for a behavioural metric instead of per-entity baselines'
+    why_it_happens: |
+      A global threshold is one number to configure and requires no per-entity state, no cold-start
+      handling, and no rolling windows. It is the first thing an engineer reaches for, and on a quick
+      test against a single user it appears to work.
+    consequence: |
+      Normal varies by orders of magnitude across entities. A global threshold set high enough not to
+      flag a heavy integration is far too high to catch a compromised casual user driven to a fraction
+      of the heavy user's volume; set low enough to catch that user, it floods on every heavy
+      integration. The detector simultaneously misses the attack it was built for and trains analysts to
+      ignore its alerts. There is no single number that serves both populations.
+    correct_approach: |
+      Establish baselines per entity and per endpoint so each observation is scored against the right
+      reference. The heavy integration is measured against its own history where high volume is normal;
+      the casual user is measured against theirs where a jump is a glaring deviation. statistical_baseline.py
+      keys baselines on entity and metric for exactly this reason.
+
+  mistake_2:
+    description: 'Building the baseline from the mean and standard deviation instead of robust statistics'
+    why_it_happens: |
+      Mean and standard deviation are the default summary statistics, taught first and available in every
+      library as the obvious way to centre and scale. The z-score is the familiar deviation measure. For
+      clean, non-adversarial data they are perfectly reasonable.
+    consequence: |
+      The baseline is computed from traffic that contains the attacks. A burst of extreme attack
+      observations pulls the mean toward the attack and inflates the standard deviation, so the baseline
+      drifts toward the attack and the next attack observation produces a deflated deviation score. The
+      attacker degrades the detector simply by attacking, and the more they attack the less the detector
+      reacts.
+    correct_approach: |
+      Use the median and the MAD, and score with the modified z-score. Robust statistics depend on rank,
+      not magnitude, so a minority of extreme attack observations in the window barely moves the centre or
+      the spread. The attack still scores as a large deviation because the baseline did not follow it.
+      This is mandatory for security baselines, not optional.
+
+  mistake_3:
+    description: 'Letting flagged or blocked traffic update the baseline, leaving the slow-ramp attack undefended'
+    why_it_happens: |
+      The simplest baseline update rule feeds every observation into the rolling window. Robust statistics
+      handle the obvious bursts, so it feels like the contamination problem is solved and there is no need
+      to filter what enters the window.
+    consequence: |
+      Robust statistics resist a minority of extreme observations but not a sustained trend that is the
+      majority of the recent window. A patient adversary ramps slowly, each step within expected variation,
+      and every step enters the window and nudges the baseline up. Over weeks the baseline is walked from
+      the entity's true normal to the attack level, and no single step ever fires. The adversary has
+      trained the baseline to accept the attack.
+    correct_approach: |
+      Apply a contamination guard: exclude flagged and confirmed-attack observations from the window that
+      computes future baselines. As soon as a step in the ramp is large enough to flag, it stops feeding
+      the baseline, so the baseline stops following the ramp. The adversary can only move the baseline with
+      observations that look normal, which are not the attack. baseline_contamination_guard.py implements
+      this hold-out.
+
+  mistake_4:
+    description: 'Trusting a freshly built personal baseline before it has enough history, so a new entity can establish a permissive normal'
+    why_it_happens: |
+      Once a per-entity baseline mechanism exists, it is tempting to use each entity's baseline as soon as
+      it has any observations. A new entity gets a baseline from its first few hours and is scored against
+      it immediately, which feels like the personalised approach working as designed.
+    consequence: |
+      A baseline built from a handful of observations is both noisy and exploitable. An adversary who
+      controls a new entity can seed a high baseline during a deliberately busy first period, establishing
+      a permissive personal normal, and then operate at attack volume that sits within the inflated
+      baseline. The cold-start window is an exposure: a new entity with a self-established baseline has no
+      independent reference to deviate from.
+    correct_approach: |
+      Score new entities against a population prior built from a cohort of similar entities until the
+      personal baseline accrues sufficient history, blending from the prior toward the personal baseline as
+      observations accumulate and requiring a minimum history before the personal baseline is trusted alone.
+      cold_start_prior.py implements the blend and the minimum-history gate.
+
+  mistake_5:
+    description: 'Composing per-metric deviations by averaging, so a single large deviation is diluted by many ordinary metrics'
+    why_it_happens: |
+      Averaging the per-metric deviation scores is the natural way to produce a single entity score: it is
+      symmetric, simple, and bounded. It treats every metric equally and feels fair.
+    consequence: |
+      An attack often shows as one enormous deviation on one metric -- a request rate fifty times normal --
+      while every other metric stays ordinary because the attacker is not abnormal in those dimensions.
+      Averaging the one huge deviation with a dozen near-zero deviations produces a modest composed score
+      that sits below the alert threshold. The strongest evidence of the attack is averaged away by the
+      metrics that happen to be normal, and the attack is missed.
+    correct_approach: |
+      Compose deviations so the score is driven by the strongest weighted deviation with secondary evidence
+      from other elevated metrics, not diluted by metrics at normal. Weight each metric by its independent
+      detection value and aggregate closer to a weighted maximum-plus-evidence than to an average, so one
+      large deviation on a high-value metric drives the entity score. compose_entity_deviation in
+      baseline_deviation_scorer.py implements this.
+
+section_summary:
+
+  compact: |
+    Anomaly detection is undefined without an explicit baseline, and Section 13.03 builds the per-entity
+    per-endpoint behavioural baselines that the whole temporal family of Chapter 13 measures deviation
+    against. Normal is per-entity: a global threshold floods on heavy users and misses attacks on
+    compromised light users, because their normals differ by orders of magnitude, so baselines are keyed on
+    entity and endpoint with a population prior as the cold-start backoff. Robust statistics -- the median
+    and the MAD, scored by the modified z-score -- are mandatory because the baseline is computed from
+    traffic that contains the attacks, and mean and standard deviation drift toward an attack burst while
+    robust statistics ignore the minority. The rolling window trades adaptivity against stability and
+    contamination resistance. The contamination guard defeats the slow-ramp attack that robust statistics
+    cannot: flagged traffic is excluded from baseline updates, so a patient adversary cannot walk the
+    baseline upward. Deviation is scored by modified z-score and percentile rank, and per-metric deviations
+    compose into an entity deviation score driven by the strongest deviation rather than averaged. The
+    baseline is the single reference the temporal family depends on, so its robustness and its guard
+    propagate to every downstream detector.
+
+  key_takeaways:
+    - 'Anomaly detection is undefined without an explicit baseline: every temporal detector scores deviation from a reference, and the reference is the per-entity baseline built here'
+    - 'Normal is per-entity: a global threshold floods on heavy users and misses attacks on compromised light users because their normals differ by orders of magnitude'
+    - 'Robust statistics (median and MAD, modified z-score) are mandatory for security baselines because the baseline is computed from traffic containing the attacks, and mean and std dev drift toward an attack burst'
+    - 'The contamination guard defeats the slow-ramp attack that robust statistics cannot: excluding flagged traffic from baseline updates stops a patient adversary from walking the baseline upward'
+    - 'The rolling window trades adaptivity against stability and contamination resistance, and a new entity is scored against a population prior until its personal baseline accrues'
+    - 'Compose per-metric deviations so the entity score is driven by the strongest weighted deviation, not averaged, so one large deviation on a high-value metric is not diluted by ordinary metrics'
+
+preview_section_13_04:
+  title: 'Section 13.04: Time-Series Anomaly Detection -- Temporal Deviation from the Behavioural Envelope'
+  summary: |
+    Section 13.04 extends the per-entity baselines of 13.03 into the temporal dimension, detecting when a
+    behavioural metric departs from its own historical envelope over time. It treats request rate, refusal
+    rate, and error rate as time series with seasonal structure -- daily, weekly, business-cycle patterns
+    that a naive threshold misclassifies as anomalies -- and applies seasonal decomposition to isolate the
+    residual component where genuine anomalies live. It builds forecasting-based anomaly detection that
+    flags observations falling outside a prediction interval, streaming online detection that scores each
+    new point without recomputing history, change-point detection that identifies when a metric's
+    distribution shifts rather than a single outlier point (the account-compromise signal), and
+    multi-resolution analysis that catches both the sudden spike of a burst attack and the slow ramp of a
+    patient exfiltration in the same metric. The baselines built in 13.03 are the reference these temporal
+    detectors forecast and decompose against.
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 1 Section 1.04: descriptive statistics, percentiles -- the statistics the baseline is built from'
+    - 'Chapter 1 Section 1.11: evaluation metrics -- used to tune baseline deviation thresholds'
+    - 'Chapter 12 Section 12.03: anomaly detection -- the zero-label baseline of normal traffic this section makes explicit and per-entity'
+    - 'Chapter 13 Section 13.01: behavioural detection taxonomy -- the temporal family this baseline founds'
+    - 'Chapter 13 Section 13.02: session modelling -- the session features the baseline is computed over'
+  forward_references:
+    - 'Section 13.04: time-series anomaly detection -- forecasts and decomposes against these baselines'
+    - 'Section 13.05: drift detection -- uses the baseline distributions as reference windows'
+    - 'Section 13.07: rate-based detection -- thresholds rate against the per-entity rate baseline'
+    - 'Section 13.10: user behaviour profiling -- folds the composed entity deviation score into the persistent profile'
+  tags:
+    - statistical-baselines
+    - per-entity-baseline
+    - robust-statistics
+    - median-mad
+    - modified-z-score
+    - rolling-window
+    - cold-start
+    - population-prior
+    - baseline-contamination
+    - slow-ramp-attack
+    - contamination-guard
+    - deviation-scoring
+    - owasp-llm04
+    - owasp-llm10
+    - chapter-13-temporal-foundation
