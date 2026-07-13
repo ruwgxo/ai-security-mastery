@@ -1,0 +1,883 @@
+# section_14_06_failure_modes.yaml
+
+---
+document_info:
+  title: 'Failure Modes: Fail-Open versus Fail-Closed'
+  chapter: 14
+  section: 6
+  section_code: '1406'
+  author: Raghav Dinesh
+  github: https://github.com/ruwgxo/ai-security-mastery
+  license: MIT
+  version: '1.0'
+  created: '2026-06-21'
+  estimated_pages: 7
+  estimated_reading_time: 50-60 minutes
+section_overview:
+  one_line_summary: 'When a detector errors, times out, or is unavailable the gateway must do something
+    deliberate: fail-open passes the request favouring availability, fail-closed blocks it favouring security,
+    and the choice is made per detector and per tier -- classifying detectors as essential or droppable
+    -- so a partial failure degrades gracefully to the essential detectors rather than failing one way
+    for everything.'
+  why_this_section_exists: |-
+    Sections 14.04 and 14.05 made the gateway fast per request and sufficient in aggregate,
+    and both assumed the detectors work. Detectors do not always work. A detector can raise an
+    exception, exceed its timeout, or become unavailable because the service behind it is down,
+    and when that happens the gateway has to decide what to do with the request it was
+    inspecting. This is the failure concern named in the 14.01 taxonomy, and it is the one with
+    the sharpest consequence of neglect: an unspecified failure mode is not the absence of a
+    decision but a decision made by the bug, because whatever the code happens to do when the
+    exception propagates becomes the policy. This section makes the failure behaviour
+    deliberate. It defines the two possible policies -- fail-open, which admits the request when
+    detection fails and favours availability, and fail-closed, which blocks it and favours
+    security -- and establishes that each carries a real and opposite risk, so neither is safe
+    in the abstract. It then makes the central argument of the section: the policy is chosen per
+    detector and per tier, not once globally, because a critical security detector and a
+    best-effort enrichment detector warrant opposite policies. It handles the timeout from 14.04
+    as one failure kind that resolves through the same policy, and it defines degraded-mode
+    operation, classifying detectors as essential or droppable so that a partial failure sheds
+    the droppable detectors and keeps serving through the essential ones. The result is a
+    gateway whose behaviour under detector failure is designed rather than accidental.
+  position_in_chapter: |-
+    Section 14.06 is the first of the two resilience sections (14.06-14.07) and the response to
+    the failure-handling concern from the 14.01 taxonomy. It decides what a single failing
+    detector does. Section 14.07 then supplies the mechanism that stops a detector from failing
+    repeatedly into a cascade -- circuit breakers, bulkheads, health checks, and redundancy --
+    and turns the degraded-mode classification defined here into the graceful degradation it
+    operates. This section sets the policy; 14.07 builds the machinery that enforces and
+    contains it.
+learning_objectives:
+  knowledge:
+  - Describe the three ways a detector fails -- error, timeout, and unavailability -- and why the gateway
+    must respond deliberately to each
+  - Define fail-open as passing the request when detection fails, favouring availability, and fail-closed
+    as blocking it, favouring security
+  - Explain why an unspecified failure mode is a failure mode chosen by the bug rather than the engineer
+  - State the fail-open risk (admitting the attack the failed detector would have caught) and the fail-closed
+    risk (denying service to legitimate traffic)
+  - Explain why the fail-open versus fail-closed choice is made per detector and per tier rather than
+    as a single global policy
+  - Describe how the timeout from Section 14.04 is one failure kind that resolves through the same per-detector
+    policy
+  - Explain degraded-mode operation and the classification of detectors as essential (fail-closed) or
+    droppable (fail-open)
+  skills:
+  - Assign a fail-open or fail-closed policy to each detector and apply it to an error, a timeout, or
+    an unavailability
+  - Build a decision table stating the policy per detector class with the risk each policy takes
+  - Classify detectors as essential or droppable so a partial failure degrades to the essential path
+  - Map a per-detector timeout to its fail-open or fail-closed resolution
+  security_mindset:
+  - Recognise that leaving the failure mode unspecified hands the security-versus-availability decision
+    to whatever the code does on an exception
+  - Internalise that neither fail-open nor fail-closed is safe in the abstract -- each trades one real
+    risk for the other
+  - Understand that a single global failure policy forces the wrong trade on some detectors, because critical
+    and best-effort detectors warrant opposite policies
+  - Appreciate that degraded-mode classification lets a partial failure degrade to the essential security
+    detectors rather than failing the whole gateway one way
+prerequisites:
+- 'Section 14.01: the production deployment concern taxonomy that names failure handling and warns that
+  an unspecified failure mode is chosen by the bug'
+- 'Section 14.03: the failure-isolated integration boundary where the fail-open/fail-closed decision is
+  applied'
+- 'Section 14.04: the per-detector timeout introduced as a latency bound and resolved here as a failure
+  mode'
+- 'Section 14.05: the throughput scaling whose overload conditions can drive detector failure and degraded
+  operation'
+- 'Chapter 13 Section 13.01: the tiers whose differing roles justify per-tier failure policies'
+- Working knowledge of exception handling and the difference between availability and security as competing
+  goals
+prose_content:
+  part_1:
+    title: An Unspecified Failure Mode Is Chosen by the Bug
+    body: |-
+      Every detector integrated into the request path can fail, and there are three ways it
+      does. It can error -- raise an exception from a bug, a malformed input, or a missing
+      model artifact. It can time out -- exceed the deadline that Section 14.04 put on it to
+      bound its latency. Or it can be unavailable -- the service behind it is down, unreachable,
+      or not yet started. In all three cases the gateway is left holding a request it was in
+      the middle of inspecting, with no verdict from that detector, and it has to do something
+      with the request anyway.
+
+      The single most important idea in this section is that this something is always chosen,
+      whether or not anyone chose it. If the failure mode is not specified, the request does
+      not hang in limbo; it takes whatever path the code happens to take when the exception
+      propagates. Maybe the exception bubbles up and the whole request is rejected, silently
+      making the policy fail-closed. Maybe it is swallowed by a broad catch and the request
+      proceeds as if the detector had passed it, silently making the policy fail-open. Either
+      way a security-versus-availability decision of real consequence has been made, and it has
+      been made by the accident of code structure rather than by an engineer weighing the
+      trade. An unspecified failure mode is a failure mode chosen by the bug.
+
+      That reframing is why this section exists as a design activity rather than an
+      error-handling detail. The goal is not to prevent detectors from failing -- they will --
+      but to ensure that what happens when they do is a deliberate choice with a stated
+      rationale. The failure-isolated integration boundary from Section 14.03 is where the
+      choice is applied: the wrapper already catches the fault so it does not break the path,
+      and this section supplies the policy the wrapper applies. The two policies it can apply
+      are fail-open and fail-closed, and the rest of the section is about choosing between
+      them.
+  part_2:
+    title: 'Fail-Open and Fail-Closed: Two Policies, Two Risks'
+    body: |-
+      The two policies are simple to state. Fail-open means that when a detector fails, the
+      gateway passes the request -- it proceeds as though the failed detector had not objected.
+      Fail-closed means that when a detector fails, the gateway blocks the request -- it
+      refuses to proceed without the detector verdict. Fail-open favours availability: the
+      request is served even though a detector could not run. Fail-closed favours security: the
+      request is denied rather than served uninspected.
+
+      What makes the choice hard is that each policy carries a real risk, and the risks are
+      opposite. The fail-open risk is that the gateway admits the very attack the failed
+      detector was there to catch. If the injection classifier fails open, an injection attempt
+      that arrives during the failure sails through uninspected, and the protection the
+      detector was supposed to provide is absent exactly when an attacker who has noticed the
+      failure would strike. The fail-closed risk is the mirror image: the gateway denies
+      service to legitimate traffic because a detector is having a bad moment. If the injection
+      classifier fails closed, then while it is down every request -- the overwhelming majority
+      of which are legitimate -- is rejected, and a detector fault has become a
+      denial-of-service against the gateway own users.
+
+      Neither risk is hypothetical and neither policy is safe in the abstract. Fail-open trades
+      a security gap for continued service; fail-closed trades continued service for a security
+      guarantee. The decision table for this section makes this symmetry explicit by recording,
+      for each policy, the specific risk it takes, because the only honest way to choose is to
+      name the risk you are accepting. The choice is therefore not between a safe option and a
+      risky one but between two risks, and which risk is acceptable depends entirely on what
+      the detector guards -- which is the argument of the next part.
+  part_3:
+    title: The Policy Is Per Detector and Per Tier
+    body: |-
+      A single global failure policy is tempting because it is simple: decide once that the
+      gateway fails open, or that it fails closed, and apply it everywhere. But a global policy
+      is wrong for some detectors no matter which way it is set, because the detectors do not
+      all guard the same thing or warrant the same trade. The central design principle of this
+      section is that the fail-open versus fail-closed choice is made per detector and per
+      tier.
+
+      Consider two detectors at opposite ends. A prompt injection classifier is a critical
+      security detector: its whole purpose is to block a class of attack, and admitting an
+      uninspected request when it fails means admitting exactly the attack it guards against.
+      For this detector the fail-open risk is severe and the fail-closed risk -- some denied
+      legitimate traffic during a fault -- is the lesser evil, so it fails closed. Now consider
+      an input PII audit tagger whose only job is to annotate requests for later audit. It
+      blocks nothing in normal operation and its signal is best-effort. If it fails, denying
+      service over a missing audit tag would be absurd -- the fail-closed risk is unacceptable
+      and the fail-open risk is a mere audit gap -- so it fails open. A global policy set to
+      fail-closed would turn the audit tagger into a denial-of-service risk; set to fail-open
+      it would leave the injection classifier admitting attacks. Only a per-detector policy
+      gets both right.
+
+      The tier dimension reinforces the same point. The off-path near-real-time and batch tiers
+      never block a request in the first place -- they consume the exchange asynchronously --
+      so their failure is naturally fail-open: there is no synchronous request to deny. The
+      inline tier is where the hard fail-closed decisions live, because it is the only tier
+      that can block. So the policy is a property of the detector and its tier together: what
+      the detector guards sets the security stakes, and which tier it runs on sets whether
+      blocking is even possible. The decision engine for this section encodes exactly this --
+      a policy attached to each detector, resolving every failure kind through that detector
+      own choice.
+  part_4:
+    title: Timeout as a Failure Mode
+    body: |-
+      Section 14.04 introduced the per-detector timeout as a latency-bounding mechanism: a
+      deadline that stops a slow detector from blowing the budget. That section deliberately
+      left one thing open -- what the gateway does when the timeout fires -- and this section
+      closes it. A timeout is a failure mode, and it resolves through exactly the same
+      per-detector policy as an error or an unavailability.
+
+      The unification is worth being explicit about, because it keeps the design simple. From
+      the gateway point of view, an errored detector, a timed-out detector, and an unavailable
+      detector are the same situation: a detector that owes a verdict and has not produced one.
+      The reason it has no verdict -- it crashed, it ran too long, it could not be reached --
+      does not change what the gateway must decide, only what it logs. So all three failure
+      kinds map to the one policy the detector carries. A critical detector that times out
+      fails closed, just as it would if it errored; a best-effort detector that times out fails
+      open, just as it would if it were unavailable. The timeout-to-policy mapping for this
+      section shows the same timeout mechanism producing opposite decisions on two detectors
+      purely because their policies differ.
+
+      This also completes the story the timeout began in 14.04. There, the timeout guaranteed
+      the worst case was bounded so the latency budget held; the cost was that a bounded
+      failure still needs a decision. Here, that decision is supplied by the failure policy,
+      so the two sections together give the full account: 14.04 bounds how long a detector may
+      take, and 14.06 says what happens when it takes too long. The timeout is not a separate
+      kind of problem with its own handling -- it is folded into the single per-detector
+      failure policy, which is what keeps the failure behaviour of the whole gateway coherent.
+  part_5:
+    title: 'Degraded-Mode Operation: Essential and Droppable Detectors'
+    body: |-
+      A per-detector policy handles the failure of one detector, but production failures are
+      often partial and correlated: several detectors on a tier degrade at once under load, or
+      a shared dependency wobbles. The question then is not just what each detector does on
+      failure but what the gateway as a whole does when it can no longer run everything. The
+      answer is degraded-mode operation, and it rests on classifying detectors as essential or
+      droppable.
+
+      An essential detector is one the gateway must keep running to provide its core security
+      guarantee -- the injection classifier, the jailbreak classifier, the output PII scanner.
+      These are the detectors the request path degrades toward, never drops: if they cannot
+      run, fail-closed is the right response, because losing them silently would leave the
+      gateway serving traffic it can no longer vouch for. A droppable detector is one whose
+      loss weakens the picture but not the core guarantee -- the audit tagger, the
+      near-real-time session scorer, the batch analytics. These are the detectors the gateway
+      sheds first under stress, failing them open, because dropping them keeps the essential
+      path serving rather than letting a best-effort detector take the whole gateway down.
+
+      This classification is what turns failure handling from a per-detector decision into a
+      whole-gateway strategy. Without it, a partial failure forces a single crude choice --
+      block everything or admit everything -- because there is no notion of which detectors
+      matter more. With it, the gateway degrades gracefully: under stress it sheds the
+      droppable detectors and keeps serving through the essential ones, so the security core
+      stays intact while the enrichment falls away. The degraded-mode classification for this
+      section is exactly this list of essential and droppable detectors, and it is the input
+      that Section 14.07 graceful degradation will operate: this section decides which
+      detectors are essential, and 14.07 builds the mechanism that sheds the rest under load.
+  part_6:
+    title: From Policy to Mechanism
+    body: |-
+      With the failure policy in place, the gateway behaviour under detector failure is now
+      designed rather than accidental. Every detector carries a deliberate fail-open or
+      fail-closed policy chosen from what it guards and which tier it runs on; every failure
+      kind -- error, timeout, unavailability -- resolves through that one policy; and the
+      essential-versus-droppable classification lets a partial failure degrade to the security
+      core rather than collapsing one way for everything. The security-versus-availability
+      trade is made once, per detector, in advance, by an engineer weighing the risk, which is
+      exactly what the 14.01 taxonomy demanded when it warned that an unspecified failure mode
+      is chosen by the bug.
+
+      What this section does not do is stop a detector from failing repeatedly. The policy says
+      what to do on each failure, but if a detector is broken it will keep failing, and calling
+      a broken detector on every request -- even to fail it open or closed by policy -- wastes
+      work, adds latency, and can turn one detector fault into a load problem that spreads.
+      Deciding the policy is necessary but not sufficient; the gateway also needs a mechanism
+      that recognises a persistently failing detector and stops calling it until it recovers.
+
+      That mechanism is the subject of Section 14.07. The circuit breaker cuts off a detector
+      that has failed repeatedly, moving from closed to open to half-open as it tests recovery,
+      so a broken detector is isolated rather than retried into a cascade. Bulkheads keep one
+      detector failure from exhausting the resources the others need; health checks and
+      readiness decide when an instance should receive traffic at all; and graceful degradation
+      operates the essential-versus-droppable classification defined here to shed non-essential
+      detectors under stress. This section decided what a failing detector does; the next
+      builds the machinery that keeps a failing detector from taking the gateway down with it.
+reference_materials:
+  table_1:
+    title: The Three Detector Failure Kinds
+    description: 'The ways a detector fails to produce a verdict and why all three resolve through the
+      same per-detector policy. From the gateway point of view they are the same situation: a detector
+      that owes a verdict and has not produced one.'
+    columns:
+    - Failure kind
+    - What happened
+    - Resolves through
+    rows:
+    - - Error
+      - The detector raised an exception (bug, bad input, missing artifact)
+      - The detector fail-open/fail-closed policy
+    - - Timeout
+      - The detector exceeded its deadline from Section 14.04
+      - The same policy -- timeout is one failure kind
+    - - Unavailable
+      - The service behind the detector is down or unreachable
+      - The same policy -- no verdict, same decision
+  table_2:
+    title: Fail-Open versus Fail-Closed
+    description: The two failure policies compared by what they do, what they favour, and the specific
+      risk each takes. Neither is safe in the abstract -- each trades one real risk for the other, which
+      is why the choice depends on what the detector guards.
+    columns:
+    - Property
+    - Fail-open
+    - Fail-closed
+    rows:
+    - - Action on failure
+      - Pass the request
+      - Block the request
+    - - Favours
+      - Availability
+      - Security
+    - - Risk taken
+      - Admits the attack the failed detector would have caught
+      - Denies service to legitimate traffic on a detector fault
+    - - Right for
+      - Best-effort and off-path detectors
+      - Critical inline security detectors
+    - - Wrong for
+      - Critical security detectors (admits attacks)
+      - Best-effort detectors (denial of service)
+  table_3:
+    title: Fail-Policy Decision Table Per Detector Class
+    description: The failure policy for each detector class with what it favours and the risk it accepts.
+      Critical inline security detectors fail closed; best-effort and off-path detectors fail open. A
+      single global policy would force the wrong trade on half of these.
+    columns:
+    - Detector class
+    - Policy
+    - Favours
+    - Risk accepted
+    rows:
+    - - Injection / jailbreak classifier
+      - Fail-closed
+      - Security
+      - Denies legitimate traffic while the detector is down
+    - - Output PII / secret scanner
+      - Fail-closed
+      - Security
+      - Blocks valid responses during a scanner fault
+    - - Policy / toxicity output filter
+      - Fail-closed
+      - Security
+      - Withholds acceptable output when the filter errors
+    - - Input PII audit tagger
+      - Fail-open
+      - Availability
+      - 'Audit gap: a request passes untagged during the fault'
+    - - Session behaviour scorer (NRT)
+      - Fail-open
+      - Availability
+      - A window of session scoring is missed
+    - - Batch analytics job
+      - Fail-open
+      - Availability
+      - A batch run is skipped or delayed
+  table_4:
+    title: Degraded-Mode Detector Classification
+    description: Detectors classified as essential or droppable for degraded-mode operation. The gateway
+      degrades toward the essential detectors and sheds the droppable ones under stress, so a partial
+      failure keeps the security core rather than failing one way for everything.
+    columns:
+    - Detector
+    - Tier
+    - Class
+    - On failure / stress
+    rows:
+    - - Injection classifier
+      - Inline
+      - Essential
+      - Fail-closed -- kept, never dropped
+    - - Jailbreak classifier
+      - Inline
+      - Essential
+      - Fail-closed -- kept, never dropped
+    - - Output PII scanner
+      - Inline
+      - Essential
+      - Fail-closed -- kept, never dropped
+    - - Input PII audit tagger
+      - Inline
+      - Droppable
+      - Fail-open -- shed first under stress
+    - - Session behaviour scorer
+      - Near-real-time
+      - Droppable
+      - Fail-open -- shed, off-path
+    - - Coordinated-network analysis
+      - Batch
+      - Droppable
+      - Fail-open -- shed, retrospective
+deliverables:
+  deliverable_1:
+    title: Fail-Open versus Fail-Closed Decision Engine
+    filename: fail_open_closed_policy.py
+    description: Attaches a fail-open or fail-closed policy to each detector, tagged by tier and by essential-or-droppable
+      class, and resolves any failure kind -- error, timeout, or unavailability -- through that one per-detector
+      policy, showing that a single global policy would force the wrong trade on half the detectors.
+    implementation_notes: Python 3.12, single quotes throughout per book convention, standard-library
+      enum and dataclasses only, prints the per-detector policies and the admit/block decision for each
+      failure kind.
+    code: |
+      # fail_open_closed_policy.py
+      # Section 14.06: Fail-Open versus Fail-Closed Decision Engine
+      # 20260121 | AI Security Mastery -- Chapter 14 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from enum import Enum
+      from typing import List
+
+
+      class FailurePolicy(Enum):
+          FAIL_OPEN = 'fail_open'      # admit the request when detection fails (availability)
+          FAIL_CLOSED = 'fail_closed'  # block the request when detection fails (security)
+
+
+      class FailureKind(Enum):
+          ERROR = 'error'              # the detector raised
+          TIMEOUT = 'timeout'          # the detector exceeded its deadline
+          UNAVAILABLE = 'unavailable'  # the detector could not be reached
+
+
+      @dataclass
+      class DetectorPolicy:
+          name: str
+          tier: str
+          essential: bool          # essential detectors fail closed, droppable ones fail open
+          policy: FailurePolicy
+          rationale: str
+
+
+      @dataclass
+      class FailureDecision:
+          detector: str
+          kind: str
+          policy: str
+          request_admitted: bool
+          detail: str
+
+
+      POLICIES: List[DetectorPolicy] = [
+          DetectorPolicy('Injection classifier', 'inline', True, FailurePolicy.FAIL_CLOSED,
+                         'Critical security detector: admitting an uninspected request risks the attack it guards against'),
+          DetectorPolicy('Jailbreak classifier', 'inline', True, FailurePolicy.FAIL_CLOSED,
+                         'Critical security detector: fail closed rather than admit a possibly malicious prompt'),
+          DetectorPolicy('Output PII scanner', 'inline', True, FailurePolicy.FAIL_CLOSED,
+                         'Leaking PII on failure is unacceptable, so withhold the response when the scan fails'),
+          DetectorPolicy('Input PII audit tagger', 'inline', False, FailurePolicy.FAIL_OPEN,
+                         'Best-effort audit signal: its failure must not deny service to a legitimate request'),
+          DetectorPolicy('Session behaviour scorer', 'near_real_time', False, FailurePolicy.FAIL_OPEN,
+                         'Off-path enrichment: it never blocks in the first place, so its failure fails open'),
+      ]
+
+
+      def decide(policy: DetectorPolicy, kind: FailureKind) -> FailureDecision:
+          '''Apply a detector policy to a specific failure and return the admit/block decision.
+
+          The policy is a property of the detector, not of the failure kind: an error, a
+          timeout, and an unavailability all resolve through the same fail-open or
+          fail-closed choice. What differs by kind is only the detail logged.
+          '''
+          admitted = policy.policy is FailurePolicy.FAIL_OPEN
+          verb = 'admitted' if admitted else 'blocked'
+          detail = f'{policy.name} {kind.value}; policy {policy.policy.value} -> request {verb}'
+          return FailureDecision(policy.name, kind.value, policy.policy.value, admitted, detail)
+
+
+      def print_policies(policies: List[DetectorPolicy]) -> None:
+          print('=' * 84)
+          print('FAIL-OPEN vs FAIL-CLOSED DECISION ENGINE')
+          print('The policy is per detector and per tier, not a single global default')
+          print('=' * 84)
+          for p in policies:
+              klass = 'essential' if p.essential else 'droppable'
+              print()
+              print(f'DETECTOR: {p.name} [{p.tier}, {klass}]')
+              print(f'  Policy   : {p.policy.value}')
+              print(f'  Rationale: {p.rationale}')
+
+
+      def demo_failures(policies: List[DetectorPolicy]) -> None:
+          print()
+          print('=' * 84)
+          print('FAILURE DECISIONS (error / timeout / unavailable resolve through the same policy)')
+          print('=' * 84)
+          for p in policies:
+              for kind in FailureKind:
+                  d = decide(p, kind)
+                  print(f'  {d.detail}')
+              print()
+          fail_open = sum(1 for p in policies if p.policy is FailurePolicy.FAIL_OPEN)
+          fail_closed = len(policies) - fail_open
+          print(f'Summary: {fail_closed} detectors fail closed (security), {fail_open} fail open (availability)')
+          print('A single global policy would force one wrong trade on half of these detectors.')
+
+
+      if __name__ == '__main__':
+          print_policies(POLICIES)
+          demo_failures(POLICIES)
+  deliverable_2:
+    title: Fail-Open versus Fail-Closed Decision Table
+    filename: fail_policy_decision_table.py
+    description: Tabulates the failure policy for each detector class with what it favours and the risk
+      it accepts, and states the symmetry of risk -- the fail-open risk of admitting the attack versus
+      the fail-closed risk of denying legitimate service -- so the choice is seen as between two risks,
+      not between a safe and a risky option.
+    implementation_notes: Python 3.12, single quotes throughout per book convention, no external dependencies,
+      prints the decision table and the risk-symmetry explanation.
+    code: |
+      # fail_policy_decision_table.py
+      # Section 14.06: Fail-Open versus Fail-Closed Decision Table
+      # 20260121 | AI Security Mastery -- Chapter 14 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from typing import List
+
+
+      @dataclass
+      class PolicyRow:
+          detector_class: str
+          policy: str
+          favours: str
+          risk_taken: str
+
+
+      ROWS: List[PolicyRow] = [
+          PolicyRow('Injection / jailbreak classifier', 'fail-closed', 'security',
+                    'Denies legitimate traffic while the detector is down'),
+          PolicyRow('Output PII / secret scanner', 'fail-closed', 'security',
+                    'Blocks valid responses during a scanner fault'),
+          PolicyRow('Policy / toxicity output filter', 'fail-closed', 'security',
+                    'Withholds acceptable output when the filter errors'),
+          PolicyRow('Input PII audit tagger', 'fail-open', 'availability',
+                    'Audit gap: a request passes untagged during the fault'),
+          PolicyRow('Session behaviour scorer (NRT)', 'fail-open', 'availability',
+                    'A window of session scoring is missed'),
+          PolicyRow('Batch analytics job', 'fail-open', 'availability',
+                    'A batch run is skipped or delayed'),
+      ]
+
+
+      def print_decision_table(rows: List[PolicyRow]) -> None:
+          print('=' * 92)
+          print('FAIL-OPEN vs FAIL-CLOSED DECISION TABLE')
+          print('Each policy takes a real risk; the question is which risk is acceptable for that detector')
+          print('=' * 92)
+          header = 'Detector class'.ljust(36) + 'Policy'.ljust(14) + 'Favours'.ljust(14) + 'Risk taken'
+          print(header)
+          print('-' * 92)
+          for r in rows:
+              print(r.detector_class.ljust(36) + r.policy.ljust(14) + r.favours.ljust(14) + r.risk_taken)
+          print('-' * 92)
+
+
+      def risk_symmetry() -> None:
+          print()
+          print('=' * 92)
+          print('THE SYMMETRY OF RISK')
+          print('=' * 92)
+          print('Fail-open risk : admitting the attack the failed detector would have caught.')
+          print('Fail-closed risk: denying service to legitimate traffic on a detector fault.')
+          print()
+          print('Neither policy is safe in the abstract -- each trades one risk for the other.')
+          print('Fail-closed on a critical security detector accepts a denial-of-service risk to')
+          print('avoid admitting an attack. Fail-open on a best-effort detector accepts an audit')
+          print('gap to avoid denying service. The right choice depends on what the detector')
+          print('guards and what its failure would cost, which is why the policy is per detector.')
+
+
+      if __name__ == '__main__':
+          print_decision_table(ROWS)
+          risk_symmetry()
+  deliverable_3:
+    title: Degraded-Mode Detector Classification
+    filename: degraded_mode_classification.py
+    description: Classifies detectors as essential (fail-closed, never dropped) or droppable (fail-open,
+      shed first under stress) and shows the essential path the gateway degrades toward, so a partial
+      failure sheds the droppable detectors and keeps serving through the essential security detectors
+      rather than failing one way for everything.
+    implementation_notes: Python 3.12, single quotes throughout per book convention, no external dependencies,
+      prints the essential and droppable classifications and the retained essential path.
+    code: |
+      # degraded_mode_classification.py
+      # Section 14.06: Degraded-Mode Detector Classification
+      # 20260121 | AI Security Mastery -- Chapter 14 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from typing import List
+
+
+      @dataclass
+      class DetectorClass:
+          name: str
+          tier: str
+          essential: bool
+          on_failure: str
+          justification: str
+
+
+      DETECTORS: List[DetectorClass] = [
+          DetectorClass('Injection classifier', 'inline', True, 'fail-closed',
+                        'Primary defence against prompt injection; must not be silently dropped'),
+          DetectorClass('Jailbreak classifier', 'inline', True, 'fail-closed',
+                        'Primary defence against jailbreaks; part of the essential path'),
+          DetectorClass('Output PII scanner', 'inline', True, 'fail-closed',
+                        'Prevents data leakage in responses; essential to keep'),
+          DetectorClass('Input PII audit tagger', 'inline', False, 'fail-open',
+                        'Audit enrichment only; droppable without weakening the essential path'),
+          DetectorClass('Session behaviour scorer', 'near_real_time', False, 'fail-open',
+                        'Off-path signal; droppable under stress'),
+          DetectorClass('Coordinated-network analysis', 'batch', False, 'fail-open',
+                        'Retrospective analytics; droppable, runs off-path'),
+      ]
+
+
+      def classify(detectors: List[DetectorClass]) -> None:
+          print('=' * 88)
+          print('DEGRADED-MODE DETECTOR CLASSIFICATION')
+          print('Essential detectors are kept (fail-closed); droppable ones are shed (fail-open)')
+          print('=' * 88)
+          essential = [d for d in detectors if d.essential]
+          droppable = [d for d in detectors if not d.essential]
+          print()
+          print('ESSENTIAL (the path degrades TO these, never drops them):')
+          for d in essential:
+              print(f'  - {d.name} [{d.tier}] -> {d.on_failure}')
+              print(f'      {d.justification}')
+          print()
+          print('DROPPABLE (shed first under stress, without weakening the essential path):')
+          for d in droppable:
+              print(f'  - {d.name} [{d.tier}] -> {d.on_failure}')
+              print(f'      {d.justification}')
+
+
+      def degraded_path(detectors: List[DetectorClass]) -> None:
+          print()
+          print('=' * 88)
+          print('WHAT DEGRADED MODE MEANS')
+          print('=' * 88)
+          essential = [d.name for d in detectors if d.essential]
+          print('Under partial failure the gateway does not fail one way for everything. It sheds')
+          print('the droppable detectors and keeps serving through the essential ones:')
+          print()
+          print('  Essential path retained: ' + ', '.join(essential))
+          print()
+          print('This is why the classification matters: without it, a partial failure forces a')
+          print('single global choice -- block everything or admit everything. With it, the gateway')
+          print('degrades gracefully to its essential security detectors and keeps running.')
+
+
+      if __name__ == '__main__':
+          classify(DETECTORS)
+          degraded_path(DETECTORS)
+  deliverable_4:
+    title: Timeout-to-Failure-Policy Mapping
+    filename: timeout_to_policy_mapping.py
+    description: Maps the per-detector timeout from Section 14.04 to its fail-open or fail-closed resolution,
+      showing a detector completing within its deadline and detectors timing out under opposite policies
+      -- the same timeout mechanism producing a block for a critical detector and an admit for a best-effort
+      one.
+    implementation_notes: Python 3.12, single quotes throughout per book convention, standard-library
+      enum and dataclasses only, prints the timeout configuration and worked timeout outcomes under each
+      policy.
+    code: |
+      # timeout_to_policy_mapping.py
+      # Section 14.06: Timeout-to-Failure-Policy Mapping
+      # 20260121 | AI Security Mastery -- Chapter 14 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from enum import Enum
+      from typing import List
+
+
+      class Policy(Enum):
+          FAIL_OPEN = 'fail_open'
+          FAIL_CLOSED = 'fail_closed'
+
+
+      @dataclass
+      class DetectorTimeout:
+          name: str
+          timeout_ms: float
+          policy: Policy
+
+
+      @dataclass
+      class TimeoutOutcome:
+          detector: str
+          elapsed_ms: float
+          timed_out: bool
+          resolution: str
+
+
+      def resolve_timeout(cfg: DetectorTimeout, elapsed_ms: float) -> TimeoutOutcome:
+          '''A timeout is one failure kind among error and unavailable, and it resolves
+          through the same per-detector policy. Section 14.04 introduced the timeout as a
+          latency-bounding mechanism; here the timeout is mapped to the fail-open or
+          fail-closed decision that says what the gateway does when the deadline is hit.
+          '''
+          if elapsed_ms <= cfg.timeout_ms:
+              return TimeoutOutcome(cfg.name, elapsed_ms, False,
+                                    'completed within deadline; normal verdict used')
+          if cfg.policy is Policy.FAIL_OPEN:
+              resolution = 'timed out -> fail-open -> request admitted without this detector'
+          else:
+              resolution = 'timed out -> fail-closed -> request blocked'
+          return TimeoutOutcome(cfg.name, elapsed_ms, True, resolution)
+
+
+      CONFIGS: List[DetectorTimeout] = [
+          DetectorTimeout('Injection classifier', 20.0, Policy.FAIL_CLOSED),
+          DetectorTimeout('Output PII scanner', 15.0, Policy.FAIL_CLOSED),
+          DetectorTimeout('Input PII audit tagger', 10.0, Policy.FAIL_OPEN),
+      ]
+
+
+      def demo() -> None:
+          print('=' * 84)
+          print('TIMEOUT-TO-FAILURE-POLICY MAPPING')
+          print('The 14.04 timeout bounds latency; the 14.06 policy decides what a timeout does')
+          print('=' * 84)
+          print()
+          header = 'Detector'.ljust(28) + 'Timeout'.ljust(11) + 'On timeout'
+          print(header)
+          print('-' * 84)
+          for c in CONFIGS:
+              print(c.name.ljust(28) + f'{c.timeout_ms:.0f}ms'.ljust(11) + c.policy.value)
+          print('-' * 84)
+          print()
+          print('WORKED OUTCOMES')
+          print('-' * 84)
+          trials = [
+              (CONFIGS[0], 12.0),   # within deadline
+              (CONFIGS[0], 26.0),   # timed out, fail-closed
+              (CONFIGS[2], 18.0),   # timed out, fail-open
+          ]
+          for cfg, elapsed in trials:
+              o = resolve_timeout(cfg, elapsed)
+              print(f'  {o.detector}: {o.elapsed_ms:.0f}ms -> {o.resolution}')
+          print()
+          print('The timeout does not decide the outcome on its own -- it is bounded by 14.04 and')
+          print('resolved by the 14.06 policy. A critical detector times out closed; a best-effort')
+          print('detector times out open. Same timeout mechanism, opposite decisions by policy.')
+
+
+      if __name__ == '__main__':
+          demo()
+common_mistakes:
+  mistake_1:
+    description: Leaving the failure mode unspecified and letting the code decide what happens when a
+      detector fails
+    why_it_happens: |-
+      In normal operation the detector never fails, so the failure path is never exercised and
+      feels theoretical, and it is easy to assume the request will be handled sensibly without
+      deciding what sensible means.
+    consequence: When a detector eventually fails, the request takes whatever path the code happens to
+      take -- silently failing open through a swallowed exception or failing closed through an uncaught
+      one -- so a security-versus-availability decision of real consequence is made by the accident of
+      code structure rather than by an engineer.
+    correct_approach: Specify a deliberate fail-open or fail-closed policy for every detector and apply
+      it at the isolated integration boundary, so that what happens on failure is a chosen policy with
+      a stated rationale, never whatever the bug does.
+  mistake_2:
+    description: Applying a single global failure policy to every detector
+    why_it_happens: |-
+      One policy for the whole gateway is simple to state and reason about, and choosing once
+      seems cleaner than maintaining a per-detector decision, so the gateway is set to fail
+      open everywhere or fail closed everywhere.
+    consequence: 'The global policy is wrong for some detectors whichever way it is set: fail-closed everywhere
+      turns a best-effort audit tagger fault into a denial of service, while fail-open everywhere leaves
+      the injection classifier admitting the attacks it exists to block.'
+    correct_approach: Choose the policy per detector and per tier from what the detector guards and whether
+      its tier can block, so critical inline security detectors fail closed and best-effort or off-path
+      detectors fail open.
+  mistake_3:
+    description: Treating fail-open as the safe default because it keeps the service up
+    why_it_happens: |-
+      Availability is visible and measured, and an outage is an obvious incident, so fail-open
+      feels like the responsible choice because the gateway keeps serving and nothing appears
+      to break.
+    consequence: A critical security detector set to fail open silently admits the attacks it was meant
+      to catch during every failure window, and an attacker who notices the detector is down has a clear
+      opening that produces no visible outage to alert anyone.
+    correct_approach: Recognise that fail-open takes a real security risk and is only the right default
+      for best-effort and off-path detectors; fail the critical inline security detectors closed, accepting
+      the availability cost as the lesser risk for what they guard.
+  mistake_4:
+    description: Handling a timeout as a separate concern with its own ad hoc behaviour instead of through
+      the failure policy
+    why_it_happens: |-
+      The timeout was introduced in a different section as a latency mechanism, so it is easy
+      to treat it as a performance detail and bolt on whatever behaviour is convenient when it
+      fires, separately from the error-handling policy.
+    consequence: The gateway ends up with inconsistent failure behaviour -- a detector that fails closed
+      on an error but open on a timeout, or vice versa -- so its response to failure depends on the incidental
+      reason for the failure rather than on a coherent policy.
+    correct_approach: Treat the timeout as one failure kind alongside error and unavailability, resolving
+      all three through the same per-detector policy, so a detector fails the same way regardless of why
+      it failed to produce a verdict.
+  mistake_5:
+    description: Having no essential-versus-droppable classification, so a partial failure forces a single
+      crude gateway-wide choice
+    why_it_happens: |-
+      Classifying every detector as essential or droppable is extra design work, and when all
+      detectors are treated as equally important there is no obvious need for it until several
+      fail at once.
+    consequence: When a partial or correlated failure hits, the gateway has no notion of which detectors
+      matter more, so it can only block everything or admit everything, losing either the service or the
+      entire security core instead of degrading gracefully.
+    correct_approach: Classify detectors as essential (fail-closed, never dropped) or droppable (fail-open,
+      shed first), so a partial failure degrades to the essential security detectors and keeps serving
+      through them while the droppable enrichment falls away.
+section_summary:
+  compact: |-
+    When a detector errors, times out, or becomes unavailable, the gateway must do something
+    deliberate, because an unspecified failure mode is not the absence of a decision but a
+    decision made by the bug -- whatever the code does on the exception becomes the policy.
+    The two policies are fail-open, which passes the request and favours availability, and
+    fail-closed, which blocks it and favours security. Each carries a real and opposite risk:
+    fail-open admits the attack the failed detector would have caught, and fail-closed denies
+    service to legitimate traffic on a detector fault, so neither is safe in the abstract and
+    the choice is between two risks. The policy is therefore made per detector and per tier,
+    not once globally, because a critical inline security detector like the injection
+    classifier warrants fail-closed while a best-effort audit tagger or an off-path scorer
+    warrants fail-open, and a single global policy forces the wrong trade on half the
+    detectors. The timeout from Section 14.04 is one failure kind that resolves through the
+    same per-detector policy as an error or unavailability, so the same timeout mechanism
+    produces opposite decisions on detectors whose policies differ. Degraded-mode operation
+    classifies detectors as essential (fail-closed, never dropped) or droppable (fail-open,
+    shed first), so a partial or correlated failure degrades gracefully to the essential
+    security detectors rather than failing the whole gateway one way for everything. This
+    decides what a failing detector does; the mechanism that stops a detector from failing
+    repeatedly into a cascade is Section 14.07.
+  key_takeaways:
+  - An unspecified failure mode is a failure mode chosen by the bug, so the gateway response to a detector
+    error, timeout, or unavailability must be a deliberate policy
+  - Fail-open passes the request favouring availability and risks admitting the attack; fail-closed blocks
+    it favouring security and risks denying legitimate service -- neither is safe in the abstract
+  - The fail-open versus fail-closed choice is made per detector and per tier, because a critical security
+    detector and a best-effort enrichment detector warrant opposite policies
+  - A single global failure policy forces the wrong trade on some detectors whichever way it is set
+  - The timeout from Section 14.04 is one failure kind that resolves through the same per-detector policy
+    as an error or unavailability
+  - Degraded-mode operation classifies detectors as essential (fail-closed) or droppable (fail-open) so
+    a partial failure degrades to the essential security path rather than failing one way for everything
+preview_section_14_07:
+  title: High Availability, Circuit Breakers, and Graceful Degradation
+  summary: |-
+    Section 14.06 decided what a failing detector does; Section 14.07 builds the mechanism that
+    keeps a failing detector from taking the gateway down with it. It introduces the circuit
+    breaker that cuts off a detector after repeated failures -- moving between closed, open,
+    and half-open as it tests recovery -- so a broken detector is isolated rather than retried
+    into a cascade. It adds bulkheads that keep one detector failure from exhausting shared
+    resources, health checks and readiness that decide when an instance receives traffic,
+    redundancy and failover for the tiers, and the graceful degradation that operates the
+    essential-versus-droppable classification defined here. It is the second resilience
+    section, turning failure policy into failure containment.
+metadata:
+  cross_chapter_references:
+  - 'Section 14.01: the production deployment concern taxonomy that names failure handling and warns an
+    unspecified failure mode is chosen by the bug'
+  - 'Section 14.03: the failure-isolated integration boundary where the fail-open/fail-closed policy is
+    applied'
+  - 'Section 14.04: the per-detector timeout introduced as a latency bound and resolved here as a failure
+    mode'
+  - 'Section 14.05: the throughput scaling whose overload can drive detector failure and degraded operation'
+  - 'Chapter 13 Section 13.01: the tiers whose differing roles justify per-tier failure policies'
+  forward_references:
+  - 'Section 14.07: circuit breakers, bulkheads, health checks, and graceful degradation -- the mechanism
+    that contains repeated detector failure'
+  - 'Section 14.07: graceful degradation operates the essential-versus-droppable classification defined
+    here'
+  - 'Section 14.08: observability -- emitting the failure and policy signals so failures are visible and
+    tunable'
+  - 'Section 14.11: the production gateway capstone -- the per-detector failure policy assembled into
+    the running service'
+  tags:
+  - failure-modes
+  - fail-open
+  - fail-closed
+  - security-vs-availability
+  - per-detector-policy
+  - per-tier-policy
+  - timeout-as-failure
+  - degraded-mode
+  - essential-vs-droppable
+  - graceful-degradation
+  - failure-isolation
+  - resilience
+  - production-deployment
+  - part-3-chapter-4
