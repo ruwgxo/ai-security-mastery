@@ -1,0 +1,862 @@
+# section_14_05_throughput_scaling.yaml
+
+---
+document_info:
+  title: Throughput and Horizontal Scaling
+  chapter: 14
+  section: 5
+  section_code: '1405'
+  author: Raghav Dinesh
+  github: https://github.com/ruwgxo/ai-security-mastery
+  license: MIT
+  version: '1.0'
+  created: '2026-06-21'
+  estimated_pages: 6
+  estimated_reading_time: 45-55 minutes
+section_overview:
+  one_line_summary: 'Throughput is the requests per second the gateway must sustain, and horizontal scaling
+    -- adding instances -- is how it is met: the stateless inline tier scales cleanly by replication,
+    the stateful near-real-time and batch tiers scale by coordinating shared state, and backpressure and
+    autoscaling keep the system sustaining peak load without collapsing or over-provisioning.'
+  why_this_section_exists: |-
+    Section 14.04 made each individual request fit the sub-50ms latency budget. A request that
+    fits the budget one at a time is necessary but not sufficient, because production does not
+    send one request at a time -- it sends thousands per second, and a gateway that handles one
+    request in fifty milliseconds still fails if it cannot handle the rate at which requests
+    arrive. Latency is about a single request; throughput is about the aggregate. This section
+    engineers throughput. It defines throughput as the requests per second the gateway must
+    sustain, establishes horizontal scaling -- adding instances -- as the way to meet it rather
+    than vertical scaling of a single instance, and explains why the statelessness of the
+    inline tier is what makes its horizontal scaling clean. It then addresses the harder case:
+    the near-real-time and batch tiers hold shared state, so scaling them is not mere
+    replication but state coordination. Around this it builds the operational machinery of
+    scale -- load balancing across instances, autoscaling on a load signal, backpressure when
+    load exceeds capacity, and capacity planning to size the tiers for peak -- so that the
+    latency-correct gateway of 14.04 becomes a throughput-correct one that sustains the load it
+    will actually see.
+  position_in_chapter: |-
+    Section 14.05 is the second of the two performance sections (14.04-14.05) and the response
+    to the throughput half of the latency-and-throughput performance concern. Where 14.04
+    engineered per-request latency, this section engineers aggregate throughput and scaling.
+    With performance complete, the resilience sections (14.06-14.07) take over: 14.06 decides
+    what happens when a detector fails, and 14.07 keeps one failure from cascading -- the
+    failure side of the same production system this section scales.
+learning_objectives:
+  knowledge:
+  - Define throughput as the requests per second the detection gateway must sustain, distinct from per-request
+    latency
+  - Explain why horizontal scaling -- adding instances -- is the way to meet throughput, and how it differs
+    from vertical scaling
+  - Explain why the statelessness of the inline tier makes its horizontal scaling clean, so any instance
+    can serve any request
+  - Describe why scaling the stateful near-real-time and batch tiers requires coordinating shared state
+    rather than simply replicating
+  - Describe load balancing across gateway instances and why the algorithm differs between a stateless
+    and a stateful tier
+  - Explain autoscaling on a load signal and why each tier scales on the signal that reflects its own
+    load
+  - Explain backpressure -- shedding or queuing rather than collapsing -- when load exceeds capacity,
+    and capacity planning for peak load
+  skills:
+  - Model throughput and plan the horizontal scaling of each detection tier for a target request rate
+  - Produce a throughput and scaling table stating the scaling model, statefulness, and scaling difficulty
+    per tier
+  - Configure load balancing and autoscaling per tier on the appropriate algorithm and scale signal
+  - Calculate capacity for peak load and apply backpressure decisions -- serve, queue, or shed -- as load
+    approaches and exceeds capacity
+  security_mindset:
+  - Recognise that a gateway that cannot sustain the request rate fails just as surely as one that is
+    too slow, so throughput is a security property
+  - Internalise that statelessness is engineered into the inline tier precisely to make the hot path scale
+    cleanly under load
+  - Understand that the stateful tiers are a harder scaling problem, which is a further reason they are
+    kept off the hot path
+  - Appreciate that backpressure protects the requests in flight by shedding excess deliberately, rather
+    than letting the whole gateway collapse under overload
+prerequisites:
+- 'Section 14.01: the production deployment concern taxonomy that names latency and cost, with throughput
+  as the aggregate face of load'
+- 'Section 14.04: the per-request latency budget this section scales to aggregate throughput'
+- 'Section 14.02: the architecture pattern whose instances are the unit of horizontal scaling'
+- 'Chapter 13 Section 13.01: the state-latency coupling that makes the inline tier stateless and the off-path
+  tiers stateful'
+- Working knowledge of load balancers, instance replication, and queue-based backpressure
+- Familiarity with the difference between horizontal scaling (more instances) and vertical scaling (a
+  bigger instance)
+prose_content:
+  part_1:
+    title: 'From Latency to Throughput: The Aggregate View'
+    body: |-
+      Section 14.04 answered a question about a single request: can the gateway inspect it and
+      return a verdict within fifty milliseconds. This section answers a different question
+      about many requests: can the gateway sustain the rate at which they arrive. These are not
+      the same question, and a system can pass the first while failing the second. A gateway
+      that handles one request in a comfortable forty milliseconds still fails if ten thousand
+      requests arrive each second and it can only process five thousand, because the backlog
+      grows without bound until the gateway falls over.
+
+      Throughput is the name for this aggregate quantity: the requests per second the gateway
+      must sustain. It is the load side of the system, where latency is the per-request side,
+      and both must be satisfied for the gateway to work in production. The relationship
+      between them is not that one implies the other. A fast per-request latency helps
+      throughput -- each instance finishes requests sooner and can take the next -- but it does
+      not by itself provide throughput, because a single instance has a finite capacity no
+      matter how fast each request is. Meeting a throughput of ten thousand requests per second
+      is not about making each request faster; it is about having enough capacity to serve them
+      all.
+
+      This reframing is why throughput is a distinct engineering concern with its own section.
+      The whole apparatus of this section -- scaling, load balancing, autoscaling, backpressure,
+      capacity planning -- exists to provide and manage capacity at the aggregate level, on top
+      of the per-request latency that 14.04 already secured. A gateway that is latency-correct
+      but not throughput-correct is a gateway that works in a demo and fails in production, and
+      closing that gap is the work here.
+  part_2:
+    title: Horizontal Scaling and Why the Inline Tier Scales Cleanly
+    body: |-
+      There are two ways to add capacity. Vertical scaling makes a single instance bigger --
+      more CPU, more memory -- so it handles more requests. Horizontal scaling adds more
+      instances and spreads the load across them. Vertical scaling hits a ceiling quickly,
+      because there is a largest instance you can buy and a single instance is a single point
+      of failure, so production throughput at scale is met horizontally: to double capacity,
+      double the instances.
+
+      Horizontal scaling is clean when any instance can handle any request, and that condition
+      is exactly statelessness. A stateless instance holds no per-request or per-session state
+      that a request depends on, so a request can be sent to any instance and get the same
+      answer. When that is true, adding capacity is just adding instances behind a load
+      balancer, and capacity is linear in instance count: the scaling planner for this section
+      computes the instance count for a target rate as a simple division precisely because the
+      inline tier is stateless.
+
+      The inline tier is stateless by design, and this is where the Chapter 13 architecture
+      pays off again. The inline detectors read precomputed summaries and score the request in
+      front of them; they do not accumulate state across requests, because the stateful work
+      was deliberately pushed to the slower tiers. That design choice was made for latency in
+      Chapter 13 and for the latency budget in 14.04, and here it delivers a third benefit: the
+      hot path scales horizontally and cleanly. The tier that must handle the full request rate
+      is the tier that is easiest to scale, which is not a coincidence but the consequence of
+      engineering the hot path to be stateless.
+  part_3:
+    title: 'Scaling the Stateful Tiers: Coordinating Shared State'
+    body: |-
+      The near-real-time and batch tiers do not have the luxury of statelessness. A
+      near-real-time session scorer holds a recent window of state per session; a batch job
+      works over a large historical corpus. Their whole function is to consult state that spans
+      many requests, so they cannot be stateless, and that makes their scaling a harder problem
+      than the inline tier.
+
+      The difficulty is that you cannot scale a stateful tier by simple replication, because
+      two independent replicas each holding their own copy of the state would disagree. If a
+      session hashes to one instance on one request and a different instance on the next, and
+      each instance maintains its own view of that session, neither has the complete picture.
+      Scaling a stateful tier therefore means coordinating the state across instances, and the
+      usual tool is partitioning: the state is divided by a key -- the session identifier, say
+      -- and each instance owns a partition, with the load balancer routing every request for a
+      given key to the instance that owns that key. This keeps a session on one instance so its
+      state stays local and complete, and it is why the near-real-time tier balances by
+      consistent hash on the session key rather than by least-connections.
+
+      Partitioning scales, but it costs more than replication in coordination: rebalancing when
+      instances are added or removed, handling the state of a partition whose instance fails,
+      and keeping the routing consistent. The scaling planner reflects this by flagging the
+      stateful tiers -- it shows an instance floor from the arithmetic but notes that
+      coordination adds cost beyond that floor. This extra difficulty is one more reason the
+      Chapter 13 partition put these detectors off the hot path: not only is their latency too
+      high for the inline budget, their scaling is too costly to sit on the tier that must
+      absorb the full request rate. The stateful tiers are scaled where their coordination cost
+      is paid away from the hot path.
+  part_4:
+    title: Load Balancing and Autoscaling
+    body: |-
+      Horizontal scaling needs two pieces of operational machinery to work: a way to spread
+      requests across the instances, and a way to change the instance count as load changes.
+      These are load balancing and autoscaling.
+
+      The load balancer sits in front of a tier and distributes requests across its instances,
+      and the right algorithm depends on the tier statefulness. The stateless inline tier
+      balances on something like least-connections, whose only goal is even load: since any
+      instance serves any request, the balancer just keeps the instances evenly busy and sends
+      fewer new requests to a slow one. The stateful near-real-time tier cannot balance that
+      way, because a request must reach the instance holding its session state, so it balances
+      by consistent hash on the session key. The load balancer also runs health checks and
+      stops routing to an instance that fails them, which is the first line of the availability
+      work that Section 14.07 develops fully.
+
+      Autoscaling changes the instance count automatically in response to load, so the tier is
+      sized to what it is actually handling rather than fixed at a guess. The key design point
+      is that each tier scales on the signal that reflects its own load. The inline tier scales
+      on request rate per instance, because request rate is what it feels. The near-real-time
+      tier scales on consumer lag -- how far behind the queue it is running -- because lag is
+      what tells it the incoming rate exceeds its processing rate. The batch tier scales on job
+      backlog. A single global metric would scale the wrong tier at the wrong time; the tier
+      that is actually under load is the one whose own signal has moved. Cooldowns on scale-up
+      and scale-down keep the autoscaler from thrashing, adding capacity promptly when load
+      rises and removing it more slowly when load falls.
+  part_5:
+    title: 'Backpressure: Degrading Gracefully Under Overload'
+    body: |-
+      Autoscaling adds capacity, but it is not instantaneous -- new instances take time to
+      start, and load can spike faster than the autoscaler can react. There will therefore be
+      moments when incoming load exceeds current capacity, and what the gateway does in those
+      moments decides whether it degrades gracefully or collapses. The mechanism for degrading
+      gracefully is backpressure.
+
+      Backpressure is a graduated response to load relative to capacity. Below capacity, the
+      gateway serves every request normally. Above capacity but within a small queue headroom,
+      it queues the overflow briefly, betting that the spike is short or that autoscaling will
+      catch up. Beyond that, it sheds load: it rejects the excess requests explicitly, ideally
+      with a retry signal so callers back off and try again shortly, rather than accepting
+      requests it cannot serve. The backpressure calculator for this section encodes exactly
+      this ladder -- serve, then queue, then shed -- as a function of incoming rate against
+      capacity and headroom.
+
+      Shedding load feels like a failure, but it is the opposite -- it is what prevents a
+      failure. A gateway that accepts every request under overload, holding them all while it
+      falls further behind, eventually exhausts its memory or its threads and collapses, taking
+      down the requests already in flight along with the new ones. A gateway that sheds the
+      excess protects the requests it can serve by refusing the ones it cannot. Shedding a
+      fraction deliberately is how the system stays up under load it was not provisioned for,
+      and it is the difference between a bad minute and an outage. Under overload, controlled
+      partial service beats uncontrolled total failure.
+  part_6:
+    title: Capacity Planning and the Complete Performance Picture
+    body: |-
+      Backpressure handles the load you did not plan for; capacity planning is the discipline of
+      planning for the load you can foresee, so that backpressure is the rare exception rather
+      than the routine. Capacity planning sizes each tier for peak load, not average load,
+      because a system sized for the average is over capacity exactly when it matters most --
+      at the peak. Peak is the average multiplied by a peak factor that reflects the traffic
+      shape, and the tiers are provisioned to serve that peak with headroom to spare.
+
+      The headroom is deliberate. The capacity calculator for this section sizes the fleet so
+      that at peak it runs at a target utilisation below one hundred per cent -- eighty per
+      cent, for instance -- rather than exactly at capacity. Running at full utilisation at
+      peak leaves no margin for a burst above the expected peak, for an instance failing, or
+      for the autoscaler to react, so a fleet sized to be exactly full at peak is a fleet that
+      sheds load at the slightest surprise. Sizing for peak at a target utilisation buys the
+      margin that keeps the system serving through the ordinary variation around the peak.
+
+      With capacity planning, the performance picture of the chapter is complete. Section 14.04
+      made each request fit the latency budget; this section made the gateway sustain the
+      aggregate request rate -- scaling the stateless inline tier cleanly by replication,
+      scaling the stateful tiers by coordinating their state, balancing and autoscaling each
+      tier on its own load, absorbing overload with backpressure, and sizing for peak with
+      headroom. The gateway is now fast per request and sufficient in aggregate. What it is not
+      yet is resilient: nothing so far says what happens when a detector errors or times out,
+      or how one failure is kept from taking down the whole gateway. That is the resilience
+      stage, and Section 14.06 opens it with the decision every failing detector forces --
+      fail-open or fail-closed.
+reference_materials:
+  table_1:
+    title: Latency Versus Throughput
+    description: The two performance dimensions compared. Latency is about a single request; throughput
+      is about the aggregate rate. Both must be satisfied, and a system can pass one while failing the
+      other.
+    columns:
+    - Property
+    - Latency (14.04)
+    - Throughput (14.05)
+    rows:
+    - - Question
+      - How fast is one request?
+      - How many requests per second can be sustained?
+    - - Unit
+      - Milliseconds per request
+      - Requests per second
+    - - Failure mode
+      - A request is too slow and the detector is removed
+      - The request rate exceeds capacity and the backlog grows
+    - - Primary lever
+      - Budget allocation, parallelism, timeouts
+      - Horizontal scaling, load balancing, backpressure
+    - - Relationship
+      - Faster requests help throughput
+      - But capacity, not speed, provides throughput
+  table_2:
+    title: Throughput and Scaling Model Per Tier
+    description: 'Each Chapter 13 tier with its statefulness, scaling model, scaling difficulty, and bottleneck.
+      Statefulness determines the scaling model: the stateless inline tier replicates cleanly, the stateful
+      tiers must coordinate state.'
+    columns:
+    - Tier
+    - Statefulness
+    - Scaling model
+    - Scaling difficulty
+    rows:
+    - - Inline
+      - Stateless (reads precomputed summaries)
+      - Horizontal by replication
+      - Easy -- any instance serves any request
+    - - Near-real-time
+      - Stateful (recent-window session state)
+      - Horizontal with state partitioning
+      - Moderate -- state partitioned by key
+    - - Batch
+      - Stateful (large historical corpus)
+      - Data-parallel job scheduling
+      - Moderate -- parallelise over data partitions
+  table_3:
+    title: Load Balancing and Autoscaling Per Tier
+    description: The load-balancing algorithm and autoscaling signal for each tier. The algorithm follows
+      statefulness, and each tier scales on the signal that reflects its own load rather than a single
+      global metric.
+    columns:
+    - Tier
+    - Load-balance algorithm
+    - Autoscale signal
+    - Why
+    rows:
+    - - Inline
+      - Least-connections
+      - Requests/sec per instance
+      - 'Stateless: goal is even load; request rate is what it feels'
+    - - Near-real-time
+      - Consistent-hash by session key
+      - Consumer lag (queue depth)
+      - 'Stateful: a session must reach its partition; lag signals falling behind'
+    - - Batch
+      - Job scheduler assignment
+      - Pending job backlog
+      - 'Data-parallel: backlog signals work waiting to be scheduled'
+  table_4:
+    title: Backpressure Ladder
+    description: The graduated backpressure response as incoming load rises relative to capacity. Serve,
+      then queue within headroom, then shed the excess -- controlled partial service under overload rather
+      than uncontrolled collapse.
+    columns:
+    - Incoming load
+    - Action
+    - What happens
+    - Why
+    rows:
+    - - At or below capacity
+      - Serve
+      - All requests served normally
+      - The fleet can handle the load
+    - - Above capacity, within queue headroom
+      - Queue
+      - Overflow queued briefly
+      - Bet the spike is short or autoscaling catches up
+    - - Beyond queue headroom
+      - Shed
+      - Excess rejected with a retry signal
+      - Protect the requests in flight rather than collapse
+deliverables:
+  deliverable_1:
+    title: Horizontal Scaling Planner
+    filename: horizontal_scaling_planner.py
+    description: Models throughput and plans the horizontal scaling of each detection tier for a target
+      request rate, computing the base instance count plus headroom. The stateless inline tier plan is
+      a simple division because capacity is linear in instances; the stateful tiers show an instance floor
+      with a note that state coordination adds cost beyond replication.
+    implementation_notes: Python 3.12, single quotes throughout per book convention, standard-library
+      math only, prints a per-tier scaling plan and per-tier notes on statefulness.
+    code: |
+      # horizontal_scaling_planner.py
+      # Section 14.05: Throughput Modelling and Horizontal Scaling Planner
+      # 20260121 | AI Security Mastery -- Chapter 14 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import math
+      from dataclasses import dataclass
+      from typing import List
+
+
+      @dataclass
+      class TierScalingModel:
+          tier: str
+          stateless: bool
+          per_instance_rps: float
+          scaling_method: str
+
+
+      @dataclass
+      class ScalingPlan:
+          tier: str
+          target_rps: float
+          instances_needed: int
+          headroom_instances: int
+          total_instances: int
+          note: str
+
+
+      def plan_tier(model: TierScalingModel, target_rps: float, headroom_fraction: float) -> ScalingPlan:
+          '''Compute how many instances a tier needs to sustain target throughput.
+
+          For a stateless tier this is simple division plus headroom: any instance can
+          handle any request, so capacity is linear in instance count. For a stateful
+          tier the same arithmetic gives a floor, but coordinating shared state means the
+          real cost is higher -- the note flags that replication alone is not enough.
+          '''
+          base = math.ceil(target_rps / model.per_instance_rps)
+          headroom = math.ceil(base * headroom_fraction)
+          total = base + headroom
+          if model.stateless:
+              note = 'Stateless: capacity is linear in instances; any instance serves any request'
+          else:
+              note = 'Stateful: instance floor shown, but shared-state coordination adds cost beyond replication'
+          return ScalingPlan(model.tier, target_rps, base, headroom, total, note)
+
+
+      TIERS: List[TierScalingModel] = [
+          TierScalingModel('Inline', stateless=True, per_instance_rps=800.0, scaling_method='Replication'),
+          TierScalingModel('Near-real-time', stateless=False, per_instance_rps=2500.0, scaling_method='State partitioning'),
+          TierScalingModel('Batch', stateless=False, per_instance_rps=50000.0, scaling_method='Data-parallel jobs'),
+      ]
+
+
+      def print_plan(target_rps: float, headroom_fraction: float = 0.3) -> None:
+          print('=' * 82)
+          print('HORIZONTAL SCALING PLANNER')
+          print(f'Target throughput: {target_rps:.0f} requests/sec  |  Headroom: {headroom_fraction:.0%}')
+          print('=' * 82)
+          print()
+          header = ('Tier'.ljust(18) + 'Stateless'.ljust(12) + 'Per-inst RPS'.ljust(14)
+                    + 'Base'.ljust(7) + 'Headroom'.ljust(10) + 'Total')
+          print(header)
+          print('-' * 82)
+          for m in TIERS:
+              p = plan_tier(m, target_rps, headroom_fraction)
+              row = (m.tier.ljust(18) + str(m.stateless).ljust(12) + f'{m.per_instance_rps:.0f}'.ljust(14)
+                     + str(p.instances_needed).ljust(7) + str(p.headroom_instances).ljust(10) + str(p.total_instances))
+              print(row)
+          print('-' * 82)
+          print()
+          print('Notes per tier:')
+          for m in TIERS:
+              p = plan_tier(m, target_rps, headroom_fraction)
+              print(f'  {m.tier}: {p.note}')
+          print()
+          print('The inline tier needs the most instances despite scaling cleanest, because it')
+          print('does the most work per request on the hot path. Its statelessness is what lets')
+          print('the plan be a simple division -- the stateful tiers need more than replication.')
+
+
+      if __name__ == '__main__':
+          print_plan(target_rps=20000.0)
+  deliverable_2:
+    title: Throughput and Scaling Table
+    filename: throughput_scaling_table.py
+    description: Tabulates the scaling model, statefulness, scaling difficulty, and bottleneck for each
+      tier, and states the scaling principle that statelessness is what makes horizontal scaling clean
+      -- the inline tier is engineered stateless so the hot path scales by replication, while the stateful
+      tiers must partition or coordinate state.
+    implementation_notes: Python 3.12, single quotes throughout per book convention, no external dependencies,
+      prints the per-tier scaling table and the scaling principle.
+    code: |
+      # throughput_scaling_table.py
+      # Section 14.05: Throughput and Scaling Model Per Tier
+      # 20260121 | AI Security Mastery -- Chapter 14 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from typing import List
+
+
+      @dataclass
+      class TierScaling:
+          tier: str
+          statefulness: str
+          scaling_model: str
+          scaling_difficulty: str
+          bottleneck: str
+
+
+      TIERS: List[TierScaling] = [
+          TierScaling(
+              tier='Inline',
+              statefulness='Stateless (reads precomputed summaries)',
+              scaling_model='Horizontal by replication',
+              scaling_difficulty='Easy -- any instance serves any request',
+              bottleneck='Per-request compute on the hot path',
+          ),
+          TierScaling(
+              tier='Near-real-time',
+              statefulness='Stateful (recent-window session state)',
+              scaling_model='Horizontal with state partitioning',
+              scaling_difficulty='Moderate -- state must be partitioned by key',
+              bottleneck='Coordinating and partitioning the shared state',
+          ),
+          TierScaling(
+              tier='Batch',
+              statefulness='Stateful (large historical corpus)',
+              scaling_model='Data-parallel job scheduling',
+              scaling_difficulty='Moderate -- parallelise over data partitions',
+              bottleneck='Data shuffle and job scheduling over the corpus',
+          ),
+      ]
+
+
+      def print_table(tiers: List[TierScaling]) -> None:
+          print('=' * 84)
+          print('THROUGHPUT AND SCALING MODEL PER TIER')
+          print('Statefulness determines the scaling model and its difficulty')
+          print('=' * 84)
+          for t in tiers:
+              print()
+              print(f'TIER: {t.tier}')
+              print(f'  Statefulness      : {t.statefulness}')
+              print(f'  Scaling model     : {t.scaling_model}')
+              print(f'  Scaling difficulty: {t.scaling_difficulty}')
+              print(f'  Bottleneck        : {t.bottleneck}')
+
+
+      def scaling_principle() -> None:
+          print()
+          print('=' * 84)
+          print('THE SCALING PRINCIPLE')
+          print('=' * 84)
+          print('Statelessness is what makes horizontal scaling clean. When any instance can')
+          print('serve any request, adding capacity is just adding instances behind a load')
+          print('balancer. The inline tier is engineered to be stateless -- it reads precomputed')
+          print('summaries rather than holding state -- precisely so the hot path scales this way.')
+          print()
+          print('The near-real-time and batch tiers hold shared state, so scaling them is not')
+          print('mere replication: the state must be partitioned or coordinated across instances.')
+          print('That is a harder scaling problem, which is another reason these tiers were kept')
+          print('off the hot path -- their scaling cost is paid where latency is not at stake.')
+
+
+      if __name__ == '__main__':
+          print_table(TIERS)
+          scaling_principle()
+  deliverable_3:
+    title: Load Balancing and Autoscaling Configuration Reference
+    filename: load_balancing_autoscaling.py
+    description: 'Provides a per-tier load-balancing and autoscaling configuration: the balancing algorithm
+      that follows statefulness (least-connections for the stateless inline tier, consistent-hash for
+      the stateful near-real-time tier) and the autoscale signal that reflects each tier own load (request
+      rate, consumer lag, job backlog) with cooldowns.'
+    implementation_notes: Python 3.12, single quotes throughout per book convention, no external dependencies,
+      prints the autoscaling and load-balancing configuration references per tier.
+    code: |
+      # load_balancing_autoscaling.py
+      # Section 14.05: Load Balancing and Autoscaling Configuration Reference
+      # 20260121 | AI Security Mastery -- Chapter 14 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import List
+
+
+      @dataclass
+      class AutoscaleConfig:
+          tier: str
+          scale_signal: str
+          target_value: str
+          min_instances: int
+          max_instances: int
+          scale_up_cooldown_s: int
+          scale_down_cooldown_s: int
+
+
+      @dataclass
+      class LoadBalanceConfig:
+          tier: str
+          algorithm: str
+          health_check: str
+          reason: str
+
+
+      AUTOSCALE: List[AutoscaleConfig] = [
+          AutoscaleConfig('Inline', 'requests/sec per instance', '80% of per-instance capacity', 4, 80, 30, 180),
+          AutoscaleConfig('Near-real-time', 'consumer lag (queue depth)', 'lag under 5 seconds', 2, 24, 60, 300),
+          AutoscaleConfig('Batch', 'pending job backlog', 'backlog cleared within window', 0, 40, 60, 120),
+      ]
+
+      LOAD_BALANCE: List[LoadBalanceConfig] = [
+          LoadBalanceConfig('Inline', 'least-connections', 'P99 latency and readiness probe', 'Even load; a slow instance receives fewer new requests'),
+          LoadBalanceConfig('Near-real-time', 'consistent-hash by session key', 'consumer liveness', 'Keeps a session on one instance so its partitioned state stays local'),
+      ]
+
+
+      def print_autoscale(configs: List[AutoscaleConfig]) -> None:
+          print('=' * 84)
+          print('AUTOSCALING CONFIGURATION REFERENCE')
+          print('Each tier scales on the signal that reflects its own load')
+          print('=' * 84)
+          for c in configs:
+              print()
+              print(f'TIER: {c.tier}')
+              print(f'  Scale signal       : {c.scale_signal}')
+              print(f'  Target             : {c.target_value}')
+              print(f'  Min / Max instances: {c.min_instances} / {c.max_instances}')
+              print(f'  Scale-up cooldown  : {c.scale_up_cooldown_s}s')
+              print(f'  Scale-down cooldown: {c.scale_down_cooldown_s}s')
+
+
+      def print_load_balance(configs: List[LoadBalanceConfig]) -> None:
+          print()
+          print('=' * 84)
+          print('LOAD BALANCING CONFIGURATION REFERENCE')
+          print('=' * 84)
+          for c in configs:
+              print()
+              print(f'TIER: {c.tier}')
+              print(f'  Algorithm   : {c.algorithm}')
+              print(f'  Health check: {c.health_check}')
+              print(f'  Reason      : {c.reason}')
+          print()
+          print('The inline tier balances on least-connections because it is stateless -- any')
+          print('instance serves any request, so the goal is only even load. The near-real-time')
+          print('tier balances by consistent hash on the session key because it is stateful --')
+          print('a session must land on the instance that holds its partitioned state.')
+          print()
+          print('The scale signal differs by tier: the inline tier scales on request rate, the')
+          print('near-real-time tier on consumer lag, and the batch tier on job backlog. Each')
+          print('signal is the load the tier actually feels, not a single global metric.')
+
+
+      if __name__ == '__main__':
+          print_autoscale(AUTOSCALE)
+          print_load_balance(LOAD_BALANCE)
+  deliverable_4:
+    title: Backpressure and Capacity Planning Calculator
+    filename: backpressure_capacity_planner.py
+    description: Calculates capacity for peak load by sizing the fleet to run at a target utilisation
+      below one hundred per cent at peak, and applies the backpressure ladder -- serve, queue, or shed
+      -- as incoming load rises relative to capacity, showing how shedding the excess protects the requests
+      in flight rather than letting the gateway collapse.
+    implementation_notes: Python 3.12, single quotes throughout per book convention, standard-library
+      math only, prints a capacity plan sized for peak and a set of backpressure decisions across load
+      levels.
+    code: |
+      # backpressure_capacity_planner.py
+      # Section 14.05: Backpressure and Capacity Planning Calculator
+      # 20260121 | AI Security Mastery -- Chapter 14 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import math
+      from dataclasses import dataclass
+      from typing import List
+
+
+      @dataclass
+      class CapacityInputs:
+          average_rps: float
+          peak_multiplier: float       # peak load as a multiple of average
+          per_instance_rps: float
+          target_utilisation: float    # keep instances at this fraction at peak
+
+
+      @dataclass
+      class CapacityResult:
+          peak_rps: float
+          instances_for_peak: int
+          provisioned_capacity_rps: float
+          utilisation_at_peak: float
+
+
+      def plan_capacity(inp: CapacityInputs) -> CapacityResult:
+          peak_rps = inp.average_rps * inp.peak_multiplier
+          # Size so that at peak the fleet runs at target utilisation, not 100%.
+          effective_per_instance = inp.per_instance_rps * inp.target_utilisation
+          instances = math.ceil(peak_rps / effective_per_instance)
+          provisioned = instances * inp.per_instance_rps
+          util = peak_rps / provisioned if provisioned else 0.0
+          return CapacityResult(peak_rps, instances, provisioned, util)
+
+
+      @dataclass
+      class BackpressureDecision:
+          incoming_rps: float
+          capacity_rps: float
+          action: str
+          detail: str
+
+
+      def backpressure(incoming_rps: float, capacity_rps: float, queue_headroom_rps: float) -> BackpressureDecision:
+          '''Decide how to handle load relative to capacity.
+
+          Below capacity: serve normally. Above capacity but within queue headroom:
+          queue the overflow briefly. Beyond that: shed load -- reject the excess with
+          a retry signal rather than letting the whole gateway collapse. Shedding a
+          fraction deliberately protects the requests already in flight.
+          '''
+          if incoming_rps <= capacity_rps:
+              return BackpressureDecision(incoming_rps, capacity_rps, 'serve', 'Within capacity; all requests served')
+          if incoming_rps <= capacity_rps + queue_headroom_rps:
+              overflow = incoming_rps - capacity_rps
+              return BackpressureDecision(incoming_rps, capacity_rps, 'queue',
+                                          f'Overflow {overflow:.0f} rps queued within headroom')
+          shed = incoming_rps - (capacity_rps + queue_headroom_rps)
+          return BackpressureDecision(incoming_rps, capacity_rps, 'shed',
+                                      f'Shedding {shed:.0f} rps beyond queue; excess rejected with retry signal')
+
+
+      def demo() -> None:
+          print('=' * 82)
+          print('CAPACITY PLANNING')
+          print('=' * 82)
+          inp = CapacityInputs(average_rps=6000.0, peak_multiplier=3.3, per_instance_rps=800.0, target_utilisation=0.8)
+          r = plan_capacity(inp)
+          print(f'  Average load        : {inp.average_rps:.0f} rps')
+          print(f'  Peak multiplier     : {inp.peak_multiplier}x')
+          print(f'  Peak load           : {r.peak_rps:.0f} rps')
+          print(f'  Per-instance capacity: {inp.per_instance_rps:.0f} rps')
+          print(f'  Target utilisation  : {inp.target_utilisation:.0%} at peak')
+          print(f'  Instances for peak  : {r.instances_for_peak}')
+          print(f'  Provisioned capacity: {r.provisioned_capacity_rps:.0f} rps')
+          print(f'  Utilisation at peak : {r.utilisation_at_peak:.0%}')
+          print()
+          print('Sizing for peak at 80% utilisation leaves headroom so the fleet is not at')
+          print('100% when peak hits -- capacity planning sizes for peak, not average.')
+          print()
+          print('=' * 82)
+          print('BACKPRESSURE DECISIONS')
+          print('=' * 82)
+          capacity = r.provisioned_capacity_rps
+          headroom = 2000.0
+          for incoming in [capacity * 0.7, capacity * 1.05, capacity + headroom + 3000.0]:
+              d = backpressure(incoming, capacity, headroom)
+              print()
+              print(f'  Incoming {d.incoming_rps:.0f} rps vs capacity {d.capacity_rps:.0f} rps -> {d.action.upper()}')
+              print(f'    {d.detail}')
+          print()
+          print('Backpressure degrades gracefully: serve, then queue, then shed. Shedding a')
+          print('fraction protects the requests in flight rather than letting the gateway')
+          print('collapse under load it cannot serve.')
+
+
+      if __name__ == '__main__':
+          demo()
+common_mistakes:
+  mistake_1:
+    description: Assuming that meeting the per-request latency budget means the gateway can handle production
+      load
+    why_it_happens: |-
+      Latency is the concern that gets engineered first and measured most, so a gateway that
+      comfortably meets its P99 on a single request feels done, and the aggregate rate is not
+      exercised until real traffic arrives.
+    consequence: The latency-correct gateway is deployed with too little capacity, the incoming request
+      rate exceeds what the fleet can process, the backlog grows without bound, and the gateway falls
+      over despite every individual request being within budget.
+    correct_approach: 'Treat throughput as a distinct concern from latency: model the requests per second
+      the gateway must sustain and scale the fleet to meet that aggregate rate, because per-request speed
+      does not by itself provide capacity.'
+  mistake_2:
+    description: Scaling the gateway vertically -- a bigger instance -- instead of horizontally
+    why_it_happens: |-
+      Vertical scaling is the simplest change to make: no load balancer, no distributed
+      concerns, just a larger machine, and it works well enough at small scale to look like
+      the answer.
+    consequence: The single instance hits the ceiling of the largest machine available, cannot scale further,
+      and remains a single point of failure whose loss is a total outage, so the approach fails exactly
+      when production load grows.
+    correct_approach: Meet production throughput horizontally by adding instances behind a load balancer,
+      using vertical scaling only for the per-instance efficiency that reduces how many instances the
+      horizontal plan needs.
+  mistake_3:
+    description: Scaling a stateful tier by simple replication as if it were stateless
+    why_it_happens: |-
+      Replication is how the inline tier scales, and it is tempting to apply the same clean
+      pattern to the near-real-time and batch tiers without accounting for the per-session or
+      per-corpus state they hold.
+    consequence: Independent replicas each hold a partial view of the shared state, a session routed to
+      different instances on different requests is seen incompletely by each, and the tier produces wrong
+      or inconsistent results because no instance has the whole picture.
+    correct_approach: Scale stateful tiers by partitioning the state by key and routing each key to the
+      instance that owns it -- consistent-hash balancing for the near-real-time tier -- accepting the
+      coordination cost that replication alone does not incur.
+  mistake_4:
+    description: Autoscaling every tier on a single global metric such as overall CPU
+    why_it_happens: |-
+      A single cluster-wide metric is easy to configure and reason about, and CPU is the
+      default signal many autoscalers reach for, so it is applied uniformly across tiers.
+    consequence: The metric moves for reasons unrelated to a given tier load, so the wrong tier scales
+      at the wrong time -- the inline tier fails to scale when request rate spikes because overall CPU
+      looked fine, while the batch tier scales needlessly.
+    correct_approach: 'Scale each tier on the signal that reflects its own load: request rate for the
+      inline tier, consumer lag for the near-real-time tier, and job backlog for the batch tier, so the
+      tier actually under load is the one that scales.'
+  mistake_5:
+    description: Accepting all traffic under overload instead of applying backpressure, and sizing capacity
+      for average rather than peak
+    why_it_happens: |-
+      Rejecting requests feels like giving up, so the instinct is to accept everything and try
+      to serve it, and sizing for the average looks efficient because it provisions the fewest
+      instances.
+    consequence: Under a spike the gateway holds more requests than it can serve, exhausts memory or threads,
+      and collapses -- taking down the in-flight requests too -- while a fleet sized for the average was
+      already over capacity before the peak even arrived.
+    correct_approach: Apply backpressure -- serve, then queue within headroom, then shed the excess with
+      a retry signal -- so overload degrades gracefully, and size capacity for peak load at a target utilisation
+      below full so there is margin for bursts and instance loss.
+section_summary:
+  compact: |-
+    Throughput is the requests per second the gateway must sustain, a distinct concern from
+    the per-request latency of 14.04: a gateway can meet its latency budget on one request and
+    still collapse if it cannot handle the arrival rate. Throughput is met by horizontal
+    scaling -- adding instances behind a load balancer -- rather than vertical scaling, which
+    hits a ceiling and stays a single point of failure. Horizontal scaling is clean when any
+    instance can serve any request, which is statelessness, and the inline tier is engineered
+    stateless -- it reads precomputed summaries rather than holding state -- so the hot path
+    scales by simple replication with capacity linear in instance count. The near-real-time
+    and batch tiers hold shared state, so they cannot be replicated blindly: their state must
+    be partitioned by key and coordinated across instances, a harder and costlier scaling
+    problem that is another reason they sit off the hot path. Load balancing follows
+    statefulness -- least-connections for the stateless inline tier, consistent-hash by session
+    key for the stateful near-real-time tier -- and each tier autoscales on the signal that
+    reflects its own load: request rate, consumer lag, or job backlog. Backpressure handles
+    overload gracefully with a ladder of serve, queue, then shed, protecting the requests in
+    flight rather than collapsing, and capacity planning sizes each tier for peak load at a
+    target utilisation below full so there is margin for bursts, instance loss, and autoscaler
+    lag.
+  key_takeaways:
+  - Throughput -- the requests per second the gateway must sustain -- is a distinct concern from per-request
+    latency, and a latency-correct gateway still fails if it cannot handle the arrival rate
+  - Throughput is met by horizontal scaling -- adding instances -- not vertical scaling, which hits a
+    ceiling and remains a single point of failure
+  - The inline tier is engineered stateless so it scales cleanly by replication, with capacity linear
+    in instance count because any instance can serve any request
+  - The stateful near-real-time and batch tiers scale by partitioning and coordinating shared state rather
+    than simple replication, a harder problem that keeps them off the hot path
+  - Load balancing follows statefulness (least-connections versus consistent-hash) and each tier autoscales
+    on the signal that reflects its own load -- request rate, consumer lag, or job backlog
+  - Backpressure degrades overload gracefully with a serve-queue-shed ladder that protects in-flight requests,
+    and capacity planning sizes for peak at a target utilisation below full for margin
+preview_section_14_06:
+  title: 'Failure Modes: Fail-Open versus Fail-Closed'
+  summary: |-
+    Sections 14.04 and 14.05 made the gateway fast per request and sufficient in aggregate.
+    Section 14.06 opens the resilience stage by confronting what happens when a detector
+    errors, times out, or is unavailable. It defines fail-open -- passing the request when
+    detection fails, favouring availability -- and fail-closed -- blocking it, favouring
+    security -- establishes that the choice is made per detector and per tier rather than
+    globally, handles the timeout from 14.04 as a failure mode, and defines degraded-mode
+    operation that classifies detectors as essential or droppable. It is the first resilience
+    section, deciding what a failing detector does.
+metadata:
+  cross_chapter_references:
+  - 'Section 14.01: the production deployment concern taxonomy, with throughput as the aggregate face
+    of load'
+  - 'Section 14.04: the per-request latency budget scaled here to aggregate throughput'
+  - 'Section 14.02: the architecture pattern whose instances are the unit of horizontal scaling'
+  - 'Chapter 13 Section 13.01: the state-latency coupling that makes the inline tier stateless and the
+    off-path tiers stateful'
+  - 'Chapter 13 Section 13.11: the behavioural monitoring gateway scaled to production throughput here'
+  forward_references:
+  - 'Section 14.06: failure modes -- what a detector does when it errors or times out, the resilience
+    counterpart to scaling'
+  - 'Section 14.07: high availability -- keeping one instance or detector failure from cascading, building
+    on the health checks introduced here'
+  - 'Section 14.10: cost optimisation -- sizing and sampling to keep the scaled tiers affordable'
+  - 'Section 14.11: the production gateway capstone -- the scaled, load-balanced tiers assembled into
+    one running service'
+  tags:
+  - throughput
+  - horizontal-scaling
+  - vertical-scaling
+  - statelessness
+  - state-partitioning
+  - load-balancing
+  - autoscaling
+  - backpressure
+  - load-shedding
+  - capacity-planning
+  - peak-load
+  - state-latency-coupling
+  - inline-tier
+  - production-deployment
+  - part-3-chapter-4
