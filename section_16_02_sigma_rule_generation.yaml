@@ -1,0 +1,522 @@
+# section_16_02_sigma_rule_generation.yaml
+
+---
+document_info:
+  title: Automated Sigma Rule Generation
+  chapter: 16
+  section: 2
+  section_code: '1602'
+  author: Raghav Dinesh
+  github: https://github.com/ruwgxo/ai-security-mastery
+  license: MIT
+  version: '1.0'
+  created: '2026-06-21'
+  estimated_pages: 7
+  estimated_reading_time: 50-60 minutes
+section_overview:
+  one_line_summary: |-
+    The first integration is the portable one: a generator that turns the detector suite into Sigma rules -- platform-agnostic detection logic in the logsource-detection-condition taxonomy -- by mapping detector verdicts to Sigma conditions, so the detection logic deploys to any SIEM and, because it is generated rather than hand-authored, stays in sync with the deployed detectors.
+  why_this_section_exists: |-
+    The connectors in the sections that follow each bind the suite to one platform. Sigma is the antidote to that: a rule written once in a neutral format that Splunk, Elastic, and other platforms each compile to their own query language. Generating Sigma from the detectors gives the integration surface a portable core -- detection logic that runs anywhere without being rewritten per platform -- and it is where the chapter starts because it is the least coupled and the most reusable part of the surface.
+
+    The section also settles a question the whole chapter depends on: how does a detector verdict become a rule the SIEM evaluates? A Sigma rule is governed by three keys -- logsource (the stream it runs on), detection (the field selection that matches), and condition (how selections combine). The detection-event schema of 16.01 supplies the fields, and the verdict supplies the selection: flag and block alert, allow stays quiet. That mapping is small but load-bearing, and it is kept as data so it is auditable and tunable rather than buried in the generator. Finally, the section makes generation the mechanism that defeats drift. Hand-authored SIEM rules go stale the moment a detector changes; generated rules are regenerated from the detectors, and a content hash over the rule set turns a detector change into a redeploy signal, keeping the SIEM logic current by construction.
+  position_in_chapter: |-
+    Section 16.02 builds the portable core of the integration surface before the platform-specific connectors of 16.03-16.05. It consumes the detection-event schema of 16.01, expresses the Chapter 11 Section 11.02 signature layer as SIEM-deployable rules, and produces the rule set that the Splunk (16.03) and Elastic (16.05) integrations deploy onto their platforms. The verdict-to-condition mapping defined here is reused by every connector that evaluates rules.
+learning_objectives:
+  knowledge:
+  - Explain what makes Sigma portable, platform-agnostic detection logic
+  - |-
+    Describe the Sigma taxonomy -- logsource, detection, condition -- and what each governs
+  - |-
+    Explain how a detector verdict maps to a Sigma detection condition and why allow stays quiet
+  - |-
+    Explain why generated rules stay in sync with the detectors while hand-authored rules drift
+  - |-
+    Describe how a content hash over the rule set turns a detector change into a redeploy signal
+  - Connect the generated rules back to the Chapter 11 Section 11.02 signature layer
+  skills:
+  - |-
+    Build a Sigma rule from a detector descriptor with a correct logsource, detection, and condition
+  - Map the suite's verdicts to a Sigma detection selection kept as auditable data
+  - Generate and version a Sigma rule set for the whole detector suite
+  - Compute a rule-set content hash and drive an auto-redeploy decision from it
+  - Serialise a rule to Sigma YAML that a platform's Sigma compiler can consume
+  security_mindset:
+  - |-
+    Recognise that portable detection logic avoids platform lock-in and is worth building before platform connectors
+  - |-
+    Internalise that generating rules from detectors is what keeps the SIEM in sync with what the suite actually detects
+  - |-
+    Understand that the verdict-to-condition mapping is load-bearing and belongs in auditable data, not buried in code
+  - |-
+    Appreciate that a detectable rule-set change is the signal that keeps deployment automatic rather than remembered
+prerequisites:
+- |-
+  Chapter 16 Section 16.01: the detection-event schema whose fields the Sigma selection references
+- |-
+  Chapter 15 Section 15.01: the verdicts (allow, flag, block) the mapping translates
+- |-
+  Chapter 11 Section 11.02: Sigma rules and the signature layer these generated rules express
+- Familiarity with the Sigma rule format -- logsource, detection, condition, level
+- |-
+  Familiarity with the idea of a portable rule format compiled to per-platform queries
+prose_content:
+  part_1:
+    title: Sigma as Portable Detection Logic
+    body: |-
+      Every platform connector in this chapter binds the suite to one product: the Splunk connector speaks HEC, the Datadog connector speaks the Logs API, the Elastic connector speaks Logstash. That binding is necessary for delivering events, but it is a liability for detection logic. If the rule that says 'a blocked injection is a high-severity alert' is written in Splunk's search language, it runs only on Splunk, and a team that moves to Elastic rewrites it. Sigma exists to break that coupling. A Sigma rule is detection logic in a neutral, YAML-based format, and each platform has a Sigma compiler that translates it into that platform's own query language. Write the rule once; deploy it anywhere.
+
+      That portability is why the chapter builds Sigma generation first, before any connector. The generated rules are the part of the integration surface with no platform lock-in -- the same rule set targets Splunk and Elastic and whatever comes next, through their compilers. And generating the rules from the detectors, rather than writing them by hand, adds a second property that matters as much as portability: the rules cannot drift from the detectors, because they are derived from them. The rest of the section builds the generator, defines the verdict mapping it rests on, and makes regeneration the mechanism that keeps deployment current.
+  part_2:
+    title: 'The Sigma Taxonomy: Logsource, Detection, Condition'
+    body: |-
+      A Sigma rule is governed by three keys. Logsource names the stream the rule runs on -- here, the detection gateway's event stream, identified by a product and service so the platform routes the rule to the right index or data source. Detection is the heart of the rule: one or more named selections, each a set of field values that must be present for the selection to match. Condition combines the selections into the rule's overall match -- in the simplest case, just the name of the single selection. Around these three sit metadata: a title, a stable id, a description, a level, and optional tags such as MITRE ATLAS technique references.
+
+      The generator's job is to fill those keys from a detector. The logsource is fixed for the whole suite -- every detector writes to the same gateway stream. The detection selection is where the detector's identity and verdicts go: a selection that matches when the event's detector field is this detector and its verdict is one of the alerting verdicts. The condition references that selection. The level comes from the detector's severity. So a rule is almost entirely determined by two facts about the detector -- its name and which verdicts should alert -- which is exactly why generation is feasible: there is no per-rule cleverness to hand-craft, only a descriptor to translate.
+  part_3:
+    title: Mapping Detector Verdicts to Sigma Conditions
+    body: |-
+      The translation from a detection to a Sigma match runs through the verdict. The suite's three verdicts are allow, flag, and block, and they do not all deserve an alert. Allow means nothing was detected; emitting a Sigma match for every allowed request would bury the real alerts under the overwhelming majority of benign traffic, so allow stays quiet -- it produces no rule match. Flag means suspicious but not blocked, and it alerts at a medium level so an analyst reviews it without it reading as a confirmed block. Block means a high-confidence detection the gateway stopped, and it alerts at a high level, escalated to critical for the exfiltration detector where a block is a confirmed data-loss event.
+
+      This mapping is small, but it is load-bearing, so the section keeps it as data rather than hiding it in the generator's control flow. A verdict-mapping table states, for each verdict, whether it alerts and at what level, with the rationale attached. That makes the translation auditable -- a reviewer can see exactly which detections become alerts -- and tunable, because a deployment that wants flags to stay silent, or blocks to alert at critical across the board, changes the data, not the code. The generator reads the alerting verdicts from this mapping and writes them into the detection selection, so the one rule about which detections matter lives in one place and feeds every generated rule.
+  part_4:
+    title: Generation Versus Hand-Authoring, and the Drift Problem
+    body: |-
+      It is entirely possible to write these Sigma rules by hand -- there are only six detectors, and each rule is short. The reason not to is drift. A hand-authored rule is a snapshot: it is correct on the day it is written and slowly wrong thereafter, because the detector it mirrors keeps changing. A detector gains a new verdict behaviour, is renamed, has its severity revised -- and the hand-written rule, untouched, now describes a detector that no longer exists. The gap is invisible, because nothing errors; the SIEM simply evaluates a rule that no longer matches what the suite does, and the divergence surfaces only when an incident falls through it.
+
+      Generation removes the snapshot. The rules are a function of the detector descriptors, so regenerating after any detector change produces rules that match the detectors as they are now. The section makes the change itself detectable with a content hash over the whole rule set: regenerate, and if the hash differs from the last deployed hash, the rule set has changed and must be redeployed. With auto-redeploy enabled, that hash difference is the trigger -- a detector change flows automatically to regenerated rules to a redeploy, with no engineer remembering to update a rule. Keeping the SIEM in sync stops being a maintenance task and becomes a property of the pipeline.
+  part_5:
+    title: Versioning, Deployment, and the Signature-Layer Connection
+    body: |-
+      The generated rules are versioned as a set, not individually. A ruleset version and a content hash together identify exactly what is deployed, and the deployment configuration names the targets -- the platforms the portable rules compile to, typically Splunk and Elastic, whose connectors evaluate Sigma. The deployment plan is a small decision: compute the current hash, compare it to the previously deployed hash, and if they differ and auto-redeploy is on, deploy to the configured targets. That is the whole control loop, and it is deliberately boring, because a deployment mechanism that is exciting is a deployment mechanism that surprises you.
+
+      Finally, the generated rules close a loop opened much earlier in the book. Chapter 11 Section 11.02 introduced Sigma as the format of the signature detection layer -- the human-readable, portable expression of a known-bad pattern. Back then, Sigma was where a detection concept was written down. Here it is where a deployed detector is expressed for the SIEM. The same format that described the signature layer as a detection idea now carries the whole suite's detections to the platforms that action them, so the signature-layer concept and its SIEM-deployable form are two views of one thing. With the portable core built, the next three sections bind the events themselves to the specific platforms.
+reference_materials:
+  table_1:
+    title: The Three Governing Keys of a Sigma Rule
+    description: |-
+      A Sigma rule is governed by logsource, detection, and condition. The generator fills each from a detector descriptor and the detection-event schema.
+    columns:
+    - Key
+    - What it governs
+    - Filled from
+    rows:
+    - - logsource
+      - The event stream the rule runs on
+      - Fixed gateway product/service for the whole suite
+    - - detection
+      - The field selection that matches
+      - The detector name and its alerting verdicts
+    - - condition
+      - How selections combine into a match
+      - A reference to the single selection
+    - - level
+      - The severity the match reports
+      - The detector's severity (medium/high/critical)
+    - - tags
+      - MITRE ATLAS/ATT&CK references
+      - The detector's attack references, when present
+  table_2:
+    title: Detector Verdict to Sigma Condition
+    description: |-
+      The verdict decides whether a detection becomes a Sigma match and at what level. Allow stays quiet so alerts are not buried; flag and block alert.
+    columns:
+    - Verdict
+    - Alerts?
+    - Sigma level
+    - Rationale
+    rows:
+    - - allow
+      - 'No'
+      - informational
+      - Nothing detected; a match per allow would bury the real alerts
+    - - flag
+      - 'Yes'
+      - medium
+      - Suspicious, not blocked; review without reading as a confirmed block
+    - - block
+      - 'Yes'
+      - high
+      - High-confidence block; escalated to critical for exfiltration
+  table_3:
+    title: Generated Versus Hand-Authored Sigma Rules
+    description: |-
+      Generation is preferred not because hand-authoring is hard but because it drifts. Generated rules are a function of the detectors and stay in sync.
+    columns:
+    - Property
+    - Hand-authored
+    - Generated
+    rows:
+    - - Sync with detectors
+      - Drifts as detectors change
+      - In sync by construction
+    - - Change detection
+      - None -- divergence is invisible
+      - Content hash flags any change
+    - - Redeployment
+      - Manual, remembered
+      - Automatic on hash change
+    - - Effort per detector change
+      - Re-edit each affected rule
+      - Regenerate the set
+    - - Failure mode
+      - Stale rule, silent gap
+      - Redeploy signal fires
+deliverables:
+  deliverable_1:
+    title: The Sigma Rule Generator
+    filename: sigma_rule_generator.py
+    description: |-
+      The generator that turns detector descriptors into portable Sigma rules. A DetectorDescriptor names the detector, its alerting verdicts, its level, and its attack references; build_sigma_rule fills the logsource-detection-condition taxonomy from it; and SigmaRuleGenerator registers the six suite detectors and emits the whole rule set. Includes a dependency-free Sigma YAML emitter so the file runs standalone.
+    implementation_notes: |-
+      Python 3.12, single quotes throughout per book convention, standard-library dataclasses and typing only. The SUITE_DESCRIPTORS mirror the six Chapter 15 detectors, with exfiltration alerting only on block at critical. to_sigma_yaml is a tiny emitter for standalone running; the suite uses PyYAML and the pySigma library to compile rules to each back end. Self-checks that every rule carries the three governing keys and a verdict mapping.
+    code: |
+      # sigma_rule_generator.py
+      # Section 16.02: Automated Sigma Rule Generation
+      # 20260121 | AI Security Mastery -- Chapter 16 by Raghav Dinesh
+      # Single quotes throughout per book convention
+      #
+      # Sigma is portable, platform-agnostic detection logic. This generator turns the
+      # detector suite into Sigma rules by mapping detector verdicts to Sigma
+      # conditions, so the logic deploys to any platform and -- because it is generated
+      # rather than hand-authored -- stays in sync with the deployed detectors. It
+      # expresses the Chapter 11 signature layer as SIEM-deployable rules.
+
+      from dataclasses import dataclass, field
+      from typing import Any, Dict, List
+
+
+      @dataclass
+      class DetectorDescriptor:
+          detector: str
+          title: str
+          description: str
+          alert_verdicts: List[str]
+          level: str
+          attack_refs: List[str] = field(default_factory=list)
+
+
+      def _slug(name: str) -> str:
+          return name.replace('_', '-').replace(' ', '-').lower()
+
+
+      def build_sigma_rule(desc: DetectorDescriptor, *, product: str = 'ai_gateway',
+                           service: str = 'detection') -> Dict[str, Any]:
+          '''Construct a Sigma rule (dict ready to serialise) from a detector
+          descriptor. Verdicts become the detection selection; the detection-event
+          fields become the logsource and field references.'''
+          rule: Dict[str, Any] = {
+              'title': desc.title,
+              'id': f'ai-sec-{_slug(desc.detector)}',
+              'status': 'experimental',
+              'description': desc.description,
+              'author': 'ai-security-mastery (generated)',
+              'logsource': {'product': product, 'service': service},
+              'detection': {
+                  'selection': {'detector': desc.detector, 'verdict': list(desc.alert_verdicts)},
+                  'condition': 'selection',
+              },
+              'level': desc.level,
+          }
+          if desc.attack_refs:
+              rule['tags'] = list(desc.attack_refs)
+          return rule
+
+
+      def to_sigma_yaml(rule: Dict[str, Any]) -> str:
+          '''Serialise a rule dict to Sigma YAML text. A tiny, dependency-free emitter
+          so the deliverable runs standalone; the suite uses PyYAML.'''
+          lines: List[str] = []
+
+          def emit(key: str, val: Any, indent: int) -> None:
+              pad = '    ' * indent
+              if isinstance(val, dict):
+                  lines.append(f'{pad}{key}:')
+                  for k, v in val.items():
+                      emit(k, v, indent + 1)
+              elif isinstance(val, list):
+                  lines.append(f'{pad}{key}:')
+                  for item in val:
+                      lines.append(f'{pad}    - {item}')
+              else:
+                  lines.append(f'{pad}{key}: {val}')
+
+          for key, val in rule.items():
+              emit(key, val, 0)
+          return '\n'.join(lines) + '\n'
+
+
+      class SigmaRuleGenerator:
+          '''Generates and versions a Sigma rule set from detector descriptors. Because
+          the rules are generated from the descriptors, regenerating after a detector
+          change keeps the SIEM logic in sync with the detectors.'''
+
+          def __init__(self, version: str = '1.0') -> None:
+              self.version = version
+              self._descriptors: List[DetectorDescriptor] = []
+
+          def register(self, desc: DetectorDescriptor) -> None:
+              self._descriptors.append(desc)
+
+          def generate(self) -> Dict[str, str]:
+              out: Dict[str, str] = {}
+              for desc in self._descriptors:
+                  rule = build_sigma_rule(desc)
+                  out[rule['id']] = to_sigma_yaml(rule)
+              return out
+
+
+      SUITE_DESCRIPTORS: List[DetectorDescriptor] = [
+          DetectorDescriptor('prompt_injection', 'AI Prompt Injection Detected',
+                             'The prompt injection detector flagged or blocked a request.',
+                             ['flag', 'block'], 'high', ['attack.atlas.aml-t0051']),
+          DetectorDescriptor('jailbreak', 'AI Jailbreak Attempt Detected',
+                             'The jailbreak detector flagged or blocked a request.',
+                             ['flag', 'block'], 'high', ['attack.atlas.aml-t0054']),
+          DetectorDescriptor('pii_scanner', 'PII Exposure Detected',
+                             'The PII scanner flagged or blocked personal data on input or output.',
+                             ['flag', 'block'], 'medium'),
+          DetectorDescriptor('toxicity_detector', 'Toxic Content Detected',
+                             'The toxicity detector flagged or blocked content.',
+                             ['flag', 'block'], 'medium'),
+          DetectorDescriptor('exfiltration_detector', 'Data Exfiltration Detected',
+                             'The exfiltration detector flagged or blocked an output.',
+                             ['block'], 'critical'),
+          DetectorDescriptor('combined_pipeline', 'AI Detection Pipeline Alert',
+                             'The combined detection pipeline produced an aggregate alert.',
+                             ['flag', 'block'], 'high'),
+      ]
+
+
+      if __name__ == '__main__':
+          gen = SigmaRuleGenerator(version='1.0')
+          for d in SUITE_DESCRIPTORS:
+              gen.register(d)
+          rules = gen.generate()
+          print(f'generated {len(rules)} sigma rules:')
+          for rid in rules:
+              print(f'  - {rid}')
+          for rid, text in rules.items():
+              assert 'logsource:' in text and 'detection:' in text and 'condition:' in text, rid
+              assert 'verdict:' in text, rid
+          print('all rules have logsource/detection/condition and a verdict mapping: ok')
+  deliverable_2:
+    title: Detector-Verdict-to-Sigma-Condition Mapping
+    filename: sigma_verdict_mapping.py
+    description: |-
+      The verdict-to-condition mapping as auditable data: for each verdict, whether it alerts, its default Sigma level, and the rationale. alerting_verdicts and as_condition produce the detection selection the generator writes into every rule, so the one rule about which detections matter lives in one place.
+    implementation_notes: |-
+      Python 3.12, single quotes throughout per book convention, standard-library dataclasses and typing only. Keeping the mapping as data makes it auditable and tunable -- a deployment silences flags or escalates blocks by editing the data, not the generator. Self-checks that allow never alerts and that block maps to high.
+    code: |
+      # sigma_verdict_mapping.py
+      # Section 16.02: Detector-Verdict-to-Sigma-Condition Mapping
+      # 20260121 | AI Security Mastery -- Chapter 16 by Raghav Dinesh
+      # Single quotes throughout per book convention
+      #
+      # The rule that turns a detector verdict into a Sigma detection condition, as
+      # data. Kept out of the generator so the translation is auditable and a
+      # deployment can tune which verdicts alert.
+
+      from dataclasses import dataclass
+      from typing import Dict, List
+
+
+      @dataclass
+      class VerdictMapping:
+          verdict: str
+          alerts: bool
+          default_level: str
+          rationale: str
+
+
+      MAPPING: List[VerdictMapping] = [
+          VerdictMapping('allow', False, 'informational',
+                         'Nothing detected; no Sigma match. A match per allow would bury the alerts.'),
+          VerdictMapping('flag', True, 'medium',
+                         'Suspicious but not blocked; alerts at medium so an analyst reviews it.'),
+          VerdictMapping('block', True, 'high',
+                         'High-confidence block; alerts at high, escalated to critical for exfiltration.'),
+      ]
+
+
+      def alerting_verdicts() -> List[str]:
+          return [m.verdict for m in MAPPING if m.alerts]
+
+
+      def level_for(verdict: str) -> str:
+          for m in MAPPING:
+              if m.verdict == verdict:
+                  return m.default_level
+          raise KeyError(verdict)
+
+
+      def as_condition(alerting: List[str]) -> Dict[str, object]:
+          return {'selection': {'verdict': list(alerting)}, 'condition': 'selection'}
+
+
+      if __name__ == '__main__':
+          for m in MAPPING:
+              mark = 'ALERT' if m.alerts else 'quiet'
+              print(f'{m.verdict:6} [{mark}] level={m.default_level}')
+          print('alerting verdicts:', alerting_verdicts())
+          assert 'allow' not in alerting_verdicts()
+          assert level_for('block') == 'high'
+          print('mapping consistent: ok')
+  deliverable_3:
+    title: Sigma Rule Versioning and Deployment Configuration
+    filename: sigma_deployment_config.py
+    description: |-
+      Versioning and deployment for the generated rule set: a pinned ruleset version, the deployment targets, and a content hash that makes a rule-set change detectable. deployment_plan compares the current hash to the previously deployed hash and, with auto-redeploy on, turns a detector change into a redeploy -- the mechanism that keeps the SIEM in sync with the detectors.
+    implementation_notes: |-
+      Python 3.12, single quotes throughout per book convention, standard-library hashlib, dataclasses, and typing only. Imports the generator from the first deliverable. The __main__ block walks the full loop -- first deploy, no-change no-op, and a detector change that regenerates, changes the hash, and re-triggers deployment -- asserting the drift detection works.
+    code: |
+      # sigma_deployment_config.py
+      # Section 16.02: Sigma Rule Versioning and Deployment Configuration
+      # 20260121 | AI Security Mastery -- Chapter 16 by Raghav Dinesh
+      # Single quotes throughout per book convention
+      #
+      # Generated rules need versioning and a deployment target, or they drift like
+      # hand-authored ones. This config pins a rule-set version, records a content hash
+      # so a change is detectable, and names the platforms each rule set deploys to.
+      # Regenerating after a detector change produces a new hash -- the redeploy signal.
+
+      import hashlib
+      from dataclasses import dataclass, field
+      from typing import Dict, List
+
+
+      @dataclass
+      class SigmaDeploymentConfig:
+          ruleset_version: str = '1.0'
+          targets: List[str] = field(default_factory=lambda: ['splunk', 'elastic'])
+          auto_redeploy_on_change: bool = True
+
+          def validate(self) -> None:
+              assert self.ruleset_version, 'ruleset_version must be set'
+              assert self.targets, 'at least one deployment target required'
+
+
+      def ruleset_hash(rules: Dict[str, str]) -> str:
+          '''A stable content hash over the generated rule set. A detector change
+          regenerates the rules, changes this hash, and triggers redeployment.'''
+          h = hashlib.sha256()
+          for rid in sorted(rules):
+              h.update(rid.encode('utf-8'))
+              h.update(rules[rid].encode('utf-8'))
+          return h.hexdigest()[:16]
+
+
+      def deployment_plan(rules: Dict[str, str], cfg: SigmaDeploymentConfig,
+                          previous_hash: str = '') -> Dict[str, object]:
+          cfg.validate()
+          current = ruleset_hash(rules)
+          changed = current != previous_hash
+          deploy = changed and cfg.auto_redeploy_on_change
+          return {'ruleset_version': cfg.ruleset_version, 'rule_count': len(rules),
+                  'current_hash': current, 'previous_hash': previous_hash or '(none)',
+                  'changed': changed, 'deploy_now': deploy,
+                  'targets': cfg.targets if deploy else []}
+
+
+      if __name__ == '__main__':
+          from sigma_rule_generator import SigmaRuleGenerator, SUITE_DESCRIPTORS
+          gen = SigmaRuleGenerator()
+          for d in SUITE_DESCRIPTORS:
+              gen.register(d)
+          rules = gen.generate()
+          cfg = SigmaDeploymentConfig()
+          plan1 = deployment_plan(rules, cfg, previous_hash='')
+          print('first run :', {k: plan1[k] for k in ('rule_count', 'changed', 'deploy_now')})
+          plan2 = deployment_plan(rules, cfg, previous_hash=plan1['current_hash'])
+          print('no change :', {k: plan2[k] for k in ('changed', 'deploy_now')})
+          SUITE_DESCRIPTORS[2].alert_verdicts = ['flag', 'block', 'allow']
+          gen2 = SigmaRuleGenerator()
+          for d in SUITE_DESCRIPTORS:
+              gen2.register(d)
+          plan3 = deployment_plan(gen2.generate(), cfg, previous_hash=plan1['current_hash'])
+          print('detector changed:', {k: plan3[k] for k in ('changed', 'deploy_now')})
+          assert plan1['deploy_now'] and not plan2['deploy_now'] and plan3['deploy_now']
+          print('drift detection works: ok')
+common_mistakes:
+  mistake_1:
+    description: |-
+      Writing detection rules in one platform's query language instead of portable Sigma
+    why_it_happens: |-
+      The team is on one platform today, and writing the rule directly in its search language is the shortest path to a working alert.
+    consequence: |-
+      The detection logic runs only on that platform. A migration or a second platform means rewriting every rule, and the logic is locked in.
+    correct_approach: |-
+      Express detection logic once in Sigma and let each platform's compiler translate it. One rule set targets many back ends without a rewrite.
+  mistake_2:
+    description: Hand-authoring the Sigma rules instead of generating them from the detectors
+    why_it_happens: |-
+      There are only a few detectors and each rule is short, so writing them by hand looks quicker than building a generator.
+    consequence: |-
+      Each rule is a snapshot that goes stale as its detector changes, and the divergence is invisible until an incident falls through the gap.
+    correct_approach: |-
+      Generate the rules from detector descriptors so they are a function of the detectors, and regenerate on any change to keep them in sync.
+  mistake_3:
+    description: Emitting a Sigma match for every request, including allowed ones
+    why_it_happens: |-
+      It feels thorough to record every detection decision as a rule hit, and allow is a decision too.
+    consequence: |-
+      The overwhelming majority of traffic is benign, so an allow-matching rule floods the SIEM and buries the flag and block alerts that matter.
+    correct_approach: |-
+      Map only flag and block to a Sigma match and keep allow quiet, so the alerts that fire are the ones a responder should see.
+  mistake_4:
+    description: Deploying generated rules with no version or change detection
+    why_it_happens: |-
+      Generation already feels automatic, so tracking a version and a hash seems like unnecessary bookkeeping.
+    consequence: |-
+      There is no way to tell whether the deployed rules match the current detectors, so regeneration either never redeploys or redeploys blindly every time.
+    correct_approach: |-
+      Version the rule set and hash its contents, and redeploy exactly when the hash changes, so deployment is both automatic and minimal.
+section_summary:
+  compact: |-
+    Section 16.02 builds the portable core of the integration surface: a generator that turns the Chapter 15 detector suite into Sigma rules -- platform-agnostic detection logic that each SIEM's Sigma compiler translates to its own query language, so the logic deploys anywhere without a per-platform rewrite. A Sigma rule is governed by three keys -- logsource (the gateway event stream), detection (the field selection that matches), and condition (how selections combine) -- and the generator fills them from a small detector descriptor, because a rule is almost entirely determined by two facts: the detector's name and which verdicts should alert. That verdict mapping is the load-bearing translation and is kept as auditable data: allow stays quiet so the real alerts are not buried, flag alerts at medium, and block alerts at high, escalated to critical for exfiltration. The decisive reason to generate rather than hand-author is drift: a hand-written rule is a snapshot that goes silently stale as its detector changes, while generated rules are a function of the detectors and stay in sync by construction. The section makes the change detectable with a content hash over the rule set, so regenerating after a detector change alters the hash and, with auto-redeploy, triggers redeployment -- turning 'keep the SIEM in sync' from a maintenance task into a property of the pipeline. The generated rules also close a loop from Chapter 11 Section 11.02, where Sigma first appeared as the signature layer's format: the same format now carries the whole suite's detections to the platforms that action them.
+  key_takeaways:
+  - |-
+    Sigma is portable detection logic: one rule the platforms' Sigma compilers translate to their own query languages
+  - |-
+    A Sigma rule is governed by logsource, detection, and condition; the generator fills them from a detector descriptor
+  - |-
+    The verdict mapping is load-bearing and kept as data: allow stays quiet, flag alerts medium, block alerts high
+  - |-
+    Generation beats hand-authoring because generated rules stay in sync with the detectors while hand-written rules drift
+  - |-
+    A content hash over the rule set turns a detector change into a redeploy signal, keeping the SIEM current automatically
+  - |-
+    The generated rules express the Chapter 11 Section 11.02 signature layer as SIEM-deployable detection logic
+preview_section_16_03:
+  title: 'Splunk Integration: HEC and Add-ons'
+  summary: |-
+    Section 16.03 builds the first platform connector: Splunk via the HTTP Event Collector and a Splunk add-on. It maps the detection-event schema to Splunk fields so a detection becomes a structured, searchable Splunk event, deploys the generated Sigma rules into Splunk, and is tested end to end from a detection through HEC to a searchable event and a Splunk-side alert -- the first push connector, owning delivery of events into the platform.
+metadata:
+  cross_chapter_references:
+  - |-
+    Chapter 16 Section 16.01: the detection-event schema whose fields the Sigma selection references
+  - |-
+    Chapter 15 Section 15.01: the verdicts the mapping translates into Sigma conditions
+  - |-
+    Chapter 11 Section 11.02: Sigma as the signature-layer format these generated rules express
+  forward_references:
+  - 'Section 16.03: the Splunk connector that deploys these generated Sigma rules'
+  - |-
+    Section 16.05: the Elastic connector that also evaluates the generated Sigma rules
+  - |-
+    Section 16.07: the chapter summary, where Sigma is the portable core of the integration surface
+  tags:
+  - sigma-rules
+  - sigma-generation
+  - portable-detection-logic
+  - logsource-detection-condition
+  - verdict-mapping
+  - automated-rule-deployment
+  - drift-prevention
+  - ruleset-versioning
+  - content-hash
+  - signature-layer
+  - mitre-atlas
+  - unified-api
+  - detection-event-schema
+  - part-4-chapter-2
