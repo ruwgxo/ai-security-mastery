@@ -1,0 +1,555 @@
+# section_16_06_custom_siem_enrichment.yaml
+
+---
+document_info:
+  title: Custom SIEM Integration and Alert Enrichment
+  chapter: 16
+  section: 6
+  section_code: '1606'
+  author: Raghav Dinesh
+  github: https://github.com/ruwgxo/ai-security-mastery
+  license: MIT
+  version: '1.0'
+  created: '2026-06-21'
+  estimated_pages: 7
+  estimated_reading_time: 50-60 minutes
+section_overview:
+  one_line_summary: |-
+    The integration surface is completed by two pieces: a custom webhook contract -- documented, versioned, and HMAC-signed -- that delivers detections to any platform without a dedicated connector, and an alert enrichment pipeline that fills the schema's IOC and label slots with the Chapter 13 Section 13.11 entity, session, and graph context and attaches response actions, turning a raw detection into an alert a responder can act on.
+  why_this_section_exists: |-
+    The three platform connectors cover the common case, but 'the common case' is not 'every case': a team may run a home-grown SIEM, a niche platform, or a SOAR tool with no Sigma compiler and no dedicated connector. The custom webhook is the escape hatch that makes the suite deliver anywhere -- a documented HTTP contract that any endpoint able to receive a POST can consume. Because it is generic, its contract has to be explicit where a platform SDK would have been implicit: a versioned envelope so the receiver knows the shape, and an HMAC signature so the receiver can trust the delivery is authentic and unmodified. That signed, versioned contract is the first half of the section.
+
+    The second half addresses something every connector so far has deferred. The detection-event schema has carried empty iocs and labels slots since 16.01, and delivering a detection with those slots empty delivers a fact without a story: an analyst gets 'injection blocked on session X' and must reconstruct who that entity is, what else they did, and what to do about it. The alert enrichment pipeline fills the slots. It draws the Chapter 13 Section 13.11 behavioural context -- the entity's risk, the session's history, the coordinated-group membership from the graph -- into the labels, derives IOCs from the evidence and context, and attaches the response actions the detection warrants. The output is the same DetectionEvent shape, enriched, so every connector delivers the richer alert unchanged. Enrichment is what moves the chapter's output from detection to actionable alert.
+  position_in_chapter: |-
+    Section 16.06 completes the integration surface mapped in 16.01: the custom webhook is the fifth and most general delivery path, and the enrichment pipeline is the actionability layer that applies to all of them. It draws the Chapter 13 Section 13.11 entity, session, and graph context into the detection-event schema of 16.01, and its enriched output flows through every connector built in 16.02-16.05. The section is the last build before the chapter summary in 16.07.
+learning_objectives:
+  knowledge:
+  - |-
+    Explain why a custom webhook path is needed alongside the dedicated platform connectors
+  - 'Describe the webhook contract: a versioned envelope and an HMAC-signed payload'
+  - |-
+    Explain why an HMAC signature is required for a generic webhook and how the receiver verifies it
+  - |-
+    Explain what alert enrichment adds and why a raw detection is not yet an actionable alert
+  - |-
+    Describe how the Chapter 13 Section 13.11 context, IOCs, and response actions fill the schema slots
+  - |-
+    Explain why enriched events preserve the detection-event shape so every connector delivers them unchanged
+  skills:
+  - Build a versioned webhook envelope around detection events and HMAC-sign it
+  - Verify a webhook signature and reject a tampered payload
+  - |-
+    Enrich a detection with entity, session, and graph context behind a context-source interface
+  - |-
+    Derive IOCs from evidence and behavioural context, and attach verdict-appropriate response actions
+  - Confirm an enriched event still conforms to the detection-event schema
+  security_mindset:
+  - |-
+    Recognise that a generic delivery path must carry its own trust, so an unsigned webhook is not acceptable
+  - |-
+    Internalise that a detection without context is a fact without a story, and enrichment supplies the story
+  - |-
+    Understand that response actions attached to an alert are what move it from detection toward response
+  - |-
+    Appreciate that enrichment must preserve the schema so it composes with every connector rather than replacing them
+prerequisites:
+- |-
+  Chapter 16 Section 16.01: the detection-event schema with the iocs and labels slots enrichment fills
+- |-
+  Chapter 16 Sections 16.03-16.05: the connectors whose delivered detections enrichment improves
+- |-
+  Chapter 13 Section 13.11: the entity, session, and graph context the enrichment pipeline draws on
+- Familiarity with HMAC message authentication and webhook contracts
+- Familiarity with IOCs and response actions in a SOC context
+prose_content:
+  part_1:
+    title: 'The Custom Webhook: Delivering Anywhere'
+    body: |-
+      The dedicated connectors are the right tool when the team is on Splunk, Datadog, or Elastic. The custom webhook is the right tool for everything else -- a home-grown SIEM, a SOAR platform, a niche tool, an internal event bus. It asks the least of the receiver: the ability to accept an HTTP POST. The gateway POSTs detection events to a configured endpoint, and whatever is on the other end consumes them. This is the escape hatch that means the suite is never blocked by the absence of a purpose-built connector; if a platform can receive a POST, it can receive detections.
+
+      The cost of that generality is that nothing about the contract can be assumed. A platform SDK encodes the payload shape and the authentication; a raw webhook has neither unless the contract states them. So the webhook is defined by an explicit contract rather than a convention. The payload is a versioned envelope -- a contract_version, a delivery id, an emitted-at timestamp, an event count, and the detection events themselves -- so a receiver can parse it and know the shape it is parsing, and can handle a future version deliberately. The webhook is a push integration like the others, owning delivery, but it is the one whose contract the section has to make fully explicit, because there is no SDK to make it implicit.
+  part_2:
+    title: 'Signing the Payload: Trust on a Generic Channel'
+    body: |-
+      A dedicated connector authenticates with a platform token, and the platform's ingestion endpoint knows how to check it. A generic webhook endpoint has no such shared machinery, so the contract has to carry its own trust. Without it, any party that can reach the endpoint could POST forged detections, and the receiver could not tell a real delivery from an injected one -- a security tool that accepts unauthenticated events is itself an attack surface. The webhook closes that with an HMAC signature: the gateway signs the canonical JSON payload with a secret shared with the receiver, and sends the signature alongside the delivery.
+
+      The receiver recomputes the HMAC over the payload it received and compares it, in constant time, to the signature sent. If they match, the payload is authentic -- it came from a holder of the shared secret -- and unmodified, because any change to the bytes changes the HMAC. If they do not match, the receiver rejects the delivery. The section's stub receiver does exactly this, verifying every delivery and rejecting a tampered one, so the contract is exercised as a real endpoint should implement it. The signing secret is a credential and lives in the environment, never in source. This is the discipline the dedicated connectors got from their platforms, rebuilt explicitly for the channel that has no platform to provide it.
+  part_3:
+    title: Why a Raw Detection Is Not Yet an Alert
+    body: |-
+      Every connector to this point delivers a faithful detection, and a faithful detection is still not an actionable alert. Consider what arrives: 'the exfiltration detector blocked an output on session sess-880, confidence 0.98, canary triggered.' True, precise -- and by itself, thin. Who is behind session sess-880? Is this their first suspicious act or their sixth? Are they acting alone or as part of a cluster the graph already flagged? What should the responder actually do? The detection answers none of these, and an analyst who has to answer them by hand, per alert, under time pressure, is doing work the system already has the material to do.
+
+      This is the gap the detection-event schema anticipated. Since 16.01 the schema has carried iocs and labels slots, deliberately empty, waiting for exactly this. The raw detection is the what; enrichment adds the who, the how-much, and the what-next. It is not a nicety layered on top -- it is the step that turns the chapter's output from a stream of true facts into a stream of alerts a SOC can triage and act on. And it belongs here, after the delivery paths, because it applies to all of them: enrichment happens to the event before delivery, so every connector -- the three platforms and the webhook -- ships the enriched alert without changing anything.
+  part_4:
+    title: Enriching from the Chapter 13 Behavioural Context
+    body: |-
+      The enrichment pipeline's raw material is the behavioural monitoring layer of Chapter 13 Section 13.11 -- the entity, session, and graph context the suite already maintains. For a detection, the pipeline asks that layer for the context of the session and source, and receives the entity's identity and rolling risk score, how many detections this session has already produced, and whether the entity belongs to a coordinated group the graph analysis has clustered. That context goes into the event's labels: the entity id, the entity risk, the session's event count, the group id when present. Now the alert says not just 'injection blocked' but 'injection blocked by entity-42, risk 0.87, sixth event this session, member of cluster-3.'
+
+      From the same material the pipeline derives IOCs -- the indicators a SOC pivots on. Known-bad indicators tied to the entity (an IP the behavioural layer already distrusts) become IOCs on the event; evidence such as a triggered canary becomes an IOC of its own. The pipeline accesses the Chapter 13 layer behind a small interface, so it is testable with a stub standing in for the real context store and the real store is injected in production. Crucially, the pipeline writes only into the schema's existing slots -- labels and iocs -- so the enriched event is the same DetectionEvent it started as, richer but structurally unchanged. That is what lets enrichment sit in front of every connector without any connector knowing it is there.
+  part_5:
+    title: Attaching Response Actions and Completing the Surface
+    body: |-
+      The last thing enrichment adds is the answer to 'what next.' Based on the verdict and the context, the pipeline attaches the response actions available for the detection. A block offers to quarantine the session, revoke the token, and notify the SOC; a flag offers to watch the entity and notify the SOC; an allow offers nothing. The context sharpens this: an entity in a coordinated group gets a group-level action -- quarantine the group, not just the session -- because the graph says the threat is broader than the one request. The actions ride in the labels, so the alert arrives with its response options attached, and the responder chooses rather than researches.
+
+      With enrichment attached, the integration surface mapped in 16.01 is complete. Sigma gives portable logic; the three connectors deliver events to the major platforms; the webhook delivers to anything else; and enrichment makes every delivered detection actionable, carrying the Chapter 13 behavioural context, the IOCs, and the response actions into the same schema every connector already speaks. A detection now flows from the Chapter 15 suite, through build_event into the shared schema, through enrichment that fills its open slots, and out through whichever connector the deployment uses -- arriving as an alert with a story and a set of next steps. Section 16.07 steps back to synthesise this whole surface and to hand off to Chapter 17, where the detections now reaching the SIEM feed the monitoring and tuning that improves the detectors.
+reference_materials:
+  table_1:
+    title: The Webhook Contract
+    description: |-
+      The custom webhook makes its contract explicit because there is no platform SDK to make it implicit: a versioned envelope and an HMAC signature.
+    columns:
+    - Contract element
+    - Purpose
+    rows:
+    - - contract_version
+      - Tells the receiver the payload shape it is parsing
+    - - delivery_id
+      - Uniquely identifies a delivery for dedup and tracing
+    - - emitted_at
+      - When the delivery was produced
+    - - event_count + events
+      - The detection events, in the shared schema
+    - - HMAC signature
+      - Proves the delivery is authentic and unmodified
+    - - shared secret
+      - Held by gateway and receiver; read from the environment
+  table_2:
+    title: What Enrichment Adds to a Raw Detection
+    description: |-
+      Enrichment fills the schema's open slots, turning the what of a detection into an actionable alert with a who, a how-much, and a what-next.
+    columns:
+    - Enrichment
+    - Source
+    - Goes into
+    - Answers
+    rows:
+    - - Entity + risk
+      - Chapter 13 Section 13.11
+      - labels
+      - Who is behind this?
+    - - Session event count
+      - Chapter 13 session context
+      - labels
+      - First act or repeat?
+    - - Coordinated group
+      - Chapter 13 graph analysis
+      - labels
+      - Acting alone or in a cluster?
+    - - IOCs
+      - Evidence + known-bad indicators
+      - iocs
+      - What can the SOC pivot on?
+    - - Response actions
+      - Verdict + context
+      - labels
+      - What should the responder do?
+  table_3:
+    title: Response Actions by Verdict and Context
+    description: |-
+      The actions attached depend on the verdict, sharpened by the behavioural context -- a coordinated-group member warrants a group-level action.
+    columns:
+    - Verdict
+    - Base actions
+    - With coordinated group
+    rows:
+    - - block
+      - quarantine_session, revoke_token, notify_soc
+      - + quarantine_group
+    - - flag
+      - watch_entity, notify_soc
+      - + quarantine_group
+    - - allow
+      - (none)
+      - (none)
+deliverables:
+  deliverable_1:
+    title: The Custom SIEM Webhook
+    filename: custom_siem_webhook.py
+    description: |-
+      The generic delivery path: build_webhook_payload wraps detection events in a versioned envelope; sign_payload and verify_signature implement HMAC-SHA256 signing and constant-time verification; CustomSiemWebhook delivers the signed payload behind a swappable transport. The stub receiver verifies every delivery and rejects a tampered one, exercising the contract as a real endpoint should.
+    implementation_notes: |-
+      Python 3.12, single quotes throughout per book convention, standard-library hashlib, hmac, json, time, dataclasses, and typing only. The canonical JSON (sorted keys, tight separators) makes the signature reproducible on the receiver. The signing secret is read from the environment via the config; the endpoint must be https. Self-checks that a valid signature verifies and a tampered payload is rejected.
+    code: |
+      # custom_siem_webhook.py
+      # Section 16.06: Custom SIEM Integration -- Webhook Contract
+      # 20260121 | AI Security Mastery -- Chapter 16 by Raghav Dinesh
+      # Single quotes throughout per book convention
+      #
+      # The escape hatch for any platform without a dedicated connector. The gateway
+      # POSTs detection events to an arbitrary endpoint on a documented webhook
+      # contract: a stable JSON envelope, a versioned schema, and an HMAC signature the
+      # receiver verifies. Any platform that can receive an HTTP POST can consume
+      # detections this way.
+
+      import hashlib
+      import hmac
+      import json
+      import time
+      from dataclasses import dataclass
+      from typing import Any, Dict, List, Optional
+
+
+      def sample_event() -> Dict[str, Any]:
+          return {
+              'schema_version': '1.0', 'event_id': 'req-4001:prompt_injection',
+              'timestamp': '2026-01-21T13:45:00Z', 'detector': 'prompt_injection',
+              'verdict': 'block', 'severity': 'critical', 'score': 0.93, 'confidence': 0.95,
+              'latency_ms': 4.0, 'surface': 'input', 'request_id': 'req-4001',
+              'session_id': 'sess-100', 'source': 'prod-gateway-1',
+              'evidence': [{'source': 'pattern', 'label': 'instruction_override', 'detail': 'ignore all rules'}],
+              'iocs': [], 'labels': {},
+          }
+
+
+      WEBHOOK_CONTRACT_VERSION = '1.0'
+
+
+      @dataclass
+      class WebhookConfig:
+          endpoint_url: str = 'https://siem.example.com/hooks/ai-detection'
+          signing_secret_env_var: str = 'WEBHOOK_SIGNING_SECRET'
+          contract_version: str = WEBHOOK_CONTRACT_VERSION
+
+          def validate(self) -> None:
+              assert self.endpoint_url.startswith('https'), 'webhook endpoint must be https'
+
+
+      def build_webhook_payload(events: List[Dict[str, Any]], *,
+                                contract_version: str = WEBHOOK_CONTRACT_VERSION,
+                                delivery_id: Optional[str] = None,
+                                emitted_at: Optional[str] = None) -> Dict[str, Any]:
+          '''Build the webhook envelope around one or more detection events. The
+          envelope is the stable contract; the events inside follow the 16.01 schema.'''
+          return {
+              'contract_version': contract_version,
+              'delivery_id': delivery_id if delivery_id is not None else f'dlv-{int(time.time()*1000)}',
+              'emitted_at': emitted_at if emitted_at is not None else time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+              'event_count': len(events), 'events': events,
+          }
+
+
+      def sign_payload(payload: Dict[str, Any], secret: str) -> str:
+          '''HMAC-SHA256 over the canonical JSON payload. The receiver recomputes this
+          to verify the delivery is authentic and unmodified.'''
+          body = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+          return hmac.new(secret.encode('utf-8'), body, hashlib.sha256).hexdigest()
+
+
+      def verify_signature(payload: Dict[str, Any], secret: str, signature: str) -> bool:
+          return hmac.compare_digest(sign_payload(payload, secret), signature)
+
+
+      class WebhookTransport:
+          def post(self, url: str, payload: Dict[str, Any], signature: str) -> Dict[str, Any]:
+              raise NotImplementedError
+
+
+      class StubWebhookTransport(WebhookTransport):
+          '''In-memory receiver that verifies the signature exactly as a real endpoint
+          should, so the contract is exercised end to end.'''
+          def __init__(self, secret: str) -> None:
+              self._secret = secret
+              self.received: List[Dict[str, Any]] = []
+              self.rejected: int = 0
+          def post(self, url, payload, signature):
+              if not verify_signature(payload, self._secret, signature):
+                  self.rejected += 1
+                  return {'status': 401, 'ok': False}
+              self.received.append(payload)
+              return {'status': 202, 'ok': True}
+
+
+      class CustomSiemWebhook:
+          '''Delivers detection events to any platform on the documented webhook
+          contract. A push integration whose payload is signed and versioned.'''
+          name = 'custom_webhook'
+          model = 'push'
+
+          def __init__(self, secret: str, transport: Optional[WebhookTransport] = None,
+                       config: Optional[WebhookConfig] = None) -> None:
+              self._secret = secret
+              self._cfg = config if config is not None else WebhookConfig()
+              self._transport = transport if transport is not None else StubWebhookTransport(secret)
+
+          def deliver(self, events: List[Dict[str, Any]]) -> Dict[str, Any]:
+              self._cfg.validate()
+              payload = build_webhook_payload(events, contract_version=self._cfg.contract_version)
+              signature = sign_payload(payload, self._secret)
+              resp = self._transport.post(self._cfg.endpoint_url, payload, signature)
+              return {'delivered': resp.get('ok', False), 'status': resp.get('status'),
+                      'event_count': payload['event_count'], 'delivery_id': payload['delivery_id']}
+
+
+      if __name__ == '__main__':
+          secret = 'shared-signing-secret'
+          stub = StubWebhookTransport(secret)
+          hook = CustomSiemWebhook(secret, transport=stub)
+          events = [sample_event(),
+                    {**sample_event(), 'event_id': 'req-4002:pii', 'detector': 'pii_scanner',
+                     'verdict': 'flag', 'severity': 'medium', 'request_id': 'req-4002'}]
+          result = hook.deliver(events)
+          print('deliver result:', result)
+          good = build_webhook_payload(events)
+          good_sig = sign_payload(good, secret)
+          tampered = {**good, 'event_count': 999}
+          assert result['delivered'] and result['event_count'] == 2
+          assert verify_signature(good, secret, good_sig)
+          assert not verify_signature(tampered, secret, good_sig)
+          print('valid signature verifies, tampered payload rejected: ok')
+  deliverable_2:
+    title: The Alert Enrichment Pipeline
+    filename: alert_enrichment_pipeline.py
+    description: |-
+      The actionability layer: AlertEnrichmentPipeline.enrich fills the schema's labels and iocs slots with the Chapter 13 Section 13.11 entity, session, and graph context, derives IOCs from evidence and known-bad indicators, and attaches verdict-and-context-appropriate response actions -- including a group-level action for a coordinated-group member. The enriched event preserves the DetectionEvent shape, so every connector delivers it unchanged.
+    implementation_notes: |-
+      Python 3.12, single quotes throughout per book convention, standard-library dataclasses and typing only. The Chapter 13 context is reached through a ContextSource Protocol, with a deterministic StubContextSource for standalone running and the real 13.11 store injected in production. The pipeline writes only into existing schema slots, never new top-level fields, so enrichment composes with every connector. Self-checks full enrichment for a high-risk session and minimal enrichment for a low-risk unknown, asserting the schema is preserved.
+    code: |
+      # alert_enrichment_pipeline.py
+      # Section 16.06: Alert Enrichment Pipeline
+      # 20260121 | AI Security Mastery -- Chapter 16 by Raghav Dinesh
+      # Single quotes throughout per book convention
+      #
+      # A raw detection is an isolated event. This pipeline turns it into an actionable
+      # alert by filling the slots the detection-event schema (16.01) left open: it
+      # draws the entity, session, and graph context of Chapter 13 Section 13.11 into
+      # the labels, derives IOCs from the evidence and context, and attaches the
+      # response actions available for the detection. The output is the same
+      # DetectionEvent shape, enriched -- so every connector delivers it unchanged.
+
+      from dataclasses import dataclass, field
+      from typing import Any, Dict, List, Optional, Protocol
+
+
+      def sample_event() -> Dict[str, Any]:
+          return {
+              'schema_version': '1.0', 'event_id': 'req-5001:exfiltration_detector',
+              'timestamp': '2026-01-21T14:20:00Z', 'detector': 'exfiltration_detector',
+              'verdict': 'block', 'severity': 'critical', 'score': 0.96, 'confidence': 0.98,
+              'latency_ms': 7.7, 'surface': 'output', 'request_id': 'req-5001',
+              'session_id': 'sess-880', 'source': 'prod-gateway-1',
+              'evidence': [{'source': 'aggregate', 'label': 'canary_triggered',
+                            'detail': 'system prompt canary in output'}],
+              'iocs': [], 'labels': {},
+          }
+
+
+      # --- Chapter 13 Section 13.11 behavioural context (behind an interface) -----
+      # The enrichment source is the behavioural monitoring layer of Chapter 13: entity
+      # risk, session context, and the coordinated-network graph. Behind a Protocol so
+      # the pipeline is testable with a stub and the real 13.11 store is injected in
+      # production.
+
+      @dataclass
+      class BehaviouralContext:
+          entity_id: str
+          entity_risk: float                       # 0..1 rolling risk score for the entity
+          session_event_count: int                 # detections in this session so far
+          coordinated_group: Optional[str]         # graph cluster id, if the entity is in one
+          known_bad_indicators: List[str] = field(default_factory=list)
+
+
+      class ContextSource(Protocol):
+          def context_for(self, session_id: Optional[str], source: str) -> BehaviouralContext:
+              ...
+
+
+      class StubContextSource:
+          '''Deterministic stand-in for the Chapter 13 Section 13.11 behavioural store.
+          Returns escalating context for a known high-risk session so enrichment can be
+          exercised. NOT a real store -- replace with the 13.11 entity/session/graph
+          context in production.'''
+          def context_for(self, session_id: Optional[str], source: str) -> BehaviouralContext:
+              if session_id == 'sess-880':
+                  return BehaviouralContext(entity_id='entity-42', entity_risk=0.87,
+                                            session_event_count=6, coordinated_group='cluster-3',
+                                            known_bad_indicators=['198.51.100.7'])
+              return BehaviouralContext(entity_id='entity-unknown', entity_risk=0.10,
+                                        session_event_count=1, coordinated_group=None)
+
+
+      # --- Response actions -------------------------------------------------------
+      # The actions available for a detection, attached so the alert moves from
+      # detection to response. What is offered depends on verdict and severity.
+
+      RESPONSE_ACTIONS = {
+          'block': ['quarantine_session', 'revoke_token', 'notify_soc'],
+          'flag': ['watch_entity', 'notify_soc'],
+          'allow': [],
+      }
+
+
+      def response_actions_for(event: Dict[str, Any], ctx: BehaviouralContext) -> List[str]:
+          actions = list(RESPONSE_ACTIONS.get(event['verdict'], []))
+          # A coordinated-group member warrants a group-level action beyond the session.
+          if ctx.coordinated_group and 'quarantine_group' not in actions:
+              if event['verdict'] in ('block', 'flag'):
+                  actions.append('quarantine_group')
+          return actions
+
+
+      # --- IOC derivation ---------------------------------------------------------
+      # IOCs are the indicators a SOC pivots on. They come from the evidence (what
+      # fired) and the behavioural context (known-bad indicators tied to the entity).
+
+      def derive_iocs(event: Dict[str, Any], ctx: BehaviouralContext) -> List[Dict[str, str]]:
+          iocs: List[Dict[str, str]] = []
+          for ind in ctx.known_bad_indicators:
+              iocs.append({'type': 'ip', 'value': ind, 'source': 'behavioural_context'})
+          for ev in event.get('evidence', []):
+              if ev.get('label') == 'canary_triggered':
+                  iocs.append({'type': 'canary', 'value': ev.get('detail', ''), 'source': 'evidence'})
+          return iocs
+
+
+      # --- The enrichment pipeline ------------------------------------------------
+
+      @dataclass
+      class EnrichmentConfig:
+          add_entity_context: bool = True
+          add_iocs: bool = True
+          add_response_actions: bool = True
+
+
+      class AlertEnrichmentPipeline:
+          '''Enriches a raw detection event into an actionable alert, in place on the
+          detection-event schema: labels carry the Chapter 13 context, iocs carry the
+          indicators, and labels carry the response actions.'''
+
+          def __init__(self, context_source: Optional[ContextSource] = None,
+                       config: Optional[EnrichmentConfig] = None) -> None:
+              self._ctx_source = context_source if context_source is not None else StubContextSource()
+              self._cfg = config if config is not None else EnrichmentConfig()
+
+          def enrich(self, event: Dict[str, Any]) -> Dict[str, Any]:
+              enriched = dict(event)
+              enriched['labels'] = dict(event.get('labels', {}))
+              ctx = self._ctx_source.context_for(event.get('session_id'), event['source'])
+
+              if self._cfg.add_entity_context:
+                  enriched['labels'].update({
+                      'entity_id': ctx.entity_id,
+                      'entity_risk': f'{ctx.entity_risk:.2f}',
+                      'session_event_count': str(ctx.session_event_count),
+                  })
+                  if ctx.coordinated_group:
+                      enriched['labels']['coordinated_group'] = ctx.coordinated_group
+
+              if self._cfg.add_iocs:
+                  enriched['iocs'] = derive_iocs(event, ctx)
+
+              if self._cfg.add_response_actions:
+                  actions = response_actions_for(event, ctx)
+                  enriched['labels']['response_actions'] = ','.join(actions)
+
+              return enriched
+
+
+      if __name__ == '__main__':
+          pipeline = AlertEnrichmentPipeline()
+
+          # High-risk session: full enrichment, coordinated-group escalation, IOCs.
+          enriched = pipeline.enrich(sample_event())
+          print('labels        :')
+          for k, v in sorted(enriched['labels'].items()):
+              print(f'    {k} = {v}')
+          print('iocs          :', enriched['iocs'])
+
+          # The enriched alert is still a DetectionEvent -- every connector delivers it.
+          assert enriched['event_id'] == 'req-5001:exfiltration_detector'
+          assert enriched['labels']['entity_id'] == 'entity-42'
+          assert enriched['labels']['coordinated_group'] == 'cluster-3'
+          assert 'quarantine_group' in enriched['labels']['response_actions']
+          assert any(i['type'] == 'ip' for i in enriched['iocs'])
+          assert any(i['type'] == 'canary' for i in enriched['iocs'])
+
+          # Low-risk unknown session: minimal enrichment, no group action, no IOCs.
+          low = pipeline.enrich({**sample_event(), 'session_id': 'sess-new', 'verdict': 'flag',
+                                 'severity': 'medium', 'evidence': []})
+          assert low['labels']['entity_id'] == 'entity-unknown'
+          assert 'coordinated_group' not in low['labels']
+          assert 'quarantine_group' not in low['labels']['response_actions']
+          assert low['iocs'] == []
+          print('\nenrichment: context, iocs, and response actions attached; schema preserved: ok')
+common_mistakes:
+  mistake_1:
+    description: Shipping a custom webhook with no signature, trusting any POST to the endpoint
+    why_it_happens: |-
+      The dedicated connectors authenticated via the platform, so it is easy to forget the generic path has no platform to do it.
+    consequence: |-
+      Anyone who can reach the endpoint can POST forged detections, and the receiver cannot tell real deliveries from injected ones -- the security tool becomes an attack surface.
+    correct_approach: |-
+      Sign the payload with an HMAC over a shared secret and have the receiver verify it in constant time, rejecting anything that does not match.
+  mistake_2:
+    description: Sending an unversioned webhook payload
+    why_it_happens: |-
+      The current shape is obvious to whoever writes both ends today, so a version field looks like ceremony.
+    consequence: |-
+      The moment the payload shape changes, every receiver breaks with no way to negotiate, because nothing told them which shape they were parsing.
+    correct_approach: |-
+      Put a contract_version in the envelope so receivers parse deliberately and a future version can be handled rather than silently breaking them.
+  mistake_3:
+    description: |-
+      Delivering raw detections and leaving the analyst to reconstruct the context per alert
+    why_it_happens: |-
+      The detection is true and complete on its own terms, so delivering it feels like the finished job.
+    consequence: |-
+      Every alert costs the analyst the manual work of finding the entity, its history, and its group, and choosing a response -- slow, error-prone, and repeated for each alert.
+    correct_approach: |-
+      Enrich before delivery with the Chapter 13 context, IOCs, and response actions, so the alert arrives with the who, the how-much, and the what-next already attached.
+  mistake_4:
+    description: Enriching by adding new top-level fields that break the shared schema
+    why_it_happens: |-
+      New context feels like it deserves new fields, and adding them to the event is the obvious way to attach it.
+    consequence: |-
+      The enriched event no longer matches the detection-event schema, so the connectors that map the schema mis-handle or drop the new fields, and enrichment stops composing with delivery.
+    correct_approach: |-
+      Write enrichment only into the schema's existing iocs and labels slots, so the enriched event is structurally identical and every connector delivers it unchanged.
+section_summary:
+  compact: |-
+    Section 16.06 completes the integration surface with its two remaining pieces. The custom webhook is the delivery path for any platform without a dedicated connector -- a home-grown SIEM, a SOAR tool, an event bus -- asking only that the receiver accept an HTTP POST. Because it is generic, its contract is made explicit where a platform SDK would have been implicit: the payload is a versioned envelope, so a receiver knows and can negotiate the shape it parses, and it is HMAC-signed with a shared secret, so the receiver can verify every delivery is authentic and unmodified and reject a tampered one -- a security tool that accepted unauthenticated events would itself be an attack surface. The alert enrichment pipeline addresses what every connector deferred: a raw detection is a true fact without a story, and the schema's iocs and labels slots have been empty since 16.01 waiting for it. The pipeline draws the Chapter 13 Section 13.11 behavioural context -- the entity and its risk, the session's event count, coordinated-group membership from the graph -- into the labels, derives IOCs from evidence and known-bad indicators, and attaches response actions chosen by verdict and sharpened by context, so a coordinated-group member gets a group-level quarantine, not just a session one. Enrichment writes only into the schema's existing slots, so the enriched event is the same DetectionEvent shape and every connector -- the three platforms and the webhook -- delivers the richer alert unchanged. With enrichment in front of every delivery path, the surface mapped in 16.01 is complete: portable Sigma logic, three platform connectors, a universal webhook, and an actionability layer that turns detections into alerts with a story and a set of next steps.
+  key_takeaways:
+  - |-
+    The custom webhook delivers detections to any platform that can accept an HTTP POST, when no dedicated connector exists
+  - |-
+    A generic channel must carry its own trust: the webhook payload is a versioned envelope, HMAC-signed and verified by the receiver
+  - |-
+    A raw detection is a fact without a story; enrichment supplies the who, the how-much, and the what-next
+  - |-
+    Enrichment fills the schema's iocs and labels slots with the Chapter 13 entity, session, and graph context
+  - |-
+    Response actions are attached by verdict and sharpened by context, so a coordinated-group member gets a group-level action
+  - |-
+    Enrichment preserves the detection-event shape, so it composes in front of every connector without changing any of them
+preview_section_16_07:
+  title: Chapter Summary and the Path to Monitoring
+  summary: |-
+    Section 16.07 synthesises the whole integration surface -- the detection-event schema, the Sigma generator, the Splunk, Datadog, and Elastic connectors, the custom webhook, and the enrichment pipeline -- into one architecture, with a per-platform reference card, an integration checklist, a consolidated list of the chapter's mistakes, and a knowledge assessment. It then hands off to Chapter 17: with detections now flowing into the SIEM as actionable alerts, the next chapter closes the loop by monitoring and tuning the detectors those alerts come from.
+metadata:
+  cross_chapter_references:
+  - |-
+    Chapter 16 Section 16.01: the detection-event schema whose iocs and labels slots enrichment fills
+  - |-
+    Chapter 13 Section 13.11: the entity, session, and graph context the enrichment pipeline draws on
+  - |-
+    Chapter 16 Sections 16.03-16.05: the connectors whose delivered detections enrichment makes actionable
+  - 'Chapter 12 Section 12.09: the response actions enrichment attaches to an alert'
+  forward_references:
+  - |-
+    Section 16.07: the chapter summary that synthesises the completed integration surface
+  - |-
+    Chapter 17: monitoring and tuning, fed by the enriched detections now reaching the SIEM
+  tags:
+  - custom-siem
+  - webhook-contract
+  - hmac-signing
+  - payload-versioning
+  - alert-enrichment
+  - ioc-derivation
+  - response-actions
+  - behavioural-context
+  - entity-context
+  - coordinated-group
+  - schema-preservation
+  - push-integration
+  - detection-event-schema
+  - part-4-chapter-2

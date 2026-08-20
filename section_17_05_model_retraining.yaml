@@ -1,0 +1,581 @@
+# section_17_05_model_retraining.yaml
+
+---
+document_info:
+  title: 'Model Retraining: When, How Often, and Validation'
+  chapter: 17
+  section: 5
+  section_code: '1705'
+  author: Raghav Dinesh
+  github: https://github.com/ruwgxo/ai-security-mastery
+  license: MIT
+  version: '1.0'
+  created: '2026-06-21'
+  estimated_pages: 8
+  estimated_reading_time: 55-70 minutes
+section_overview:
+  one_line_summary: |-
+    Retraining turns the curated dataset into a refreshed detector, and the section is about the three disciplines around the training call rather than the call itself: WHEN to retrain -- triggered by the Chapter 13 drift signal and accumulated labels, not a fixed calendar; VALIDATION -- every candidate checked against the quality bar and the incumbent on a held-out set before it may be promoted, because a retrained detector can be worse; and PROMOTION -- through the Chapter 12 model registry as a versioned artifact with a rollback path, so a regression can be undone.
+  why_this_section_exists: |-
+    Curation (17.04) produced trustworthy labelled data; this section refreshes the detectors on it. The training call itself is the least interesting part -- fit a model to data -- and the section deliberately stubs it, because the engineering that matters is the discipline that surrounds it. A detection system that retrains carelessly is more dangerous than one that never retrains at all, because careless retraining replaces a known-good detector with an unproven one and calls it an upgrade. The whole point of this section is to make retraining safe, and safety here has three parts that map to three questions the naive approach gets wrong.
+
+    When to retrain: not on a schedule. A calendar-based 'retrain every month' either retrains when nothing has changed -- wasting effort and risking a regression for no gain -- or fails to retrain when the world has shifted fast, leaving the detector stale between calendar dates. The trigger is instead the Chapter 13 drift signal (the live distribution has moved far enough to warrant a refresh) or the accumulation of enough new curated labels, with a cooldown to prevent thrashing on a noisy signal. How to validate: never trust the candidate. A retrained model can be worse than the incumbent -- trained on residual label noise, on a lingering imbalance, or on an adversarially poisoned dataset -- and the only way to know is to measure it on a held-out evaluation set against both an absolute quality bar and the current incumbent, rejecting any candidate that fails either. How to promote: reversibly. A validated candidate enters the model registry as a new version and becomes production, but the previous version stays available, so a candidate that passed validation yet regresses in production can be rolled back. These three disciplines are what separate a retraining pipeline that improves the suite from one that degrades it.
+  position_in_chapter: |-
+    Section 17.05 is the retraining stage of the improvement loop, consuming the curated dataset from 17.04 and producing a validated, registry-promoted candidate for the A/B testing of 17.06. It is where the Chapter 13 Section 13.05 drift signal becomes an action trigger and where the Chapter 12 Section 12.14 model registry provides versioned promotion and rollback. Its validation discipline is the first of the two safety gates -- the second being the live A/B test -- that guard the path to production.
+learning_objectives:
+  knowledge:
+  - |-
+    Explain why retraining is triggered by drift and label accumulation rather than a fixed schedule
+  - |-
+    Describe the cooldown and why it prevents retraining from thrashing on a noisy signal
+  - |-
+    Explain why every retrained candidate must be validated before it can be promoted
+  - |-
+    Describe validation against both an absolute quality bar and the incumbent, and why both are needed
+  - |-
+    Explain why validation uses the true imbalanced distribution, not the rebalanced training view
+  - Describe registry promotion as versioning and why a rollback path is required
+  - |-
+    Explain how the training call is stubbed and why the disciplines around it are the real content
+  skills:
+  - Decide whether to retrain from a drift score, accumulated labels, and a cooldown
+  - Train a candidate detector from a curated training view
+  - |-
+    Validate a candidate against a quality bar and against the incumbent on a held-out set
+  - Promote a validated candidate through a versioned registry
+  - Roll back a promotion to the previous version after a production regression
+  security_mindset:
+  - |-
+    Internalise that careless retraining is more dangerous than not retraining, because it replaces known-good with unproven
+  - |-
+    Recognise that a retrained candidate can be worse and must never be trusted without validation
+  - |-
+    Understand that validation on a rebalanced set would lie, so the true distribution must be used to judge
+  - |-
+    Appreciate that promotion must be reversible, because validation cannot catch every production regression
+prerequisites:
+- |-
+  Chapter 17 Section 17.04: the curated dataset -- training view and evaluation set -- this stage consumes
+- |-
+  Chapter 17 Section 17.02: the detection metrics validation measures the candidate against
+- 'Chapter 13 Section 13.05: the drift signal that triggers retraining'
+- |-
+  Chapter 12 Section 12.14: the model registry that provides versioned promotion and rollback
+- Familiarity with train/validation splits, quality gates, and model versioning
+prose_content:
+  part_1:
+    title: The Discipline Around the Training Call
+    body: |-
+      Retraining a detector sounds like the core of a chapter on tuning, and it is the stage everyone pictures when they imagine improving a model: take the new data, fit a new model, ship it. But the fitting is the easy part, and in a security context it is also the least dangerous part to get slightly wrong -- a marginally worse model that is caught and rejected costs nothing. What is genuinely dangerous is shipping the new model without knowing whether it is better, because that replaces a detector whose behaviour is known and trusted with one whose behaviour is not, under the reassuring label of an upgrade. This section is built on the premise that careless retraining is worse than no retraining, and so it treats the training call as a stubbed black box and spends its attention on the three disciplines that make retraining safe: when to do it, how to check the result, and how to ship it reversibly.
+
+      The stub is a deliberate teaching choice, consistent with how the rest of Part 4 stubbed external services. The retrainer fits a simple separating threshold on a score feature -- enough to exhibit real train-and-validate behaviour, deterministically and with no modelling library -- and a production deployment swaps in a real trainer behind the same interface. Nothing about the disciplines changes when the stub is replaced by a gradient-boosted model or a fine-tuned transformer: the trigger still decides when, validation still decides whether, and the registry still decides how it ships. By stubbing the model, the section keeps the focus where the engineering risk actually lives -- not in the mathematics of fitting, but in the process that decides whether a freshly-fitted detector is allowed anywhere near production traffic.
+  part_2:
+    title: 'When to Retrain: Drift and Labels, Not the Calendar'
+    body: |-
+      The most common retraining schedule is a calendar: retrain monthly, or quarterly, or nightly. Every calendar schedule is wrong in one of two directions. If the world has not changed since the last retrain, a scheduled retrain does pure risk for no reward -- it spins up a new candidate that might regress, to solve a problem that does not exist, because the current detector is still well-matched to current traffic. If the world has changed fast -- a new attack technique in wide use, a sudden traffic shift -- a calendar leaves the detector stale in the gap between scheduled dates, missing exactly the attacks the retrain would have caught. A schedule optimises for neither the cost nor the need; it optimises for being easy to put in a cron job.
+
+      The right trigger is the signal that the world has actually moved, and Chapter 13 already built it: the drift detector, whose score rises as the live distribution diverges from the training distribution. When drift crosses a threshold, a retrain is warranted because the detector's assumptions have measurably decayed. The trigger fires on that drift signal or, alternatively, on the accumulation of enough new curated labels -- because a large batch of fresh ground truth is worth incorporating even without a strong drift signal, and because it means the retrain will have enough new data to learn from. Over both sits a cooldown: a minimum number of cycles between retrains, so a drift signal that flickers above and below its threshold cannot cause the loop to retrain every few minutes. Thrashing is its own failure mode -- constant retraining is constant regression risk and constant churn in production -- and the cooldown is the governor that keeps a responsive trigger from becoming a hair-trigger. Retraining becomes an event driven by evidence, fired when the data says it is needed and blocked when it is too soon to be safe.
+  part_3:
+    title: Why a Candidate Must Never Be Trusted
+    body: |-
+      Suppose the trigger fires, the retrainer fits a candidate on the curated training view, and the candidate is ready. The single most important rule in the section is: do not ship it. A freshly retrained candidate is an unknown, and there are concrete reasons it may be worse than the incumbent it would replace, none of them exotic. The curated data, however carefully gated in 17.04, may carry residual label noise -- dispositions that were resolved but still wrong. It may carry a subtler imbalance than the rebalancing corrected for. And most seriously, it may have been poisoned: an adversary who understands that analyst dispositions become training labels could deliberately shape those dispositions to teach the detector to ignore their attacks, turning the improvement loop into an attack vector. A candidate trained on any of these is worse than the incumbent, and it arrives looking exactly like a candidate trained on good data.
+
+      The defence is validation: measure the candidate on a held-out evaluation set before it is allowed to be promoted, against two bars. The absolute quality bar is the floor from Part 4 -- minimum recall, maximum false-positive rate, minimum precision -- that any deployable detector must clear; a candidate below it is unfit regardless of how it compares to the incumbent. The relative bar is the incumbent itself: a candidate that clears the absolute floor but detects fewer attacks than the detector it would replace is a regression, and retraining must never go backwards, so a recall regression against the incumbent rejects the candidate even if it technically passes the floor. A candidate must clear both to be promotable. This is why the poisoned dataset in the section's example is caught: the poison drives the candidate's recall below the bar and below the incumbent, and validation refuses to promote it, leaving production untouched. Validation is the checkpoint that makes the whole retraining path safe to run automatically -- because a candidate that fails it simply does not ship, and the loop tries again next cycle with more data.
+  part_4:
+    title: Validating on the True Distribution
+    body: |-
+      There is a subtle trap in how validation is measured, and getting it wrong quietly defeats the whole check. The candidate was trained on the rebalanced training view from 17.04 -- the view that caps the benign class so the trainer can learn a boundary. It would be natural to validate on a similarly balanced set. It would also be wrong, and wrong in a way that echoes the base-rate problem of 17.02. Precision measured on a balanced set is a fiction: it tells you what precision the detector would have if attacks were as common as benign traffic, which they are not. A detector can look precise on a 50/50 evaluation set and flood analysts with false positives in production, because production has the real, rare-attack base rate that makes the false-positive rate dominate precision.
+
+      So validation must use the true, imbalanced distribution -- the full curated set from 17.04, not the training view. This is exactly why 17.04 was careful to keep the full set intact alongside the rebalanced view: the rebalanced view is for training, and the true distribution is for judging. Measuring the candidate's recall, false-positive rate, and precision on the imbalanced evaluation set gives numbers that predict production behaviour, because the evaluation set has production's shape. The quality bar's precision floor only means something when it is measured this way; on a balanced set it would be trivially passed by detectors that would fail catastrophically in production. The training/evaluation distinction that curation set up is not bookkeeping -- it is what makes validation predictive, and validating on the wrong distribution is a way to pass every candidate and ship regressions with confidence.
+  part_5:
+    title: Reversible Promotion Through the Registry
+    body: |-
+      A candidate that passes validation earns promotion, but promotion is not a file copy that overwrites the running model. It goes through the model registry that Chapter 12 Section 12.14 built: the candidate is registered as a new version, the registry records it in the version history, and it becomes the current production version -- while every previous version remains stored and available. This versioning is what makes promotion reversible, and reversibility is necessary because validation, however careful, cannot catch every regression. A candidate can pass validation on the held-out set and still regress in production, because the held-out set is a sample and production is the full, live, shifting reality; an evaluation set cannot contain an attack pattern that only appears next week. When that happens, the registry's rollback returns production to the previous version in one operation -- drop the regressing version, restore the prior one -- with no retraining and no scramble.
+
+      Rollback is the safety net under validation, and together they are defence in depth for the retraining path: validation catches the candidate that is knowably worse before it ships, and rollback catches the candidate that turns out worse after it ships. This section provides the first; the A/B testing of 17.06 provides an intermediate layer between them, proving a validated candidate is actually better on a bounded slice of live traffic before it takes all of it. But the registry's rollback is the ultimate backstop, the guarantee that no retraining -- however it was triggered, however it validated -- can leave production stuck with a worse detector and no way back. With retraining producing validated, reversibly-promoted candidates, the loop's final stage tests them on live traffic and assembles the whole loop into one running system.
+reference_materials:
+  table_1:
+    title: The Three Retraining Disciplines
+    description: |-
+      The training call is stubbed; these three disciplines around it are the section's real content and what make retraining safe.
+    columns:
+    - Discipline
+    - Question
+    - Mechanism
+    - Guards against
+    rows:
+    - - Trigger
+      - When to retrain?
+      - Drift signal or label accumulation, with cooldown
+      - Wasteful or stale retraining, and thrashing
+    - - Validation
+      - Is the candidate good?
+      - Quality bar + incumbent comparison on held-out data
+      - Shipping a worse or poisoned candidate
+    - - Promotion
+      - How to ship it?
+      - Versioned registry with rollback
+      - An irreversible regression in production
+  table_2:
+    title: Why Not a Calendar Schedule
+    description: |-
+      Every fixed schedule is wrong in one of two directions. The drift-and-label trigger fires on evidence instead.
+    columns:
+    - Situation
+    - Calendar schedule
+    - Drift/label trigger
+    rows:
+    - - World unchanged since last retrain
+      - Retrains anyway -- risk, no reward
+      - Does not retrain -- no need
+    - - World shifts fast between dates
+      - Detector stays stale until next date
+      - Drift fires -- retrains promptly
+    - - Large batch of new labels
+      - Ignored until the date
+      - Label accumulation fires the retrain
+    - - Noisy, flickering signal
+      - (N/A)
+      - Cooldown blocks thrashing
+  table_3:
+    title: The Two Validation Bars
+    description: |-
+      A candidate must clear both the absolute floor and the incumbent. Either failure blocks promotion.
+    columns:
+    - Bar
+    - Checks
+    - Rejects
+    rows:
+    - - Absolute quality bar
+      - Recall, FPR, precision vs. fixed floor
+      - A candidate unfit for deployment on its own terms
+    - - Incumbent comparison
+      - Recall vs. the current production model
+      - A candidate that regresses -- retraining must not go backwards
+    - - Distribution used
+      - The true imbalanced eval set (not the training view)
+      - Precision numbers that would lie on a balanced set
+  table_4:
+    title: Defence in Depth for the Retraining Path
+    description: |-
+      Three layers guard the path from curated data to production, each catching what the previous cannot.
+    columns:
+    - Layer
+    - Catches
+    - Built in
+    rows:
+    - - Validation
+      - A candidate knowably worse before it ships
+      - '17.05'
+    - - A/B test
+      - A validated candidate not actually better on live traffic
+      - '17.06'
+    - - Registry rollback
+      - A shipped candidate that regresses in production
+      - 17.05 (registry)
+deliverables:
+  deliverable_1:
+    title: The Model Retrainer
+    filename: model_retrainer.py
+    description: |-
+      Assembles the three retraining disciplines. evaluate_trigger decides whether to retrain from a drift score, accumulated labels, and a cooldown; train_model fits a stubbed threshold candidate from the curated training view; validate_candidate checks the candidate against the quality bar and the incumbent on the true imbalanced evaluation set; ModelRegistry promotes a validated candidate as a new version and can roll back; ModelRetrainer wires trigger -> train -> validate -> promote so a candidate that fails validation never reaches production.
+    implementation_notes: |-
+      Python 3.12, single quotes throughout per book convention, standard-library dataclasses, enum, and typing only. The model is deliberately stubbed -- a threshold fit by Youden's J on a score feature -- so the file runs standalone and deterministically; a real trainer replaces train_model behind the same DetectorModel contract without changing the disciplines. Validation uses the imbalanced eval set, not the training view. The __main__ block shows drift triggering, cooldown blocking thrashing on a 0.99 drift signal, a good candidate validating and promoting, a poisoned candidate being rejected by validation (recall below bar and regressed vs incumbent) with production unchanged, and a rollback.
+    code: |
+      # model_retrainer.py
+      # Section 17.05: Model Retraining -- When, How Often, and Validation
+      # 20260121 | AI Security Mastery -- Chapter 17 by Raghav Dinesh
+      # Single quotes throughout per book convention
+      #
+      # Retraining turns the curated dataset (17.04) into a refreshed detector. The
+      # hard parts are not the training call -- they are the three disciplines around
+      # it. WHEN: retraining is triggered by the Chapter 13 drift signal and the
+      # accumulation of curated labels, not a fixed calendar, so the detector is
+      # refreshed when the data has actually moved. VALIDATION: every candidate is
+      # checked against the quality bar and the current traffic before it may be
+      # promoted, because a retrained detector can be worse than the one it replaces.
+      # PROMOTION: the validated candidate enters the Chapter 12 model registry as a
+      # new version with a rollback path, so a regression can be undone. The model
+      # itself is stubbed (standard library only); the disciplines around it are real.
+
+      from dataclasses import dataclass, field
+      from enum import Enum
+      from typing import Callable, Dict, List, Optional, Protocol
+
+
+      # --- The curated dataset, as this stage consumes it -------------------------
+      # Mirrors the LabelledExample of 17.04, reproduced so this file runs standalone.
+      # In the suite these come from dataset_curator.CuratedDataset.training_view().
+
+      @dataclass
+      class Example:
+          detection_id: str
+          detector: str
+          is_attack: bool
+          label_confidence: float
+          features: Dict[str, float] = field(default_factory=dict)
+
+
+      # --- The retrain trigger ----------------------------------------------------
+      # When to retrain is a decision, not a schedule. It fires on either of two
+      # signals: drift (the Chapter 13 detector says the live distribution has moved
+      # far enough) or label accumulation (enough new curated labels to be worth a
+      # retrain). A cooldown prevents thrashing -- retraining every few minutes on a
+      # noisy drift signal costs more than it gains.
+
+      @dataclass
+      class RetrainTriggerConfig:
+          drift_threshold: float = 0.15            # Chapter 13 drift score above which retrain is warranted
+          min_new_labels: int = 50                # or this many new curated labels since last retrain
+          cooldown_cycles: int = 3                # minimum cycles between retrains, to avoid thrashing
+
+
+      @dataclass
+      class TriggerState:
+          cycles_since_retrain: int = 999          # start ready
+          new_labels_since_retrain: int = 0
+
+
+      @dataclass
+      class TriggerDecision:
+          should_retrain: bool
+          reason: str
+
+
+      def evaluate_trigger(drift_score: float, state: TriggerState,
+                           cfg: RetrainTriggerConfig) -> TriggerDecision:
+          '''Decide whether to retrain this cycle. Drift OR label accumulation can
+          trigger, but the cooldown blocks either from firing too soon after the last
+          retrain -- so a noisy drift signal cannot cause thrashing.'''
+          if state.cycles_since_retrain < cfg.cooldown_cycles:
+              return TriggerDecision(False, f'cooldown ({state.cycles_since_retrain}/{cfg.cooldown_cycles} cycles)')
+          if drift_score >= cfg.drift_threshold:
+              return TriggerDecision(True, f'drift {drift_score:.3f} >= {cfg.drift_threshold}')
+          if state.new_labels_since_retrain >= cfg.min_new_labels:
+              return TriggerDecision(True, f'{state.new_labels_since_retrain} new labels >= {cfg.min_new_labels}')
+          return TriggerDecision(False, 'no drift, insufficient new labels')
+
+
+      # --- The (stubbed) model ----------------------------------------------------
+      # A trained detector is represented by a threshold learned from the data and a
+      # version tag. The "training" fits a separating threshold on a single score
+      # feature -- enough to be deterministic, runnable, and to exhibit real
+      # train/validate behaviour without a modelling library. The disciplines around
+      # it are what the section teaches; swap in a real model behind the same shape.
+
+      @dataclass
+      class DetectorModel:
+          detector: str
+          version: str
+          threshold: float                         # alert when features['score'] >= threshold
+          trained_on: int                          # number of examples
+
+          def predict_is_attack(self, ex: Example) -> bool:
+              return ex.features.get('score', 0.0) >= self.threshold
+
+
+      def train_model(detector: str, version: str, dataset: List[Example]) -> DetectorModel:
+          '''Fit a threshold that best separates attacks from benign on the score
+          feature. Standard-library stub: scans candidate thresholds and picks the one
+          maximising (recall - fpr) on the training data. A real trainer replaces this
+          body; the signature and the DetectorModel contract stay the same.'''
+          scored = [e for e in dataset if 'score' in e.features]
+          if not scored:
+              return DetectorModel(detector, version, threshold=0.5, trained_on=0)
+          candidates = sorted({round(e.features['score'], 3) for e in scored})
+          attacks = [e for e in scored if e.is_attack]
+          benign = [e for e in scored if not e.is_attack]
+          best_t, best_score = 0.5, -1.0
+          for t in candidates:
+              tp = sum(1 for e in attacks if e.features['score'] >= t)
+              fp = sum(1 for e in benign if e.features['score'] >= t)
+              recall = tp / len(attacks) if attacks else 0.0
+              fpr = fp / len(benign) if benign else 0.0
+              j = recall - fpr                     # Youden's J -- balances catching attacks vs false alarms
+              if j > best_score:
+                  best_score, best_t = j, t
+          return DetectorModel(detector, version, threshold=best_t, trained_on=len(scored))
+
+
+      # --- Validation -------------------------------------------------------------
+      # A candidate is validated on a held-out evaluation set (the true, imbalanced
+      # distribution from 17.04 -- NOT the rebalanced training view) against two bars:
+      # it must clear the absolute quality bar, and it must not regress against the
+      # incumbent. Either failure blocks promotion.
+
+      @dataclass
+      class QualityBar:
+          min_recall: float = 0.85
+          max_fpr: float = 0.02
+          min_precision: float = 0.50              # at the evaluation set's base rate
+
+
+      @dataclass
+      class ValidationResult:
+          passed: bool
+          recall: float
+          fpr: float
+          precision: float
+          reasons: List[str] = field(default_factory=list)
+
+
+      def _evaluate(model: DetectorModel, eval_set: List[Example]) -> Dict[str, float]:
+          tp = fp = tn = fn = 0
+          for e in eval_set:
+              pred = model.predict_is_attack(e)
+              if e.is_attack and pred: tp += 1
+              elif e.is_attack and not pred: fn += 1
+              elif not e.is_attack and pred: fp += 1
+              else: tn += 1
+          recall = tp / (tp + fn) if (tp + fn) else 0.0
+          fpr = fp / (fp + tn) if (fp + tn) else 0.0
+          precision = tp / (tp + fp) if (tp + fp) else 0.0
+          return {'recall': recall, 'fpr': fpr, 'precision': precision}
+
+
+      def validate_candidate(candidate: DetectorModel, incumbent: Optional[DetectorModel],
+                             eval_set: List[Example], bar: QualityBar) -> ValidationResult:
+          '''Validate against the absolute quality bar AND against the incumbent. A
+          candidate that clears the bar but regresses recall versus the incumbent is
+          rejected -- retraining must not go backwards.'''
+          m = _evaluate(candidate, eval_set)
+          reasons: List[str] = []
+          if m['recall'] < bar.min_recall:
+              reasons.append(f'recall {m["recall"]:.3f} < {bar.min_recall}')
+          if m['fpr'] > bar.max_fpr:
+              reasons.append(f'fpr {m["fpr"]:.3f} > {bar.max_fpr}')
+          if m['precision'] < bar.min_precision:
+              reasons.append(f'precision {m["precision"]:.3f} < {bar.min_precision}')
+          if incumbent is not None:
+              inc = _evaluate(incumbent, eval_set)
+              if m['recall'] < inc['recall'] - 1e-9:
+                  reasons.append(f'recall regressed vs incumbent ({m["recall"]:.3f} < {inc["recall"]:.3f})')
+          return ValidationResult(not reasons, round(m['recall'], 4), round(m['fpr'], 4),
+                                  round(m['precision'], 4), reasons)
+
+
+      # --- The model registry and promotion with rollback ------------------------
+      # Promotion is versioned. The registry keeps the version history and the current
+      # production version, so a promotion can be rolled back to the previous version
+      # if the candidate regresses in production despite passing validation. This is
+      # the Chapter 12 Section 12.14 registry, used by the retraining loop.
+
+      class ModelRegistry:
+          def __init__(self, detector: str) -> None:
+              self.detector = detector
+              self._versions: Dict[str, DetectorModel] = {}
+              self._history: List[str] = []
+              self.current: Optional[DetectorModel] = None
+
+          def register(self, model: DetectorModel) -> None:
+              self._versions[model.version] = model
+
+          def promote(self, version: str) -> None:
+              if version not in self._versions:
+                  raise KeyError(f'unknown version {version}')
+              self._history.append(version)
+              self.current = self._versions[version]
+
+          def rollback(self) -> Optional[DetectorModel]:
+              '''Return to the previous promoted version. The safety net for a
+              candidate that passed validation but regresses in production.'''
+              if len(self._history) < 2:
+                  return None
+              self._history.pop()                  # drop the regressing version
+              prev = self._history[-1]
+              self.current = self._versions[prev]
+              return self.current
+
+
+      class ModelRetrainer:
+          '''Assembles the retraining discipline: trigger -> train -> validate ->
+          promote, with rollback available. Retraining that fails validation does not
+          promote, so a worse candidate never reaches production through this path.'''
+
+          def __init__(self, detector: str, bar: Optional[QualityBar] = None,
+                       trigger_cfg: Optional[RetrainTriggerConfig] = None) -> None:
+              self.detector = detector
+              self.bar = bar if bar is not None else QualityBar()
+              self.trigger_cfg = trigger_cfg if trigger_cfg is not None else RetrainTriggerConfig()
+              self.registry = ModelRegistry(detector)
+              self._version_counter = 0
+
+          def _next_version(self) -> str:
+              self._version_counter += 1
+              return f'v{self._version_counter}'
+
+          def seed(self, dataset: List[Example]) -> DetectorModel:
+              '''Train and promote an initial incumbent, unconditionally.'''
+              model = train_model(self.detector, self._next_version(), dataset)
+              self.registry.register(model)
+              self.registry.promote(model.version)
+              return model
+
+          def maybe_retrain(self, drift_score: float, state: TriggerState,
+                            training_view: List[Example], eval_set: List[Example]) -> Dict[str, object]:
+              '''One cycle of the retraining discipline. Returns what happened, so the
+              continuous loop (17.06) can act on it.'''
+              decision = evaluate_trigger(drift_score, state, self.trigger_cfg)
+              if not decision.should_retrain:
+                  return {'retrained': False, 'trigger': decision.reason, 'promoted': False}
+
+              candidate = train_model(self.detector, self._next_version(), training_view)
+              self.registry.register(candidate)
+              result = validate_candidate(candidate, self.registry.current, eval_set, self.bar)
+
+              promoted = False
+              if result.passed:
+                  self.registry.promote(candidate.version)
+                  promoted = True
+                  state.cycles_since_retrain = 0
+                  state.new_labels_since_retrain = 0
+              return {'retrained': True, 'trigger': decision.reason, 'candidate': candidate.version,
+                      'validation_passed': result.passed, 'promoted': promoted,
+                      'recall': result.recall, 'fpr': result.fpr, 'reasons': result.reasons}
+
+
+      # --- Deterministic synthetic data for the self-check ------------------------
+
+      def _make_examples(n_attack: int, n_benign: int, attack_score: float,
+                         benign_score: float, spread: float = 0.05) -> List[Example]:
+          out: List[Example] = []
+          for i in range(n_attack):
+              s = min(1.0, attack_score + ((i % 5) - 2) * spread)
+              out.append(Example(f'a{i}', 'prompt_injection', True, 1.0, {'score': s}))
+          for i in range(n_benign):
+              s = max(0.0, benign_score + ((i % 5) - 2) * spread)
+              out.append(Example(f'b{i}', 'prompt_injection', False, 1.0, {'score': s}))
+          return out
+
+
+      if __name__ == '__main__':
+          retrainer = ModelRetrainer('prompt_injection')
+
+          # Seed an incumbent on well-separated data: attacks score high, benign low.
+          seed_data = _make_examples(40, 40, attack_score=0.85, benign_score=0.20)
+          incumbent = retrainer.seed(seed_data)
+          print(f'seeded incumbent {incumbent.version} threshold={incumbent.threshold:.3f}')
+
+          # --- Trigger discipline ---
+          print('\n--- trigger ---')
+          fresh = TriggerState(cycles_since_retrain=999, new_labels_since_retrain=0)
+          d = evaluate_trigger(0.20, fresh, retrainer.trigger_cfg)
+          print(f'drift 0.20, ready        -> retrain={d.should_retrain} ({d.reason})')
+          assert d.should_retrain
+          cooling = TriggerState(cycles_since_retrain=1, new_labels_since_retrain=999)
+          d2 = evaluate_trigger(0.99, cooling, retrainer.trigger_cfg)
+          print(f'drift 0.99, in cooldown  -> retrain={d2.should_retrain} ({d2.reason})')
+          assert not d2.should_retrain               # cooldown blocks thrashing even on huge drift
+
+          # --- A good retrain: drift fired, candidate improves, validates, promotes ---
+          print('\n--- good retrain ---')
+          state = TriggerState(cycles_since_retrain=999, new_labels_since_retrain=0)
+          good_view = _make_examples(60, 300, attack_score=0.80, benign_score=0.15)   # still separable
+          good_eval = _make_examples(20, 980, attack_score=0.80, benign_score=0.15)   # imbalanced eval
+          r1 = retrainer.maybe_retrain(0.20, state, good_view, good_eval)
+          print(f'  {r1}')
+          assert r1['retrained'] and r1['validation_passed'] and r1['promoted']
+
+          # --- A bad retrain: poisoned view (labels flipped) must FAIL validation, NOT promote ---
+          print('\n--- poisoned retrain (must be rejected) ---')
+          before = retrainer.registry.current.version
+          state2 = TriggerState(cycles_since_retrain=999, new_labels_since_retrain=0)
+          # Poison: attacks and benign have overlapping/reversed scores -> no good threshold
+          poisoned_view = _make_examples(60, 300, attack_score=0.30, benign_score=0.70)
+          clean_eval = _make_examples(20, 980, attack_score=0.80, benign_score=0.15)
+          r2 = retrainer.maybe_retrain(0.20, state2, poisoned_view, clean_eval)
+          print(f'  retrained={r2["retrained"]} passed={r2["validation_passed"]} '
+                f'promoted={r2["promoted"]}')
+          print(f'  reasons: {r2["reasons"]}')
+          assert r2['retrained'] and not r2['validation_passed'] and not r2['promoted']
+          assert retrainer.registry.current.version == before   # production unchanged
+
+          # --- Rollback: undo a promotion ---
+          print('\n--- rollback ---')
+          cur = retrainer.registry.current.version
+          rolled = retrainer.registry.rollback()
+          print(f'  rolled back from {cur} to {rolled.version if rolled else None}')
+          assert rolled is not None and rolled.version != cur
+
+          print('\nretraining: trigger, validation, promotion, rollback all correct: ok')
+common_mistakes:
+  mistake_1:
+    description: Retraining on a fixed calendar schedule
+    why_it_happens: |-
+      A cron job that retrains monthly is trivial to set up and feels like responsible maintenance.
+    consequence: |-
+      It retrains when nothing changed -- risking a regression for no gain -- and stays stale when the world shifts fast between dates, missing exactly the attacks a timely retrain would catch.
+    correct_approach: |-
+      Trigger retraining on the Chapter 13 drift signal or accumulated curated labels, with a cooldown to prevent thrashing, so retraining is driven by evidence of change rather than the calendar.
+  mistake_2:
+    description: Promoting a retrained candidate without validating it
+    why_it_happens: |-
+      A model trained on fresh, curated data is assumed to be an improvement over the older one.
+    consequence: |-
+      A candidate trained on residual label noise, lingering imbalance, or a poisoned dataset is shipped as an upgrade and silently degrades the suite -- careless retraining is worse than none.
+    correct_approach: |-
+      Validate every candidate on a held-out set against the quality bar and the incumbent before promotion, and refuse any candidate that fails either -- a failed candidate simply does not ship.
+  mistake_3:
+    description: Validating the candidate on a balanced evaluation set
+    why_it_happens: |-
+      The candidate was trained on a rebalanced view, so validating on a similarly balanced set seems consistent.
+    consequence: |-
+      Precision on a balanced set is a fiction that ignores the real base rate, so a candidate that looks precise passes validation and then floods analysts with false positives in production.
+    correct_approach: |-
+      Validate on the true imbalanced distribution -- the full curated set 17.04 kept for exactly this -- so the measured precision predicts production behaviour.
+  mistake_4:
+    description: Promoting a candidate in place, with no way back to the previous version
+    why_it_happens: |-
+      Overwriting the running model with the validated candidate is the simplest deploy, and validation is assumed to be sufficient.
+    consequence: |-
+      A candidate that passed validation but regresses on live traffic -- an attack pattern the eval set did not contain -- leaves production stuck with a worse detector and no quick recovery.
+    correct_approach: |-
+      Promote through a versioned registry that keeps every prior version, so a production regression is undone with a one-operation rollback to the last good version.
+section_summary:
+  compact: |-
+    Section 17.05 retrains the detectors on the curated dataset, and its subject is the three disciplines around the training call, not the call itself -- which it deliberately stubs, because careless retraining is more dangerous than none, replacing a known-good detector with an unproven one under the label of an upgrade. When to retrain is decided not by a calendar -- which either retrains when nothing changed or stays stale when the world shifts fast -- but by the Chapter 13 drift signal or the accumulation of new curated labels, with a cooldown that stops a noisy signal from thrashing the loop. Whether to trust the candidate is never assumed: a retrained model can be worse for concrete reasons -- residual label noise, lingering imbalance, or an adversarially poisoned dataset shaped through analyst dispositions -- so every candidate is validated on a held-out set against two bars, the absolute quality floor and the incumbent, and rejected if it fails either, because retraining must never go backwards. Validation uses the true imbalanced distribution, not the rebalanced training view, because precision on a balanced set is a fiction that hides the base-rate reality and would pass detectors that flood production with false positives. How to ship a validated candidate is reversibly: it is promoted through the Chapter 12 registry as a new version while every prior version stays available, so a candidate that passes validation but regresses in production can be rolled back in one operation. Validation, the A/B test of 17.06, and registry rollback form defence in depth -- catching a bad candidate before it ships, before it takes all traffic, and after it ships respectively -- so the retraining path can run automatically without ever leaving production stuck with a worse detector.
+  key_takeaways:
+  - |-
+    Careless retraining is worse than none; the disciplines around the training call, not the call, are what matter
+  - |-
+    Retraining is triggered by drift or label accumulation with a cooldown, never by a fixed calendar
+  - |-
+    A retrained candidate is never trusted: it is validated against the quality bar and the incumbent before promotion
+  - |-
+    Validation uses the true imbalanced distribution, because precision on a balanced set is a base-rate fiction
+  - |-
+    A poisoned or noisy candidate is caught by validation and never reaches production, leaving the incumbent in place
+  - |-
+    Promotion is reversible through the versioned registry, so a candidate that regresses in production can be rolled back
+preview_section_17_06:
+  title: A/B Testing and the Continuous Improvement Loop
+  summary: |-
+    Section 17.06 adds the final safety gate and assembles the whole loop. A/B testing proves a validated candidate is actually better than the incumbent on live traffic -- splitting a bounded fraction of traffic to the candidate, measuring detection metrics on each arm, and declaring a winner only on a statistically significant improvement, with early-stopping if the candidate regresses. Then the capstone wires all six stages -- measure, curate, retrain, validate, A/B-test, promote -- into one running continuous improvement loop, the assembled system the whole chapter has been building.
+metadata:
+  cross_chapter_references:
+  - |-
+    Chapter 17 Section 17.04: the curated training view and evaluation set this stage consumes
+  - 'Chapter 17 Section 17.02: the detection metrics validation measures against'
+  - 'Chapter 13 Section 13.05: the drift signal that triggers retraining'
+  - |-
+    Chapter 12 Section 12.14: the model registry providing versioned promotion and rollback
+  forward_references:
+  - |-
+    Section 17.06: A/B testing, the live-traffic gate for a validated candidate, and the assembled loop
+  - |-
+    Section 17.07: the synthesis, where retraining is the stage that refreshes the detectors safely
+  tags:
+  - model-retraining
+  - retrain-trigger
+  - drift-triggered
+  - cooldown
+  - validation
+  - quality-bar
+  - incumbent-comparison
+  - model-registry
+  - promotion
+  - rollback
+  - data-poisoning
+  - true-distribution
+  - defence-in-depth
+  - part-4-chapter-3
