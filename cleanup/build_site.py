@@ -273,11 +273,29 @@ def render_section(path):
 
 # ── TOC builder ───────────────────────────────────────────────────────────────
 
-CH_TITLES = {
-    1:'ML Fundamentals', 2:'Deep Learning', 3:'NLP & Language Models',
-    4:'Modern LLMs', 5:'AI Security Landscape', 6:'Prompt Injection',
-    7:'Jailbreaks', 8:'Data Poisoning', 9:'Model Extraction', 10:'Adversarial Examples'
-}
+def load_chapter_titles():
+    """Read the real chapter title out of each chapter_XX_index.yaml's
+    document_info.title, rather than a hand-maintained dict that goes stale
+    every time a new chapter is added. Strips the 'Chapter N: ' prefix and
+    trailing ' - Index' suffix some chapter files carry."""
+    titles = {}
+    for f in sorted(BOOK_DIR.glob('chapter_*_index.yaml')):
+        m = re.match(r'chapter_(\d+)_index', f.stem)
+        if not m: continue
+        ch = int(m.group(1))
+        with open(f, encoding='utf-8', errors='replace') as fh:
+            raw2000 = fh.read(2000)
+        tm = re.search(r"title:\s*['\"]?(.+?)['\"]?\s*$", raw2000, re.MULTILINE)
+        if not tm:
+            continue
+        title = tm.group(1).strip().strip("\"'")
+        title = re.sub(r"^Chapter\s+\d+\s*[:\-]\s*", '', title)
+        title = re.sub(r"\s*-\s*Index\s*$", '', title).strip()
+        if title:
+            titles[ch] = title
+    return titles
+
+CH_TITLES = load_chapter_titles()
 
 def build_toc():
     files = sorted(BOOK_DIR.glob('section_*.yaml'))
