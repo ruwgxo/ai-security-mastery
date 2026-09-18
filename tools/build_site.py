@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""build_site_v2.py — AI Security Mastery book site generator
-Run from repo root: python3 build_site_v2.py
+"""build_site.py — AI Security Mastery book site generator
+Run from repo root: python3 tools/build_site.py
 Outputs docs/index.html — enable GitHub Pages on /docs folder.
 """
 
@@ -562,8 +562,8 @@ SHELL = """<!DOCTYPE html>
         <h1>AI Security Mastery</h1>
         <p class="tag-line">From ML Fundamentals to Production Detection Systems</p>
         <div class="w-meta">
-          <span>18 chapters</span>
-          <span>182 sections</span>
+          <span>__CHAPTER_COUNT__ chapters</span>
+          <span>__SECTION_COUNT__ sections</span>
           <span>~1,080 pages</span>
           <span>90-day path</span>
           <span>Free &amp; open source</span>
@@ -605,7 +605,9 @@ def main():
     toc_json = json.dumps(toc, separators=(',',':'))
     secs_json = json.dumps(secs, separators=(',',':'))
 
-    html = SHELL.replace('{CSS}', CSS) \
+    html = SHELL.replace('__CHAPTER_COUNT__', str(len(toc))) \
+               .replace('__SECTION_COUNT__', str(len(secs))) \
+               .replace('{CSS}', CSS) \
                .replace('{JS}', JS.replace('__TOC__', toc_json).replace('__SECS__', secs_json))
 
     out = OUT_DIR / 'index.html'
