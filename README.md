@@ -6,7 +6,7 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![DOI](https://zenodo.org/badge/1125137519.svg)](https://doi.org/10.5281/zenodo.22131915)
 
-**Status:** v1.0 complete — 18 chapters, 267 sections. v2.0 in progress (see [Roadmap](#roadmap--v20)).
+**Status:** v1.0 complete — 18 chapters, 270 sections. v2.0 in progress (see [Roadmap](#roadmap--v20)).
 
 Read online: [ruwgxo.com/book](https://ruwgxo.com/book)
 
@@ -90,7 +90,7 @@ Python 3.12+, NumPy, PyTorch, scikit-learn, Transformers, FastAPI, MLflow
 
 ## Scope
 
-LLM security focus. Out of scope: CV security, RL security, federated learning attacks.
+LLM security focus. Computer-vision, reinforcement-learning and federated-learning security are not primary topics; they appear only where they illustrate a threat to ML systems generally (for example, physical adversarial examples in Section 10.8 and federated gradient poisoning in Section 8.14).
 
 ---
 
