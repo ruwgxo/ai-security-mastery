@@ -73,7 +73,8 @@ The book is authored as structured YAML under `book/`. Each chapter has an index
 - **Running prototype**: a live detection endpoint built from the book's own
   chapters — read the theory, then query the system built from it
 - **Readable-format generator**: a proper, reusable YAML-book site generator,
-  replacing the interim build script behind the current site
+  replacing the interim build script behind the current site (kept outside this
+  repository until then; this repo holds book content only)
 - **Executable notebooks in the browser**: JupyterLite on the book site — no
   install, no server, no account
 - **Continuous verification**: every embedded code block executed on every commit
