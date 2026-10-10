@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """build_site.py — AI Security Mastery book site generator
 Run from repo root: python3 tools/build_site.py
-Outputs docs/index.html — enable GitHub Pages on /docs folder.
+Outputs docs/index.html (build output, not committed); CI deploys it to ruwgxo.github.io.
+Exits non-zero if a section fails to parse or a chapter index names a missing section.
 """
 
-import glob, json, re, yaml
+import glob, json, re, sys, yaml
 from pathlib import Path
 from html import escape
 
@@ -16,15 +17,12 @@ OUT_DIR  = Path('docs')
 def load_yaml(path):
     with open(path, encoding='utf-8', errors='replace') as f:
         raw = f.read()
-    try:
-        docs = list(yaml.safe_load_all(raw))
-        merged = {}
-        for d in docs:
-            if isinstance(d, dict):
-                merged.update(d)
-        return merged
-    except Exception:
-        return {}
+    # Parse errors propagate so main() reports them instead of rendering an empty section.
+    merged = {}
+    for d in yaml.safe_load_all(raw):
+        if isinstance(d, dict):
+            merged.update(d)
+    return merged
 
 # ── Content extraction ────────────────────────────────────────────────────────
 
@@ -316,6 +314,29 @@ def build_toc():
     return [{'num':ch,'title':CH_TITLES.get(ch,f'Chapter {ch}'),'sections':ch_map[ch]}
             for ch in sorted(ch_map)]
 
+def check_chapter_indexes():
+    """Every section file a chapter index names must exist, unless the entry is marked planned."""
+    problems = []
+    for idx in sorted(BOOK_DIR.glob('chapter_*_index.yaml')):
+        try:
+            doc = load_yaml(idx)
+        except yaml.YAMLError as e:
+            problems.append(f"{idx.name}: {e}")
+            continue
+        stack = [doc]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                fn = node.get('filename')
+                planned = str(node.get('status', '')).startswith('planned')
+                if isinstance(fn, str) and fn.startswith('section_') and not planned \
+                        and not (BOOK_DIR / fn).exists():
+                    problems.append(f"{idx.name}: references missing {fn}")
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+    return problems
+
 # ── HTML shell ────────────────────────────────────────────────────────────────
 
 CSS = """
@@ -535,7 +556,7 @@ SHELL = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Security Mastery — Raghav Dinesh</title>
-<meta name="description" content="AI Security Mastery: From ML Fundamentals to Production Detection Systems. Free open-source book, 182 sections.">
+<meta name="description" content="AI Security Mastery: From ML Fundamentals to Production Detection Systems. Free open-source book, __SECTION_COUNT__ sections.">
 <link rel="alternate" type="text/plain" href="/llms.txt">
 <style>{CSS}</style>
 </head>
@@ -616,9 +637,13 @@ def main():
     print(f"\n✓ {out} — {kb} KB, {len(secs)} sections, {len(errors)} errors")
     for n, e in errors[:5]:
         print(f"  ! {n}: {e}")
-    print("\nDeploy:")
-    print("  git add docs/index.html && git commit -m 'build: full content render' && git push")
-    print("  ruwgxo.github.io → copy to book.html with ← ruwgxo.com link")
+    index_errors = check_chapter_indexes()
+    for e in index_errors:
+        print(f"  ! {e}")
+    if errors or index_errors:
+        sys.exit(1)
+    print("\nDeploy: docs/ is build output and is not committed. Pushing book/ changes to main")
+    print("  runs .github/workflows/deploy-site.yml, which copies it to ruwgxo.github.io/book/index.html")
 
 if __name__ == '__main__':
     main()
