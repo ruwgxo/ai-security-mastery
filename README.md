@@ -6,7 +6,7 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![DOI](https://zenodo.org/badge/1125137519.svg)](https://doi.org/10.5281/zenodo.22131915)
 
-**Status:** v1.0 complete — 18 chapters, 270 sections. v2.0 in progress (see [Roadmap](#roadmap--v20)).
+**Status:** v1.1 — 18 chapters, 270 sections; v1 content complete. v2.0 in progress (see [Roadmap](#roadmap--v20)).
 
 Read online: [ruwgxo.com/book](https://ruwgxo.com/book)
 
