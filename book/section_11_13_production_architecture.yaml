@@ -139,27 +139,31 @@ prose_content:
       architecture combines all three, assigning each detection primitive to the pattern
       that best fits its latency requirement, confidence level, and temporal scope:
 
-      Inline gateway: high-confidence, low-latency detections that must block. Track 1
-      (keyword injection, L1) and Track 4 (label distribution anomaly in training calls,
-      L1) run inline and block. Their L1 signature rules are fast, deterministic, and
-      have FPR targets at 1% — low enough to tolerate blocking without excessive false
-      blocks. Track 3 (semantic gating, L2) runs inline and flags rather than blocks:
-      the 5% FPR target is acceptable for flagging but too high for blocking. The inline
+      Inline gateway: high-confidence, low-latency detections that must block. Track 1's
+      keyword rule (L1) runs inline and blocks, as does the Chapter 8 poisoning monitor's
+      label-distribution rule on the training API (L1; upstream of the gateway, but the
+      same inline pattern). These L1 signature rules are fast, deterministic, and have FPR
+      targets at or below 1% — low enough to tolerate blocking without excessive false
+      blocks. Track 1's centroid gate (L2) and Track 3's shot counter (L1) run inline and
+      flag rather than block: the centroid gate's 5% FPR target is acceptable for flagging
+      but too high for blocking. The inline
       gateway is responsible for the binary block/pass decision on every request; flagging
       decisions pass through to the application but are logged for sidecar and SIEM
       consumption.
 
       Sidecar: moderate-confidence detections and ML inference that cannot afford to
-      block but should produce near-real-time alerts. Track 2''s jailbreak classifier
-      (L3 ML), Track 6 (adversarial entropy heuristic, L2), and Track 7''s compound
-      squeezer+classifier (L2+L3) run in the sidecar. These tracks are too expensive
+      block but should produce near-real-time alerts. Track 1''s injection and semantic
+      jailbreak classifiers (L3 ML), Track 2 (perplexity, L2, which needs a reference
+      language model forward pass), Tracks 4 and 5 (per-turn session scorers, L4, backed
+      by the session store), and Track 7''s compound squeezer+classifier (L2+L3) run in
+      the sidecar. These tracks are too expensive
       to run synchronously on every request in the inline path — the ML inference alone
       adds 15–30ms. In the sidecar, they run asynchronously on a copy of the request,
       producing alerts within 30–120 seconds of the request. The sidecar also runs the
       Chapter 12 ML detectors when they are deployed.
 
-      SIEM: stateful and campaign-level detection. Track 5 (model extraction session
-      accumulator, L4) runs in the SIEM. The accumulator requires cross-session state
+      SIEM: stateful and campaign-level detection. Track 6''s per-user accumulation
+      (model extraction, L4) runs in the SIEM. The accumulator requires cross-session state
       that is most naturally maintained in a SIEM''s windowing query engine. The SIEM
       also runs the Section 11.12 threat hunting queries and the Section 11.07
       multi-event correlation rules. Alert latency from the SIEM is 5–60 minutes for
@@ -167,12 +171,12 @@ prose_content:
       requires 500 queries to accumulate.
 
       The hybrid assignment by gateway track:
-      Inline (block): Track 1, Track 4.
-      Inline (flag): Track 3.
-      Sidecar (flag, near-real-time): Track 2 (ML component), Track 6, Track 7.
-      SIEM (alert, windowed): Track 5, correlation rules, threat hunting queries.
-      Track 2 (Sigma component) runs inline as a fast L1 check; the ML component
-      runs in the sidecar as a follow-up for prompts that pass the L1 check.
+      Inline (block): Track 1 keyword rule; Chapter 8 poisoning rule on the training API.
+      Inline (flag): Track 1 centroid gate, Track 3, Track 6 per-request rule.
+      Sidecar (flag, near-real-time): Track 1 classifiers, Track 2, Tracks 4 and 5, Track 7.
+      SIEM (alert, windowed): Track 6 per-user accumulation, correlation rules, threat
+      hunting queries. Track 1''s keyword rule runs inline as a fast L1 check; its ML
+      classifiers run in the sidecar as a follow-up for prompts that pass the L1 check.
 
   part_3_integration_points:
     heading: 'Integration Points: Pre-Inference, Post-Inference, Session Streaming'
@@ -227,35 +231,36 @@ prose_content:
 
       Fail-open vs fail-closed by layer:
 
-      L1 Signature rules (Track 1, Track 4): fail-closed. These are fast, deterministic
+      L1 Signature rules (Track 1 keywords, Chapter 8 poisoning rule): fail-closed. These are fast, deterministic
       rules with no external dependencies. If the rule engine crashes, the detection
       system has a bug — this is not an expected failure mode. Fail-closed here means
       blocking all requests until the rule engine is restored, which is the correct
       response to a complete failure of the detection foundation.
 
-      L2 Heuristic rules (Track 3, Track 6, Track 7 squeezer): fail-open with logging.
+      L2 Heuristic rules (Track 1 centroid gate, Track 2, Track 7 squeezer): fail-open with logging.
       Heuristic computation may time out under extreme load (embedding computation takes
       2–5ms; under load, this can exceed the latency budget). If the heuristic times out,
       the request passes with a logged warning: gateway_action=pass, detection_timeout=true.
       The SIEM collects these timeout events; a spike in timeouts is an alert that the
       detection system is under stress.
 
-      L3 ML inference (Track 2 classifier, Track 7 adversarial classifier, sidecar):
+      L3 ML inference (Track 1 classifiers, Track 7 adversarial classifier, sidecar):
       fail-open. ML inference is the most latency-variable component and the most
       likely to time out. Fail-closed for ML inference would cause availability impact
       during any spike in model serving load. Fail-open with timeout logging is the
       correct policy; the SIEM alert on timeout spikes provides the visibility needed
       to investigate.
 
-      L4 Session accumulator (Track 5, SIEM): fail-open by design. SIEM-based detection
+      L4 Stateful detection (Tracks 4 and 5 in the sidecar, Track 6 in the SIEM): fail-open
+      by design. SIEM-based detection
       always has alert latency; the failure mode of a SIEM query timing out is that the
       alert fires late, not that the request is blocked. No availability impact.
 
       Circuit breakers: the gateway implements a circuit breaker per detection track.
-      If Track 3 times out more than 5 times in 60 seconds, the circuit opens: Track 3
-      is bypassed for the next 60 seconds, all requests pass through as if Track 3 did
-      not exist, and the SIEM receives a circuit_open event for Track 3. After 60
-      seconds, the circuit enters half-open state: one in ten requests tests Track 3;
+      If Track 1''s centroid gate times out more than 5 times in 60 seconds, the circuit
+      opens: the gate is bypassed for the next 60 seconds, all requests pass through as if
+      it did not exist, and the SIEM receives a circuit_open event for the gate. After 60
+      seconds, the circuit enters half-open state: one in ten requests tests the gate;
       if it succeeds, the circuit closes; if it fails again, the open period extends.
       Circuit breakers prevent a slow detection component from cascading into full
       gateway unavailability.
@@ -274,7 +279,7 @@ prose_content:
       Zero-rate alerts are as important as high-rate alerts.
 
       Signal 2 — Detection latency per component (P50/P95/P99 histogram). Latency
-      drift signals resource pressure before the component fails. Track 3 latency
+      drift signals resource pressure before the component fails. Centroid-gate latency
       creeping from 4ms to 12ms over a week indicates embedding service degradation
       that will eventually cause timeouts.
 
@@ -322,8 +327,8 @@ prose_content:
 
       Throughput scaling. The inline gateway from Chapter 11 is a single-process Python
       service. Chapter 14 adds horizontal scaling: a stateless gateway design that allows
-      N gateway instances behind a load balancer, with the session state (Track 5
-      accumulator) moved to a shared Redis store. The Chapter 14 gateway processes
+      N gateway instances behind a load balancer, with the session state (Tracks 4 and 5,
+      and Track 6''s per-user windows) moved to a shared Redis store. The Chapter 14 gateway processes
       10,000+ requests per second across the scaled fleet.
 
       Cost modelling. Each detection track has a cost per request in terms of compute
@@ -384,33 +389,36 @@ reference_materials:
       - 'Rationale'
       - 'Fail Mode'
     rows:
-      - ['Track 1 — Direct Injection (Sigma)', 'Inline', 'Block',
+      - ['Track 1 — Keyword rule (L1)', 'Inline', 'Block',
          'L1 keyword rules are microsecond-fast; 1% FPR acceptable for blocking; must prevent injection from reaching model',
          'Fail-closed: engine failure → all requests blocked until restored']
-      - ['Track 2 — Jailbreak (Sigma L1 component)', 'Inline', 'Flag',
-         'Fast L1 keyword check; 1% FPR too high to block (jailbreak attempts may be legitimate security research); flags for sidecar follow-up',
-         'Fail-open: timeout → request passes with detection_timeout flag']
-      - ['Track 2 — Jailbreak (ML classifier L3)', 'Sidecar', 'Flag',
-         'ML inference adds 15ms; too expensive for synchronous blocking path; near-real-time alert is sufficient',
-         'Fail-open: sidecar queue full → alert delayed; no model impact']
-      - ['Track 3 — Semantic Gating', 'Inline', 'Flag',
+      - ['Track 1 — Centroid gate (L2)', 'Inline', 'Flag',
          '5% FPR too high to block; embedding computation adds 4ms but is in the latency budget; inline flag allows downstream contextual override',
          'Fail-open: timeout → request passes with detection_timeout flag']
-      - ['Track 4 — Poisoning Monitor', 'Inline', 'Block (training API)',
-         'Training API calls are low volume; L1 label distribution anomaly is fast; must prevent malicious training data from reaching pipeline',
-         'Fail-closed: training API unavailable if rule engine crashes']
-      - ['Track 5 — Extraction Signals (Sigma)', 'Inline', 'Flag',
-         'Per-request Sigma rule is fast; flags suspicious individual requests for session accumulator correlation',
-         'Fail-open: timeout → request passes with detection_timeout flag']
-      - ['Track 5 — Extraction Signals (session accumulator)', 'SIEM', 'Alert',
-         'Session accumulation requires cross-request state; SIEM windowing engine is natural home; alert latency acceptable for campaign detection',
-         'Alert latency increases if SIEM falls behind; no model impact']
-      - ['Track 6 — Adversarial Entropy', 'Sidecar', 'Flag',
-         '0.5% FPR and 2ms entropy computation; borderline for inline but moved to sidecar to protect Track 7 latency budget',
+      - ['Track 1 — Injection and jailbreak classifiers (L3)', 'Sidecar', 'Flag',
+         'ML inference adds 15ms; too expensive for synchronous blocking path; near-real-time alert is sufficient',
          'Fail-open: sidecar queue full → alert delayed; no model impact']
+      - ['Track 2 — Perplexity detector', 'Sidecar', 'Flag',
+         'Needs a reference language model forward pass (~6ms); 0.5% FPR suits the adversarial review queue',
+         'Fail-open: sidecar queue full → alert delayed; no model impact']
+      - ['Track 3 — Shot-count detector', 'Inline', 'Flag',
+         'Counting dialogue turns in the assembled context is sub-millisecond; flags many-shot prompts for review',
+         'Fail-open: timeout → request passes with detection_timeout flag']
+      - ['Tracks 4 and 5 — Trajectory and coherence scorers', 'Sidecar', 'Flag',
+         'Per-turn scoring against session state in the shared store; a flag one turn late is acceptable for multi-turn attacks',
+         'Fail-open: session store unavailable → scores not updated; alert on store errors']
+      - ['Track 6 — Per-request extraction rule', 'Inline', 'Flag',
+         'Per-request Sigma rule is fast; flags suspicious individual requests for per-user correlation in the SIEM',
+         'Fail-open: timeout → request passes with detection_timeout flag']
+      - ['Track 6 — Per-user query accumulation', 'SIEM', 'Alert',
+         'Cross-request state; SIEM windowing engine is natural home; alert latency acceptable for campaign detection',
+         'Alert latency increases if SIEM falls behind; no model impact']
       - ['Track 7 — Squeezer+Classifier', 'Sidecar', 'Flag',
          'Squeezer (8ms) + classifier (5ms) totals 13ms; too expensive for inline at scale; sidecar provides near-real-time coverage without latency cost',
          'Fail-open: sidecar queue full → alert delayed; no model impact']
+      - ['Upstream — Chapter 8 poisoning rule (training API)', 'Inline', 'Block (training API)',
+         'Training API calls are low volume; L1 label distribution anomaly is fast; must prevent malicious training data from reaching pipeline',
+         'Fail-closed: training API unavailable if rule engine crashes']
 
   table_3_observability_signals:
     title: 'Detection System Observability Signals'
@@ -548,7 +556,7 @@ deliverables:
                   'undetected (fail-open) depending on policy per track'
               ),
               best_for='High-confidence L1/L2 rules that must block; real-time decisions',
-              infrastructure_requirement='Lightweight Python service in request path; stateless except Track 5 hook',
+              infrastructure_requirement='Lightweight Python service in request path; stateless except the Track 6 per-request hook',
           ),
           ArchitecturePattern(
               pattern=Pattern.SIDECAR,
@@ -584,8 +592,8 @@ deliverables:
 
       TRACK_PLACEMENTS: list[TrackPlacement] = [
           TrackPlacement(
-              track_id=1, track_name='Direct Injection Detection',
-              component='Sigma keyword rule',
+              track_id=1, track_name='Injection and Semantic Classifiers',
+              component='Injection keyword rule',
               pattern=Pattern.INLINE_GATEWAY, action=Action.BLOCK,
               fail_mode=FailMode.FAIL_CLOSED,
               latency_ms=0.05,
@@ -593,26 +601,8 @@ deliverables:
               fail_description='Engine failure → all requests blocked until rule engine restored.',
           ),
           TrackPlacement(
-              track_id=2, track_name='Jailbreak Detection (Sigma L1)',
-              component='Keyword Sigma rule',
-              pattern=Pattern.INLINE_GATEWAY, action=Action.FLAG,
-              fail_mode=FailMode.FAIL_OPEN,
-              latency_ms=0.05,
-              rationale='Fast L1 check; 1% FPR too high to block without analyst review; flags for sidecar ML follow-up.',
-              fail_description='Timeout → request passes with detection_timeout=true logged for SIEM.',
-          ),
-          TrackPlacement(
-              track_id=2, track_name='Jailbreak Detection (ML classifier L3)',
-              component='Jailbreak embedding classifier',
-              pattern=Pattern.SIDECAR, action=Action.FLAG,
-              fail_mode=FailMode.FAIL_OPEN,
-              latency_ms=0.0,
-              rationale='ML inference adds 15ms; too expensive for synchronous path; near-real-time alert is sufficient.',
-              fail_description='Queue full → alert delayed; no model availability impact.',
-          ),
-          TrackPlacement(
-              track_id=3, track_name='Semantic Similarity Gating',
-              component='Cosine similarity gate',
+              track_id=1, track_name='Injection and Semantic Classifiers',
+              component='Centroid-similarity gate',
               pattern=Pattern.INLINE_GATEWAY, action=Action.FLAG,
               fail_mode=FailMode.FAIL_OPEN,
               latency_ms=4.0,
@@ -620,26 +610,62 @@ deliverables:
               fail_description='Timeout → request passes with detection_timeout=true logged.',
           ),
           TrackPlacement(
-              track_id=4, track_name='Data Poisoning Monitor',
-              component='Label distribution Sigma rule',
-              pattern=Pattern.INLINE_GATEWAY, action=Action.BLOCK,
-              fail_mode=FailMode.FAIL_CLOSED,
-              latency_ms=0.05,
-              rationale='Training API calls are low-volume; L1 rule is fast; must prevent malicious data reaching training pipeline.',
-              fail_description='Engine failure → training API unavailable until restored.',
+              track_id=1, track_name='Injection and Semantic Classifiers',
+              component='Injection and jailbreak classifiers',
+              pattern=Pattern.SIDECAR, action=Action.FLAG,
+              fail_mode=FailMode.FAIL_OPEN,
+              latency_ms=0.0,
+              rationale='ML inference adds 15ms; too expensive for synchronous path; near-real-time alert is sufficient.',
+              fail_description='Queue full → alert delayed; no model availability impact.',
           ),
           TrackPlacement(
-              track_id=5, track_name='Model Extraction Signals (per-request Sigma)',
+              track_id=2, track_name='Perplexity Detector',
+              component='Perplexity detector',
+              pattern=Pattern.SIDECAR, action=Action.FLAG,
+              fail_mode=FailMode.FAIL_OPEN,
+              latency_ms=0.0,
+              rationale='Reference language model forward pass (~6ms); sidecar keeps it off the inline budget.',
+              fail_description='Queue full → alert delayed; no model availability impact.',
+          ),
+          TrackPlacement(
+              track_id=3, track_name='Shot-Count Detector',
+              component='Shot-count detector',
+              pattern=Pattern.INLINE_GATEWAY, action=Action.FLAG,
+              fail_mode=FailMode.FAIL_OPEN,
+              latency_ms=0.2,
+              rationale='Sub-millisecond count of dialogue turns in the assembled context; flags many-shot prompts.',
+              fail_description='Timeout → request passes with detection_timeout=true logged.',
+          ),
+          TrackPlacement(
+              track_id=4, track_name='Trajectory Anomaly Scorer',
+              component='Trajectory anomaly scorer',
+              pattern=Pattern.SIDECAR, action=Action.FLAG,
+              fail_mode=FailMode.FAIL_OPEN,
+              latency_ms=0.0,
+              rationale='Per-turn scoring against session state in the shared store; a flag one turn late is acceptable.',
+              fail_description='Session store unavailable → scores not updated; alert on store errors.',
+          ),
+          TrackPlacement(
+              track_id=5, track_name='Coherence Analyser',
+              component='Coherence analyser',
+              pattern=Pattern.SIDECAR, action=Action.FLAG,
+              fail_mode=FailMode.FAIL_OPEN,
+              latency_ms=0.0,
+              rationale='Per-turn scoring of payload fragments against session state; same placement as Track 4.',
+              fail_description='Session store unavailable → scores not updated; alert on store errors.',
+          ),
+          TrackPlacement(
+              track_id=6, track_name='Query Monitor and Rate Limiter',
               component='Per-request extraction Sigma rule',
               pattern=Pattern.INLINE_GATEWAY, action=Action.FLAG,
               fail_mode=FailMode.FAIL_OPEN,
               latency_ms=0.05,
-              rationale='Fast L1 flag; identifies suspicious individual requests for session accumulator correlation in SIEM.',
+              rationale='Fast L1 flag; identifies suspicious individual requests for per-user correlation in SIEM.',
               fail_description='Timeout → request passes with detection_timeout=true logged.',
           ),
           TrackPlacement(
-              track_id=5, track_name='Model Extraction Signals (session accumulator)',
-              component='Session state accumulator',
+              track_id=6, track_name='Query Monitor and Rate Limiter',
+              component='Per-user query accumulator',
               pattern=Pattern.SIEM, action=Action.ALERT,
               fail_mode=FailMode.FAIL_OPEN,
               latency_ms=0.0,
@@ -647,22 +673,22 @@ deliverables:
               fail_description='SIEM ingestion delay → alert latency increase; no model availability impact.',
           ),
           TrackPlacement(
-              track_id=6, track_name='Adversarial Input Detection',
-              component='Entropy heuristic',
-              pattern=Pattern.SIDECAR, action=Action.FLAG,
-              fail_mode=FailMode.FAIL_OPEN,
-              latency_ms=0.0,
-              rationale='0.5% FPR and 2ms compute; moved to sidecar to protect inline latency budget for Track 3 and Track 7.',
-              fail_description='Queue full → alert delayed; no model availability impact.',
-          ),
-          TrackPlacement(
-              track_id=7, track_name='Adversarial Detection Ensemble',
+              track_id=7, track_name='Adversarial Detection',
               component='Squeezer (L2) + adversarial classifier (L3)',
               pattern=Pattern.SIDECAR, action=Action.FLAG,
               fail_mode=FailMode.FAIL_OPEN,
               latency_ms=0.0,
               rationale='Squeezer (8ms) + classifier (5ms) = 13ms synchronous; too expensive for inline at scale; sidecar provides near-real-time.',
               fail_description='Queue full → alert delayed; no model availability impact.',
+          ),
+          TrackPlacement(
+              track_id=0, track_name='Upstream: Chapter 8 Poisoning Monitor',
+              component='Label distribution Sigma rule',
+              pattern=Pattern.INLINE_GATEWAY, action=Action.BLOCK,
+              fail_mode=FailMode.FAIL_CLOSED,
+              latency_ms=0.05,
+              rationale='Training API calls are low-volume; L1 rule is fast; must prevent malicious data reaching training pipeline.',
+              fail_description='Engine failure → training API unavailable until restored.',
           ),
       ]
 
@@ -838,6 +864,15 @@ deliverables:
           coverage_gaps: list[str]
           total_inline_latency_ms: float
 
+      # Synchronous cost if a sidecar component has to move inline
+      SIDECAR_LATENCY_ESTIMATES_MS: dict[str, float] = {
+          'Injection and jailbreak classifiers': 15.0,
+          'Perplexity detector': 6.0,
+          'Trajectory anomaly scorer': 1.0,
+          'Coherence analyser': 1.0,
+          'Squeezer (L2) + adversarial classifier (L3)': 13.0,
+      }
+
       def design_architecture(req: DeploymentRequirements) -> ArchitectureRecommendation:
           placements: list[TrackPlacement] = []
           warnings: list[str] = []
@@ -861,8 +896,7 @@ deliverables:
               if tp.pattern == Pattern.SIDECAR and not req.sidecar_available:
                   if tp.latency_ms == 0.0:
                       # originally sidecar; estimate its latency
-                      est_latency = {'Track 2 ML': 15.0, 'Track 6': 2.0, 'Track 7': 13.0}.get(
-                          tp.component[:7], 10.0)
+                      est_latency = SIDECAR_LATENCY_ESTIMATES_MS.get(tp.component, 10.0)
                   else:
                       est_latency = tp.latency_ms
 
@@ -887,8 +921,8 @@ deliverables:
               # SIEM not available: flag SIEM components as gaps
               if tp.pattern == Pattern.SIEM and not req.siem_available:
                   coverage_gaps.append(
-                      f'T{tp.track_id} {tp.component}: SIEM unavailable — session accumulator '
-                      f'not deployable. Track 5 session-level detection is a gap.'
+                      f'T{tp.track_id} {tp.component}: SIEM unavailable — per-user accumulator '
+                      f'not deployable. Track 6 campaign-level detection is a gap.'
                   )
                   continue
 
@@ -907,7 +941,7 @@ deliverables:
           if req.blocking_required and not blocking_placements:
               warnings.append(
                   'Blocking is required but no track is configured to block. '
-                  'Track 1 must be deployed inline with fail-closed policy.'
+                  'The Track 1 keyword rule must be deployed inline with fail-closed policy.'
               )
 
           # Inline latency check
@@ -915,7 +949,7 @@ deliverables:
           if total_inline > req.inline_latency_budget_ms:
               warnings.append(
                   f'Total inline latency {total_inline:.1f}ms exceeds budget '
-                  f'{req.inline_latency_budget_ms:.1f}ms. Consider moving Track 3 or Track 6 to sidecar.'
+                  f'{req.inline_latency_budget_ms:.1f}ms. Consider moving the Track 1 centroid gate to the sidecar.'
               )
 
           return ArchitectureRecommendation(
@@ -1006,8 +1040,9 @@ common_mistakes:
       rule that blocks causes legitimate users to be unable to use the service —
       which is a denial of service caused by the detection system, not by an attacker.
     correct_approach: >
-      Inline blocking is reserved for high-confidence, low-FPR, fast rules: Track 1
-      (1% FPR, microseconds) and Track 4 (training pipeline only, low volume). All
+      Inline blocking is reserved for high-confidence, low-FPR, fast rules: Track 1's
+      keyword rule (1% FPR, microseconds) and the Chapter 8 poisoning rule (training API
+      only, low volume). All
       other detections flag rather than block, and moderate-confidence ML detections
       run asynchronously in the sidecar where they cannot affect request latency.
 
@@ -1061,8 +1096,8 @@ common_mistakes:
       correct; fail-closed for slow probabilistic components is an availability risk.
     correct_approach: >
       Apply fail-closed only to the components where blocking on failure is the correct
-      security outcome: Track 1 (L1 signature, blocking) and Track 4 (training pipeline,
-      blocking). Apply fail-open with timeout logging to all heuristic and ML components.
+      security outcome: Track 1's keyword rule (L1 signature, blocking) and the Chapter 8
+      poisoning rule (training pipeline, blocking). Apply fail-open with timeout logging to all heuristic and ML components.
       The timeout log feeds the observability system; the SIEM coverage regression
       signal catches when timeouts become systematic.
 
@@ -1091,9 +1126,11 @@ section_summary:
     system: the inline gateway blocks high-confidence signals before model inference;
     the sidecar flags moderate-confidence signals asynchronously with zero latency
     impact; and the SIEM detects campaigns over extended time windows. The seven-track
-    gateway distributes across all three patterns in the hybrid architecture: Tracks 1
-    and 4 block inline, Track 3 flags inline, Tracks 2 (ML), 6, and 7 flag via sidecar,
-    and Track 5 (session accumulator) alerts via SIEM. Failure mode design applies
+    gateway distributes across all three patterns in the hybrid architecture: Track 1's
+    keyword rule blocks inline; Track 1's centroid gate, Track 3 and Track 6's per-request
+    rule flag inline; Track 1's classifiers and Tracks 2, 4, 5 and 7 flag via sidecar; and
+    Track 6's per-user accumulation alerts via SIEM. The Chapter 8 poisoning rule blocks
+    inline on the training API. Failure mode design applies
     fail-closed to fast deterministic rules and fail-open to heuristic and ML components.
     Eight observability signals — alert rate, detection latency, circuit breaker state,
     timeout rate, queue depth, FPR per rule, coverage regression, and log field
@@ -1159,9 +1196,9 @@ metadata:
     - part-3
   atlas_anchors:
     - 'Architecture-level: hybrid pattern positions detection against all ATLAS tactic categories'
-    - 'Inline blocking covers: AML.T0051 (Track 1), AML.T0020 (Track 4)'
-    - 'Sidecar flags cover: AML.T0054 (Track 2 ML), AML.T0043 (Track 7), AML.T0015 (Track 7)'
-    - 'SIEM alerts cover: AML.T0040 session accumulation (Track 5)'
+    - 'Inline blocking covers: AML.T0051 (Track 1), AML.T0020 (Chapter 8 training API rule)'
+    - 'Sidecar flags cover: AML.T0054 (Track 1 classifiers, Tracks 2, 4, 5), AML.T0043 (Tracks 2, 7), AML.T0015 (Track 7)'
+    - 'SIEM alerts cover: AML.T0040 per-user accumulation (Track 6)'
   word_count_estimate: 4400
   deliverables_count: 2
   common_mistakes_count: 5

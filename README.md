@@ -6,7 +6,7 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![DOI](https://zenodo.org/badge/1125137519.svg)](https://doi.org/10.5281/zenodo.22131915)
 
-**Status:** v1.0 complete — 18 chapters, 267 sections. v2.0 in progress (see [Roadmap](#roadmap--v20)).
+**Status:** v1.0 complete — 18 chapters, 270 sections. v2.0 in progress (see [Roadmap](#roadmap--v20)).
 
 Read online: [ruwgxo.com/book](https://ruwgxo.com/book)
 
@@ -73,7 +73,8 @@ The book is authored as structured YAML under `book/`. Each chapter has an index
 - **Running prototype**: a live detection endpoint built from the book's own
   chapters — read the theory, then query the system built from it
 - **Readable-format generator**: a proper, reusable YAML-book site generator,
-  replacing the interim build script behind the current site
+  replacing the interim build script behind the current site (kept outside this
+  repository until then; this repo holds book content only)
 - **Executable notebooks in the browser**: JupyterLite on the book site — no
   install, no server, no account
 - **Continuous verification**: every embedded code block executed on every commit
@@ -90,7 +91,7 @@ Python 3.12+, NumPy, PyTorch, scikit-learn, Transformers, FastAPI, MLflow
 
 ## Scope
 
-LLM security focus. Out of scope: CV security, RL security, federated learning attacks.
+LLM security focus. Computer-vision, reinforcement-learning and federated-learning security are not primary topics; they appear only where they illustrate a threat to ML systems generally (for example, physical adversarial examples in Section 10.8 and federated gradient poisoning in Section 8.14).
 
 ---
 
