@@ -568,25 +568,36 @@ deliverables:
           return model
 
 
-      def compute_confidence_scores(model, X: np.ndarray) -> np.ndarray:
+      def compute_confidence_scores(model, X: np.ndarray, y: Optional[np.ndarray] = None) -> np.ndarray:
           '''
-          Return maximum predicted class probability for each input.
+          Return each input's confidence: the probability of its true class when the
+          labels are known (the usual membership-inference setting -- the adversary holds
+          the record), otherwise the maximum class probability. Max confidence is a weak
+          signal: a confidently wrong prediction on a non-member looks like a member.
           Requires model to expose predict_proba(X).
           '''
           proba = model.predict_proba(X)
-          return proba.max(axis=1)
+          if y is None:
+              return proba.max(axis=1)
+          return proba[np.arange(len(X)), np.asarray(y, dtype=int)]
 
 
       def sweep_thresholds(
           member_scores: np.ndarray,
           non_member_scores: np.ndarray,
-          n_thresholds: int = 100,
+          n_thresholds: Optional[int] = None,
       ) -> List[Tuple[float, float, float, float]]:
           '''
           Sweep confidence thresholds and return (threshold, tpr, fpr, accuracy) tuples.
+          By default every observed score is a threshold, plus one above the maximum, so
+          the ROC curve is exact and runs from (0, 0) to (1, 1). Scores of an overfit model
+          bunch near 1.0, where an evenly spaced grid has almost no resolution.
           '''
           all_scores = np.concatenate([member_scores, non_member_scores])
-          thresholds = np.linspace(all_scores.min(), all_scores.max(), n_thresholds)
+          if n_thresholds is None:
+              thresholds = np.append(np.unique(all_scores), np.inf)
+          else:
+              thresholds = np.linspace(all_scores.min(), all_scores.max(), n_thresholds)
           results: List[Tuple[float, float, float, float]] = []
           n_members = len(member_scores)
           n_non_members = len(non_member_scores)
@@ -615,7 +626,8 @@ deliverables:
           sweep_sorted = sorted(sweep, key=lambda x: x[2])  # sort by FPR
           fprs = [s[2] for s in sweep_sorted]
           tprs = [s[1] for s in sweep_sorted]
-          auc = float(np.trapz(tprs, fprs))
+          trapezoid = getattr(np, 'trapezoid', None) or np.trapz  # trapz was removed in NumPy 2.4
+          auc = float(trapezoid(tprs, fprs))
           return abs(auc)
 
 
@@ -625,6 +637,8 @@ deliverables:
           X_non_members: np.ndarray,
           calibration_fraction: float = 0.5,
           rng: Optional[np.random.Generator] = None,
+          y_members: Optional[np.ndarray] = None,
+          y_non_members: Optional[np.ndarray] = None,
       ) -> MIAResult:
           '''
           Run confidence-based membership inference attack.
@@ -640,14 +654,20 @@ deliverables:
           cal_nm = X_non_members[:n_cal_nm]
           eval_nm = X_non_members[n_cal_nm:]
 
-          cal_m_scores = compute_confidence_scores(model, cal_m)
-          cal_nm_scores = compute_confidence_scores(model, cal_nm)
+          def labels(y, part):
+              if y is None:
+                  return None
+              return y[:n_cal_m] if part == 'cal_m' else y[n_cal_m:] if part == 'eval_m' else \
+                     y[:n_cal_nm] if part == 'cal_nm' else y[n_cal_nm:]
+
+          cal_m_scores = compute_confidence_scores(model, cal_m, labels(y_members, 'cal_m'))
+          cal_nm_scores = compute_confidence_scores(model, cal_nm, labels(y_non_members, 'cal_nm'))
           sweep = sweep_thresholds(cal_m_scores, cal_nm_scores)
           best_t, _, _, _ = select_best_threshold(sweep)
           auc = approximate_auc(sweep)
 
-          eval_m_scores = compute_confidence_scores(model, eval_m)
-          eval_nm_scores = compute_confidence_scores(model, eval_nm)
+          eval_m_scores = compute_confidence_scores(model, eval_m, labels(y_members, 'eval_m'))
+          eval_nm_scores = compute_confidence_scores(model, eval_nm, labels(y_non_members, 'eval_nm'))
           tp = float((eval_m_scores >= best_t).sum())
           fp = float((eval_nm_scores >= best_t).sum())
           tn = float((eval_nm_scores < best_t).sum())
@@ -687,7 +707,8 @@ deliverables:
           print(f'Train accuracy: {train_acc:.1%}  Test accuracy: {test_acc:.1%}')
           print(f'Generalisation gap: {train_acc - test_acc:.1%}')
 
-          result = run_confidence_mia(target, X_members, X_non_members[:400])
+          result = run_confidence_mia(target, X_members, X_non_members[:400],
+                                      y_members=y_members, y_non_members=y[400:800])
           print(f'\nConfidence-Based MIA Results:')
           print(f'  Threshold:  {result.threshold}')
           print(f'  TPR:        {result.tpr:.1%}')
@@ -800,11 +821,12 @@ deliverables:
                                  alpha=0.0001, random_state=42)
           target.fit(X_m, y_m)
 
-          conf_result = run_confidence_mia(target, X_m, X_nm)
+          conf_result = run_confidence_mia(target, X_m, X_nm, y_members=y_m, y_non_members=y_nm)
           loss_result = run_loss_mia(target, X_m, y_m, X_nm, y_nm)
 
           print('MEMBERSHIP INFERENCE COMPARISON -- Chapter 9 Section 9.6')
           header = f'{'Variant':<25} {'Accuracy':>10} {'TPR':>8} {'FPR':>8} {'AUC':>8}'
+          print(header)
           print('-' * 65)
           for r in [conf_result, loss_result]:
               print(f'{r.attack_variant:<25} {r.accuracy:>9.1%} {r.tpr:>7.1%} {r.fpr:>7.1%} {r.auc_approx:>7.4f}')
@@ -875,20 +897,32 @@ deliverables:
           return shadow_models
 
 
+      def membership_features(proba: np.ndarray, y: Optional[np.ndarray] = None) -> np.ndarray:
+          '''
+          Attack features for each record. With the record's true label (the Shokri et al.
+          setting: the adversary holds the record and asks whether it was trained on), the
+          confidence on the true class is the membership signal. Without labels, the sorted
+          confidence vector is used, which carries much less signal.
+          '''
+          if y is None:
+              return np.sort(proba, axis=1)[:, ::-1]
+          p_true = proba[np.arange(len(y)), y]
+          return np.column_stack([p_true, np.log(np.clip(p_true, 1e-12, 1.0)), proba.max(axis=1)])
+
+
       def collect_meta_training_data(
           shadow_models: List[Tuple],
+          use_labels: bool = True,
       ) -> Tuple[np.ndarray, np.ndarray]:
           '''
-          Collect (confidence_vector, membership_label) pairs from all shadow models.
-          Returns X_meta (confidence vectors) and y_meta (0=non-member, 1=member).
+          Collect (attack_features, membership_label) pairs from all shadow models.
+          Returns X_meta (attack features) and y_meta (0=non-member, 1=member).
           '''
           X_meta_parts: List[np.ndarray] = []
           y_meta_parts: List[np.ndarray] = []
-          for model, X_in, _, X_out, _ in shadow_models:
-              in_proba = model.predict_proba(X_in)
-              out_proba = model.predict_proba(X_out)
-              X_meta_parts.append(in_proba)
-              X_meta_parts.append(out_proba)
+          for model, X_in, y_in, X_out, y_out in shadow_models:
+              X_meta_parts.append(membership_features(model.predict_proba(X_in), y_in if use_labels else None))
+              X_meta_parts.append(membership_features(model.predict_proba(X_out), y_out if use_labels else None))
               y_meta_parts.append(np.ones(len(X_in), dtype=int))
               y_meta_parts.append(np.zeros(len(X_out), dtype=int))
           return np.vstack(X_meta_parts), np.concatenate(y_meta_parts)
@@ -907,26 +941,32 @@ deliverables:
           n_shadow: int = 5,
           shadow_train_fraction: float = 0.5,
           rng: Optional[np.random.Generator] = None,
+          y_target_members: Optional[np.ndarray] = None,
+          y_target_non_members: Optional[np.ndarray] = None,
       ) -> ShadowModelResult:
           '''
           Full shadow model attack pipeline.
           target_model: victim model (predict_proba required)
           X_pool / y_pool: data available to adversary for shadow training
           X_target_members / X_target_non_members: records to classify
+          y_target_*: the records' true labels; without them the label-free features are used
+          shadow_model_class / kwargs and shadow_train_fraction should mimic how the target
+          was trained -- the shadow models stand in for it.
           '''
+          use_labels = y_target_members is not None and y_target_non_members is not None
           shadow_models = train_shadow_models(
               shadow_model_class, shadow_model_kwargs,
               X_pool, y_pool, n_shadow, shadow_train_fraction, rng,
           )
-          X_meta, y_meta = collect_meta_training_data(shadow_models)
+          X_meta, y_meta = collect_meta_training_data(shadow_models, use_labels)
           meta_clf = meta_classifier_class(**meta_classifier_kwargs)
           meta_clf.fit(X_meta, y_meta)
 
           # Apply meta-classifier to target model outputs
-          target_m_proba = target_model.predict_proba(X_target_members)
-          target_nm_proba = target_model.predict_proba(X_target_non_members)
-          m_preds = meta_clf.predict(target_m_proba)
-          nm_preds = meta_clf.predict(target_nm_proba)
+          m_preds = meta_clf.predict(membership_features(
+              target_model.predict_proba(X_target_members), y_target_members if use_labels else None))
+          nm_preds = meta_clf.predict(membership_features(
+              target_model.predict_proba(X_target_non_members), y_target_non_members if use_labels else None))
 
           tp = float(m_preds.sum())
           fp = float(nm_preds.sum())
@@ -944,33 +984,45 @@ deliverables:
 
 
       if __name__ == '__main__':
+          import warnings
+          from sklearn.exceptions import ConvergenceWarning
           from sklearn.linear_model import LogisticRegression
           from sklearn.neural_network import MLPClassifier
           from sklearn.datasets import make_classification
 
-          X, y = make_classification(n_samples=3000, n_features=20, random_state=42)
-          target = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500,
-                                 alpha=0.0001, random_state=42)
-          target.fit(X[:500], y[:500])
+          warnings.filterwarnings('ignore', category=ConvergenceWarning)
+          X, y = make_classification(n_samples=4000, n_features=20, n_informative=8,
+                                     flip_y=0.15, random_state=42)
+          n_train = 300
+          X_members, y_members = X[:n_train], y[:n_train]
+          X_non, y_non = X[3000:3000 + n_train], y[3000:3000 + n_train]
 
-          result = run_shadow_model_attack(
-              target_model=target,
-              shadow_model_class=MLPClassifier,
-              shadow_model_kwargs={'hidden_layer_sizes': (32,), 'max_iter': 300, 'random_state': 1},
-              meta_classifier_class=LogisticRegression,
-              meta_classifier_kwargs={'max_iter': 500},
-              X_pool=X[500:2000],
-              y_pool=y[500:2000],
-              X_target_members=X[:250],
-              X_target_non_members=X[2000:2250],
-              n_shadow=5,
-          )
           print(f'Shadow Model Attack -- Chapter 9 Section 9.6')
-          print(f'Shadow models trained: {result.n_shadow_models}')
-          print(f'Meta-training samples: {result.meta_train_size}')
-          print(f'Attack accuracy:       {result.attack_accuracy:.1%}')
-          print(f'TPR:                   {result.attack_tpr:.1%}')
-          print(f'FPR:                   {result.attack_fpr:.1%}')
+          print(f'Two targets that differ only in regularisation; shadow models trained the same way.')
+          print(f'Random-guess baseline: 50.0% accuracy.')
+          for name, alpha in (('overfit (alpha=1e-4)', 1e-4), ('regularised (alpha=10)', 10.0)):
+              kwargs = {'hidden_layer_sizes': (64, 32), 'max_iter': 2000, 'alpha': alpha}
+              target = MLPClassifier(random_state=42, **kwargs).fit(X_members, y_members)
+              gap = target.score(X_members, y_members) - target.score(X[3000:], y[3000:])
+              result = run_shadow_model_attack(
+                  target_model=target,
+                  shadow_model_class=MLPClassifier,
+                  shadow_model_kwargs={**kwargs, 'random_state': 1},
+                  meta_classifier_class=LogisticRegression,
+                  meta_classifier_kwargs={'max_iter': 1000},
+                  X_pool=X[n_train:3 * n_train],
+                  y_pool=y[n_train:3 * n_train],
+                  X_target_members=X_members, X_target_non_members=X_non,
+                  y_target_members=y_members, y_target_non_members=y_non,
+                  n_shadow=5, shadow_train_fraction=0.5,
+              )
+              print(f'\nTarget: {name}')
+              print(f'  Generalisation gap:    {gap:.1%}')
+              print(f'  Shadow models trained: {result.n_shadow_models}')
+              print(f'  Meta-training samples: {result.meta_train_size}')
+              print(f'  Attack accuracy:       {result.attack_accuracy:.1%}')
+              print(f'  TPR:                   {result.attack_tpr:.1%}')
+              print(f'  FPR:                   {result.attack_fpr:.1%}')
   - heading: threshold_attack.py
     id: deliverable_4
     filename: threshold_attack.py
@@ -1012,14 +1064,16 @@ deliverables:
           model,
           X_cal_members: np.ndarray,
           X_cal_non_members: np.ndarray,
-          n_sweep: int = 200,
+          n_sweep: Optional[int] = None,
+          y_cal_members: Optional[np.ndarray] = None,
+          y_cal_non_members: Optional[np.ndarray] = None,
       ) -> ThresholdCalibration:
           '''
           Calibrate a confidence threshold from a small set of known members
           and non-members. Returns the threshold with highest balanced accuracy.
           '''
-          m_scores = compute_confidence_scores(model, X_cal_members)
-          nm_scores = compute_confidence_scores(model, X_cal_non_members)
+          m_scores = compute_confidence_scores(model, X_cal_members, y_cal_members)
+          nm_scores = compute_confidence_scores(model, X_cal_non_members, y_cal_non_members)
           sweep = sweep_thresholds(m_scores, nm_scores, n_thresholds=n_sweep)
           best_t, best_tpr, best_fpr, best_acc = select_best_threshold(sweep)
           return ThresholdCalibration(
@@ -1035,10 +1089,12 @@ deliverables:
           calibration: ThresholdCalibration,
           X_eval_members: np.ndarray,
           X_eval_non_members: np.ndarray,
+          y_eval_members: Optional[np.ndarray] = None,
+          y_eval_non_members: Optional[np.ndarray] = None,
       ) -> MIAResult:
           '''Apply a calibrated threshold to evaluation members and non-members.'''
-          m_scores = compute_confidence_scores(model, X_eval_members)
-          nm_scores = compute_confidence_scores(model, X_eval_non_members)
+          m_scores = compute_confidence_scores(model, X_eval_members, y_eval_members)
+          nm_scores = compute_confidence_scores(model, X_eval_non_members, y_eval_non_members)
           sweep = sweep_thresholds(m_scores, nm_scores)
           auc = approximate_auc(sweep)
           t = calibration.best_threshold
@@ -1067,11 +1123,13 @@ deliverables:
           target.fit(X[:400], y[:400])
 
           # Adversary has 20 known members and 20 known non-members for calibration
-          calibration = calibrate_threshold(target, X[:20], X[400:420])
+          calibration = calibrate_threshold(target, X[:20], X[400:420],
+                                            y_cal_members=y[:20], y_cal_non_members=y[400:420])
           print(f'Calibrated threshold: {calibration.best_threshold}')
           print(f'Calibration accuracy: {calibration.calibration_accuracy:.1%}')
 
-          result = run_threshold_attack(target, calibration, X[20:200], X[420:600])
+          result = run_threshold_attack(target, calibration, X[20:200], X[420:600],
+                                        y_eval_members=y[20:200], y_eval_non_members=y[420:600])
           print(f'\nThreshold Attack Evaluation:')
           print(f'  TPR:        {result.tpr:.1%}')
           print(f'  FPR:        {result.fpr:.1%}')

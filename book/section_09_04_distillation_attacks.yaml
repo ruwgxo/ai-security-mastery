@@ -525,13 +525,15 @@ deliverables:
     description: >
       Soft-label distillation attack implementation. Queries a black-box classifier that returns
       probability vectors (grey-box access), builds a labelled training set of (input, soft_label)
-      pairs, and trains a student neural network using KL divergence loss against the victim's soft
-      outputs. Tracks fidelity vs query count to produce the budget-fidelity curve. Demonstrates the
-      information advantage of soft labels over the hard-label baseline.
+      pairs, and trains a student neural network to match the victim's soft outputs by regressing
+      the victim's centred log-probabilities. Tracks fidelity vs query count to produce the
+      budget-fidelity curve. Demonstrates the information advantage of soft labels over the
+      hard-label baseline.
     notes: >
-      Single quotes throughout per book convention. Requires numpy, sklearn, and scipy. Student
-      model is a simple MLPClassifier by default but accepts any estimator with fit() and
-      predict_proba() methods. Temperature scaling is parameterised. No hardcoded model
+      Single quotes throughout per book convention. Requires numpy, sklearn, and scipy. The
+      SoftLabelStudent regresses the victim's centred log-probabilities with an MLPRegressor; any
+      estimator with fit() and predict_proba() can be passed, and one without soft_targets is
+      trained on the argmax labels. Temperature scaling is parameterised. No hardcoded model
       architectures or feature dimensions.
     code: |
       # soft_label_distiller.py
@@ -579,6 +581,36 @@ deliverables:
           return float(np.mean(np.sum(p_clip * (np.log(p_clip) - np.log(q_clip)), axis=-1)))
 
 
+      class SoftLabelStudent:
+          '''
+          Student trained on the victim's probability vectors rather than its labels.
+          sklearn classifiers only accept hard labels, so the student regresses the
+          victim's centred log-probabilities (logit matching) with an MLPRegressor and
+          turns its outputs back into probabilities with a softmax.
+          '''
+
+          soft_targets = True
+
+          def __init__(self, hidden_layer_sizes=(32, 16), max_iter=2000, random_state=None) -> None:
+              from sklearn.neural_network import MLPRegressor
+              self._model = MLPRegressor(hidden_layer_sizes=hidden_layer_sizes, max_iter=max_iter,
+                                         random_state=random_state)
+
+          def fit(self, X: np.ndarray, proba: np.ndarray) -> 'SoftLabelStudent':
+              logits = np.log(np.clip(proba, 1e-6, 1.0))
+              self._model.fit(X, logits - logits.mean(axis=1, keepdims=True))
+              return self
+
+          def predict_proba(self, X: np.ndarray) -> np.ndarray:
+              z = self._model.predict(X)
+              z = z - z.max(axis=1, keepdims=True)
+              e = np.exp(z)
+              return e / e.sum(axis=1, keepdims=True)
+
+          def predict(self, X: np.ndarray) -> np.ndarray:
+              return self.predict_proba(X).argmax(axis=1)
+
+
       def run_soft_label_distillation(
           victim,
           surrogate_class,
@@ -597,7 +629,9 @@ deliverables:
           surrogate on accumulated (input, soft_label) pairs.
 
           victim: any object with predict_proba(X) returning shape (n, K)
-          surrogate_class: sklearn estimator class with fit() and predict_proba()
+          surrogate_class: estimator class with fit() and predict_proba(); a class with
+          soft_targets = True (SoftLabelStudent) is trained on the probability vectors,
+          any other is trained on their argmax, which discards the soft-label information
           '''
           if rng is None:
               rng = np.random.default_rng(seed=42)
@@ -630,14 +664,14 @@ deliverables:
               if len(labelled_X) == 0 or queries_used < 50:
                   continue
 
-              X_train = np.vstack(labelled_X)
-              # Convert soft labels to hard labels for sklearn fit (hard-label proxy)
-              y_train = np.vstack(soft_labels).argmax(axis=1)
-
-              surrogate = surrogate_class(**surrogate_kwargs)
-              surrogate.fit(X_train, y_train)
-
               if queries_used % checkpoint_every < batch_size:
+                  X_train = np.vstack(labelled_X)
+                  targets = np.vstack(soft_labels)
+                  if not getattr(surrogate_class, 'soft_targets', False):
+                      targets = targets.argmax(axis=1)  # hard-label proxy: soft information lost
+                  surrogate = surrogate_class(**surrogate_kwargs)
+                  surrogate.fit(X_train, targets)
+
                   victim_val_labels = victim.predict(X_val)
                   surrogate_val_labels = surrogate.predict(X_val)
                   agreement = float(np.mean(surrogate_val_labels == victim_val_labels))
@@ -666,7 +700,7 @@ deliverables:
           X_all, y_all = make_classification(
               n_samples=3000, n_features=input_dim, n_informative=15, random_state=42
           )
-          victim = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
+          victim = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=1000, random_state=42)
           victim.fit(X_all[:2000], y_all[:2000])
 
           rng = np.random.default_rng(seed=0)
@@ -675,8 +709,8 @@ deliverables:
 
           result = run_soft_label_distillation(
               victim=victim,
-              surrogate_class=MLPClassifier,
-              surrogate_kwargs={'hidden_layer_sizes': (32, 16), 'max_iter': 300},
+              surrogate_class=SoftLabelStudent,
+              surrogate_kwargs={'hidden_layer_sizes': (32, 16), 'random_state': 0},
               X_pool=X_pool,
               X_val=X_val,
               query_budget=1000,
@@ -761,13 +795,12 @@ deliverables:
               if queries_used < 50:
                   continue
 
-              X_train = np.vstack(labelled_X)
-              y_train = np.concatenate(hard_labels)
+              if queries_used % checkpoint_every < batch_size:
+                  X_train = np.vstack(labelled_X)
+                  y_train = np.concatenate(hard_labels)
+                  surrogate = surrogate_class(**surrogate_kwargs)
+                  surrogate.fit(X_train, y_train)
 
-              surrogate = surrogate_class(**surrogate_kwargs)
-              surrogate.fit(X_train, y_train)
-
-              if queries_used % checkpoint_every < batch_size and surrogate is not None:
                   victim_val = victim.predict(X_val)
                   surrogate_val = surrogate.predict(X_val)
                   agreement = float(np.mean(surrogate_val == victim_val))
@@ -800,37 +833,46 @@ deliverables:
               print(f'{q:>8} | {s_agr:>14.1%} | {h_agr:>14.1%} | {advantage:>+14.1%}')
 
 
+      def queries_to_reach(result: DistillationResult, target: float) -> Optional[int]:
+          '''First checkpoint query count at which agreement reaches target, or None.'''
+          return next((cp.queries_used for cp in result.checkpoints if cp.surrogate_agreement >= target), None)
+
+
       if __name__ == '__main__':
           from sklearn.neural_network import MLPClassifier
           from sklearn.datasets import make_classification
-          from soft_label_distiller import run_soft_label_distillation
+          from soft_label_distiller import SoftLabelStudent, run_soft_label_distillation
 
           input_dim = 20
           X_all, y_all = make_classification(
               n_samples=3000, n_features=input_dim, n_informative=15, random_state=42
           )
-          victim = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
+          victim = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=1000, random_state=42)
           victim.fit(X_all[:2000], y_all[:2000])
 
           rng = np.random.default_rng(seed=0)
           X_pool = rng.uniform(-3.0, 3.0, size=(2000, input_dim))
           X_val = X_all[2000:]
 
+          # Same pool order, budget and student architecture; only the label type differs
           soft_result = run_soft_label_distillation(
               victim=victim,
-              surrogate_class=MLPClassifier,
-              surrogate_kwargs={'hidden_layer_sizes': (32, 16), 'max_iter': 300},
-              X_pool=X_pool, X_val=X_val, query_budget=1000,
+              surrogate_class=SoftLabelStudent,
+              surrogate_kwargs={'hidden_layer_sizes': (32, 16), 'random_state': 0},
+              X_pool=X_pool, X_val=X_val, query_budget=1600,
               batch_size=100, temperature=2.0, checkpoint_every=200,
           )
           hard_result = run_hard_label_distillation(
               victim=victim,
               surrogate_class=MLPClassifier,
-              surrogate_kwargs={'hidden_layer_sizes': (32, 16), 'max_iter': 300},
-              X_pool=X_pool, X_val=X_val, query_budget=1000,
+              surrogate_kwargs={'hidden_layer_sizes': (32, 16), 'max_iter': 2000, 'random_state': 0},
+              X_pool=X_pool, X_val=X_val, query_budget=1600,
               batch_size=100, checkpoint_every=200,
           )
           compare_distillation_modes(soft_result, hard_result)
+          target = max(cp.surrogate_agreement for cp in hard_result.checkpoints)
+          print(f'Queries to reach {target:.1%} (hard-label best): '
+                f'soft {queries_to_reach(soft_result, target)}, hard {queries_to_reach(hard_result, target)}')
   - heading: active_distiller.py
     id: deliverable_3
     filename: active_distiller.py
@@ -949,45 +991,54 @@ deliverables:
 
 
       if __name__ == '__main__':
+          import warnings
+          from sklearn.exceptions import ConvergenceWarning
           from sklearn.neural_network import MLPClassifier
           from sklearn.datasets import make_classification
           from hard_label_distiller import run_hard_label_distillation
 
+          warnings.filterwarnings('ignore', category=ConvergenceWarning)  # small students on few points
           input_dim = 20
           X_all, y_all = make_classification(
               n_samples=3000, n_features=input_dim, n_informative=15, random_state=42
           )
-          victim = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
+          victim = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=1000, random_state=42)
           victim.fit(X_all[:2000], y_all[:2000])
-
-          rng = np.random.default_rng(seed=0)
-          X_pool = rng.uniform(-3.0, 3.0, size=(2000, input_dim))
           X_val = X_all[2000:]
-          shared_kwargs = {'hidden_layer_sizes': (32, 16), 'max_iter': 300}
+          shared_kwargs = {'hidden_layer_sizes': (32, 16), 'max_iter': 1000, 'random_state': 0}
 
-          active_result = run_active_distillation(
-              victim=victim, surrogate_class=MLPClassifier,
-              surrogate_kwargs=shared_kwargs,
-              X_pool=X_pool, X_val=X_val, query_budget=600,
-              n_seed=50, batch_size=50, checkpoint_every=100,
-          )
-          passive_result = run_hard_label_distillation(
-              victim=victim, surrogate_class=MLPClassifier,
-              surrogate_kwargs=shared_kwargs,
-              X_pool=X_pool, X_val=X_val, query_budget=600,
-              batch_size=50, checkpoint_every=100,
-          )
+          # Same student, budget and pool; only the query selection differs. Mean of 3 pools.
+          n_runs = 3
+          curves = {'active': [], 'passive': []}
+          for run in range(n_runs):
+              X_pool = np.random.default_rng(seed=run).uniform(-3.0, 3.0, size=(2000, input_dim))
+              active_result = run_active_distillation(
+                  victim=victim, surrogate_class=MLPClassifier,
+                  surrogate_kwargs=shared_kwargs,
+                  X_pool=X_pool, X_val=X_val, query_budget=800,
+                  n_seed=50, batch_size=50, checkpoint_every=100,
+                  rng=np.random.default_rng(seed=run),
+              )
+              passive_result = run_hard_label_distillation(
+                  victim=victim, surrogate_class=MLPClassifier,
+                  surrogate_kwargs=shared_kwargs,
+                  X_pool=X_pool, X_val=X_val, query_budget=800,
+                  batch_size=50, checkpoint_every=100,
+                  rng=np.random.default_rng(seed=run),
+              )
+              curves['active'].append({cp.queries_used: cp.surrogate_agreement for cp in active_result.checkpoints})
+              curves['passive'].append({cp.queries_used: cp.surrogate_agreement for cp in passive_result.checkpoints})
 
-          print('ACTIVE vs PASSIVE DISTILLATION EFFICIENCY')
+          qs = sorted(set.intersection(*(set(c) for v in curves.values() for c in v)))
+          mean = {k: {q: float(np.mean([c[q] for c in v])) for q in qs} for k, v in curves.items()}
+          print(f'ACTIVE vs PASSIVE DISTILLATION EFFICIENCY (hard labels, mean of {n_runs} runs)')
           print(f'{"Queries":>8} | {"Active":>10} | {"Passive":>10} | {"Gain":>8}')
           print('-' * 45)
-          a_by_q = {cp.queries_used: cp.surrogate_agreement for cp in active_result.checkpoints}
-          p_by_q = {cp.queries_used: cp.surrogate_agreement for cp in passive_result.checkpoints}
-          for q in sorted(set(a_by_q) | set(p_by_q)):
-              a = a_by_q.get(q, float('nan'))
-              p = p_by_q.get(q, float('nan'))
-              gain = (a - p) if (a == a and p == p) else float('nan')
-              print(f'{q:>8} | {a:>9.1%} | {p:>9.1%} | {gain:>+7.1%}')
+          for q in qs:
+              print(f'{q:>8} | {mean["active"][q]:>9.1%} | {mean["passive"][q]:>9.1%} | {mean["active"][q] - mean["passive"][q]:>+7.1%}')
+          target = max(mean['passive'].values())
+          reach = {k: next((q for q in qs if mean[k][q] >= target), None) for k in mean}
+          print(f'Queries to reach {target:.1%} (passive best): active {reach["active"]}, passive {reach["passive"]}')
   - heading: llm_distiller.py
     id: deliverable_4
     filename: llm_distiller.py

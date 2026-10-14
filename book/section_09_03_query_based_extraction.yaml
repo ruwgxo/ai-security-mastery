@@ -544,12 +544,14 @@ deliverables:
       ) -> List[Tuple[np.ndarray, int, np.ndarray, int]]:
           '''
           Sample random inputs until n_pairs opposite-label pairs are found.
+          Each input is used in at most one pair, so the pairs' boundary points are
+          independent constraints (pairs sharing an endpoint give a rank-deficient system).
           Returns list of (x_neg, label_neg, x_pos, label_pos) tuples.
           '''
           if rng is None:
               rng = np.random.default_rng(seed=42)
           pairs: List[Tuple[np.ndarray, int, np.ndarray, int]] = []
-          pool: List[Tuple[np.ndarray, int]] = []
+          unpaired: List[Tuple[np.ndarray, int]] = []
 
           while len(pairs) < n_pairs and oracle.budget_remaining > 0:
               x = rng.uniform(input_low, input_high, size=input_dim)
@@ -557,14 +559,16 @@ deliverables:
                   label = oracle.query(x)
               except RuntimeError:
                   break
-              pool.append((x, label))
-              # Check against existing pool for opposite-label pairs
-              for prev_x, prev_label in pool[:-1]:
-                  if prev_label != label and len(pairs) < n_pairs:
-                      if label == 0:
-                          pairs.append((x, label, prev_x, prev_label))
-                      else:
-                          pairs.append((prev_x, prev_label, x, label))
+              # Pair with the oldest unpaired input of the opposite label, if any
+              match = next((i for i, (_, prev_label) in enumerate(unpaired) if prev_label != label), None)
+              if match is None:
+                  unpaired.append((x, label))
+                  continue
+              prev_x, prev_label = unpaired.pop(match)
+              if label == 0:
+                  pairs.append((x, label, prev_x, prev_label))
+              else:
+                  pairs.append((prev_x, prev_label, x, label))
           return pairs
 
 
@@ -686,6 +690,15 @@ deliverables:
               recovered_weights = recovered_weights / norm
               recovered_bias = recovered_bias / norm
 
+          # The null vector's sign is arbitrary (w and -w define the same hyperplane).
+          # One query just off the boundary on the +w side fixes it.
+          probe = boundary_pts[0] + 1e-2 * recovered_weights
+          try:
+              if oracle.query(probe) == 0:
+                  recovered_weights, recovered_bias = -recovered_weights, -recovered_bias
+          except RuntimeError:
+              pass
+
           return ExtractionResult(
               recovered_weights=recovered_weights,
               recovered_bias=float(recovered_bias),
@@ -719,22 +732,28 @@ deliverables:
           from sklearn.datasets import make_classification
 
           input_dim = 20
-          X, y = make_classification(n_samples=1000, n_features=input_dim, random_state=42)
-          victim = LogisticRegression(random_state=42).fit(X, y)
+          X, y = make_classification(n_samples=1200, n_features=input_dim, random_state=42)
+          X_train, y_train, test_X = X[:1000], y[:1000], X[1000:]
+          victim = LogisticRegression(random_state=42).fit(X_train, y_train)
 
           # Extraction oracle with generous budget
           oracle = BudgetedOracle(victim_model=victim, budget=5000)
-          result = extract_linear_model(oracle, input_dim=input_dim)
+          # Seed inputs span the feature range the API accepts (standardised features, about -3 to 3)
+          result = extract_linear_model(oracle, input_dim=input_dim, input_low=-3.0, input_high=3.0)
+          queries_for_extraction = oracle.stats.total_queries
 
-          # Validate on held-out inputs
-          rng = np.random.default_rng(seed=99)
-          test_X = rng.uniform(0.0, 1.0, size=(200, input_dim))
+          # Validate on held-out inputs from the victim's own input distribution
           agreement = validate_extraction(result, oracle, test_X)
           result.agreement_rate = agreement
+          victim_labels = victim.predict(test_X)
+          majority = float(max(victim_labels.mean(), 1.0 - victim_labels.mean()))
+          true_w = victim.coef_[0] / np.linalg.norm(victim.coef_[0])
 
-          print(f'Queries used:    {result.queries_used}')
+          print(f'Queries used:    {queries_for_extraction}')
           print(f'Theoretical O(d): ~{input_dim * 15} (d={input_dim}, log factor ~15)')
-          print(f'Agreement rate:  {result.agreement_rate:.1%}')
+          print(f'Agreement rate:  {result.agreement_rate:.1%} on {len(test_X)} held-out inputs')
+          print(f'Baseline:        {majority:.1%} (always predicting the majority label)')
+          print(f'Cosine(recovered w, true w): {float(true_w.dot(result.recovered_weights)):.6f}')
           print(f'Note: {result.note}')
   - heading: tree_extractor.py
     id: deliverable_3
@@ -778,29 +797,32 @@ deliverables:
           feature_high: float,
           precision: float = 1e-4,
           max_steps: int = 40,
+          grid: int = 16,
       ) -> Optional[Tuple[float, int, int]]:
           '''
-          Find the split threshold for feature_idx by binary search.
+          Find a split threshold for feature_idx: scan a coarse grid along the feature
+          (other features held at the reference), then binary-search the first label change.
+          Comparing only the two ends of the range misses splits whenever the label
+          changes an even number of times along the line (0 -> 1 -> 0).
           Returns (threshold, label_left, label_right) or None if no split exists
           or budget is exhausted.
           '''
-          ref_label = oracle.stats.total_queries  # will be overwritten
-          try:
-              probe_low = reference.copy()
-              probe_low[feature_idx] = feature_low
-              label_low = oracle.query(probe_low)
-
-              probe_high = reference.copy()
-              probe_high[feature_idx] = feature_high
-              label_high = oracle.query(probe_high)
-          except RuntimeError:
-              return None
-
-          if label_low == label_high:
+          values = np.linspace(feature_low, feature_high, grid)
+          labels = []
+          for value in values:
+              probe = reference.copy()
+              probe[feature_idx] = value
+              try:
+                  labels.append(oracle.query(probe))
+              except RuntimeError:
+                  return None
+          change = next((i for i in range(grid - 1) if labels[i] != labels[i + 1]), None)
+          if change is None:
               return None  # no split on this feature in this range
 
-          # Binary search for the threshold
-          lo, hi = feature_low, feature_high
+          # Binary search for the threshold between the two grid points
+          lo, hi = float(values[change]), float(values[change + 1])
+          label_low, label_high = labels[change], labels[change + 1]
           label_lo = label_low
           for _ in range(max_steps):
               if hi - lo < precision:
@@ -892,21 +914,26 @@ deliverables:
           X, y = make_classification(n_samples=500, n_features=input_dim, random_state=42)
           victim = DecisionTreeClassifier(max_depth=4, random_state=42).fit(X, y)
 
-          oracle = BudgetedOracle(victim_model=victim, budget=3000)
+          test_X = make_classification(n_samples=700, n_features=input_dim, random_state=42)[0][500:]  # held out
+
+          oracle = BudgetedOracle(victim_model=victim, budget=20000)
           feature_ranges = [(float(X[:, i].min()), float(X[:, i].max())) for i in range(input_dim)]
           reference = X[0].copy()
 
-          root = extract_tree_node(oracle, reference, input_dim, feature_ranges, depth=0, max_depth=4)
+          # The extracted tree need not split where the victim does, so it may need more
+          # levels than the victim's depth of 4 to reproduce the same partition.
+          root = extract_tree_node(oracle, reference, input_dim, feature_ranges, depth=0, max_depth=8)
 
-          # Validate on test inputs
-          rng = np.random.default_rng(seed=77)
-          test_X = rng.uniform(-3.0, 3.0, size=(200, input_dim))
+          # Validate on held-out inputs from the victim's input distribution
           extracted = np.array([predict_with_tree(root, x) for x in test_X])
           victim_preds = victim.predict(test_X)
           agreement = float(np.mean(extracted == victim_preds))
+          majority = float(max(victim_preds.mean(), 1.0 - victim_preds.mean()))
 
+          print(f'Victim leaves:  {victim.get_n_leaves()}')
           print(f'Queries used:   {oracle.stats.total_queries}')
-          print(f'Agreement rate: {agreement:.1%}')
+          print(f'Agreement rate: {agreement:.1%} on {len(test_X)} held-out inputs')
+          print(f'Baseline:       {majority:.1%} (always predicting the majority label)')
   - heading: active_learning_extractor.py
     id: deliverable_4
     filename: active_learning_extractor.py
@@ -969,6 +996,7 @@ deliverables:
           n_steps: int = 50,
           batch_size: int = 10,
           rng: Optional[np.random.Generator] = None,
+          strategy: str = 'uncertainty',
       ) -> ActiveLearningResult:
           '''
           Run active learning extraction against the oracle.
@@ -981,6 +1009,7 @@ deliverables:
           n_initial: number of random seed queries before active learning begins
           n_steps: number of active learning iterations
           batch_size: number of inputs selected per iteration
+          strategy: 'uncertainty' (active learning) or 'random' (the baseline it is measured against)
           '''
           if rng is None:
               rng = np.random.default_rng(seed=42)
@@ -1016,9 +1045,12 @@ deliverables:
               if len(pool_indices) == 0:
                   break
 
-              # Score pool by uncertainty
+              # Score pool by uncertainty (the random baseline ignores the scores)
               scores = uncertainty_score(surrogate, X_pool[pool_indices])
-              top_k = pool_indices[np.argsort(scores)[-batch_size:]]
+              if strategy == 'random':
+                  top_k = rng.choice(pool_indices, size=min(batch_size, len(pool_indices)), replace=False)
+              else:
+                  top_k = pool_indices[np.argsort(scores)[-batch_size:]]
               max_uncertainty = float(scores.max())
 
               # Query victim for selected inputs
@@ -1052,41 +1084,45 @@ deliverables:
 
 
       if __name__ == '__main__':
-          from sklearn.linear_model import LogisticRegression
+          import warnings
+          from sklearn.exceptions import ConvergenceWarning
           from sklearn.neural_network import MLPClassifier
           from sklearn.datasets import make_classification
 
           input_dim = 10
           X, y = make_classification(n_samples=2000, n_features=input_dim, random_state=42)
-          victim = MLPClassifier(hidden_layer_sizes=(32, 16), random_state=42, max_iter=500).fit(X, y)
+          warnings.filterwarnings('ignore', category=ConvergenceWarning)  # small surrogates on few points
+          victim = MLPClassifier(hidden_layer_sizes=(32, 16), random_state=42, max_iter=2000).fit(X, y)
 
-          # Pool for active learning; validation set for fidelity measurement
-          rng = np.random.default_rng(seed=0)
-          X_pool = rng.uniform(-3.0, 3.0, size=(1000, input_dim))
-          X_val = rng.uniform(-3.0, 3.0, size=(300, input_dim))
-          y_val_victim = victim.predict(X_val)
+          # Active learning against its baseline: the same surrogate, budget and pool, with
+          # inputs chosen by surrogate uncertainty or at random. Averaged over five pools
+          # drawn from the victim's input distribution; fidelity = agreement with the victim.
+          n_runs, target = 5, 0.85
+          curves = {'uncertainty': [], 'random': []}
+          for run in range(n_runs):
+              X_new = make_classification(n_samples=2500, n_features=input_dim, random_state=43 + run)[0]
+              X_pool, X_val = X_new[:2000], X_new[2000:]
+              y_val_victim = victim.predict(X_val)
+              for strategy in curves:
+                  result = run_active_learning_extraction(
+                      oracle=BudgetedOracle(victim_model=victim, budget=420),
+                      surrogate_class=MLPClassifier,
+                      surrogate_kwargs={'hidden_layer_sizes': (32,), 'max_iter': 2000, 'random_state': 0},
+                      X_pool=X_pool, X_val=X_val, y_val_victim=y_val_victim,
+                      n_initial=20, n_steps=20, batch_size=20,
+                      rng=np.random.default_rng(seed=run), strategy=strategy,
+                  )
+                  curves[strategy].append([s.surrogate_accuracy for s in result.steps])
+          queries = [s.queries_used for s in result.steps]
+          mean = {k: np.mean(v, axis=0) for k, v in curves.items()}
 
-          oracle = BudgetedOracle(victim_model=victim, budget=800)
-          result = run_active_learning_extraction(
-              oracle=oracle,
-              surrogate_class=LogisticRegression,
-              surrogate_kwargs={'max_iter': 500},
-              X_pool=X_pool,
-              X_val=X_val,
-              y_val_victim=y_val_victim,
-              n_initial=20,
-              n_steps=30,
-              batch_size=20,
-          )
-
-          print(f'Total queries used: {result.total_queries}')
-          print(f'Steps completed:    {len(result.steps)}')
-          if result.steps:
-              final = result.steps[-1]
-              print(f'Final surrogate accuracy: {final.surrogate_accuracy:.1%}')
-              print(f'Fidelity curve (every 5 steps):')
-              for s in result.steps[::5]:
-                  print(f'  Step {s.step:3d} | Queries: {s.queries_used:4d} | Accuracy: {s.surrogate_accuracy:.1%}')
+          print(f'Victim: MLP (32, 16). Surrogate: MLP (32). Mean of {n_runs} runs.')
+          print(f'Queries | Active learning | Random sampling')
+          for i in range(0, len(queries), 4):
+              print(f'{queries[i]:7d} | {mean["uncertainty"][i]:15.1%} | {mean["random"][i]:15.1%}')
+          for k, label in (('uncertainty', 'Active learning'), ('random', 'Random sampling')):
+              hit = next((q for q, a in zip(queries, mean[k]) if a >= target), None)
+              print(f'{label} reaches {target:.0%} fidelity at: {hit if hit else "not within budget"} queries')
   - heading: query_distribution_analyser.py
     id: deliverable_5
     filename: query_distribution_analyser.py
@@ -1226,20 +1262,22 @@ deliverables:
           from boundary_mapper import BudgetedOracle, map_boundary
 
           input_dim = 10
-          X, y = make_classification(n_samples=1000, n_features=input_dim, random_state=42)
-          victim = LogisticRegression(random_state=42).fit(X, y)
+          X, y = make_classification(n_samples=1200, n_features=input_dim, random_state=42)
+          victim = LogisticRegression(random_state=42).fit(X[:1000], y[:1000])
 
-          # Legitimate user queries: concentrated around a real use-case cluster
+          # Legitimate user queries: real inputs from the distribution the product serves
+          # (held out from the victim's training data)
           rng = np.random.default_rng(seed=1)
-          benign_queries = rng.normal(loc=0.5, scale=0.15, size=(200, input_dim))
+          benign_queries = X[1000:]
 
-          # Extraction queries: boundary mapping
-          oracle = BudgetedOracle(victim_model=victim, budget=500)
-          extraction_points = map_boundary(oracle, input_dim=input_dim, n_boundary_points=30)
-          extraction_queries = np.array(extraction_points) if extraction_points else rng.uniform(0, 1, size=(30, input_dim))
+          # Extraction queries: boundary mapping, seeded across the feature range the API accepts
+          oracle = BudgetedOracle(victim_model=victim, budget=2000)
+          extraction_points = map_boundary(oracle, input_dim=input_dim, n_boundary_points=30,
+                                           input_low=-3.0, input_high=3.0)
+          extraction_queries = np.array(extraction_points) if extraction_points else rng.uniform(-3.0, 3.0, size=(30, input_dim))
 
-          # Random baseline
-          random_queries = rng.uniform(0.0, 1.0, size=(200, input_dim))
+          # Random baseline over the same feature range
+          random_queries = rng.uniform(-3.0, 3.0, size=(200, input_dim))
 
           reports = [
               analyse_query_distribution(benign_queries, label='benign_user', classifier=victim),

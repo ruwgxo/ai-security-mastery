@@ -499,9 +499,9 @@ deliverables:
       Black-box model inversion using zeroth-order optimisation. Estimates the gradient of the
       target class confidence with respect to the input via finite differences (two queries per
       dimension per step), then takes a gradient ascent step toward higher target class confidence.
-      Tracks reconstruction fidelity against a known ground-truth member at each step to produce the
-      inversion progress curve. Intended as the adversary-side implementation demonstrating the
-      attack the Section 9.12 output perturbation defends against.
+      Tracks the distance to a reference point (the demo uses the target class prototype) at each
+      step to produce the inversion progress curve. Intended as the adversary-side implementation
+      demonstrating the attack the Section 9.12 output perturbation defends against.
     notes: >
       Single quotes throughout per book convention. Requires numpy and sklearn. Victim model accepts
       any object with predict_proba(X). Dimensionality, step size, perturbation delta, and budget
@@ -573,6 +573,31 @@ deliverables:
           return grad
 
 
+      def inversion_step(
+          x: np.ndarray,
+          grad_confidence: np.ndarray,
+          confidence: float,
+          step_size: float,
+          prior_mean: Optional[np.ndarray] = None,
+          prior_weight: float = 0.0,
+      ) -> np.ndarray:
+          '''
+          One ascent step on log(confidence) - prior_weight * ||x - prior_mean||^2.
+          The log keeps the gradient informative where the confidence is saturated near
+          0 or 1, and the step has fixed length (normalised gradient). Without a prior,
+          maximising confidence walks off the data into regions the model never saw; the
+          prior (Fredrikson et al. use auxiliary knowledge the same way) keeps the
+          reconstruction near plausible inputs, where it converges on the class prototype.
+          '''
+          grad = grad_confidence / max(confidence, 1e-12)
+          if prior_mean is not None and prior_weight > 0.0:
+              grad = grad - 2.0 * prior_weight * (x - prior_mean)
+          norm = np.linalg.norm(grad)
+          if norm > 0.0:
+              x = x + step_size * grad / norm
+          return np.clip(x, -3.0, 3.0)
+
+
       def run_black_box_inversion(
           model: QueryCountingModel,
           target_class: int,
@@ -583,11 +608,14 @@ deliverables:
           step_size: float = 0.05,
           delta: float = 1e-3,
           rng: Optional[np.random.Generator] = None,
+          prior_mean: Optional[np.ndarray] = None,
+          prior_weight: float = 0.0,
       ) -> InversionResult:
           '''
           Run zeroth-order gradient ascent to maximise target class confidence.
           x_init: starting point (random if None)
-          x_ground_truth: known training member for MSE tracking (optional)
+          x_ground_truth: reference point for MSE tracking (optional), e.g. the class prototype
+          prior_mean / prior_weight: optional prior on plausible inputs (see inversion_step)
           '''
           if rng is None:
               rng = np.random.default_rng(seed=42)
@@ -613,9 +641,7 @@ deliverables:
                   reconstruction_mse=round(mse, 6) if mse is not None else None,
               ))
 
-              x = x + step_size * grad
-              # Clip to valid input range
-              x = np.clip(x, -3.0, 3.0)
+              x = inversion_step(x, grad, conf, step_size, prior_mean, prior_weight)
 
           final_conf = model.confidence(x, target_class) if model.queries < model._budget else steps[-1].target_confidence
           return InversionResult(
@@ -643,19 +669,26 @@ deliverables:
           from sklearn.datasets import make_classification
 
           X, y = make_classification(n_samples=500, n_features=10, random_state=42)
-          victim = MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=500, random_state=42)
+          victim = MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=2000, random_state=42)
           victim.fit(X, y)
 
-          # Pick a class-1 training member as the ground truth to track
-          class1_idx = np.where(y == 1)[0][0]
-          x_truth = X[class1_idx]
+          # Inversion converges on what the model treats as a typical class-1 input: track
+          # the distance to the class-1 training mean (the prototype) and to class 0's.
+          prototype_1, prototype_0 = X[y == 1].mean(axis=0), X[y == 0].mean(axis=0)
+          x_start = np.random.default_rng(seed=42).uniform(-1.0, 1.0, size=10)
 
           oracle = QueryCountingModel(victim, budget=5000)
           result = run_black_box_inversion(
-              oracle, target_class=1, input_dim=10,
-              x_ground_truth=x_truth, n_steps=50, step_size=0.02,
+              oracle, target_class=1, input_dim=10, x_init=x_start.copy(),
+              x_ground_truth=prototype_1, n_steps=50, step_size=0.1,
+              prior_mean=X.mean(axis=0), prior_weight=0.01,
           )
           render_inversion_progress(result)
+          x = result.reconstructed_input
+          print('Distance to class-1 prototype: %.3f (start %.3f)' % (
+              np.linalg.norm(x - prototype_1), np.linalg.norm(x_start - prototype_1)))
+          print('Distance to class-0 prototype: %.3f (start %.3f)' % (
+              np.linalg.norm(x - prototype_0), np.linalg.norm(x_start - prototype_0)))
   - heading: gradient_inverter.py
     id: deliverable_2
     filename: gradient_inverter.py
@@ -680,7 +713,7 @@ deliverables:
       from typing import List, Optional
 
       from black_box_inverter import (
-          InversionResult, InversionStep, QueryCountingModel,
+          InversionResult, InversionStep, QueryCountingModel, inversion_step,
       )
 
 
@@ -715,10 +748,13 @@ deliverables:
           n_steps: int = 30,
           step_size: float = 0.05,
           rng: Optional[np.random.Generator] = None,
+          prior_mean: Optional[np.ndarray] = None,
+          prior_weight: float = 0.0,
       ) -> InversionResult:
           '''
           Gradient-based inversion using central difference gradient estimates.
           More accurate gradient than forward difference; higher query cost per step.
+          prior_mean / prior_weight: optional prior on plausible inputs (see inversion_step)
           '''
           if rng is None:
               rng = np.random.default_rng(seed=42)
@@ -742,8 +778,7 @@ deliverables:
                   target_confidence=round(conf, 4),
                   reconstruction_mse=round(mse, 6) if mse is not None else None,
               ))
-              x = x + step_size * grad
-              x = np.clip(x, -3.0, 3.0)
+              x = inversion_step(x, grad, conf, step_size, prior_mean, prior_weight)
 
           final_conf = (model.confidence(x, target_class)
                         if model.queries < model._budget
@@ -777,22 +812,19 @@ deliverables:
           from black_box_inverter import run_black_box_inversion
 
           X, y = make_classification(n_samples=500, n_features=10, random_state=42)
-          victim = MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=500, random_state=42)
+          victim = MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=2000, random_state=42)
           victim.fit(X, y)
-          class1_idx = np.where(y == 1)[0][0]
-          x_truth = X[class1_idx]
+          prototype_1 = X[y == 1].mean(axis=0)  # MSE is measured against the class-1 prototype
+          x_start = np.random.default_rng(seed=42).uniform(-1.0, 1.0, size=10)
+          shared = dict(target_class=1, input_dim=10, x_ground_truth=prototype_1, n_steps=25,
+                        step_size=0.1, prior_mean=X.mean(axis=0), prior_weight=0.01)
 
           bb_oracle = QueryCountingModel(victim, budget=5000)
-          bb_result = run_black_box_inversion(
-              bb_oracle, target_class=1, input_dim=10,
-              x_ground_truth=x_truth, n_steps=25, step_size=0.02,
-          )
+          bb_result = run_black_box_inversion(bb_oracle, x_init=x_start.copy(), **shared)
           grad_oracle = QueryCountingModel(victim, budget=5000)
-          grad_result = run_gradient_inversion(
-              grad_oracle, target_class=1, input_dim=10,
-              x_ground_truth=x_truth, n_steps=25, step_size=0.02,
-          )
+          grad_result = run_gradient_inversion(grad_oracle, x_init=x_start.copy(), **shared)
           compare_inversion_methods(bb_result, grad_result)
+          print('Start: MSE to class-1 prototype %.6f' % float(np.mean((x_start - prototype_1) ** 2)))
   - heading: llm_training_extractor.py
     id: deliverable_3
     filename: llm_training_extractor.py
@@ -903,7 +935,7 @@ deliverables:
           seed_prefixes: List[str],
           n_completions_per_prefix: int = 10,
           completion_length: int = 8,
-          top_k: int = 5,
+          top_k: Optional[int] = 5,
           seed: int = 42,
       ) -> List[ExtractionCandidate]:
           '''
@@ -912,10 +944,14 @@ deliverables:
           '''
           rng = random.Random(seed)
           candidates: List[ExtractionCandidate] = []
+          seen = set()
 
           for prefix in seed_prefixes:
               for _ in range(n_completions_per_prefix):
                   text = target_model.sample(prefix, completion_length, rng)
+                  if text in seen:
+                      continue  # identical generations are one candidate (Carlini et al. deduplicate)
+                  seen.add(text)
                   target_ppl = target_model.perplexity(text)
                   reference_ppl = reference_model.perplexity(text)
                   if reference_ppl == 0 or not math.isfinite(target_ppl):
@@ -930,9 +966,9 @@ deliverables:
                   ))
 
           candidates.sort(key=lambda c: c.perplexity_ratio)
-          for i, c in enumerate(candidates[:top_k]):
+          for i, c in enumerate(candidates):
               c.rank = i + 1
-          return candidates[:top_k]
+          return candidates if top_k is None else candidates[:top_k]
 
 
       def render_extraction_results(candidates: List[ExtractionCandidate]) -> None:
@@ -971,8 +1007,22 @@ deliverables:
           reference.fit(reference_corpus)
 
           prefixes = ['the patient', 'patient john', 'the account', 'api key', 'the weather']
-          candidates = run_llm_extraction(target, reference, prefixes, n_completions_per_prefix=15)
-          render_extraction_results(candidates)
+          ranked = run_llm_extraction(target, reference, prefixes, n_completions_per_prefix=15, top_k=None)
+          render_extraction_results(ranked[:5])
+
+          # Ground truth the adversary does not have: is the candidate verbatim training text?
+          unique_training = sorted(set(training_corpus))
+
+          def verbatim(text: str) -> bool:
+              return any(text in sentence for sentence in unique_training)
+
+          top_k = 5
+          hits_top = sum(verbatim(c.text) for c in ranked[:top_k])
+          hits_all = sum(verbatim(c.text) for c in ranked)
+          print('\nVerbatim training text in the top %d by ratio: %d of %d (%.0f%%)' % (
+              top_k, hits_top, top_k, 100.0 * hits_top / top_k))
+          print('Verbatim training text among all %d distinct generations: %d (%.0f%%) -- the baseline' % (
+              len(ranked), hits_all, 100.0 * hits_all / max(len(ranked), 1)))
   - heading: memorisation_analyser.py
     id: deliverable_4
     filename: memorisation_analyser.py
