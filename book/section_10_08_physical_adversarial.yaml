@@ -384,10 +384,11 @@ deliverables:
       physical-world variation
     notes: >
       Python 3.12, single quotes throughout per book convention. Requires: torch,
-      torch.nn.functional. Import ToyLinear from fgsm_attack.py for demo. Patch is a (C, H_patch,
-      W_patch) tensor optimised via Adam. EOT: at each step, sample N_transforms (position, scale,
-      brightness) and average loss. Patch clamped to [0, 1] after each step (valid pixel values
-      required for printing).
+      torch.nn.functional. The demo trains a small shape classifier (PatchDemoCNN on
+      make_shape_dataset, a few seconds on CPU), so success is measured against a model that is
+      correct without the patch. Patch is a (C, H_patch, W_patch) tensor optimised via Adam. EOT: at
+      each step, sample N_transforms (position, scale, brightness) and average loss. Patch clamped
+      to [0, 1] after each step (valid pixel values required for printing).
     code: |
       # adversarial_patch.py
       # Section 10.8: Universal Adversarial Patch with EOT
@@ -401,6 +402,7 @@ deliverables:
       from torch import Tensor
       from dataclasses import dataclass
       from typing import Tuple
+      import math
       import random
 
 
@@ -540,54 +542,143 @@ deliverables:
           y_true: Tensor,
           n_trials: int = 20,
           eot_cfg: EOTConfig = None,
+          y_target: Tensor = None,
       ) -> float:
-          '''Fraction of (image, transform) pairs where patch causes misclassification.'''
+          '''
+          Fraction of (image, transform) pairs where the patch succeeds.
+          With y_target: targeted success, the fraction classified as the target class.
+          Without it: untargeted success, the fraction misclassified.
+          '''
           if eot_cfg is None:
               eot_cfg = EOTConfig()
-          total_correct = 0
+          hits = 0
           total = 0
           with torch.no_grad():
               for _ in range(n_trials):
                   patched = sample_eot_transform(images, patch, eot_cfg)
                   preds = model(patched).argmax(dim=1)
-                  total_correct += (preds == y_true).sum().item()
+                  if y_target is not None:
+                      hits += (preds == y_target).sum().item()
+                  else:
+                      hits += (preds != y_true).sum().item()
                   total += images.size(0)
-          return 1.0 - (total_correct / total)
+          return hits / total
+
+
+      # --- Demo data and model -------------------------------------------------------
+      # A patch attack only means something against a model that classifies correctly
+      # without the patch. These helpers build a small learnable dataset of smooth
+      # shapes and a convolutional classifier that recognises each shape anywhere in
+      # the image (global max pooling), so one universal patch can hijack it at any
+      # position. Training takes a few seconds on CPU.
+
+      SHAPES = ('horizontal bar', 'vertical bar', 'diagonal', 'anti-diagonal',
+                'square', 'cross', 'ring', 'dot')
+
+
+      def draw_shape(kind: str, size: int = 28, rng: random.Random = random) -> Tensor:
+          '''One smooth shape on a dim background, at a random position and size: (1, size, size).'''
+          yy, xx = torch.meshgrid(torch.arange(size, dtype=torch.float32),
+                                  torch.arange(size, dtype=torch.float32), indexing='ij')
+          cy, cx = rng.uniform(8, size - 9), rng.uniform(8, size - 9)
+          half = rng.uniform(5, 7)
+          dy, dx = yy - cy, xx - cx
+          far = torch.full_like(dy, 99.0)
+          inside = (dy.abs() <= half) & (dx.abs() <= half)
+          if kind == 'horizontal bar':
+              dist = torch.where(dx.abs() <= half, dy.abs(), far)
+          elif kind == 'vertical bar':
+              dist = torch.where(dy.abs() <= half, dx.abs(), far)
+          elif kind == 'diagonal':
+              dist = torch.where(inside, (dy - dx).abs() / math.sqrt(2), far)
+          elif kind == 'anti-diagonal':
+              dist = torch.where(inside, (dy + dx).abs() / math.sqrt(2), far)
+          elif kind == 'square':
+              dist = torch.where(inside, (half - torch.maximum(dy.abs(), dx.abs())).abs(), far)
+          elif kind == 'cross':
+              dist = torch.where(inside, torch.minimum(dy.abs(), dx.abs()), far)
+          elif kind == 'ring':
+              dist = ((dy ** 2 + dx ** 2).sqrt() - half).abs()
+          else:  # dot
+              dist = (dy ** 2 + dx ** 2).sqrt() / 1.5
+          image = 0.15 + 0.75 * torch.exp(-(dist ** 2) / (2 * 1.6 ** 2))
+          return image.clamp(0.0, 1.0).unsqueeze(0)
+
+
+      def make_shape_dataset(n: int, seed: int = 0, size: int = 28) -> Tuple[Tensor, Tensor]:
+          '''n images (n, 1, size, size) and their shape labels, reproducible from seed.'''
+          rng = random.Random(seed)
+          labels = torch.tensor([rng.randrange(len(SHAPES)) for _ in range(n)])
+          images = torch.stack([draw_shape(SHAPES[int(c)], size, rng) for c in labels])
+          return images, labels
+
+
+      class PatchDemoCNN(nn.Module):
+          '''Two conv layers and global max pooling: detects a shape wherever it appears.'''
+          def __init__(self, n_classes: int = len(SHAPES)):
+              super().__init__()
+              self.conv1 = nn.Conv2d(1, 16, kernel_size=5, padding=2)
+              self.conv2 = nn.Conv2d(16, 32, kernel_size=5, padding=2)
+              self.fc = nn.Linear(32, n_classes)
+
+          def forward(self, x: Tensor) -> Tensor:
+              x = F.relu(self.conv1(x))
+              x = F.relu(self.conv2(x))
+              return self.fc(torch.amax(x, dim=(2, 3)))
+
+
+      def train_demo_classifier(n_train: int = 2000, epochs: int = 6, seed: int = 0) -> nn.Module:
+          '''Train PatchDemoCNN on the shape dataset; returns the model in eval mode.'''
+          torch.manual_seed(seed)
+          x, y = make_shape_dataset(n_train, seed=seed)
+          model = PatchDemoCNN()
+          optimiser = torch.optim.Adam(model.parameters(), lr=3e-3)
+          for _ in range(epochs):
+              perm = torch.randperm(n_train)
+              for i in range(0, n_train, 64):
+                  idx = perm[i:i + 64]
+                  optimiser.zero_grad()
+                  F.cross_entropy(model(x[idx]), y[idx]).backward()
+                  optimiser.step()
+          model.eval()
+          return model
+
+
+      def demo_setup(target: int = 0, n_eval: int = 200, seed: int = 42):
+          '''
+          Trained model plus images whose true class is not the target, for patch demos.
+          Returns (model, images, y_true, y_target, clean_accuracy).
+          '''
+          torch.manual_seed(seed)
+          random.seed(seed)
+          model = train_demo_classifier()
+          x, y = make_shape_dataset(n_eval + 100, seed=seed + 1)
+          with torch.no_grad():
+              clean_acc = (model(x).argmax(dim=1) == y).float().mean().item()
+          keep = y != target
+          return model, x[keep][:n_eval], y[keep][:n_eval], torch.tensor([target]), clean_acc
 
 
       def demo() -> None:
-          try:
-              from fgsm_attack import ToyLinear
-          except ImportError:
-              print('Run from directory containing fgsm_attack.py')
-              return
-
-          torch.manual_seed(42)
-          random.seed(42)  # EOT transforms draw from Python's random module
-          model = ToyLinear()
-          model.eval()
-
-          images = torch.rand(8, 1, 28, 28)
-          y_true = torch.randint(0, 10, (8,))
-          y_target = torch.tensor([0])
-
-          # Baseline: no patch
+          model, images, y_true, y_target, clean_acc = demo_setup(target=0)
           with torch.no_grad():
-              clean_preds = model(images).argmax(1)
-          clean_acc = (clean_preds == y_true).float().mean().item()
+              baseline = (model(images).argmax(dim=1) == y_target).float().mean().item()
 
           print('Universal Adversarial Patch with EOT')
-          print(f'Clean accuracy (no patch): {clean_acc:.3f}')
+          print(f'Classifier clean accuracy: {clean_acc:.3f}')
+          print(f'Target class: {SHAPES[int(y_target)]}')
+          print(f'Images classified as target without a patch: {baseline:.3f}')
 
-          # Generate patch
-          eot_cfg = EOTConfig(n_transforms=5, scale_min=0.15, scale_max=0.30)
-          patch = generate_patch(model, images, y_target, patch_size=(6, 6),
-                                 n_steps=50, lr=0.05, eot_cfg=eot_cfg)
+          # Optimise on a small batch, evaluate on the rest
+          train_x, eval_x, eval_y = images[:32], images[32:], y_true[32:]
+          eot_cfg = EOTConfig(n_transforms=8, scale_min=0.25, scale_max=0.35)
+          patch = generate_patch(model, train_x, y_target, patch_size=(8, 8),
+                                 n_steps=100, lr=0.05, eot_cfg=eot_cfg)
           print(f'Patch shape: {tuple(patch.shape)}')
 
-          # Evaluate
-          rate = patch_attack_success_rate(model, patch, images, y_true, n_trials=20, eot_cfg=eot_cfg)
-          print(f'Patch attack success rate (EOT, {eot_cfg.n_transforms} transforms): {rate:.3f}')
+          rate = patch_attack_success_rate(model, patch, eval_x, eval_y, n_trials=20,
+                                           eot_cfg=eot_cfg, y_target=y_target)
+          print(f'Targeted patch success on held-out images (EOT, {eot_cfg.n_transforms} transforms): {rate:.3f}')
 
 
       if __name__ == '__main__':
@@ -612,19 +703,19 @@ deliverables:
       import matplotlib.pyplot as plt
       import numpy as np
       from typing import List
-      from adversarial_patch import apply_patch_to_batch, generate_patch, EOTConfig
+      from adversarial_patch import apply_patch_to_batch, generate_patch, EOTConfig, demo_setup, SHAPES
 
 
       def sweep_scale(
           model,
           patch: torch.Tensor,
           images: torch.Tensor,
-          y_true: torch.Tensor,
+          y_target: torch.Tensor,
           scales: List[float],
           fixed_row: int = 0,
           fixed_col: int = 0,
       ) -> List[float]:
-          '''Measure attack success at each patch scale with fixed position.'''
+          '''Measure targeted attack success (fraction classified as y_target) at each patch scale.'''
           success_rates = []
           img_h, img_w = images.size(-2), images.size(-1)
           with torch.no_grad():
@@ -635,7 +726,7 @@ deliverables:
                   col = min(fixed_col, img_w - pw)
                   patched = apply_patch_to_batch(images, patch, row, col, ph, pw)
                   preds = model(patched).argmax(dim=1)
-                  rate = (preds != y_true).float().mean().item()
+                  rate = (preds == y_target).float().mean().item()
                   success_rates.append(rate)
           return success_rates
 
@@ -644,11 +735,11 @@ deliverables:
           model,
           patch: torch.Tensor,
           images: torch.Tensor,
-          y_true: torch.Tensor,
+          y_target: torch.Tensor,
           brightness_levels: List[float],
-          scale: float = 0.25,
+          scale: float = 0.30,
       ) -> List[float]:
-          '''Measure attack success at each brightness level (simulates lighting variation).'''
+          '''Measure targeted attack success at each brightness level (simulates lighting variation).'''
           success_rates = []
           img_h, img_w = images.size(-2), images.size(-1)
           ph, pw = max(2, int(img_h * scale)), max(2, int(img_w * scale))
@@ -657,7 +748,7 @@ deliverables:
                   patched = apply_patch_to_batch(images, patch, 0, 0, ph, pw)
                   patched = torch.clamp(patched * b_level, 0.0, 1.0)
                   preds = model(patched).argmax(dim=1)
-                  rate = (preds != y_true).float().mean().item()
+                  rate = (preds == y_target).float().mean().item()
                   success_rates.append(rate)
           return success_rates
 
@@ -674,15 +765,15 @@ deliverables:
           ax1.plot([s * 100 for s in scales], scale_rates,
                    color='#e74c3c', linewidth=2, marker='o', markersize=5)
           ax1.set_xlabel('Patch scale (% of image dimension)', fontsize=11)
-          ax1.set_ylabel('Attack success rate', fontsize=11)
-          ax1.set_title('Patch Attack Success vs Scale\n(larger patch = higher success)', fontsize=11)
+          ax1.set_ylabel('Targeted attack success rate', fontsize=11)
+          ax1.set_title('Patch Attack Success vs Scale\n(patch works at the scales it was optimised for)', fontsize=11)
           ax1.set_ylim(0, 1.05)
           ax1.grid(True, alpha=0.3)
 
           ax2.plot(brightness_levels, brightness_rates,
                    color='#2980b9', linewidth=2, marker='s', markersize=5)
           ax2.set_xlabel('Brightness multiplier (lighting variation)', fontsize=11)
-          ax2.set_ylabel('Attack success rate', fontsize=11)
+          ax2.set_ylabel('Targeted attack success rate', fontsize=11)
           ax2.set_title('Patch Attack Success vs Brightness\n(EOT patch survives lighting change)', fontsize=11)
           ax2.set_ylim(0, 1.05)
           ax2.axvline(1.0, color='grey', linestyle='--', alpha=0.5, label='Neutral lighting')
@@ -696,28 +787,19 @@ deliverables:
 
 
       if __name__ == '__main__':
-          try:
-              from fgsm_attack import ToyLinear
-          except ImportError:
-              print('Run from directory containing fgsm_attack.py')
-              raise SystemExit
+          model, images, y_true, y_target, clean_acc = demo_setup(target=0)
+          train_x, eval_x = images[:32], images[32:]
+          print(f'Classifier clean accuracy: {clean_acc:.3f}; target class: {SHAPES[int(y_target)]}')
 
-          torch.manual_seed(42)
-          model = ToyLinear()
-          model.eval()
-          images = torch.rand(16, 1, 28, 28)
-          y_true = torch.randint(0, 10, (16,))
-          y_target = torch.tensor([0])
-
-          eot_cfg = EOTConfig(n_transforms=5)
-          patch = generate_patch(model, images, y_target,
-                                 patch_size=(6, 6), n_steps=40, lr=0.05, eot_cfg=eot_cfg)
+          eot_cfg = EOTConfig(n_transforms=8, scale_min=0.25, scale_max=0.35)
+          patch = generate_patch(model, train_x, y_target,
+                                 patch_size=(8, 8), n_steps=100, lr=0.05, eot_cfg=eot_cfg)
 
           scales = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40]
-          scale_rates = sweep_scale(model, patch, images, y_true, scales)
+          scale_rates = sweep_scale(model, patch, eval_x, y_target, scales)
 
           brightness_levels = [0.5, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.4, 1.6]
-          brightness_rates = sweep_brightness(model, patch, images, y_true, brightness_levels)
+          brightness_rates = sweep_brightness(model, patch, eval_x, y_target, brightness_levels)
 
           print(f'{"Scale%":<10} {"Success"}')
           for s, r in zip(scales, scale_rates):
@@ -735,7 +817,7 @@ deliverables:
     description: >
       Compares EOT-optimised patches against patches optimised without EOT (digital-only);
       demonstrates that EOT robustness is essential for physical-world attack success across
-      lighting and scale variation
+      lighting and position variation
     notes: >
       Python 3.12, single quotes throughout per book convention. Requires: torch, matplotlib. Import
       from adversarial_patch.py.
@@ -748,8 +830,8 @@ deliverables:
       import random
       import torch
       import matplotlib.pyplot as plt
-      from adversarial_patch import (generate_patch, EOTConfig,
-                                     apply_patch_to_batch, patch_attack_success_rate)
+      from adversarial_patch import (generate_patch, EOTConfig, apply_patch_to_batch,
+                                     demo_setup, SHAPES)
 
 
       def generate_digital_only_patch(model, images, y_target, patch_size=(6, 6),
@@ -780,41 +862,44 @@ deliverables:
           return patch.detach()
 
 
-      def benchmark_robustness(model, images, y_true, y_target,
-                                transform_severities, n_trials=10):
+      def benchmark_robustness(model, train_images, eval_images, y_target,
+                                transform_severities, n_trials=20, patch_px=8):
           '''
           Compare EOT patch vs digital-only patch across transformation severities.
-          severity: brightness multiplier deviation from 1.0 (0 = no variation).
+          Both patches are optimised on train_images and evaluated on eval_images.
+          severity: brightness multiplier deviation from 1.0 (0 = no variation); every
+          trial also places the patch at a random position.
+          Success is targeted: the fraction of images classified as y_target.
           '''
-          eot_cfg = EOTConfig(n_transforms=8, brightness_min=0.6, brightness_max=1.4)
-          patch_eot = generate_patch(model, images, y_target,
-                                     patch_size=(6, 6), n_steps=60, lr=0.05, eot_cfg=eot_cfg)
-          patch_digital = generate_digital_only_patch(model, images, y_target,
-                                                      patch_size=(6, 6), n_steps=60, lr=0.05)
+          eot_cfg = EOTConfig(n_transforms=8, scale_min=0.25, scale_max=0.35,
+                              brightness_min=0.6, brightness_max=1.4)
+          patch_eot = generate_patch(model, train_images, y_target, patch_size=(patch_px, patch_px),
+                                     n_steps=100, lr=0.05, eot_cfg=eot_cfg)
+          patch_digital = generate_digital_only_patch(model, train_images, y_target,
+                                                      patch_size=(patch_px, patch_px),
+                                                      n_steps=100, lr=0.05)
 
           eot_rates, dig_rates = [], []
-          img_h, img_w = images.size(-2), images.size(-1)
-          ph = int(img_h * 0.25)
-          pw = int(img_w * 0.25)
+          img_h, img_w = eval_images.size(-2), eval_images.size(-1)
+          ph = pw = patch_px
 
           for severity in transform_severities:
               eot_success, dig_success, total = 0, 0, 0
               with torch.no_grad():
                   for _ in range(n_trials):
-                      import random
                       b = 1.0 + random.uniform(-severity, severity)
                       row = random.randint(0, img_h - ph)
                       col = random.randint(0, img_w - pw)
-
-                      for patch, count_list in [(patch_eot, eot_success), (patch_digital, dig_success)]:
-                          patched = apply_patch_to_batch(images, patch, row, col, ph, pw)
+                      # Same transformation for both patches, so the comparison is paired
+                      for name, patch in (('eot', patch_eot), ('digital', patch_digital)):
+                          patched = apply_patch_to_batch(eval_images, patch, row, col, ph, pw)
                           patched = torch.clamp(patched * b, 0.0, 1.0)
-                          preds = model(patched).argmax(1)
-                          if patch is patch_eot:
-                              eot_success += (preds != y_true).sum().item()
+                          hits = (model(patched).argmax(1) == y_target).sum().item()
+                          if name == 'eot':
+                              eot_success += hits
                           else:
-                              dig_success += (preds != y_true).sum().item()
-                      total += images.size(0)
+                              dig_success += hits
+                      total += eval_images.size(0)
 
               eot_rates.append(eot_success / total)
               dig_rates.append(dig_success / total)
@@ -831,7 +916,7 @@ deliverables:
                    marker='s', markersize=5, linestyle='--',
                    label='Digital-only patch (brittle to variation)')
           plt.xlabel('Transformation severity (brightness deviation)', fontsize=11)
-          plt.ylabel('Attack success rate', fontsize=11)
+          plt.ylabel('Targeted attack success rate', fontsize=11)
           plt.title('EOT vs Digital-Only Patch: Physical Robustness\n(EOT maintains success under physical-world variation)', fontsize=11)
           plt.legend(fontsize=10)
           plt.grid(True, alpha=0.3)
@@ -843,23 +928,16 @@ deliverables:
 
 
       if __name__ == '__main__':
-          try:
-              from fgsm_attack import ToyLinear
-          except ImportError:
-              print('Run from directory containing fgsm_attack.py')
-              raise SystemExit
-
-          torch.manual_seed(42)
-          random.seed(42)  # EOT transforms draw from Python's random module
-          model = ToyLinear()
-          model.eval()
-          images = torch.rand(8, 1, 28, 28)
-          y_true = torch.randint(0, 10, (8,))
-          y_target = torch.tensor([0])
+          model, images, y_true, y_target, clean_acc = demo_setup(target=0)
+          train_x, eval_x = images[:32], images[32:]
+          with torch.no_grad():
+              baseline = (model(eval_x).argmax(1) == y_target).float().mean().item()
+          print(f'Classifier clean accuracy: {clean_acc:.3f}')
+          print(f'Target class: {SHAPES[int(y_target)]}; classified as target without a patch: {baseline:.3f}')
 
           severities = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
-          print('Benchmarking EOT vs digital-only patch robustness...')
-          eot_r, dig_r = benchmark_robustness(model, images, y_true, y_target, severities)
+          print('Benchmarking EOT vs digital-only patch robustness (targeted success)...')
+          eot_r, dig_r = benchmark_robustness(model, train_x, eval_x, y_target, severities)
 
           print(f'\n{"Severity":<12} {"EOT patch":<14} {"Digital only"}')
           print('-' * 42)
@@ -879,7 +957,10 @@ deliverables:
       Python 3.12, single quotes throughout per book convention. Requires: torch,
       torch.nn.functional. Import from adversarial_patch.py for demo. Two detection primitives:
       texture_anomaly_score (fast, no model forward pass) and masked_region_prediction_change
-      (slower, requires model forward passes per region).
+      (slower, requires model forward passes per region). Texture decides; masking runs only on
+      texture-flagged images, to confirm and locate the patch. Calibrate the texture threshold on
+      clean images from the deployment (calibrate_texture_threshold): a fixed threshold that suits
+      one image domain flags most natural images in another.
     code: |
       # patch_detector.py
       # Section 10.8: Adversarial Patch Detector
@@ -937,11 +1018,13 @@ deliverables:
       ) -> Tuple[bool, List[Tuple[int, int, int, int]]]:
           '''
           Detect adversarial patch by masking image regions and checking prediction change.
-          For each candidate region: replace with mean colour, check if prediction changes.
-          If prediction changes on a region: that region is a candidate patch location.
+          For each candidate region (a 4 x 4 grid, n_masks regions): replace with mean colour,
+          and flag the region if the model then predicts a different class with probability at
+          least threshold. Masking a patch hands the prediction back to the true class with
+          confidence; masking part of a natural object usually leaves the model unsure.
 
           Returns:
-              detected: bool (True if any region change exceeds threshold probability)
+              detected: bool (True if any region's masking flips the prediction confidently)
               flagged_regions: list of (row, col, h, w) for candidate patch regions
           '''
           img_h, img_w = image.size(-2), image.size(-1)
@@ -951,24 +1034,42 @@ deliverables:
 
           with torch.no_grad():
               base_pred = model(image).argmax(dim=1)
-              base_conf = F.softmax(model(image), dim=1).max(dim=1).values
 
           flagged = []
-          step_h = max(1, img_h // 4)
-          step_w = max(1, img_w // 4)
+          grid = max(1, int(round(n_masks ** 0.5)))
+          step_h = max(1, img_h // grid)
+          step_w = max(1, img_w // grid)
 
           for row in range(0, img_h - ph + 1, step_h):
               for col in range(0, img_w - pw + 1, step_w):
                   masked = image.clone()
                   masked[:, :, row:row + ph, col:col + pw] = mean_val
                   with torch.no_grad():
-                      masked_pred = model(masked).argmax(dim=1)
-                  # If prediction changes after masking: region was adversarially important
-                  if (masked_pred != base_pred).any():
+                      probs = F.softmax(model(masked), dim=1)
+                  conf, masked_pred = probs.max(dim=1)
+                  # Flag only a confident flip: the region was carrying the decision
+                  if ((masked_pred != base_pred) & (conf >= threshold)).any():
                       flagged.append((row, col, ph, pw))
 
           detected = len(flagged) > 0
           return detected, flagged
+
+
+      def calibrate_texture_threshold(
+          natural_images: Tensor,
+          percentile: float = 99.0,
+          margin: float = 1.05,
+          window_size: int = 4,
+      ) -> float:
+          '''
+          Texture threshold from clean, in-distribution images: the given percentile of their
+          texture anomaly scores, times a safety margin. Calibrate per deployment; a fixed
+          threshold that suits one image domain flags most natural images in another.
+          '''
+          scores = sorted(texture_anomaly_score(natural_images[i:i + 1], window_size=window_size)[0]
+                          for i in range(natural_images.size(0)))
+          idx = min(len(scores) - 1, int(round(percentile / 100.0 * (len(scores) - 1))))
+          return scores[idx] * margin
 
 
       def detect_patch(
@@ -978,14 +1079,18 @@ deliverables:
           use_masking: bool = True,
       ) -> dict:
           '''
-          Combined patch detection: texture anomaly + masked region prediction change.
+          Two-stage patch detection. Texture anomaly decides (fast, no forward pass).
+          Masked-region prediction change then runs only on texture-flagged images, to
+          confirm the patch and locate it -- it is the expensive stage, and on its own it
+          also fires when masking hides part of a genuine object.
+          Calibrate texture_threshold with calibrate_texture_threshold() for the deployment.
           Returns detection result dict.
           '''
           tex_score, var_map = texture_anomaly_score(image, threshold=texture_threshold)
           texture_flagged = tex_score > texture_threshold
 
           masking_flagged, flagged_regions = False, []
-          if use_masking:
+          if use_masking and texture_flagged:
               masking_flagged, flagged_regions = masked_region_prediction_change(
                   model, image, n_masks=16, mask_frac=0.25,
               )
@@ -995,43 +1100,50 @@ deliverables:
               'texture_flagged': texture_flagged,
               'masking_flagged': masking_flagged,
               'flagged_regions': flagged_regions,
-              'detected': texture_flagged or masking_flagged,
+              'detected': texture_flagged,
+              'confirmed': texture_flagged and masking_flagged,
           }
 
 
       def demo() -> None:
           try:
-              from fgsm_attack import ToyLinear
-              from adversarial_patch import generate_patch, apply_patch_to_batch, EOTConfig
+              from adversarial_patch import generate_patch, apply_patch_to_batch, EOTConfig, demo_setup
           except ImportError:
-              print('Run from directory containing fgsm_attack.py and adversarial_patch.py')
+              print('Run from directory containing adversarial_patch.py')
               return
 
-          torch.manual_seed(42)
-          random.seed(42)  # EOT transforms draw from Python's random module
-          model = ToyLinear()
-          model.eval()
-          images = torch.rand(4, 1, 28, 28)
-          y_true = torch.randint(0, 10, (4,))
-          y_target = torch.tensor([0])
+          model, images, y_true, y_target, clean_acc = demo_setup(target=0, n_eval=232)
+          train_x, calib_x, test_x = images[:32], images[32:132], images[132:232]
 
-          # Generate patch
-          patch = generate_patch(model, images, y_target, patch_size=(6, 6),
-                                 n_steps=30, lr=0.05, eot_cfg=EOTConfig(n_transforms=3))
-          # Apply patch
-          patched = apply_patch_to_batch(images, patch, row=0, col=0, ph=7, pw=7)
+          patch = generate_patch(model, train_x, y_target, patch_size=(8, 8), n_steps=100, lr=0.05,
+                                 eot_cfg=EOTConfig(n_transforms=8, scale_min=0.25, scale_max=0.35))
+          patched = torch.stack([
+              apply_patch_to_batch(test_x[i:i + 1], patch, random.randint(0, 20),
+                                   random.randint(0, 20), 8, 8)[0]
+              for i in range(test_x.size(0))
+          ])
+          with torch.no_grad():
+              fooled = (model(patched).argmax(1) == y_target).float().mean().item()
 
-          print('Patch detector results:')
-          for i in range(min(2, images.size(0))):
-              print(f'\n  Sample {i} (natural image):')
-              res = detect_patch(model, images[i:i+1], texture_threshold=0.06)
-              print(f'    texture_score={res["texture_score"]:.4f} '
-                    f'detected={res["detected"]}')
-              print(f'  Sample {i} (patched image):')
-              res_p = detect_patch(model, patched[i:i+1], texture_threshold=0.06)
-              print(f'    texture_score={res_p["texture_score"]:.4f} '
-                    f'detected={res_p["detected"]} '
-                    f'flagged_regions={len(res_p["flagged_regions"])}')
+          threshold = calibrate_texture_threshold(calib_x)
+          natural_res = [detect_patch(model, test_x[i:i + 1], texture_threshold=threshold)
+                         for i in range(test_x.size(0))]
+          patched_res = [detect_patch(model, patched[i:i + 1], texture_threshold=threshold)
+                         for i in range(patched.size(0))]
+          n = len(natural_res)
+
+          print('Patch detector results')
+          print(f'Classifier clean accuracy: {clean_acc:.3f}; patched images forced to target: {fooled:.3f}')
+          print(f'Texture threshold (99th percentile of {calib_x.size(0)} clean images, +5%): {threshold:.4f}')
+          print(f'\n{"":<22} {"Natural (false pos.)":<22} {"Patched (detected)"}')
+          for key in ('detected', 'confirmed'):
+              fp = sum(r[key] for r in natural_res) / n
+              tp = sum(r[key] for r in patched_res) / n
+              print(f'{key:<22} {fp:<22.2f} {tp:.2f}')
+          example = next((r for r in patched_res if r['confirmed']), None)
+          if example:
+              print(f'\nExample confirmed patch: texture_score={example["texture_score"]:.4f}, '
+                    f'flagged regions {example["flagged_regions"][:3]}')
 
 
       if __name__ == '__main__':
