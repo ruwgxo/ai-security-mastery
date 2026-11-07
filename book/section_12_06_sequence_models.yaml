@@ -565,18 +565,25 @@ deliverables:
 
 
       if __name__ == '__main__':
+          from sequence_model_trainer import (demo_escalation_data, train_demo_detector,
+                                              evaluate_sequence_model, single_turn_baselines, report)
+          torch.manual_seed(42)
+          print('Synthetic gradual-erosion conversations (seeded; see ingest_escalation_synthetic).')
+          train_ds, val_ds, test_ds = demo_escalation_data()
           wrapper = LSTMDetectorWrapper(input_size=20, hidden_size=64)
-          wrapper._trained = True  # skip training for smoke test
-          rng = np.random.default_rng(42)
-          benign_turns = [rng.normal(0.1, 0.05, 20) for _ in range(5)]
-          attack_turns = [rng.normal(0.1, 0.05, 20) for _ in range(4)]
-          attack_turns.append(rng.normal(0.8, 0.1, 20))  # attack in final turn
-          for label, turns in [('benign', benign_turns), ('attack', attack_turns)]:
-              pred = wrapper.predict_conversation(turns)
-              print(f'[{label}] n_turns={pred.n_turns}  '
-                    f'prob={pred.attack_probability:.3f}  '
-                    f'is_attack={pred.is_attack}  '
-                    f'latency={pred.inference_ms:.1f}ms')
+          train_demo_detector(wrapper.model, train_ds, val_ds)
+          wrapper._trained = True
+
+          y = np.array([e.label for e in test_ds.examples])
+          print(f'\nHeld-out test set ({len(y)} conversations, {int(y.sum())} attack):')
+          report('LSTM (whole sequence)', y, evaluate_sequence_model(wrapper.model, test_ds, lambda m, s, l: m(s, l)))
+          for name, p in single_turn_baselines(train_ds, test_ds).items():
+              report(f'Baseline: {name}', y, p)
+          for label in (0, 1):
+              ex = next(e for e in test_ds.examples if e.label == label)
+              pred = wrapper.predict_conversation(ex.turns)
+              print(f'[{"attack" if label else "benign"}] n_turns={pred.n_turns}  prob={pred.attack_probability:.3f}  '
+                    f'is_attack={pred.is_attack}')
   - heading: 'GRU Sequence Detector with Attention'
     id: deliverable_2
     filename: gru_sequence_detector.py
@@ -759,19 +766,37 @@ deliverables:
 
 
       if __name__ == '__main__':
+          from sequence_model_trainer import (demo_escalation_data, train_demo_detector,
+                                              evaluate_sequence_model, single_turn_baselines, report)
+          torch.manual_seed(42)
+          print('Synthetic gradual-erosion conversations (seeded; see ingest_escalation_synthetic).')
+          train_ds, val_ds, test_ds = demo_escalation_data()
           wrapper = GRUDetectorWrapper(input_size=20, hidden_size=64, top_k_turns=3)
+          train_demo_detector(wrapper.model, train_ds, val_ds)
           wrapper._trained = True
-          rng = np.random.default_rng(42)
-          # Simulate gradual escalation: turns 1-4 benign, turn 5 attack
-          turns = [rng.normal(0.1, 0.05, 20) for _ in range(4)]
-          turns.append(rng.normal(0.8, 0.1, 20))
-          turns[-1][6] = 1.0  # role_boundary_marker set in final turn
-          pred = wrapper.predict_conversation(turns)
-          print(f'attack_prob={pred.attack_probability:.3f}  '
+
+          y = np.array([e.label for e in test_ds.examples])
+          print(f'\nHeld-out test set ({len(y)} conversations, {int(y.sum())} attack):')
+          report('GRU with attention', y, evaluate_sequence_model(wrapper.model, test_ds, lambda m, s, l: m(s, l)))
+          for name, p in single_turn_baselines(train_ds, test_ds).items():
+              report(f'Baseline: {name}', y, p)
+
+          # Where does attention go? Mean weight on the first, middle and last third of each conversation.
+          for label, name in [(1, 'escalation'), (0, 'benign')]:
+              thirds = np.zeros(3)
+              exs = [e for e in test_ds.examples if e.label == label]
+              for e in exs:
+                  w = np.array(wrapper.predict_conversation(e.turns).attention_weights)
+                  for k, part in enumerate(np.array_split(w, 3)):
+                      thirds[k] += part.sum() / len(exs)
+              print(f'  Attention share ({name:>10}): first third={thirds[0]:.2f}  middle={thirds[1]:.2f}  last third={thirds[2]:.2f}')
+
+          ex = next(e for e in test_ds.examples if e.label == 1)
+          pred = wrapper.predict_conversation(ex.turns)
+          print(f'\nOne escalation conversation ({pred.n_turns} turns): attack_prob={pred.attack_probability:.3f}  '
                 f'is_attack={pred.is_attack}')
           print(f'Top signal turns: {pred.top_signal_turns}')
           print(f'Attention weights: {[f"{w:.3f}" for w in pred.attention_weights]}')
-          print(f'Inference: {pred.inference_ms:.1f}ms')
   - heading: 'Conversation Dataset Builder'
     id: deliverable_3
     filename: conversation_dataset_builder.py
@@ -888,6 +913,7 @@ deliverables:
               '''
               rng = np.random.default_rng(rng_seed)
               added = 0
+              new: List[ConversationExample] = []
               for i, attack_fv in enumerate(attack_feature_vectors):
                   prefix_indices = rng.choice(
                       len(benign_feature_vectors),
@@ -895,7 +921,7 @@ deliverables:
                       replace=False,
                   )
                   turns = [benign_feature_vectors[j] for j in prefix_indices] + [attack_fv]
-                  self._examples.append(ConversationExample(
+                  new.append(ConversationExample(
                       session_id=f'synthetic_{i}',
                       turns=turns,
                       label=1,
@@ -907,14 +933,48 @@ deliverables:
               for i in range(len(attack_feature_vectors)):
                   n = rng.integers(2, min(8, len(benign_feature_vectors) + 1))
                   idx = rng.choice(len(benign_feature_vectors), size=n, replace=False)
-                  self._examples.append(ConversationExample(
+                  new.append(ConversationExample(
                       session_id=f'benign_synth_{i}',
                       turns=[benign_feature_vectors[j] for j in idx],
                       label=0,
                       source='synthetic',
                   ))
+              # Synthetic conversations have no timestamps: shuffle them so that the order-based
+              # (temporal) split in build_splits() gives every split both classes.
+              self._examples.extend(new[i] for i in rng.permutation(len(new)))
               print(f'  Built {added} synthetic attack conversations.')
               return added
+
+          def ingest_escalation_synthetic(self, n_attack: int, n_benign: int, rng_seed: int = 42) -> int:
+              '''
+              Synthetic gradual-erosion conversations (Section 7.07), 5-10 turns each. Three escalation
+              features (instruction_keyword_freq, uppercase_ratio, prior_refusal_count) ramp smoothly
+              upward across an attack conversation; in a benign conversation the same features are
+              independent draws over the same range. No single attack turn leaves the benign range --
+              only the trajectory distinguishes the two.
+              '''
+              rng = np.random.default_rng(rng_seed)
+              esc = [3, 5, 15]
+              new: List[ConversationExample] = []
+              for i in range(n_attack + n_benign):
+                  attack = i < n_attack
+                  T = int(rng.integers(5, 11))
+                  turns = []
+                  a = rng.uniform(0.0, 0.15); b = min(a + rng.uniform(0.2, 0.3), 0.45)
+                  for t in range(T):
+                      fv = rng.normal(0.1, 0.03, self.feature_size).astype(np.float32)
+                      fv[14] = (t + 1) / 10.0                                  # turn_number, same for both classes
+                      for k in esc:
+                          v = a + (b - a) * t / (T - 1) + rng.normal(0, 0.02) if attack else rng.uniform(0.0, 0.45)
+                          fv[k] = np.clip(v, 0.0, 0.45)
+                      turns.append(fv)
+                  new.append(ConversationExample(
+                      session_id=f'{"escalation" if attack else "benign"}_{i}', turns=turns,
+                      label=int(attack), source='synthetic',
+                      attack_turn_indices=list(range(T)) if attack else []))
+              self._examples.extend(new[i] for i in rng.permutation(len(new)))
+              print(f'  Built {n_attack} synthetic escalation and {n_benign} benign conversations.')
+              return n_attack
 
           def build_splits(
               self,
@@ -928,14 +988,15 @@ deliverables:
               train = ConversationDataset(self._examples[:train_end])
               val = ConversationDataset(self._examples[train_end:val_end])
               test = ConversationDataset(self._examples[val_end:])
-              n_atk_train = sum(1 for e in self._examples[:train_end] if e.label == 1)
-              print(f'  Conversation splits: train={len(train)} ({n_atk_train} attack)  '
-                    f'val={len(val)}  test={len(test)}')
+              atk = lambda ex: sum(1 for e in ex if e.label == 1)
+              print(f'  Conversation splits: train={len(train)} ({atk(train.examples)} attack)  '
+                    f'val={len(val)} ({atk(val.examples)} attack)  test={len(test)} ({atk(test.examples)} attack)')
               return train, val, test
 
 
       if __name__ == '__main__':
           rng = np.random.default_rng(42)
+          print('Synthetic feature vectors (seeded): benign prefix turns + one attack turn.')
           benign_fvs = [rng.normal(0.1, 0.05, 20) for _ in range(100)]
           attack_fvs = [rng.normal(0.7, 0.1, 20) for _ in range(30)]
 
@@ -944,7 +1005,8 @@ deliverables:
           train_ds, val_ds, test_ds = builder.build_splits()
 
           from torch.utils.data import DataLoader
-          loader = DataLoader(train_ds, batch_size=8, collate_fn=collate_fn, shuffle=True)
+          loader = DataLoader(train_ds, batch_size=8, collate_fn=collate_fn, shuffle=True,
+                              generator=torch.Generator().manual_seed(42))
           batch = next(iter(loader))
           seqs, labels, lengths = batch
           print(f'Batch: seqs={seqs.shape}  labels={labels.shape}  lengths={lengths}')
@@ -999,8 +1061,12 @@ deliverables:
           dev = torch.device(device)
           model = model.to(dev)
 
-          pw = torch.tensor([pos_weight], device=dev) if pos_weight else None
-          criterion = nn.BCELoss(weight=None) if pw is None else nn.BCEWithLogitsLoss(pos_weight=pw)
+          # The detectors end in a sigmoid and return probabilities, so the loss is BCELoss on
+          # probabilities; pos_weight becomes a per-example weight on attack conversations.
+          # (BCEWithLogitsLoss here would apply a second sigmoid.)
+          def criterion(probs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+              w = None if not pos_weight else 1.0 + (pos_weight - 1.0) * labels
+              return nn.functional.binary_cross_entropy(probs, labels, weight=w)
 
           optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
           scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=1e-5)
@@ -1011,7 +1077,7 @@ deliverables:
                                   collate_fn=collate_fn, shuffle=False)
 
           history = []
-          best_val_recall = 0.0
+          best_val_f1 = -1.0
           patience_counter = 0
           best_state = None
 
@@ -1050,16 +1116,19 @@ deliverables:
               fp = ((preds == 1) & (all_labels == 0)).sum()
               recall = tp / max(tp + fn, 1)
               precision = tp / max(tp + fp, 1)
+              f1 = 2 * precision * recall / max(precision + recall, 1e-9)
 
               history.append({
                   'epoch': epoch,
                   'train_loss': train_loss / max(len(train_loader), 1),
                   'val_recall': float(recall),
                   'val_precision': float(precision),
+                  'val_f1': float(f1),
               })
 
-              if recall > best_val_recall:
-                  best_val_recall = recall
+              # Select on F1, not recall alone: flagging every conversation maximises recall.
+              if f1 > best_val_f1:
+                  best_val_f1 = f1
                   best_state = {k: v.clone() for k, v in model.state_dict().items()}
                   patience_counter = 0
               else:
@@ -1070,7 +1139,7 @@ deliverables:
                         f'val_recall={recall:.3f}  val_precision={precision:.3f}')
 
               if patience_counter >= early_stopping_patience:
-                  print(f'  Early stopping at epoch {epoch} (best_val_recall={best_val_recall:.3f})')
+                  print(f'  Early stopping at epoch {epoch} (best_val_f1={best_val_f1:.3f})')
                   break
 
           if best_state is not None:
@@ -1078,32 +1147,67 @@ deliverables:
           return history
 
 
-      if __name__ == '__main__':
-          from gru_sequence_detector import GRUSecurityDetector
+      def evaluate_sequence_model(model: nn.Module, dataset: ConversationDataset, forward_fn: Callable) -> np.ndarray:
+          '''Attack probability per conversation, in dataset order.'''
+          model.eval(); out = []
+          loader = DataLoader(dataset, batch_size=64, collate_fn=collate_fn, shuffle=False)
+          with torch.no_grad():
+              for seqs, _, lengths in loader:
+                  r = forward_fn(model, seqs, lengths)
+                  out.extend((r[0] if isinstance(r, tuple) else r).numpy().tolist())
+          return np.array(out)
+
+
+      def single_turn_baselines(train_ds: ConversationDataset, test_ds: ConversationDataset) -> dict:
+          '''What a per-request classifier sees: logistic regression on the last turn alone, and on
+          the mean of the turns (an order-blind summary of the conversation).'''
+          from sklearn.linear_model import LogisticRegression
+          res = {}
+          for name, f in [('last turn only', lambda e: e.turns[-1]), ('mean of turns', lambda e: np.mean(e.turns, axis=0))]:
+              Xtr = np.array([f(e) for e in train_ds.examples]); ytr = [e.label for e in train_ds.examples]
+              clf = LogisticRegression(max_iter=2000, class_weight='balanced').fit(Xtr, ytr)
+              res[name] = clf.predict_proba(np.array([f(e) for e in test_ds.examples]))[:, 1]
+          return res
+
+
+      def report(name: str, y: np.ndarray, p: np.ndarray, threshold: float = 0.5) -> None:
+          from sklearn.metrics import roc_auc_score
+          pred = p >= threshold
+          print(f'  {name:<26} ROC-AUC={roc_auc_score(y, p):.3f}  recall={pred[y == 1].mean():.3f}  FPR={pred[y == 0].mean():.3f}')
+
+
+      def demo_escalation_data(seed: int = 42):
+          '''Seeded synthetic gradual-erosion conversations, split train/val/test.'''
           from conversation_dataset_builder import ConversationDatasetBuilder
-
-          rng = np.random.default_rng(42)
-          benign = [rng.normal(0.1, 0.05, 20) for _ in range(80)]
-          attack = [rng.normal(0.7, 0.1, 20) for _ in range(20)]
           builder = ConversationDatasetBuilder()
-          builder.ingest_synthetic(attack, benign)
-          train_ds, val_ds, _ = builder.build_splits()
+          builder.ingest_escalation_synthetic(n_attack=300, n_benign=600, rng_seed=seed)
+          return builder.build_splits()
 
-          model = GRUSecurityDetector(input_size=20, hidden_size=64)
+
+      def train_demo_detector(model: nn.Module, train_ds: ConversationDataset, val_ds: ConversationDataset,
+                              max_epochs: int = 60) -> List[dict]:
+          '''Train a GRU or LSTM detector on the demo conversations (class-weighted).'''
           n_b = sum(1 for e in train_ds.examples if e.label == 0)
           n_a = sum(1 for e in train_ds.examples if e.label == 1)
-          pos_w = n_b / max(n_a, 1)
+          return train_sequence_model(model, train_ds, val_ds, forward_fn=lambda m, s, l: m(s, l),
+                                      max_epochs=max_epochs, batch_size=32, pos_weight=n_b / max(n_a, 1))
 
-          def gru_forward(m, seqs, lengths):
-              return m(seqs, lengths)
 
-          history = train_sequence_model(
-              model, train_ds, val_ds,
-              forward_fn=gru_forward,
-              max_epochs=30, batch_size=16,
-              pos_weight=pos_w,
-          )
-          print(f'Final val_recall: {history[-1]["val_recall"]:.3f}')
+      if __name__ == '__main__':
+          from gru_sequence_detector import GRUSecurityDetector
+
+          torch.manual_seed(42)
+          print('Synthetic gradual-erosion conversations (seeded; see ingest_escalation_synthetic).')
+          train_ds, val_ds, test_ds = demo_escalation_data()
+          model = GRUSecurityDetector(input_size=20, hidden_size=64)
+          history = train_demo_detector(model, train_ds, val_ds)
+          best = max(history, key=lambda h: h['val_f1'])
+          print(f'Best epoch {best["epoch"]}: val_recall={best["val_recall"]:.3f}  val_precision={best["val_precision"]:.3f}')
+          y = np.array([e.label for e in test_ds.examples])
+          print(f'\nHeld-out test set ({len(y)} conversations, {int(y.sum())} attack):')
+          report('GRU (whole sequence)', y, evaluate_sequence_model(model, test_ds, lambda m, s, l: m(s, l)))
+          for name, p in single_turn_baselines(train_ds, test_ds).items():
+              report(f'Baseline: {name}', y, p)
   - heading: 'Sequence Inference Optimiser'
     id: deliverable_5
     filename: sequence_inference_optimizer.py
@@ -1218,7 +1322,14 @@ deliverables:
 
 
       if __name__ == '__main__':
+          import torch
+          from sequence_model_trainer import demo_escalation_data, train_demo_detector
+          torch.manual_seed(42)
           detector = GRUDetectorWrapper(input_size=20, hidden_size=64)
+          print('Training the GRU on synthetic gradual-erosion conversations (seeded)...')
+          train_ds, val_ds, test_ds = demo_escalation_data()
+          train_demo_detector(detector.model, train_ds, val_ds)
+          detector._trained = True
 
           print('Latency profile (GRU, CPU):')
           latencies = profile_latency(detector, max_turns=15, n_samples=20)
@@ -1230,10 +1341,11 @@ deliverables:
 
           # Async session scoring demo
           async def demo():
-              rng = np.random.default_rng(42)
+              # Replay one held-out escalation conversation turn by turn, as it would arrive.
+              ex = next(e for e in test_ds.examples if e.label == 1)
               session = 'session_001'
-              for i in range(5):
-                  fv = rng.normal(0.1 if i < 4 else 0.8, 0.05, 20)
+              print(f'\nAsync scoring of a {len(ex.turns)}-turn escalation conversation:')
+              for i, fv in enumerate(ex.turns):
                   pred = await score_conversation_async(detector, session, fv)
                   if pred:
                       print(f'  Turn {i+1}: prob={pred.attack_probability:.3f}  '

@@ -508,11 +508,13 @@ deliverables:
 
           benchmark = MLDetectionBenchmark()
 
-          # Simulate detectors with different strengths
+          # Stand-in detectors (synthetic scores, not trained models): a higher skill shifts the
+          # attack-score distribution further above the shared benign distribution.
+          print('Stand-in detectors (synthetic scores); latency columns are not measured inference.')
           def make_detector(skill):
               def predict(x):
                   i = x
-                  base = rng.beta(skill * 8 + 1, 8) if y_true[i] == 1 else rng.beta(2, 8)
+                  base = rng.beta(1 + 4 * skill, 2) if y_true[i] == 1 else rng.beta(2, 6)
                   return float(base)
               return predict
 
@@ -702,18 +704,17 @@ deliverables:
 
       if __name__ == '__main__':
           rng = np.random.default_rng(42)
-
-          def control_model(x):
-              return rng.beta(3, 6)
-
-          def treatment_model(x):
-              return rng.beta(3, 5)   # slightly better discrimination
-
+          # Stand-in models (synthetic scores, not trained detectors). The input is the request's true
+          # label, which only the stand-ins see; the treatment separates the classes better.
+          def control_model(is_attack):
+              return rng.beta(6, 3) if is_attack else rng.beta(2, 10)
+          def treatment_model(is_attack):
+              return rng.beta(8, 2) if is_attack else rng.beta(2, 12)
           ab = ABTestDetector(control_model, treatment_model, treatment_fraction=0.5)
+          print('Stand-in control and treatment models (synthetic scores), 5,000 requests, 10% attacks.')
           for i in range(5000):
-              is_attack = rng.random() < 0.1
-              ab.process(f'req_{i}', 'input', is_attack)
-
+              is_attack = bool(rng.random() < 0.1)
+              ab.process(f'req_{i}', is_attack, is_attack)
           print_ab_result(ab.evaluate())
   - heading: 'Sample Size Calculator'
     id: deliverable_3
@@ -972,24 +973,37 @@ deliverables:
 
 
       if __name__ == '__main__':
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.metrics import f1_score
+
           harness = BenchmarkReproducibilityHarness(log_path='/tmp/benchmark_runs.jsonl', seed=42)
+          print('Synthetic benchmark: a logistic regression trained and scored on data drawn from the')
+          print('global NumPy RNG, which set_all_seeds() controls.')
+          n = 400
+          y_true = (np.arange(n) % 5 == 0).astype(int)
+          inputs = list(range(n))
 
-          y_true = np.array([0, 1, 0, 1, 1, 0, 0, 1])
-          inputs = list(range(8))
+          def seeded_benchmark():
+              X = np.random.normal(0, 1, (n, 5)) + y_true[:, None] * 0.8     # drawn after set_all_seeds()
+              tr = np.arange(n) % 2 == 0
+              clf = LogisticRegression(class_weight='balanced').fit(X[tr], y_true[tr])
+              p = clf.predict_proba(X[~tr])[:, 1]
+              return {'mean_score': float(p.mean()), 'f1': float(f1_score(y_true[~tr], p >= 0.5))}
 
-          def deterministic_benchmark():
-              harness.set_all_seeds()
-              scores = np.random.beta(2, 5, len(inputs))
-              return {'mean_score': float(scores.mean()), 'f1': 0.876}
+          def unseeded_benchmark():
+              rng = np.random.default_rng()                                   # fresh entropy every run
+              X = rng.normal(0, 1, (n, 5)) + y_true[:, None] * 0.8
+              tr = np.arange(n) % 2 == 0
+              clf = LogisticRegression(class_weight='balanced').fit(X[tr], y_true[tr])
+              p = clf.predict_proba(X[~tr])[:, 1]
+              return {'mean_score': float(p.mean()), 'f1': float(f1_score(y_true[~tr], p >= 0.5))}
 
-          # Verify reproducibility
-          reproducible = harness.verify_reproducibility('ensemble', deterministic_benchmark, inputs, y_true)
-          print(f'Benchmark reproducible: {reproducible}')
-
-          run = harness.run_benchmark('ensemble', deterministic_benchmark, inputs, y_true)
-          print(f'Run logged: {run.run_id}')
+          print(f'Seeded benchmark reproducible:   {harness.verify_reproducibility("ensemble", seeded_benchmark, inputs, y_true)}')
+          print(f'Unseeded benchmark reproducible: {harness.verify_reproducibility("ensemble", unseeded_benchmark, inputs, y_true)}')
+          run = harness.run_benchmark('ensemble', seeded_benchmark, inputs, y_true)
+          print(f'Run logged: {run.config_name} (seed {run.seed})')
           print(f'  test_set_hash: {run.test_set_hash}')
-          print(f'  metrics: {run.metrics}')
+          print(f'  metrics: {{"mean_score": {run.metrics["mean_score"]:.4f}, "f1": {run.metrics["f1"]:.4f}}}')
   - heading: 'Online-Offline Divergence Analyser'
     id: deliverable_5
     filename: online_offline_divergence_analyser.py
@@ -1107,6 +1121,7 @@ deliverables:
 
 
       if __name__ == '__main__':
+          print('Simulated metric history (synthetic: online F1 drifting down over 12 days).')
           import time
           now = time.time() * 1000
           analyser = OnlineOfflineDivergenceAnalyser(widening_threshold=0.03)
