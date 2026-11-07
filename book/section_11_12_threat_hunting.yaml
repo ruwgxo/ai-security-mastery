@@ -1145,42 +1145,77 @@ deliverables:
       # Demo mode with synthetic data
       # ---------------------------------------------------------------------------
 
+      def _unit(v: np.ndarray) -> np.ndarray:
+          return v / np.linalg.norm(v)
+
+      def _point_at_distance(
+          rng: np.random.Generator,
+          centre: np.ndarray,
+          distance: float,
+      ) -> np.ndarray:
+          '''A unit vector at exactly the given cosine distance from centre, in a random direction.'''
+          u = rng.standard_normal(centre.shape[0]).astype(np.float32)
+          u = _unit(u - u.dot(centre) * centre)
+          cos = 1.0 - distance
+          return _unit(cos * centre + np.sqrt(1.0 - cos ** 2) * u)
+
+      def _cluster(
+          rng: np.random.Generator,
+          centre: np.ndarray,
+          n: int,
+          spread: float,
+      ) -> np.ndarray:
+          '''
+          n unit vectors around centre. spread is the length of the added noise vector,
+          whatever the dimension, so each point sits about spread**2 / 2 cosine distance
+          from the centre (0.15 -> about 0.01).
+          '''
+          dim = centre.shape[0]
+          noise = rng.standard_normal((n, dim)).astype(np.float32) * (spread / np.sqrt(dim))
+          points = centre + noise
+          return points / np.linalg.norm(points, axis=1, keepdims=True)
+
       def run_demo() -> None:
+          '''
+          Two synthetic corpora run through the same hunt. Both hold normal traffic and
+          known injections that Track 1 already flags. The control corpus has nothing
+          else, so the hunt must report no anomalous cluster. The test corpus adds 12
+          unflagged novel variants 0.15 cosine distance from the known-bad centroid
+          (inside the 0.20 high-proximity band), so the hunt must find that cluster and
+          nothing else. Synthetic vectors stand in for real embeddings: this checks the
+          clustering and proximity logic, not an embedding model.
+          '''
           rng = np.random.default_rng(42)
           dim = 384   # sentence-transformers/all-MiniLM-L6-v2 output dim
 
-          # Known-bad centroid (injection prompt cluster centre)
-          known_bad = rng.standard_normal(dim).astype(np.float32)
-          known_bad /= np.linalg.norm(known_bad)
+          known_bad = _unit(rng.standard_normal(dim).astype(np.float32))
+          normal_centre = _point_at_distance(rng, known_bad, 0.90)   # unrelated topic area
+          novel_centre = _point_at_distance(rng, known_bad, 0.15)    # near known-bad, not flagged
 
-          records: list[PromptRecord] = []
+          normal = _cluster(rng, normal_centre, 80, 0.30)
+          known = _cluster(rng, known_bad, 20, 0.15)
+          novel = _cluster(rng, novel_centre, 12, 0.15)
 
-          # Cluster 1: normal user traffic (far from known-bad)
-          normal_centre = rng.standard_normal(dim).astype(np.float32)
-          normal_centre /= np.linalg.norm(normal_centre)
-          for i in range(80):
-              emb = normal_centre + rng.standard_normal(dim).astype(np.float32) * 0.05
-              emb /= np.linalg.norm(emb)
-              records.append(PromptRecord(f'n{i}', emb, already_flagged=False))
+          corpora = [
+              ('Control corpus: 80 normal, 20 known-flagged, no novel variants', False),
+              ('Test corpus: 80 normal, 20 known-flagged, 12 novel variants', True),
+          ]
+          for name, with_novel in corpora:
+              records = [PromptRecord(f'n{i}', e, already_flagged=False) for i, e in enumerate(normal)]
+              records += [PromptRecord(f'k{i}', e, already_flagged=True) for i, e in enumerate(known)]
+              if with_novel:
+                  records += [PromptRecord(f'v{i}', e, already_flagged=False) for i, e in enumerate(novel)]
 
-          # Cluster 2: known injections (close to known-bad; already flagged by Track 1)
-          for i in range(20):
-              emb = known_bad + rng.standard_normal(dim).astype(np.float32) * 0.04
-              emb /= np.linalg.norm(emb)
-              records.append(PromptRecord(f'k{i}', emb, already_flagged=True))
+              print(f'\n=== {name} ===')
+              clusters = run_dbscan(records, eps=0.15, min_samples=5)
+              results = analyse_clusters(clusters, known_bad)
+              print_analysis_report(results, len(records))
 
-          # Cluster 3: novel injection variants (close to known-bad; NOT flagged — the finding)
-          novel_centre = known_bad + rng.standard_normal(dim).astype(np.float32) * 0.08
-          novel_centre /= np.linalg.norm(novel_centre)
-          for i in range(12):
-              emb = novel_centre + rng.standard_normal(dim).astype(np.float32) * 0.03
-              emb /= np.linalg.norm(emb)
-              records.append(PromptRecord(f'v{i}', emb, already_flagged=False))
-
-          print('Running demo with synthetic prompt corpus (80 normal, 20 known-flagged, 12 novel variants)')
-          clusters = run_dbscan(records, eps=0.15, min_samples=5)
-          results = analyse_clusters(clusters, known_bad)
-          print_analysis_report(results, len(records))
+              anomalous_ids = {r.cluster_id for r in results if r.anomalous}
+              hit = [p.prompt_id for cid in anomalous_ids for p in clusters[cid]]
+              print(f'Novel variants in anomalous clusters: {sum(1 for p in hit if p[0] == "v")}'
+                    f'/{len(novel) if with_novel else 0}; '
+                    f'normal prompts in anomalous clusters: {sum(1 for p in hit if p[0] == "n")}')
 
       # ---------------------------------------------------------------------------
       # Entry point
