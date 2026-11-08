@@ -432,27 +432,36 @@ deliverables:
 
 
       if __name__ == '__main__':
-          # 7-day hourly-ish series with a daily peak (period 24), low overnight
+          # 7-day synthetic hourly series with a daily peak (period 24), low overnight,
+          # plus ordinary hour-to-hour variation (seeded)
           import math
+          import random
+          random.seed(4)
           period = 24
           series = []
           for day in range(7):
               for hour in range(24):
                   base = 50 + 40 * math.sin((hour - 6) / 24 * 2 * math.pi)
-                  series.append(max(base, 5))
+                  series.append(max(base + random.gauss(0, 3), 5))
+          print('Synthetic hourly series (seeded): daily cycle plus noise, 7 days.')
+
           decomp = decompose(series, period)
+          print(f'Residual centre={decomp.residual_centre:.2f}, robust spread={decomp.residual_spread:.2f}')
 
           # Normal morning peak (hour 9): high absolute value, should NOT fire
           morning = decomp.trend + decomp.seasonal[9] + 3
           z_morning = score_observation(morning, 9, decomp)
           # Overnight attack (hour 3): absolute value below morning peak, SHOULD fire
-          night_attack = decomp.trend + decomp.seasonal[3] + 60
+          night_attack = decomp.trend + decomp.seasonal[3] + 45
           z_night = score_observation(night_attack, 3, decomp)
 
-          print(f'Morning peak value {morning:.0f} at hour 9: residual z = {z_morning:.2f} (normal)')
-          print(f'Overnight value {night_attack:.0f} at hour 3: residual z = {z_night:.2f} (anomaly)')
-          print('The overnight attack fires despite a lower absolute value than the')
-          print('morning peak, because seasonal decomposition compares against the hour.')
+          k = 3.5
+          for label, value, hour, z in (('Morning peak', morning, 9, z_morning), ('Overnight', night_attack, 3, z_night)):
+              verdict = 'anomaly' if abs(z) > k else 'normal'
+              print(f'{label} value {value:.0f} at hour {hour}: residual z = {z:.2f} ({verdict} at |z| > {k})')
+          rel = 'lower' if night_attack < morning else 'higher'
+          print(f'The overnight attack fires with a {rel} absolute value than the morning peak,')
+          print('because seasonal decomposition compares each value against its own hour.')
   - heading: 'Streaming Forecast Anomaly Scorer'
     id: deliverable_2
     filename: forecast_anomaly_scorer.py
@@ -483,7 +492,9 @@ deliverables:
           seasonal: List[float] = field(default_factory=list)
           resid_abs_ewma: float = 1.0  # running scale of residuals
           beta: float = 0.05           # residual scale smoothing
+          warmup_periods: int = 2      # period 1 initialises level/seasonal; period 2 learns the residual scale
           step: int = 0
+          _first_period: List[float] = field(default_factory=list)
 
           def _ensure_init(self, value: float) -> None:
               if self.level is None:
@@ -502,15 +513,26 @@ deliverables:
 
           def score_and_update(self, value: float, slot: int, flagged_hint: bool = False) -> Tuple[float, bool]:
               self._ensure_init(value)
+              warming = self.step < self.warmup_periods * self.period
+              if self.step < self.period:
+                  # Initialise from the first full period: level = its mean, seasonal = deviations from it.
+                  # Without this the seasonal factors start at zero, the daily cycle falls outside the
+                  # interval, and the contamination guard then keeps the forecaster from ever learning it.
+                  self._first_period.append(value)
+                  self.step += 1
+                  if self.step == self.period:
+                      self.level = sum(self._first_period) / self.period
+                      self.seasonal = [v - self.level for v in self._first_period]
+                  return 0.0, False
               f = self.forecast(slot)
               residual = value - f
               scale = self.resid_abs_ewma if self.resid_abs_ewma > 1e-9 else 1.0
               z = residual / scale
               lo, hi = self.interval(slot)
-              is_anomaly = value < lo or value > hi
+              is_anomaly = (value < lo or value > hi) and not warming
 
               # Contamination guard: do not smooth a flagged/anomalous point into state
-              if not (is_anomaly or flagged_hint):
+              if warming or not (is_anomaly or flagged_hint):
                   s = slot % self.period
                   new_level = self.alpha * (value - self.seasonal[s]) + (1 - self.alpha) * self.level
                   self.seasonal[s] = self.gamma * (value - new_level) + (1 - self.gamma) * self.seasonal[s]
@@ -522,26 +544,34 @@ deliverables:
 
       if __name__ == '__main__':
           import math
+          import random
+          random.seed(9)
+          print('Synthetic hourly series (seeded): daily cycle plus noise; 5 days of history, then day 6.')
           fc = StreamingForecaster(period=24, interval_k=3.0)
-          # Warm up over 5 days of seasonal data
+
+          def hourly(hour: int) -> float:
+              return max(50 + 40 * math.sin((hour - 6) / 24 * 2 * math.pi) + random.gauss(0, 3), 5)
+
           for day in range(5):
               for hour in range(24):
-                  v = 50 + 40 * math.sin((hour - 6) / 24 * 2 * math.pi)
-                  fc.score_and_update(max(v, 5), hour)
+                  fc.score_and_update(hourly(hour), hour)
+          level_before = fc.level
 
           # Day 6: inject an overnight burst at hour 3
           fired = []
           for hour in range(24):
-              v = 50 + 40 * math.sin((hour - 6) / 24 * 2 * math.pi)
-              v = max(v, 5)
+              v = hourly(hour)
               if hour == 3:
                   v += 70  # burst
               z, anom = fc.score_and_update(v, hour)
               if anom:
                   fired.append((hour, z))
-          print('Anomalies fired on day 6:', fired)
-          print('The hour-3 burst fired; the legitimate seasonal peak did not,')
-          print('and the burst was held out of the smoothed state by the guard.')
+          peak_hour = max(range(24), key=lambda h: fc.seasonal[h])
+          print('Anomalies fired on day 6 (hour, z):', fired)
+          print(f'Seasonal peak learned at hour {peak_hour}; peak fired: {any(h == peak_hour for h, _ in fired)}')
+          print(f'Level before day 6: {level_before:.1f}, after: {fc.level:.1f}')
+          print('The hour-3 burst fired; the legitimate seasonal peak did not, and the burst')
+          print('was held out of the smoothed state by the guard.')
   - heading: 'Change-Point Detector'
     id: deliverable_3
     filename: change_point_detector.py
@@ -663,11 +693,9 @@ deliverables:
 
 
       def aggregate(series: List[float], factor: int) -> List[float]:
-          # Aggregate fine-resolution points into coarser buckets by sum
-          out = []
-          for i in range(0, len(series), factor):
-              out.append(sum(series[i:i + factor]))
-          return out
+          # Aggregate fine-resolution points into coarser buckets by sum; a trailing partial
+          # bucket is dropped, because it is not comparable with a full one
+          return [sum(series[i:i + factor]) for i in range(0, len(series) - factor + 1, factor)]
 
 
       @dataclass
@@ -678,46 +706,74 @@ deliverables:
           bucket_index: int
 
 
-      def detect_at_resolution(series: List[float], name: str, k: float = 4.0) -> ResolutionVerdict:
-          if len(series) < 4:
+      def detect_at_resolution(series: List[float], name: str, reference_buckets: int,
+                               k: float = 4.0) -> ResolutionVerdict:
+          # Baseline before anomaly: the first reference_buckets form the baseline (held fixed, as the
+          # contamination guard keeps it); every later bucket is scored against it.
+          if len(series) <= reference_buckets or reference_buckets < 4:
               return ResolutionVerdict(name, False, 0.0, -1)
-          history = series[:-1]
-          c = _median(history)
-          s = _mad(history, c)
-          latest = series[-1]
-          score = (latest - c) / s
-          return ResolutionVerdict(name, score > k, round(score, 2), len(series) - 1)
+          ref = series[:reference_buckets]
+          c = _median(ref)
+          s = _mad(ref, c)
+          scores = [(v - c) / s for v in series[reference_buckets:]]
+          i = max(range(len(scores)), key=lambda j: scores[j])
+          return ResolutionVerdict(name, scores[i] > k, round(scores[i], 2), reference_buckets + i)
 
 
-      def multi_resolution_detect(fine_series: List[float]) -> Tuple[bool, List[ResolutionVerdict]]:
-          verdicts = [
-              detect_at_resolution(fine_series, 'fine (per-minute)'),
-              detect_at_resolution(aggregate(fine_series, 6), 'medium (per-6min)'),
-              detect_at_resolution(aggregate(fine_series, 60), 'coarse (per-hour)'),
-          ]
-          # Dedup: if multiple fire, attribute to the coarsest that fired (one event)
-          any_fired = any(v.fired for v in verdicts)
-          return any_fired, verdicts
+      RESOLUTIONS = (('fine (per-minute)', 1), ('medium (per-10min)', 10), ('coarse (per-hour)', 60))
+
+
+      def multi_resolution_detect(fine_series: List[float], reference_minutes: int) -> Tuple[bool, List[ResolutionVerdict], str]:
+          verdicts = [detect_at_resolution(aggregate(fine_series, f), name, reference_minutes // f)
+                      for name, f in RESOLUTIONS]
+          # Dedup: one event, attributed to the resolution that carries the strongest signal
+          fired = [v for v in verdicts if v.fired]
+          attributed = max(fired, key=lambda v: v.score).resolution if fired else 'none'
+          return bool(fired), verdicts, attributed
+
+
+      def _cases(rng, ref_minutes: int, scored_minutes: int):
+          def noisy(mean: float) -> float:
+              return max(0.0, rng.gauss(mean, 1.5))
+          # Burst: one minute of +20 requests -- ten times the per-minute rate, a sixth of an hour's volume
+          burst = [noisy(2.0) for _ in range(ref_minutes + scored_minutes)]
+          burst[ref_minutes + 200] += 20.0
+          # Slow ramp: the rate climbs 2.0 -> 3.2/minute across the scored period
+          ramp = [noisy(2.0) for _ in range(ref_minutes)] + \
+                 [noisy(2.0 + 1.2 * i / scored_minutes) for i in range(scored_minutes)]
+          quiet = [noisy(2.0) for _ in range(ref_minutes + scored_minutes)]
+          return (('Burst case', burst), ('Slow-ramp case', ramp), ('Quiet case', quiet))
 
 
       if __name__ == '__main__':
-          # Case 1: a short burst -- fine resolution should fire, coarse should not
-          burst = [2.0] * 200 + [40.0] + [2.0] * 19
-          fired_b, vb = multi_resolution_detect(burst)
-          print('Burst case:')
-          for v in vb:
-              print(f'  {v.resolution:<20} fired={v.fired} score={v.score}')
-          print(f'  any fired: {fired_b}\n')
+          import random
+          ref_minutes, scored_minutes = 1440, 360
+          print('Synthetic per-minute request counts (seeded): ~2/minute with ordinary variation.')
+          print('The first 24 hours are the reference baseline; the next 6 hours are scored.\n')
+          for name, series in _cases(random.Random(12), ref_minutes, scored_minutes):
+              fired, verdicts, attributed = multi_resolution_detect(series, ref_minutes)
+              print(f'{name}:')
+              for v in verdicts:
+                  print(f'  {v.resolution:<20} fired={str(v.fired):<5} max score={v.score}')
+              print(f'  any fired: {fired}; attributed to: {attributed}\n')
 
-          # Case 2: a slow ramp -- coarse resolution should fire, fine should not
-          ramp = [2.0 + i * 0.02 for i in range(220)]
-          fired_r, vr = multi_resolution_detect(ramp)
-          print('Slow-ramp case:')
-          for v in vr:
-              print(f'  {v.resolution:<20} fired={v.fired} score={v.score}')
-          print(f'  any fired: {fired_r}')
-          print('\nThe burst fires the fine resolution; the ramp fires the coarse.')
-          print('A single-resolution detector would miss one of the two.')
+          runs = 200
+          counts = {}
+          for seed in range(runs):
+              for name, series in _cases(random.Random(seed), ref_minutes, scored_minutes):
+                  for v in multi_resolution_detect(series, ref_minutes)[1]:
+                      counts[(name, v.resolution)] = counts.get((name, v.resolution), 0) + v.fired
+          print(f'Fired in {runs} seeded runs:   ' + '  '.join(f'{r.split()[0]:>6}' for r, _ in RESOLUTIONS))
+          for name in ('Burst case', 'Slow-ramp case', 'Quiet case'):
+              print(f'  {name:<26}' + '  '.join(f'{counts[(name, r)]:>6}' for r, _ in RESOLUTIONS))
+          f, m, c = (r for r, _ in RESOLUTIONS)
+          burst_fine, burst_coarse = counts[('Burst case', f)], counts[('Burst case', c)]
+          ramp_coarse, ramp_fine = counts[('Slow-ramp case', c)], counts[('Slow-ramp case', f)]
+          print(f'\nThe burst fires the fine resolution in {burst_fine} of {runs} runs and the coarse one')
+          print(f'in {burst_coarse}: an hour averages it away. The ramp fires the coarse resolution in')
+          print(f'{ramp_coarse} of {runs} runs and the fine one in {ramp_fine}: per-minute variation hides it.')
+          print('A single-resolution detector would miss one of the two; the combined verdict')
+          print('is attributed to the resolution with the strongest signal.')
 common_mistakes:
   - subject: >
       Applying a static threshold or a single baseline to a seasonal metric without modelling the

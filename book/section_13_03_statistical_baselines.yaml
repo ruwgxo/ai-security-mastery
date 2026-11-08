@@ -472,17 +472,33 @@ deliverables:
 
 
       if __name__ == '__main__':
+          import random
+          import statistics
+          random.seed(13)
           store = BaselineStore(max_len=100, min_history=20)
-          # Build a baseline for a light user: ~10 requests/hour
-          for _ in range(40):
-              store.update('user_light', 'requests_per_hour', 10.0)
+          # Synthetic hourly counts for a light user: ~10 requests/hour with ordinary variation
+          normal = [max(0.0, round(random.gauss(10, 2))) for _ in range(60)]
+          for v in normal:
+              store.update('user_light', 'requests_per_hour', v)
+          print('Synthetic hourly request counts (seeded), light user around 10/hour.')
+          c0, s0 = store.centre_spread('user_light', 'requests_per_hour')
+          print(f'Clean window:      median={c0:.1f}  MAD spread={s0:.2f}')
+
           # Inject a few attack bursts INTO the window to show robustness
           for v in [500.0, 480.0, 520.0]:
               store.update('user_light', 'requests_per_hour', v)
-          cs = store.centre_spread('user_light', 'requests_per_hour')
-          print(f'Light user baseline after 3 attack bursts in window: centre={cs[0]:.1f}, spread={cs[1]:.1f}')
-          print('Robust median ignores the minority bursts -- centre stays near 10,')
-          print('so the next attack hour still scores as a large deviation.')
+          window = list(store._get('user_light', 'requests_per_hour').window)
+          c1, s1 = store.centre_spread('user_light', 'requests_per_hour')
+          m1, sd1 = statistics.mean(window), statistics.stdev(window)
+          print(f'With 3 bursts:     median={c1:.1f}  MAD spread={s1:.2f}')
+          print(f'                   mean={m1:.1f}    std dev={sd1:.1f}   (non-robust, for comparison)')
+
+          nxt = 450.0
+          print(f'Next attack hour ({nxt:.0f}/hour): robust z={(nxt - c1) / s1:.0f}, '
+                f'mean/std z={(nxt - m1) / sd1:.1f}')
+          print('The median and MAD barely move, so the next attack hour still scores as a')
+          print('large deviation; the mean and standard deviation absorb the bursts and')
+          print('shrink the same hour to a few standard deviations.')
   - heading: 'Baseline Deviation Scorer'
     id: deliverable_2
     filename: baseline_deviation_scorer.py
@@ -542,32 +558,33 @@ deliverables:
 
 
       if __name__ == '__main__':
-          # Light user baseline: requests/hour centre 10, spread 2 (scaled MAD)
-          # Refusal rate centre 0.05, spread 0.03
-          rph_window = [10.0] * 40
-          refusal_window = [0.05] * 40
+          import random
+          random.seed(21)
 
-          # Observed attack hour: 500 requests, refusal rate 0.45
-          rph_dev = MetricDeviation(
-              metric='requests_per_hour',
-              mod_z=modified_z_score(500.0, 10.0, 2.0),
-              pct_rank=percentile_rank(500.0, rph_window),
-              weight=1.0,
-          )
-          refusal_dev = MetricDeviation(
-              metric='refusal_rate',
-              mod_z=modified_z_score(0.45, 0.05, 0.03),
-              pct_rank=percentile_rank(0.45, refusal_window),
-              weight=0.7,
-          )
-          session_dev = MetricDeviation(
-              metric='session_length',
-              mod_z=modified_z_score(12.0, 11.0, 4.0),  # ordinary
-              pct_rank=percentile_rank(12.0, [11.0] * 40),
-              weight=0.5,
-          )
+          def _median(v):
+              v = sorted(v); n = len(v)
+              return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
 
-          devs = [rph_dev, refusal_dev, session_dev]
+          def centre_spread(window):
+              c = _median(window)
+              return c, _median([abs(x - c) for x in window]) * 1.4826
+
+          # Synthetic 40-hour baseline windows for a light user (seeded)
+          rph_window = [max(0.0, round(random.gauss(10, 2))) for _ in range(40)]
+          refusal_window = [min(1.0, max(0.0, random.gauss(0.05, 0.03))) for _ in range(40)]
+          session_window = [max(1.0, round(random.gauss(11, 4))) for _ in range(40)]
+          print('Synthetic baseline windows (seeded): 40 hours of a light user.')
+
+          # Observed attack hour: 500 requests, refusal rate 0.45, ordinary session length 12
+          observed = [('requests_per_hour', 500.0, rph_window, 1.0),
+                      ('refusal_rate', 0.45, refusal_window, 0.7),
+                      ('session_length', 12.0, session_window, 0.5)]
+          devs = []
+          for metric, value, window, weight in observed:
+              c, s = centre_spread(window)
+              devs.append(MetricDeviation(metric, modified_z_score(value, c, s), percentile_rank(value, window), weight))
+              print(f'{metric:<20} baseline centre={c:<6.3g} spread={s:<6.3g} observed={value}')
+          print()
           for d in devs:
               print(f'{d.metric:<20} mod_z={d.mod_z:>8.1f}  pct={d.pct_rank:.2f}  weight={d.weight}')
           composed = compose_entity_deviation(devs)
@@ -639,8 +656,8 @@ deliverables:
 
           for n in [0, 5, 10, 20]:
               bb = BlendedBaseline(
-                  personal_centre=10.0,
-                  personal_spread=2.0,
+                  personal_centre=25.0,   # this entity is a heavier user than its cohort
+                  personal_spread=4.0,
                   personal_n=n,
                   prior_centre=prior_centre,
                   prior_spread=prior_spread,
@@ -648,6 +665,7 @@ deliverables:
               )
               c, s = bb.effective()
               print(f'  n={n:>2} history: blend_weight={bb.blend_weight():.2f}  effective centre={c:.1f}, spread={s:.1f}')
+          print('Personal baseline once established: centre=25.0, spread=4.0')
           print('A brand-new entity is scored against the cohort prior,')
           print('blending toward its personal baseline as history accrues.')
   - heading: 'Baseline Contamination Guard'
@@ -668,7 +686,7 @@ deliverables:
 
       from collections import deque
       from dataclasses import dataclass, field
-      from typing import Deque, List
+      from typing import Deque, List, Tuple
 
 
       def _median(values) -> float:
@@ -690,46 +708,106 @@ deliverables:
       @dataclass
       class GuardedBaseline:
           max_len: int = 100
+          release_delay: int = 24        # observations an unconfirmed flag waits before it may update
           window: Deque[float] = field(default_factory=deque)
+          pending: List[List[float]] = field(default_factory=list)   # [value, observations left]
           excluded_count: int = 0
+          released_count: int = 0
+
+          def _append(self, value: float) -> None:
+              self.window.append(value)
+              while len(self.window) > self.max_len:
+                  self.window.popleft()
+
+          def _tick(self) -> None:
+              # Unconfirmed flags that were not confirmed during the delay update the baseline late,
+              # so a genuine shift is eventually absorbed while confirmed attacks never are.
+              for p in self.pending:
+                  p[1] -= 1
+              for value, _ in [p for p in self.pending if p[1] <= 0]:
+                  self._append(value)
+                  self.released_count += 1
+              self.pending = [p for p in self.pending if p[1] > 0]
 
           def offer(self, obs: Observation) -> bool:
+              self._tick()
               # Confirmed/high-confidence flags never update the baseline
               if obs.confirmed_attack:
                   self.excluded_count += 1
                   return False
-              # Unconfirmed flags are held out too (could be early attack) --
-              # they are eligible to be re-offered after confirmation as benign
+              # Unconfirmed flags are held out for release_delay observations, then released
               if obs.flagged:
-                  self.excluded_count += 1
+                  self.pending.append([obs.value, float(self.release_delay)])
                   return False
-              self.window.append(obs.value)
-              while len(self.window) > self.max_len:
-                  self.window.popleft()
+              self._append(obs.value)
               return True
 
           def centre(self) -> float:
               return _median(list(self.window))
 
+          def centre_spread(self) -> Tuple[float, float]:
+              c = self.centre()
+              return c, (_median([abs(v - c) for v in self.window]) * 1.4826) or 1.0
+
+
+      def run(stream: List[float], seed: List[float], guarded: bool, flag_z: float = 3.0,
+              confirm_z: float = 6.0, max_len: int = 48) -> Tuple[GuardedBaseline, List[float]]:
+          """Feed a stream hour by hour, flagging each value against the live baseline.
+          guarded=False is the plain rolling window: every observation updates it."""
+          b = GuardedBaseline(max_len=max_len)
+          for v in seed:
+              b.offer(Observation(v, flagged=False, confirmed_attack=False))
+          zs = []
+          for v in stream:
+              c, sp = b.centre_spread()
+              z = (v - c) / sp
+              zs.append(z)
+              if guarded:
+                  b.offer(Observation(v, flagged=z > flag_z, confirmed_attack=z > confirm_z))
+              else:
+                  b.offer(Observation(v, flagged=False, confirmed_attack=False))
+          return b, zs
+
 
       if __name__ == '__main__':
-          guard = GuardedBaseline(max_len=100)
-          # Seed a normal baseline at 10
-          for _ in range(40):
-              guard.offer(Observation(10.0, flagged=False, confirmed_attack=False))
-          print(f'Baseline centre after seeding: {guard.centre():.1f}')
+          import random
+          import statistics
+          print('Synthetic hourly request counts, ordinary variation around 10/hour (sd 1.5).')
+          print('Each hour is flagged at z > 3 against the live baseline; z > 6 is high-confidence.')
+          print('Slow ramp: +2% an hour for two weeks, 10/hour to about 7,600/hour.')
+          print('100 seeded trials per configuration; caught = the last hour still fires.\n')
+          res = {}
+          for window in (48, 336):
+              for guarded in (False, True):
+                  caught, centres = 0, []
+                  for trial in range(100):
+                      rng = random.Random(trial)
+                      seed = [rng.gauss(10, 1.5) for _ in range(window)]
+                      ramp = [10 * 1.02 ** h + rng.gauss(0, 1.5) for h in range(336)]
+                      b, zs = run(ramp, seed, guarded, max_len=window)
+                      caught += zs[-1] > 3.0
+                      centres.append(b.centre())
+                  res[(window, guarded)] = caught
+                  mode = 'guarded  ' if guarded else 'unguarded'
+                  print(f'  {window:>3}h window, {mode}: caught {caught:>3}/100, '
+                        f'median final baseline centre {statistics.median(centres):>7.1f}')
 
-          # Slow-ramp attack: each step flagged as a deviation once it grows
-          ramp = [11, 13, 16, 20, 26, 34, 45, 60, 80, 110]
-          for v in ramp:
-              # Simulate the detector flagging the step as anomalous deviation
-              flagged = v > 12  # anything above near-baseline is flagged
-              guard.offer(Observation(float(v), flagged=flagged, confirmed_attack=False))
+          # Legitimate step change: the user's normal genuinely moves from 10 to 18 and stays
+          rng = random.Random(7)
+          seed = [rng.gauss(10, 1.5) for _ in range(48)]
+          step = [18 + rng.gauss(0, 1.5) for _ in range(120)]
+          print('\nLegitimate step change: 10/hour to 18/hour, sustained for five days (48h window)')
+          b, zs = run(step, seed, guarded=True)
+          last_flag = max((i for i, z in enumerate(zs) if z > 3.0), default=-1)
+          print(f'  guarded: baseline centre {b.centre():.1f}, unconfirmed flags released {b.released_count}, '
+                f'last flagged hour {last_flag + 1}')
 
-          print(f'Baseline centre after slow-ramp attempt: {guard.centre():.1f}')
-          print(f'Observations excluded by the guard: {guard.excluded_count}')
-          print('The guard held the flagged ramp out of the window, so the baseline')
-          print('stayed near 10 and the adversary could not walk it upward.')
+          print('\nWith a 48-hour window the unguarded baseline walks up with the ramp and never')
+          print('fires at the end; the guard catches the ramp only when an early hour happens to')
+          print(f'flag ({res[(48, True)]} of 100 trials), because it holds out only what is flagged. With a')
+          print('two-week window the ramp outruns the baseline either way, but only the guarded')
+          print('baseline stays near 10. The delayed release still lets a genuine shift be')
+          print('absorbed once its held-out hours age into the window.')
 common_mistakes:
   - subject: 'Using a single global threshold for a behavioural metric instead of per-entity baselines'
     id: mistake_1

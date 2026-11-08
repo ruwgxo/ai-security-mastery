@@ -440,6 +440,7 @@ deliverables:
           last_ts: float
           events: List[Event] = field(default_factory=list)
           closed: bool = False
+          token_rotations: int = 0   # composite: token changes kept inside the session (itself a signal)
 
 
       @dataclass
@@ -447,6 +448,7 @@ deliverables:
           strategy: str           # 'token', 'inactivity', 'window', 'composite'
           inactivity_timeout_s: float = 900.0
           max_session_length_s: float = 3600.0
+          token_rotation_grace_s: float = 300.0   # composite: a token change inside this gap is a rotation
 
 
       class SessionModeller:
@@ -472,13 +474,18 @@ deliverables:
                   return gap > c.inactivity_timeout_s
               if c.strategy == 'window':
                   return length > c.max_session_length_s
-              # composite: close on token change, inactivity, OR length cap --
-              # so an adversary cannot extend or fragment a session at will
+              # composite: use the token when present, but a token change only opens a new session
+              # after a real pause (token_rotation_grace_s); a rotation mid-stream is kept in the
+              # session and counted. Inactivity and the length cap close it as before, so an
+              # adversary can neither fragment nor extend a session at will.
               token_change = (
                   event.session_token is not None
                   and session.events
                   and session.events[-1].session_token != event.session_token
               )
+              if token_change and gap <= c.token_rotation_grace_s:
+                  session.token_rotations += 1
+                  token_change = False
               return token_change or gap > c.inactivity_timeout_s or length > c.max_session_length_s
 
           def ingest(self, event: Event) -> None:
@@ -524,13 +531,22 @@ deliverables:
           for ev in stream:
               modeller.ingest(ev)
           modeller.flush()
-
-          print(f'Sessions produced: {len(modeller.closed)}')
+          print(f'Composite boundary -- sessions produced: {len(modeller.closed)}')
           for s in modeller.closed:
               print(f'  {s.session_id}: {len(s.events)} turns, '
-                    f'span {s.last_ts - s.start_ts:.0f}s')
-          print('Composite boundary closed the session on token rotation,')
-          print('keeping the escalation visible rather than letting the adversary fragment it.')
+                    f'span {s.last_ts - s.start_ts:.0f}s, token rotations kept: {s.token_rotations}')
+
+          token_only = SessionModeller(BoundaryConfig(strategy='token'))
+          for ev in stream:
+              token_only.ingest(ev)
+          token_only.flush()
+          print(f'Token-only boundary -- sessions produced: {len(token_only.closed)}')
+          for s in token_only.closed:
+              print(f'  {s.session_id}: {len(s.events)} turns, span {s.last_ts - s.start_ts:.0f}s')
+
+          print('The token-only boundary lets the rotation split the escalation in two;')
+          print('the composite boundary keeps all five turns in one session and records the')
+          print('rotation, so the adversary cannot fragment the trajectory.')
   - heading: 'Behavioural Feature Extractor'
     id: deliverable_2
     filename: behavioural_feature_extractor.py
@@ -676,7 +692,6 @@ deliverables:
 
       from dataclasses import dataclass
       from typing import Callable, List
-      import hashlib
       import math
 
 
@@ -692,15 +707,32 @@ deliverables:
           return 1.0 - (dot / (na * nb))
 
 
-      def toy_embedder(text: str, dims: int = 16) -> List[float]:
-          # Deterministic pseudo-embedding for the runnable example only.
-          # In production, inject a Sentence Transformer (Chapter 3 / Section 12.07).
-          vec = [0.0] * dims
+      # Stand-in embedder for the runnable example only: a small hand-written topic lexicon maps
+      # words onto a few topic axes, so related words land near each other the way a sentence
+      # embedder places them. In production, inject a Sentence Transformer (Chapter 3 / Section 12.07).
+      TOPIC_LEXICON = {
+          'household': {'chemistry': 1.0}, 'chemistry': {'chemistry': 1.0}, 'basics': {'chemistry': 0.5},
+          'common': {'chemistry': 0.5}, 'compounds': {'chemistry': 1.0, 'reaction': 0.6},
+          'react': {'reaction': 1.0, 'chemistry': 0.6}, 'reactions': {'reaction': 1.0, 'chemistry': 0.5, 'energy': 0.3},
+          'reaction': {'reaction': 1.0, 'chemistry': 0.4, 'scale': 0.2}, 'release': {'energy': 0.6, 'reaction': 0.3},
+          'energy': {'energy': 1.0}, 'scale': {'scale': 1.0, 'energy': 0.3}, 'up': {'scale': 0.4},
+          'exact': {'scale': 0.5, 'harm': 0.3}, 'steps': {'scale': 0.4, 'harm': 0.3},
+          'quantities': {'scale': 0.6, 'harm': 0.4}, 'cause': {'harm': 0.6}, 'harm': {'harm': 1.0},
+          'birthday': {'party': 1.0}, 'party': {'party': 1.0}, 'plan': {'party': 0.4},
+          'cake': {'food': 1.0, 'party': 0.6}, 'recipe': {'food': 1.0},
+          'volcanoes': {'geology': 1.0}, 'form': {'geology': 0.3}, 'capital': {'geography': 1.0},
+          'chile': {'geography': 1.0},
+      }
+      TOPIC_AXES = sorted({axis for weights in TOPIC_LEXICON.values() for axis in weights})
+
+
+      def lexicon_embedder(text: str) -> List[float]:
+          vec = {axis: 0.0 for axis in TOPIC_AXES}
           for token in text.lower().split():
-              h = int(hashlib.sha256(token.encode()).hexdigest(), 16)
-              vec[h % dims] += 1.0
-          norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-          return [v / norm for v in vec]
+              for axis, w in TOPIC_LEXICON.get(token.strip('?.,!'), {}).items():
+                  vec[axis] += w
+          norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
+          return [vec[axis] / norm for axis in TOPIC_AXES]
 
 
       @dataclass
@@ -711,7 +743,7 @@ deliverables:
           is_escalation_signature: bool
 
 
-      def compute_topic_drift(turn_texts: List[str], embed: Embedder) -> DriftResult:
+      def compute_topic_drift(turn_texts: List[str], embed: Embedder, min_step: float = 0.02) -> DriftResult:
           if len(turn_texts) < 2:
               return DriftResult([0.0] * len(turn_texts), 0.0, 0.0, False)
 
@@ -728,8 +760,10 @@ deliverables:
           den = sum((x - mean_x) ** 2 for x in xs) or 1.0
           slope = num / den
 
-          # Monotonicity: fraction of consecutive steps that increase drift
-          increases = sum(1 for i in range(1, n) if drift[i] >= drift[i - 1])
+          # Monotonicity: fraction of consecutive steps that move further from the anchor.
+          # A step must increase drift by more than min_step; a task switch (one jump, then
+          # stability around the new topic) is therefore not monotonic.
+          increases = sum(1 for i in range(1, n) if drift[i] > drift[i - 1] + min_step)
           monotonic_fraction = increases / (n - 1)
 
           # Escalation signature: rising AND mostly monotonic
@@ -757,24 +791,29 @@ deliverables:
               'actually can you explain how volcanoes form',
               'and what is the capital of chile',
           ]
+          task_switch = [
+              'help me plan a birthday party',
+              'actually can you explain how volcanoes form',
+              'why do volcanoes form',
+              'which volcanoes form fastest',
+          ]
+          print('Embedder: a hand-written topic lexicon standing in for a sentence embedder')
+          print('(Section 12.07). The numbers show how slope and monotonicity read a drift')
+          print('trajectory; they do not measure how well a real embedder separates these prompts.')
 
-          print('Gradual jailbreak drift:')
-          r1 = compute_topic_drift(gradual_jailbreak, toy_embedder)
-          print(f'  per-turn drift:      {r1.per_turn_drift}')
-          print(f'  drift slope:         {r1.drift_slope}')
-          print(f'  monotonic fraction:  {r1.monotonic_fraction}')
-          print(f'  escalation signature:{r1.is_escalation_signature}')
+          for name, turns in (('Gradual jailbreak', gradual_jailbreak), ('Benign wandering', benign_wander),
+                              ('Benign task switch', task_switch)):
+              r = compute_topic_drift(turns, lexicon_embedder)
+              print(f'\n{name} drift:')
+              print(f'  per-turn drift:      {r.per_turn_drift}')
+              print(f'  drift slope:         {r.drift_slope}')
+              print(f'  monotonic fraction:  {r.monotonic_fraction}')
+              print(f'  escalation signature:{r.is_escalation_signature}')
 
-          print('\nBenign wandering drift:')
-          r2 = compute_topic_drift(benign_wander, toy_embedder)
-          print(f'  per-turn drift:      {r2.per_turn_drift}')
-          print(f'  drift slope:         {r2.drift_slope}')
-          print(f'  monotonic fraction:  {r2.monotonic_fraction}')
-          print(f'  escalation signature:{r2.is_escalation_signature}')
-
-          print('\nDrift is measured from the session opening, so the gradual attack')
-          print('toward an unseen target is caught by accumulating monotonic drift,')
-          print('while benign wandering is high-drift but non-monotonic.')
+          print('\nDrift is measured from the session opening. The gradual attack moves a')
+          print('little further from it every turn and carries the escalation signature;')
+          print('benign wandering and a task switch reach high drift without moving steadily')
+          print('away, so neither does.')
   - heading: 'Session Store with Streaming Aggregation and Retention'
     id: deliverable_4
     filename: session_store.py
