@@ -405,7 +405,13 @@ deliverables:
           in_flight: int = 0
           max_concurrent: int = 0
 
+          def begin(self) -> None:
+              # Saturation: count the call as in flight until its outcome is recorded.
+              self.in_flight += 1
+              self.max_concurrent = max(self.max_concurrent, self.in_flight)
+
           def record(self, latency_ms: float, flagged: bool, errored: bool) -> None:
+              self.in_flight = max(0, self.in_flight - 1)
               self.calls += 1
               self.latency_ms_sum += latency_ms
               if flagged:
@@ -463,6 +469,14 @@ deliverables:
           metrics: Dict[str, DetectorMetrics] = field(default_factory=dict)
           tracer: Tracer = field(default_factory=Tracer)
           logs: List[str] = field(default_factory=list)
+          in_flight: int = 0
+          peak_in_flight: int = 0
+
+          def begin(self, detector: str) -> None:
+              '''Mark a detector call as started, so saturation (in-flight calls) is measured.'''
+              self.metrics.setdefault(detector, DetectorMetrics(detector)).begin()
+              self.in_flight += 1
+              self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
 
           def observe(self, trace_id: str, detector: str, tier: str,
                       start_ms: float, latency_ms: float, flagged: bool, errored: bool) -> None:
@@ -474,6 +488,8 @@ deliverables:
               hot path pays almost nothing to be observed.
               '''
               m = self.metrics.setdefault(detector, DetectorMetrics(detector))
+              if m.in_flight:
+                  self.in_flight = max(0, self.in_flight - 1)
               m.record(latency_ms, flagged, errored)
               self.tracer.record_span(trace_id, detector, tier, start_ms, latency_ms)
               verdict = 'error' if errored else ('flagged' if flagged else 'clean')
@@ -483,20 +499,25 @@ deliverables:
       def demo() -> None:
           stack = ObservabilityStack()
           trace_id = uuid.uuid4().hex[:12]
-          # Simulate one request passing through three detectors on the inline tier.
-          calls = [
+          # One request through three inline detectors, with simulated latencies. The two input
+          # classifiers run in parallel (Section 14.04), so both start at 0 and are in flight
+          # together; the output PII scanner starts when the slower of the two has finished.
+          parallel = [
               ('Injection classifier', 'inline', 14.2, False, False),
               ('Jailbreak classifier', 'inline', 11.8, True, False),
-              ('Output PII scanner', 'inline', 7.1, False, False),
           ]
-          t = 0.0
-          for name, tier, lat, flagged, errored in calls:
-              stack.observe(trace_id, name, tier, t, lat, flagged, errored)
-              t += lat
+          for name, *_ in parallel:
+              stack.begin(name)
+          for name, tier, lat, flagged, errored in parallel:
+              stack.observe(trace_id, name, tier, 0.0, lat, flagged, errored)
+          t = max(lat for _, _, lat, _, _ in parallel)
+          stack.begin('Output PII scanner')
+          stack.observe(trace_id, 'Output PII scanner', 'inline', t, 7.1, False, False)
 
           print('=' * 78)
           print('OBSERVABILITY STACK: METRICS, TRACING, LOGGING')
           print('One request observed across all three pillars from a single cheap update')
+          print('(detector latencies are simulated; the observation cost below is measured)')
           print('=' * 78)
           print()
           print('METRICS (aggregate health per detector):')
@@ -510,6 +531,20 @@ deliverables:
           print('LOGS (structured per-event detail for audit and investigation):')
           for line in stack.logs:
               print(f'  {line}')
+          print()
+          print(f'SATURATION: peak {stack.peak_in_flight} detector calls in flight at once '
+                f'(the parallel input classifiers)')
+          print()
+          n = 20000
+          bench = ObservabilityStack()
+          t0 = time.perf_counter()
+          for i in range(n):
+              bench.begin('Injection classifier')
+              bench.observe(trace_id, 'Injection classifier', 'inline', 0.0, 14.2, i % 50 == 0, False)
+          per_call_us = (time.perf_counter() - t0) / n * 1e6
+          print(f'COST OF OBSERVING: {per_call_us:.1f} microseconds per detection outcome (all three pillars,')
+          print(f'measured over {n} calls on this machine) -- about {per_call_us / 1000 / 50 * 100:.3f}% of the 50ms budget')
+          print('per detector, before the export, which runs off the hot path.')
           print()
           print('The same request is now visible three ways: metrics for aggregate health,')
           print('a trace for its path through the tiers, and logs for per-event audit detail.')

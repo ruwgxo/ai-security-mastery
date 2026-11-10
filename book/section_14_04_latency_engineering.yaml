@@ -470,6 +470,7 @@ deliverables:
 
       BUDGET_MS = 50.0
       RESERVED_OVERHEAD_MS = 8.0  # gateway, network hop, serialisation -- not available to detectors
+      PARALLEL_GROUP = {'Injection classifier', 'Jailbreak classifier'}  # the two input classifiers run concurrently
 
 
       @dataclass
@@ -514,6 +515,17 @@ deliverables:
           print('-' * 82)
           allocated = sum(a.allocation_ms for a in allocations)
           print(f'Allocated to detectors: {allocated:.1f}ms of {detector_budget:.0f}ms available')
+          serial = sum(a.allocation_ms for a in allocations if a.detector not in PARALLEL_GROUP)
+          group = max(a.allocation_ms for a in allocations if a.detector in PARALLEL_GROUP)
+          critical = RESERVED_OVERHEAD_MS + serial + group
+          print(f'Critical path if every detector uses its full allocation: {RESERVED_OVERHEAD_MS:.0f}ms overhead '
+                f'+ {serial:.1f}ms serial')
+          print(f'  + {group:.1f}ms for the parallel input classifiers (their slowest member) = {critical:.1f}ms, '
+                f'{BUDGET_MS - critical:.1f}ms under budget')
+          print()
+          print('Splitting the budget by weight as if every detector ran in series is the')
+          print('conservative allocation; running the input classifiers in parallel returns the')
+          print('smaller of their two shares as headroom.')
           print()
           print('The reserved overhead is spent before any detector runs -- the network hop,')
           print('gateway processing, and serialisation. Only what remains is the detector budget,')
@@ -533,7 +545,8 @@ deliverables:
       budget at the P99.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library random only,
-      prints the percentile summary and the pass/fail verdict at the tail.
+      prints the percentile summary, the pass/fail verdict at the tail, and the verdict repeated
+      over 200 seeds.
     code: |
       # percentile_latency_harness.py
       # Section 14.04: Percentile Latency Measurement Under Load
@@ -598,10 +611,10 @@ deliverables:
           return samples
 
 
-      def print_stats(stats: LatencyStats, budget_ms: float = 50.0) -> None:
+      def print_stats(stats: LatencyStats, samples: List[float], budget_ms: float = 50.0) -> None:
           print('=' * 78)
           print('PERCENTILE LATENCY MEASUREMENT HARNESS')
-          print(f'Samples: {stats.count}  |  Budget: P99 <= {budget_ms:.0f}ms')
+          print(f'Samples: {stats.count} (simulated latencies)  |  Budget: P99 <= {budget_ms:.0f}ms')
           print('=' * 78)
           print(f'  Mean : {stats.mean:.1f}ms   <- the average looks fine and hides the tail')
           print(f'  P50  : {stats.p50:.1f}ms')
@@ -614,13 +627,31 @@ deliverables:
           else:
               print(f'FAIL: P99 {stats.p99:.1f}ms exceeds the {budget_ms:.0f}ms budget despite a healthy mean')
           print()
+          over = sum(1 for x in samples if x > budget_ms) / len(samples)
           print('The mean is well under budget while the P99 is at the tail. Budgeting on the')
-          print('mean would have declared this system healthy while 1 in 100 users saw a stall.')
+          print(f'mean would have declared this system healthy while {over:.1%} of requests took')
+          print(f'longer than the {budget_ms:.0f}ms budget.')
+
+
+      def seed_sweep(seeds: int = 200, n: int = 10000, budget_ms: float = 50.0) -> None:
+          '''The verdict should not depend on one lucky draw, so repeat it over many seeds.'''
+          means, p99s, fails = [], [], 0
+          for seed in range(seeds):
+              st = summarise(simulate_load(n, seed))
+              means.append(st.mean)
+              p99s.append(st.p99)
+              fails += st.p99 > budget_ms
+          print()
+          print(f'Over {seeds} seeds of {n} samples each:')
+          print(f'  mean ranges {min(means):.1f}-{max(means):.1f}ms, P99 ranges {min(p99s):.1f}-{max(p99s):.1f}ms')
+          mean_fails = sum(1 for m in means if m > budget_ms)
+          print(f'  P99 over budget in {fails} of {seeds} draws; mean over budget in {mean_fails} of {seeds}')
 
 
       if __name__ == '__main__':
           samples = simulate_load(10000)
-          print_stats(summarise(samples))
+          print_stats(summarise(samples), samples)
+          seed_sweep()
   - heading: 'Per-Detector Timeout Configuration'
     id: deliverable_4
     filename: detector_timeout_config.py
@@ -631,8 +662,9 @@ deliverables:
       unbounded slow detector into a bounded one that fails within the budget. The timeout makes a
       fail-open or fail-closed decision whose full policy is Section 14.06.
     notes: >
-      Python 3.12, single quotes throughout per book convention, standard-library time only, prints
-      the timeout configuration and a demonstration of the bounded worst case.
+      Python 3.12, single quotes throughout per book convention, standard-library time and
+      concurrent.futures only, prints the timeout configuration and a demonstration of the bounded
+      worst case, measured over 30 slow runs with and without the timeout.
     code: |
       # detector_timeout_config.py
       # Section 14.04: Per-Detector Timeouts for Worst-Case Bounding
@@ -640,8 +672,13 @@ deliverables:
       # Single quotes throughout per book convention
 
       import time
+      from concurrent.futures import ThreadPoolExecutor, TimeoutError as DeadlineExceeded
       from dataclasses import dataclass
       from typing import Callable, List
+
+
+      # Detector calls run on a worker pool so the request can stop waiting at the deadline.
+      _POOL = ThreadPoolExecutor(max_workers=8)
 
 
       @dataclass
@@ -670,15 +707,18 @@ deliverables:
           guarantees the worst case is bounded.
           '''
           start = time.perf_counter()
-          budget_s = cfg.timeout_ms / 1000.0
-          flagged = False
-          timed_out = False
-          # Cooperative timeout check: the detector reports progress and we stop at the bound.
-          # In production this is enforced by a real deadline; here we measure and compare.
-          flagged = detector_fn()
-          elapsed_ms = (time.perf_counter() - start) * 1000.0
-          if elapsed_ms > cfg.timeout_ms:
+          future = _POOL.submit(detector_fn)
+          try:
+              # A real deadline: the request stops waiting at the timeout, whatever the detector does.
+              flagged = future.result(timeout=cfg.timeout_ms / 1000.0)
+              timed_out = False
+          except DeadlineExceeded:
+              # The request moves on now. Python cannot kill the worker thread, so the late call
+              # finishes in the background and its result is discarded.
+              flagged = False
               timed_out = True
+          elapsed_ms = (time.perf_counter() - start) * 1000.0
+          if timed_out:
               if cfg.on_timeout_fail_open:
                   decision = 'timed out -> fail-open (admit)'
               else:
@@ -688,6 +728,7 @@ deliverables:
           return TimeoutResult(cfg.detector, round(elapsed_ms, 2), timed_out, decision)
 
 
+      # Simulated detectors: sleep stands in for inference time.
       def fast_detector() -> bool:
           time.sleep(0.002)
           return False
@@ -725,9 +766,21 @@ deliverables:
           r_slow = run_with_timeout(CONFIGS[0], slow_detector)
           print(f'Slow run : {r_slow.detector} took {r_slow.elapsed_ms:.1f}ms -> {r_slow.decision}')
           print()
-          print('Without the timeout the slow run would have added its full duration to the')
-          print('request and blown the budget. With it, the worst case is bounded and the')
-          print('detector fails within the budget rather than degrading every request.')
+          runs = 30
+          unbounded = []
+          for _ in range(runs):
+              t = time.perf_counter()
+              slow_detector()
+              unbounded.append((time.perf_counter() - t) * 1000.0)
+          bounded = [run_with_timeout(CONFIGS[0], slow_detector).elapsed_ms for _ in range(runs)]
+          print(f'Over {runs} slow runs (simulated 40ms detector, measured wall clock):')
+          print(f'  without the timeout: max {max(unbounded):.1f}ms added to the request')
+          print(f'  with the timeout   : max {max(bounded):.1f}ms (timeout {CONFIGS[0].timeout_ms:.0f}ms)')
+          print()
+          print('Without the timeout the slow run adds its full duration to the request and blows')
+          print('the budget. With it, the request stops waiting at the deadline, so the worst case')
+          print('is bounded near the timeout and the detector fails within the budget.')
+          _POOL.shutdown(wait=True)
 
 
       if __name__ == '__main__':

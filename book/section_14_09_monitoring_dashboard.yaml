@@ -498,6 +498,8 @@ deliverables:
               inline_p99_ms=54.0, latency_budget_ms=50.0, requests_per_sec=26000.0,
               error_rate=0.011, fail_closed_rate=0.009, saturation_pct=91.0,
               detection_rate=0.024, open_breakers=1, cost_per_million_usd=5.80)
+          print('Signal values in both scenarios are illustrative inputs, not measurements.')
+          print()
           print('SCENARIO A: HEALTHY GATEWAY')
           render_dashboard(healthy)
           print()
@@ -631,7 +633,7 @@ deliverables:
       fatigue is avoided.
     notes: >
       Python 3.12, single quotes throughout per book convention, no external dependencies, prints
-      the SLOs and their error budgets with the budget burned and its state.
+      the SLOs and their error budgets with the budget burned, the burn rate, and its state.
     code: |
       # alerting_slo_config.py
       # Section 14.09: Alerting and SLO/Error-Budget Configuration
@@ -655,6 +657,19 @@ deliverables:
           slo: str
           allowed_bad_fraction: float
           consumed_fraction: float
+          elapsed_days: float          # how far into the SLO window the consumption was measured
+          window_days: int = 28
+
+          def burn_rate(self) -> float:
+              '''Budget share consumed divided by window share elapsed. 1.0 spends the budget exactly
+              by the end of the window; above 1.0 the budget runs out before the window does.'''
+              if self.allowed_bad_fraction == 0 or self.elapsed_days == 0:
+                  return 0.0
+              return (self.consumed_fraction / self.allowed_bad_fraction) / (self.elapsed_days / self.window_days)
+
+          def days_to_exhaustion(self) -> float:
+              rate = self.consumed_fraction / self.elapsed_days if self.elapsed_days else 0.0
+              return (self.allowed_bad_fraction - self.consumed_fraction) / rate if rate else float('inf')
 
           def remaining_fraction(self) -> float:
               return max(0.0, self.allowed_bad_fraction - self.consumed_fraction)
@@ -671,10 +686,11 @@ deliverables:
           SLOConfig('Detection-integrity SLO', 99.9, 28, 'no essential breaker open'),
       ]
 
+      # Illustrative consumption figures, each measured part-way through the 28-day window.
       BUDGETS: List[ErrorBudget] = [
-          ErrorBudget('Latency SLO', allowed_bad_fraction=0.001, consumed_fraction=0.0004),
-          ErrorBudget('Availability SLO', allowed_bad_fraction=0.005, consumed_fraction=0.0046),
-          ErrorBudget('Detection-integrity SLO', allowed_bad_fraction=0.001, consumed_fraction=0.0002),
+          ErrorBudget('Latency SLO', allowed_bad_fraction=0.001, consumed_fraction=0.0004, elapsed_days=14),
+          ErrorBudget('Availability SLO', allowed_bad_fraction=0.005, consumed_fraction=0.0046, elapsed_days=20),
+          ErrorBudget('Detection-integrity SLO', allowed_bad_fraction=0.001, consumed_fraction=0.0002, elapsed_days=2),
       ]
 
 
@@ -698,10 +714,21 @@ deliverables:
           print('=' * 84)
           for b in budgets:
               burned = b.budget_burned_pct()
-              state = 'OK' if burned < 75 else ('WARN' if burned < 100 else 'EXHAUSTED')
-              print(f'  {b.slo}')
+              rate = b.burn_rate()
+              if burned >= 100:
+                  state = 'EXHAUSTED'
+              elif rate >= 2.0:
+                  state = 'PAGE'     # fast burn: the budget is gone well before the window ends
+              elif rate > 1.0:
+                  state = 'WARN'     # slow burn: on pace to run out before the window ends
+              else:
+                  state = 'OK'       # spending no faster than the window allows
+              print(f'  {b.slo}  (day {b.elapsed_days:g} of {b.window_days})')
               print(f'    allowed bad: {b.allowed_bad_fraction:.4f}   consumed: {b.consumed_fraction:.4f}   '
-                    f'burned: {burned:.0f}% [{state}]')
+                    f'burned: {burned:.0f}%   burn rate: {rate:.2f}x [{state}]')
+              if rate > 1.0 and burned < 100:
+                  print(f'    at this rate the budget runs out in {b.days_to_exhaustion():.1f} days, '
+                        f'{b.window_days - b.elapsed_days - b.days_to_exhaustion():.1f} days before the window ends')
           print()
           print('An alert fires when the error budget is burning too fast, not each time a metric')
           print('crosses a line. This is what prevents alert fatigue: a brief blip that stays within')
