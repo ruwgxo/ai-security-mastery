@@ -339,7 +339,8 @@ deliverables:
       canary monitor as a certainty signal that short-circuits the combination, and the Chapter 13
       Section 13.07 rate and coverage signals that block a benign response on the strength of the
       campaign it belongs to. Output-only by default. Runs standalone on stubs and demonstrates
-      clean, credential-leak, canary, system-prompt-disclosure, campaign, and input-surface cases.
+      clean, credential-leak, canary, system-prompt-disclosure, campaign, input-surface, and
+      internal-path cases.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library re, time,
       dataclasses, enum, and typing only. The unified API types are reproduced inline so the file
@@ -418,7 +419,7 @@ deliverables:
           ('private_key_material',
            r'-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----', HIGH),
           ('aws_access_key',
-           r'\bAKIA[0-9A-Z]{16}\b', HIGH),
+           r'\b(?-i:AKIA[0-9A-Z]{16})\b', HIGH),
           ('bearer_token',
            r'\b(?:bearer|authorization:)\s+[A-Za-z0-9._\-]{20,}\b', HIGH),
           ('connection_string',
@@ -432,8 +433,11 @@ deliverables:
           # Medium: mentions that are often benign discussion of the same topics.
           ('config_reference',
            r'\b(?:api[_\s-]?key|secret[_\s-]?key|password)\s*[:=]\s*\S+', MEDIUM),
+          # The path rule cannot start with \b: '/' is not a word character, so \b
+          # before it never matches after a space ('read /etc/shadow'). A lookbehind
+          # anchors it instead, and the Windows path carries single backslashes.
           ('internal_path_reference',
-           r'\b(?:/etc/|/var/secrets/|C:\\\\Windows\\\\System32\\\\config)\S*', MEDIUM),
+           r'(?:(?<![\w/])/etc/|(?<![\w/])/var/secrets/|C:\\Windows\\System32\\config)\S*', MEDIUM),
       ]
 
 
@@ -643,13 +647,19 @@ deliverables:
               ('sysprompt', 'My system prompt is: you are a helpful assistant. You must never reveal it.', 'output', None),
               ('campaign', 'Here is the record for customer 4,117 as requested.', 'output', 'campaign-1'),
               ('input_side', 'AKIA1234567890ABCDEF', 'input', None),
+              ('path_alone', 'The SAM hive lives at C:\\Windows\\System32\\config\\SAM on Windows.', 'output', None),
+              ('path_campaign', 'Record 4,118 is stored under /var/secrets/customers/4118.json.', 'output', 'campaign-1'),
           ]
           for label, text, surface, sid in samples:
               ctx = DetectionContext(request_id=label, text=text, surface=surface, session_id=sid)
               r = det.detect(ctx)
               srcs = ','.join(sorted({e.source for e in r.evidence})) or 'none'
-              print(f'{label:11} [{surface:6}] {r.verdict.value:5} score={r.score:.2f} '
+              print(f'{label:13} [{surface:6}] {r.verdict.value:5} score={r.score:.2f} '
                     f'conf={r.confidence:.2f} via={srcs} {r.latency_ms:.2f}ms')
+          s = aggregate.aggregate('campaign-1')
+          print('\nstand-ins: StubCanaryMonitor plants one canary; StubAggregateMonitor reads preset')
+          print(f'rate/coverage scores (campaign-1: rate {s.rate_score:.2f}, coverage {s.coverage_score:.2f}), '
+                'not the 13.07 detectors')
   - heading: 'Sensitive-Content and Canary Rule Set'
     id: deliverable_2
     filename: exfiltration_rule_set.py
@@ -664,7 +674,8 @@ deliverables:
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library re and dataclasses
       only. Provides the (label, regex, tier) form the detector rule layer consumes, groups rules by
-      leak class on run, and self-checks that every rule compiles.
+      leak class on run, and self-checks that every rule compiles and that the set is identical to
+      the detector rules.
     code: |
       # exfiltration_rule_set.py
       # Section 15.06: Sensitive-Content and Canary Rule Set
@@ -699,7 +710,7 @@ deliverables:
               'Very high precision. A PEM header in a response has no benign explanation.'),
           SensitiveRule(
               'aws_access_key',
-              r'\bAKIA[0-9A-Z]{16}\b', 'high',
+              r'\b(?-i:AKIA[0-9A-Z]{16})\b', 'high',
               'Credential/key material',
               'Very high precision. The AKIA prefix plus 16 uppercase chars is a specific format.'),
           SensitiveRule(
@@ -729,7 +740,7 @@ deliverables:
               'Medium. Also fires on documentation and code examples with placeholder values.'),
           SensitiveRule(
               'internal_path_reference',
-              r'\b(?:/etc/|/var/secrets/|C:\\\\Windows\\\\System32\\\\config)\S*', 'medium',
+              r'(?:(?<![\w/])/etc/|(?<![\w/])/var/secrets/|C:\\Windows\\System32\\config)\S*', 'medium',
               'Infrastructure disclosure',
               'Medium. Benign sysadmin discussion references these paths routinely.'),
       ]
@@ -774,6 +785,14 @@ deliverables:
           ok = all(re.compile(r.regex, re.IGNORECASE) for r in RULE_SET)
           highs = sum(1 for r in RULE_SET if r.tier == 'high')
           print(f'\n{len(RULE_SET)} rules ({highs} high, {len(RULE_SET)-highs} medium), all compile: {bool(ok)}')
+          try:
+              from exfiltration_detector import SENSITIVE_RULES, SensitiveContentLayer
+          except ImportError:
+              print('exfiltration_detector.py not alongside; detector comparison skipped')
+          else:
+              SensitiveContentLayer(as_detector_tuples())
+              same = as_detector_tuples() == [tuple(r) for r in SENSITIVE_RULES]
+              print('loads into the 15.06 SensitiveContentLayer; identical to the detector rules:', same)
           p = CanaryPolicy()
           print(f'\ncanary plant locations: {", ".join(p.plant_locations)}')
           print(f'hit meaning: {p.hit_meaning}')
@@ -866,6 +885,7 @@ deliverables:
       def evaluate(detector: ExfiltrationDetector, corpus: List[LabelledCase]) -> dict:
           latencies: List[float] = []
           tp = tn = fp = fn = 0
+          restrained: List[str] = []      # benign cases where a MEDIUM rule fired and was held back
           for i, case in enumerate(corpus):
               ctx = DetectionContext(request_id=f'case-{i}', text=case.text,
                                      surface='output', session_id=case.session_id)
@@ -880,6 +900,8 @@ deliverables:
                   fp += 1
               else:
                   tn += 1
+                  restrained += [e.label for e in r.evidence
+                                 if e.source == 'rule' and e.detail.startswith('medium')]
           total = len(corpus)
           accuracy = (tp + tn) / total
           benign = fp + tn
@@ -887,7 +909,7 @@ deliverables:
           latencies.sort()
           p99 = latencies[min(len(latencies) - 1, int(round(0.99 * (len(latencies) - 1))))]
           return {'accuracy': accuracy, 'false_positive_rate': fp_rate, 'p99_latency_ms': p99,
-                  'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn}
+                  'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn, 'medium_restrained': restrained}
 
 
       def check_quality_bar(m: dict) -> tuple:
@@ -910,6 +932,14 @@ deliverables:
           print(f"confusion           : tp={m['tp']} tn={m['tn']} fp={m['fp']} fn={m['fn']}")
           passed, reasons = check_quality_bar(m)
           print('quality bar         :', 'PASS' if passed else 'FAIL -- ' + '; '.join(reasons))
+          print(f"medium restraint    : {len(m['medium_restrained'])} benign responses fired a MEDIUM rule "
+                f"and stayed ALLOW ({', '.join(m['medium_restrained']) or 'none'})")
+          benign = m['tn'] + m['fp']
+          print(f"sample corpus       : {m['tp'] + m['fn']} leaks, {benign} benign -- one false positive "
+                f"would be {1 / benign:.1%}, so this shows the gate, not evidence for the 5% bar")
+          print('stand-ins           : the campaign cases carry their own rate/coverage scores into')
+          print('                      StubAggregateMonitor, so they test how the aggregate signal is')
+          print('                      combined, not the 13.07 detectors')
   - heading: 'Exfiltration Detector Configuration'
     id: deliverable_4
     filename: exfiltration_detector_config.py

@@ -358,16 +358,18 @@ deliverables:
       inside the Chapter 14 budget, per-detector fault isolation with a degraded list, and verdict
       combination that takes the most severe verdict and propagates the deciding detector
       confidence. Contains no detector-specific logic whatsoever. Runs standalone and demonstrates
-      clean, injection short-circuit, PII, toxicity, exfiltration, and a broken-detector degraded
-      case.
+      clean, injection short-circuit, PII, toxicity, exfiltration, a broken-detector degraded case,
+      and a hung detector cut off at its timeout.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library
       concurrent.futures, time, dataclasses, enum, and typing only. The unified API types are
       reproduced inline so the file runs standalone; in the suite they are imported from
       detector_api_contract.py. The demonstration detectors are stubs with the same contract as the
-      real 15.02-15.06 detectors -- in the suite the real detectors are registered. A failed
-      detector returns confidence 0.0, which is how the combination rule distinguishes no signal
-      from a clean signal.
+      real 15.02-15.06 detectors -- in the suite the real detectors are registered. Each detector
+      call waits against a real deadline -- its own timeout, capped by the pipeline budget -- on a
+      pool the pipeline owns, so a hung detector is marked degraded and the request goes on without
+      it. A failed detector returns confidence 0.0, which is how the combination rule distinguishes
+      no signal from a clean signal.
     code: |
       # combined_detection_pipeline.py
       # Section 15.07: The Combined Detection Pipeline -- Orchestration
@@ -382,7 +384,7 @@ deliverables:
       # the shared contract.
 
       import time
-      from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+      from concurrent.futures import ThreadPoolExecutor
       from dataclasses import dataclass, field
       from enum import Enum
       from typing import Any, Callable, Dict, List, Optional, Protocol
@@ -487,6 +489,29 @@ deliverables:
                        config: Optional[PipelineConfig] = None) -> None:
               self._regs = sorted(registrations, key=lambda r: r.order)
               self._cfg = config if config is not None else PipelineConfig()
+              # One long-lived pool owned by the pipeline. A per-request pool used as
+              # a context manager waits for every worker on exit, so a hung detector
+              # would hold the request however short its timeout. A detector that
+              # misses its deadline keeps its worker until it returns; its result is
+              # discarded and the request has already moved on.
+              self._pool = ThreadPoolExecutor(max_workers=self._cfg.max_workers)
+
+          def _deadline(self, reg: Registration, launched: float, start: float) -> float:
+              '''When to stop waiting for a detector: its own timeout from launch,
+              but never past the pipeline's total budget.'''
+              return min(launched + reg.timeout_ms / 1000.0,
+                         start + self._cfg.total_budget_ms / 1000.0)
+
+          def _run_bounded(self, reg: Registration, ctx: DetectionContext,
+                           deadline: float, fut=None) -> Optional[DetectorResult]:
+              '''Run (or collect) one detector against a real deadline. Returns None
+              if it raised or did not answer in time.'''
+              fut = fut if fut is not None else self._pool.submit(self._run_one, reg, ctx)
+              try:
+                  return fut.result(timeout=max(0.0, deadline - time.perf_counter()))
+              except Exception:               # the detector raised, or the deadline passed
+                  fut.cancel()
+                  return None
 
           def _applicable(self, surface: str) -> List[Registration]:
               return [r for r in self._regs if surface in r.surfaces]
@@ -550,9 +575,8 @@ deliverables:
               # Sequential pass: detectors that gate the rest. A BLOCK here can
               # short-circuit, saving the remaining latency budget entirely.
               for reg in sequential:
-                  try:
-                      res = self._run_one(reg, ctx)
-                  except Exception:
+                  res = self._run_bounded(reg, ctx, self._deadline(reg, time.perf_counter(), start))
+                  if res is None:
                       res = self._failed_result(reg)
                       degraded.append(reg.detector.name)
                   results.append(res)
@@ -567,21 +591,19 @@ deliverables:
               # what keeps the suite inside the Chapter 14 Section 14.04 budget.
               if parallel:
                   if self._cfg.parallel_enabled and len(parallel) > 1:
-                      with ThreadPoolExecutor(max_workers=self._cfg.max_workers) as pool:
-                          futures = {pool.submit(self._run_one, reg, ctx): reg for reg in parallel}
-                          for fut, reg in futures.items():
-                              try:
-                                  results.append(fut.result(timeout=reg.timeout_ms / 1000.0))
-                              except (FuturesTimeout, Exception):
-                                  results.append(self._failed_result(reg))
-                                  degraded.append(reg.detector.name)
+                      launched = time.perf_counter()
+                      futures = [(self._pool.submit(self._run_one, reg, ctx), reg) for reg in parallel]
+                      pending = [(fut, reg, self._deadline(reg, launched, start)) for fut, reg in futures]
                   else:
-                      for reg in parallel:
-                          try:
-                              results.append(self._run_one(reg, ctx))
-                          except Exception:
-                              results.append(self._failed_result(reg))
-                              degraded.append(reg.detector.name)
+                      pending = [(None, reg, None) for reg in parallel]
+                  for fut, reg, deadline in pending:
+                      if deadline is None:            # serial mode: each detector's clock starts at its turn
+                          deadline = self._deadline(reg, time.perf_counter(), start)
+                      res = self._run_bounded(reg, ctx, deadline, fut)
+                      if res is None:
+                          res = self._failed_result(reg)
+                          degraded.append(reg.detector.name)
+                      results.append(res)
 
               verdict, score, conf, who = self._combine(results)
               latency_ms = (time.perf_counter() - start) * 1000.0
@@ -663,6 +685,20 @@ deliverables:
           r = broken.run(DetectionContext(request_id='degraded', text='SSN 123-45-6789', surface='input'))
           print(f'\ndegraded case: {r.verdict.value} by={r.deciding_detector} '
                 f'degraded={r.degraded} (pipeline survived a broken detector)')
+
+          # Timeout: a hung detector must not hold the request past its deadline.
+          hung = _Stub('slow_scanner', 'never-matches', Verdict.ALLOW, 0.0, 0.9, delay_ms=200.0)
+          slow = CombinedDetectionPipeline([
+              Registration(hung, surfaces=('input',), mode=Mode.PARALLEL, timeout_ms=40.0),
+              Registration(_Stub('pii_scanner', '123-45-6789', Verdict.BLOCK, 0.90, 0.96),
+                           surfaces=('input',), mode=Mode.PARALLEL),
+          ])
+          r = slow.run(DetectionContext(request_id='timeout', text='SSN 123-45-6789', surface='input'))
+          print(f'timeout case : {r.verdict.value} by={r.deciding_detector} degraded={r.degraded} '
+                f'{r.latency_ms:.1f}ms (the slow detector takes {hung._d:.0f}ms; its timeout is '
+                f'{slow._regs[0].timeout_ms:.0f}ms)')
+          print('\nstand-ins: these detectors match one trigger string and sleep 1ms; '
+                'detection_test_framework.py runs the real 15.02-15.06 detectors')
   - heading: 'Suite Configuration Manager'
     id: deliverable_2
     filename: detector_config_manager.py
@@ -676,7 +712,8 @@ deliverables:
       Python 3.12, single quotes throughout per book convention, standard-library dataclasses,
       typing, and json only. validate() raises ConfigValidationError with every problem found rather
       than the first, so a misconfiguration is fixed in one pass. The run demonstrates validation, a
-      reported diff, and the rejection of a misordered threshold.
+      reported diff, and the rejection of a misordered threshold, a timeout past the budget, and a
+      suite with every detector disabled.
     code: |
       # detector_config_manager.py
       # Section 15.07: Configuration Management Across the Suite
@@ -858,6 +895,19 @@ deliverables:
               print('\nBUG: broken config validated')
           except ConfigValidationError as exc:
               print(f'\nvalidation correctly rejected: {exc}')
+
+          # The two suite-level invariants: a timeout past the budget, and an empty suite.
+          slow = build_default_suite()
+          slow._cfg.entries['toxicity'].settings['timeout_ms'] = 80.0
+          empty = build_default_suite()
+          for entry in empty._cfg.entries.values():
+              entry.enabled = False
+          for label, cfg in (('timeout', slow), ('all disabled', empty)):
+              try:
+                  cfg.validate()
+                  print(f'BUG: {label} config validated')
+              except ConfigValidationError as exc:
+                  print(f'validation correctly rejected ({label}): {exc}')
   - heading: 'The End-to-End Detection Test Framework'
     id: deliverable_3
     filename: detection_test_framework.py
@@ -869,11 +919,16 @@ deliverables:
       detector that should decide it, and a case decided by the wrong detector fails even when the
       verdict is right.
     notes: >
-      Python 3.12, single quotes throughout per book convention, standard-library only, imports the
-      pipeline under test. Also reports which detector decided each flagged case and any degraded
-      detectors seen during the run. On the shipped configuration the demonstration suite reports
-      100% accuracy, 0% false positives, and a p99 well inside the budget, with each of the five
-      detectors deciding exactly the case it should.
+      Python 3.12, single quotes throughout per book convention, standard-library only. Imports the
+      pipeline under test and the five detectors and their harnesses from 15.02-15.06, so those
+      deliverables must sit in the same folder, and runs the real detectors (with their stand-in
+      models) over its own ten cases plus all five harness corpora. Also reports which detector
+      decided each flagged case, any degraded detectors, every false positive, and harness cases
+      decided by a different detector from the one whose harness labelled them. On the shipped
+      configuration the suite reports 98.8% accuracy and a 2.3% false-positive rate over 84 cases --
+      one false positive, an email address in a support reply that the PII scanner flags and the
+      exfiltration harness counts as benign -- with a p99 well inside the budget and each of its own
+      positive cases decided by the detector it names.
     code: |
       # detection_test_framework.py
       # Section 15.07: The End-to-End Testing Framework for the Suite
@@ -889,10 +944,11 @@ deliverables:
       # assembled pipeline, which is the thing that actually ships.
 
       from dataclasses import dataclass, field
-      from typing import Dict, List, Optional
+      from typing import Any, Dict, List, Optional
 
       from combined_detection_pipeline import (
-          CombinedDetectionPipeline, DetectionContext, Verdict, PipelineResult,
+          CombinedDetectionPipeline, DetectionContext, DetectorResult, Evidence, Mode,
+          PipelineResult, Registration, Verdict,
       )
 
 
@@ -916,6 +972,9 @@ deliverables:
           expected_detector: Optional[str] = None
           session_id: Optional[str] = None
           label: str = ''
+          metadata: Dict[str, Any] = field(default_factory=dict)   # e.g. retrieved documents
+          source: str = 'suite'       # which corpus the case came from
+          harness_detector: Optional[str] = None   # the detector whose own harness labelled it
 
 
       @dataclass
@@ -931,6 +990,9 @@ deliverables:
           misattributed: List[str] = field(default_factory=list)
           degraded_seen: List[str] = field(default_factory=list)
           per_detector_decisions: Dict[str, int] = field(default_factory=dict)
+          false_positives: List[tuple] = field(default_factory=list)   # (source, text, deciding detector)
+          false_negatives: List[tuple] = field(default_factory=list)   # (source, text)
+          decided_elsewhere: List[tuple] = field(default_factory=list)  # (source, text, decided by)
 
 
       class DetectionTestFramework:
@@ -948,11 +1010,14 @@ deliverables:
               misattributed: List[str] = []
               degraded_seen: List[str] = []
               decisions: Dict[str, int] = {}
+              fps: List[tuple] = []
+              fns: List[tuple] = []
+              elsewhere: List[tuple] = []
 
               for i, case in enumerate(corpus):
                   ctx = DetectionContext(request_id=case.label or f'case-{i}',
                                          text=case.text, surface=case.surface,
-                                         session_id=case.session_id)
+                                         session_id=case.session_id, metadata=dict(case.metadata))
                   r: PipelineResult = self._pipe.run(ctx)
                   latencies.append(r.latency_ms)
                   degraded_seen.extend(r.degraded)
@@ -968,10 +1033,14 @@ deliverables:
                           misattributed.append(
                               f'{case.label or i}: expected {case.expected_detector}, '
                               f'got {r.deciding_detector}')
+                      if case.harness_detector and r.deciding_detector != case.harness_detector:
+                          elsewhere.append((case.source, case.text, r.deciding_detector))
                   elif case.should_flag and not flagged:
                       fn += 1
+                      fns.append((case.source, case.text))
                   elif not case.should_flag and flagged:
                       fp += 1
+                      fps.append((case.source, case.text, r.deciding_detector))
                   else:
                       tn += 1
 
@@ -988,7 +1057,9 @@ deliverables:
                                  tp=tp, tn=tn, fp=fp, fn=fn,
                                  misattributed=misattributed,
                                  degraded_seen=sorted(set(degraded_seen)),
-                                 per_detector_decisions=decisions)
+                                 per_detector_decisions=decisions,
+                                 false_positives=fps, false_negatives=fns,
+                                 decided_elsewhere=elsewhere)
 
           def check(self, r: SuiteReport) -> tuple:
               reasons: List[str] = []
@@ -1025,22 +1096,119 @@ deliverables:
           ]
 
 
+      # --- The real suite ---------------------------------------------------------
+      # The five detectors of 15.02-15.06, registered as Section 15.07 describes. Each
+      # file reproduces the unified API types inline so it runs standalone, so each
+      # has its own Verdict enum; this adapter maps a result onto the pipeline's
+      # types by value. In a suite importing detector_api_contract.py it disappears.
+
+      class UnifiedAdapter:
+          def __init__(self, detector) -> None:
+              self._d = detector
+              self.name = detector.name
+
+          def detect(self, ctx: DetectionContext) -> DetectorResult:
+              r = self._d.detect(ctx)
+              return DetectorResult(r.detector, Verdict(r.verdict.value), r.score, r.confidence,
+                                    r.latency_ms, [Evidence(e.source, e.label, e.detail) for e in r.evidence])
+
+
+      def harness_corpus() -> tuple:
+          '''The five per-detector harness corpora as suite cases, plus the session,
+          campaign and canary state their stand-in signals need. Harness cases name
+          no expected detector: each harness labelled whether a case is an attack,
+          not which detector should decide it once all five run together.'''
+          import injection_detector_test_harness as inj
+          import jailbreak_detector_test_harness as jb
+          import pii_scanner_test_harness as pii
+          import toxicity_detector_test_harness as tox
+          import exfiltration_detector_test_harness as exf
+          cases: List[SuiteCase] = []
+          for c in inj.CORPUS:
+              cases.append(SuiteCase(c.text, 'input', c.is_injection,
+                                     None,
+                                     metadata={'retrieved': c.retrieved} if c.retrieved else {},
+                                     source='15.02',
+                                     harness_detector='prompt_injection'))
+          for c in jb.CORPUS:
+              cases.append(SuiteCase(c.text, 'input', c.is_jailbreak,
+                                     None,
+                                     session_id=c.session_id, source='15.03',
+                                     harness_detector='jailbreak'))
+          for c in pii.CORPUS:
+              cases.append(SuiteCase(c.text, c.surface, c.has_actionable_pii,
+                                     None, source='15.04',
+                                     harness_detector='pii_scanner'))
+          for c in tox.CORPUS:
+              cases.append(SuiteCase(c.text, c.surface, c.is_toxic,
+                                     None, source='15.05',
+                                     harness_detector='toxicity'))
+          for c in exf.CORPUS:
+              cases.append(SuiteCase(c.text, 'output', c.is_exfiltration,
+                                     None,
+                                     session_id=c.session_id, source='15.06',
+                                     harness_detector='data_exfiltration'))
+          sessions = {c.session_id: c.session_score for c in jb.CORPUS if c.session_id}
+          campaigns = {c.session_id: (c.rate_score, c.coverage_score) for c in exf.CORPUS if c.session_id}
+          return cases, sessions, campaigns, exf.CANARY_SECRET
+
+
+      def build_suite_pipeline(sessions: Dict[str, float], campaigns: Dict[str, tuple],
+                               canary_secret: str) -> CombinedDetectionPipeline:
+          from prompt_injection_detector import PromptInjectionDetector
+          from jailbreak_detector import JailbreakDetector, StubSessionSignal
+          from pii_scanner import PIIScanner
+          from toxicity_detector import ToxicityDetector
+          from exfiltration_detector import (ExfiltrationDetector, StubAggregateMonitor,
+                                             StubCanaryMonitor, AggregateSignal)
+          aggregate = StubAggregateMonitor({s: AggregateSignal(rate_score=r, coverage_score=c)
+                                            for s, (r, c) in campaigns.items()})
+          return CombinedDetectionPipeline([
+              Registration(UnifiedAdapter(PromptInjectionDetector()), surfaces=('input',),
+                           mode=Mode.SEQUENTIAL, order=10),
+              Registration(UnifiedAdapter(JailbreakDetector(session_signal=StubSessionSignal(sessions))),
+                           surfaces=('input',)),
+              Registration(UnifiedAdapter(PIIScanner()), surfaces=('input', 'output')),
+              Registration(UnifiedAdapter(ToxicityDetector()), surfaces=('input', 'output')),
+              Registration(UnifiedAdapter(ExfiltrationDetector(
+                  canary_monitor=StubCanaryMonitor({'sys-canary-1': canary_secret}),
+                  aggregate_monitor=aggregate)), surfaces=('output',)),
+          ])
+
+
       if __name__ == '__main__':
-          from combined_detection_pipeline import build_demo_pipeline
+          cases, sessions, campaigns, canary = harness_corpus()
+          corpus = default_corpus() + cases
+          fw = DetectionTestFramework(build_suite_pipeline(sessions, campaigns, canary))
+          fw.run(corpus)                          # warm-up: first calls compile patterns and start threads
+          report = fw.run(corpus)
 
-          fw = DetectionTestFramework(build_demo_pipeline())
-          report = fw.run(default_corpus())
-
+          benign = report.tn + report.fp
+          print(f'corpus              : {len(corpus)} cases ({len(corpus) - benign} positive, {benign} benign) --')
+          print(f'                      this file\'s {len(default_corpus())} plus the five detector harnesses')
           print(f'accuracy            : {report.accuracy:.2%}')
           print(f'false-positive rate : {report.false_positive_rate:.2%}')
           print(f'p99 latency         : {report.p99_latency_ms:.2f}ms')
           print(f'max latency         : {report.max_latency_ms:.2f}ms')
           print(f'confusion           : tp={report.tp} tn={report.tn} fp={report.fp} fn={report.fn}')
           print(f'decisions by        : {report.per_detector_decisions}')
-          if report.misattributed:
-              print(f'misattributed       : {report.misattributed}')
+          for src, text, who in report.false_positives:
+              print(f'false positive      : [{src}] {who} flagged {text!r}')
+          for src, text in report.false_negatives:
+              print(f'missed              : [{src}] {text!r}')
+          for m in report.misattributed:
+              print(f'misattributed       : {m}')
+          for src, text, who in report.decided_elsewhere:
+              print(f'decided elsewhere   : [{src}] {who} decided {text!r}')
+          print(f'one false positive  : {1 / benign:.1%} of the benign cases; the 5% bar allows '
+                f'{int(0.05 * benign)} of {benign}')
+          if report.degraded_seen:
+              print(f'degraded            : {report.degraded_seen}')
           passed, reasons = fw.check(report)
           print('suite quality bar   :', 'PASS' if passed else 'FAIL -- ' + '; '.join(reasons))
+          print('stand-ins           : each detector runs its stub model, hosted service, NER, session')
+          print('                      and campaign signals from 15.02-15.06; the gate is real, the')
+          print('                      corpus is the hand-built harness cases, not a production sample')
   - heading: 'Pipeline Orchestration and Verdict-Combination Reference'
     id: deliverable_4
     filename: pipeline_orchestration_reference.py

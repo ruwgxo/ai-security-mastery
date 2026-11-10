@@ -333,7 +333,7 @@ deliverables:
       custom layer for domain-specific toxicity and a context adjustment, a combination where either
       layer can escalate and context can only de-escalate, two-sided scanning, and an explicit
       hosted-failure policy. Runs standalone on stubs and demonstrates clean, harassment, threat,
-      domain-specific, and context-dependent cases.
+      domain-specific, and context-dependent cases, and a hosted outage under each failure policy.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library time, dataclasses,
       enum, and typing only. The unified API types are reproduced inline so the file runs
@@ -341,7 +341,8 @@ deliverables:
       service and the custom model are Protocols with deterministic stubs -- NOT real services or
       models -- to be replaced with the production hosted moderation API and the trained domain
       model. The hosted call is wrapped in try/except so a hosted failure is handled by the
-      fail-open policy rather than crashing the detector.
+      configured policy rather than crashing the detector: fail-open proceeds on the custom layer
+      alone, fail-closed blocks.
     code: |
       # toxicity_detector.py
       # Section 15.05: Toxicity Detector -- Hosted APIs and Custom Models
@@ -560,6 +561,11 @@ deliverables:
               raw = max((s.score for s in signals), default=0.0)
               score = raw * factor
 
+              # Fail-closed: a strict deployment treats the hosted outage itself as
+              # block-worthy, so the verdict does not rest on the custom layer alone.
+              if hosted_failed and not self._cfg.fail_open_on_hosted_error:
+                  score = max(score, self._cfg.block_threshold)
+
               evidence: List[Evidence] = []
               for s in signals:
                   if s.score >= self._cfg.flag_threshold * 0.6:
@@ -616,6 +622,22 @@ deliverables:
               srcs = ','.join(sorted({e.source for e in r.evidence})) or 'none'
               print(f'{label:11} [{surface:6}] {r.verdict.value:5} score={r.score:.2f} '
                     f'conf={r.confidence:.2f} via={srcs} {r.latency_ms:.2f}ms')
+
+          # Hosted outage: the same clean and domain-abuse inputs under each policy.
+          class FailingHostedService:
+              def classify(self, text: str) -> Dict[str, float]:
+                  raise TimeoutError('hosted moderation timed out')
+
+          print('\nhosted service down:')
+          for policy, fail_open in (('fail-open', True), ('fail-closed', False)):
+              down = ToxicityDetector(hosted=FailingHostedService(),
+                                      config=ToxicityConfig(fail_open_on_hosted_error=fail_open))
+              for label, text in (('clean', samples[0][1]), ('domain', samples[3][1])):
+                  r = down.detect(DetectionContext(request_id=label, text=text, surface='input'))
+                  print(f'  {policy:11} {label:7} {r.verdict.value:5} score={r.score:.2f} '
+                        f'conf={r.confidence:.2f}')
+          print('\nstand-ins: StubHostedService and StubCustomModel score small fixed lexicons; the '
+                'context factor is a cue-word match')
   - heading: 'Toxicity Detector Test Harness'
     id: deliverable_2
     filename: toxicity_detector_test_harness.py
@@ -721,6 +743,12 @@ deliverables:
           print(f"confusion           : tp={m['tp']} tn={m['tn']} fp={m['fp']} fn={m['fn']}")
           passed, reasons = check_quality_bar(m)
           print('quality bar         :', 'PASS' if passed else 'FAIL -- ' + '; '.join(reasons))
+          benign = m['tn'] + m['fp']
+          print(f"sample corpus       : {m['tp'] + m['fn']} toxic, {benign} benign -- one false positive "
+                f"would be {1 / benign:.1%}, so this shows the gate, not evidence for the 5% bar")
+          print('stand-ins           : StubHostedService and StubCustomModel score fixed lexicons that')
+          print('                      contain this corpus\'s terms; the context factor matches cue words')
+          print('                      (research, quote, in the game ...), not context itself')
   - heading: 'Hosted-Versus-Custom Score Combination Reference'
     id: deliverable_3
     filename: toxicity_score_combination.py
@@ -729,7 +757,7 @@ deliverables:
       The decision logic of the detector extracted as a standalone reference: the combination rule
       (raw is the max of hosted and custom signals; score is raw times the context factor;
       thresholds map to allow/flag/block) with a table of reference cases including domain-specific
-      catches, context de-escalation, and both fail-open outcomes.
+      catches, context de-escalation, both fail-open outcomes, and the fail-closed outcome.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library dataclasses only.
       Every reference case is checked against the combine function on run, so the documented
@@ -756,21 +784,25 @@ deliverables:
           context_factor: float       # 1.0 normally, <1.0 in a benign context
           expected_band: str          # allow / flag / block
           rationale: str
+          fail_open: bool = True      # hosted-failure policy
 
 
       # The combination rule, stated plainly:
       #   raw   = max(hosted_signals, custom_signals)   -- either layer can escalate
       #   score = raw * context_factor                  -- benign context down-weights
       #   band  = block if score >= 0.80, flag if >= 0.50, else allow
+      #   hosted failed under fail-closed -> score raised to the block threshold
       # The hosted service is the maintained baseline; the custom model adds domain-
       # specific coverage and, through the context factor, corrects the hosted
       # service on context-dependent cases it scores wrongly.
 
       def combine(hosted: float, custom: float, context_factor: float,
-                  block: float = 0.80, flag: float = 0.50) -> tuple:
+                  block: float = 0.80, flag: float = 0.50, fail_open: bool = True) -> tuple:
           signals = [s for s in (hosted, custom) if s >= 0.0]
           raw = max(signals) if signals else 0.0
           score = raw * context_factor
+          if hosted < 0.0 and not fail_open:
+              score = max(score, block)
           if score >= block:
               band = 'block'
           elif score >= flag:
@@ -793,18 +825,21 @@ deliverables:
                           'Hosted service failed (fail-open); custom model still carries a clear verdict.'),
           CombinationCase(-1.0, 0.00, 1.0, 'allow',
                           'Hosted failed and custom is clean: fail-open means no block on the failure alone.'),
+          CombinationCase(-1.0, 0.00, 1.0, 'block',
+                          'Hosted failed under fail-closed: the outage itself blocks.', fail_open=False),
       ]
 
 
       if __name__ == '__main__':
-          print('hosted  custom  ctx    -> score  band    (expected)  ok')
+          print('hosted  custom  ctx   policy  -> score  band    (expected)  ok')
           all_ok = True
           for c in REFERENCE_CASES:
-              score, band = combine(c.hosted, c.custom, c.context_factor)
+              score, band = combine(c.hosted, c.custom, c.context_factor, fail_open=c.fail_open)
               ok = band == c.expected_band
               all_ok &= ok
               h = 'FAIL' if c.hosted < 0 else f'{c.hosted:.2f}'
-              print(f'{h:>6}  {c.custom:.2f}   {c.context_factor:.2f}  -> {score:.2f}   '
+              policy = 'open' if c.fail_open else 'closed'
+              print(f'{h:>6}  {c.custom:.2f}   {c.context_factor:.2f}  {policy:6}  -> {score:.2f}   '
                     f'{band:6} ({c.expected_band:6})  {"ok" if ok else "MISMATCH"}')
           print('\nall reference cases match:', all_ok)
   - heading: 'Toxicity Detector Configuration'
