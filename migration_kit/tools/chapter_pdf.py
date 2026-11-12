@@ -156,6 +156,8 @@ def walk(doc, v, depth):
         for k, x in v.items():
             if k in ('blocks',) and isinstance(x, list):
                 walk(doc, x, depth); continue
+            if isinstance(x, (list, dict)) and not x:
+                continue  # an empty slot (16.07's deliverables) has no content, so no heading either
             if short(x):
                 doc.para(scalar(x), 'kv', nice(k) + ':')
             else:
