@@ -230,6 +230,17 @@ def short(t, path):
 def str_list(lst, path):
     return [short(x, f'{path}[{i}]') if isinstance(x, str) else x for i, x in enumerate(lst)]
 
+def slot_exercises(a, path):
+    """v1 assessment (chapters 16 and 17: title, description, questions, answers) -> the exercises slot,
+    one item shaped like a list-shaped reference_materials item, keeping the v1 key as its id."""
+    it = OrderedDict([('heading', short(a['title'], f'{path}.title')), ('id', path)])
+    for k, v in a.items():
+        if k == 'title': continue
+        if k == 'description': it['description'] = prose_value(v, f'{path}.{k}')
+        elif k in ('questions', 'answers') and isinstance(v, list): it[k] = str_list(v, f'{path}.{k}')
+        else: R.add('unmapped', path=f'{path}.{k}', keys=[k]); it.setdefault('extra', OrderedDict())[k] = v
+    return [it]
+
 # ── generic resolution for keys outside named slots ──────────────────────────
 def generic_part(key, val, path, level=2):
     part = OrderedDict([('heading', label(key)), ('id', str(key))])
@@ -528,6 +539,7 @@ def convert(src_path):
                 if kk != 'items': out['section_info'].setdefault('legacy', OrderedDict())[f'deliverables.{kk}'] = dl[kk]
         else:
             out['deliverables'] = slot_deliverables(dl, 'deliverables')
+    if 'assessment' in d: out['exercises'] = slot_exercises(d['assessment'], 'assessment'); handled.add('assessment')
     if 'common_mistakes' in d: out['common_mistakes'] = slot_mistakes(d['common_mistakes'], 'common_mistakes'); handled.add('common_mistakes')
     if 'section_summary' in d: out['section_summary'] = slot_summary(d['section_summary'], 'section_summary'); handled.add('section_summary')
     if 'key_takeaways' in d:
