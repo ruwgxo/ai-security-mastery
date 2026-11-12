@@ -1,0 +1,1182 @@
+# section_12_16_benchmarking_ab_testing.yaml
+
+---
+document_info:
+  title: 'Benchmarking and A/B Testing: Measuring Detector Performance in Production'
+  chapter: 12
+  section: 16
+  section_code: '1216'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-06'
+  estimated_pages: 5
+  estimated_reading_time: '40-50 minutes'
+
+section_overview:
+  one_line_summary: 'Benchmarking and A/B testing are the quality assurance layer that converts anecdotal accuracy claims into statistically significant production evidence: without them, every model promotion is a guess dressed up as a measurement.'
+  why_this_section_exists: |
+    The ensemble built in Section 12.15 has an accuracy number from the offline test set. That number
+    answers one question -- how well does the ensemble perform on the held-out data -- but it does not
+    answer the questions that determine whether to deploy it. Does the ensemble beat each individual
+    detector enough to justify the added complexity and latency? Does it beat the Chapter 11 rule-based
+    gateway it would replace or augment? When a new model version is trained, is its observed accuracy
+    improvement real or noise? These questions require benchmarking against alternatives and A/B testing
+    against production reality.
+
+    The offline accuracy number is also a lower bound, not a guarantee. The held-out test set is drawn
+    from the same distribution as the training data, which differs from the production traffic
+    distribution. A detector that scores 0.93 F1 offline may score 0.85 in production because the
+    production distribution contains attack variants and benign patterns the test set did not. The
+    benchmark establishes the offline baseline; only production evaluation reveals the real-world
+    performance.
+
+    A/B testing is the mechanism for production evaluation. A new detector version is deployed to a
+    treatment group (a fraction of production traffic) while the current version serves the control
+    group, and the two are compared on production traffic with statistical significance testing. This is
+    the only way to know whether a new version is actually better in production, because offline metrics
+    do not reflect the production distribution and a single deployment without a control group cannot
+    isolate the version's effect from the natural variation in traffic.
+
+    Section 12.16 builds the benchmarking and A/B testing infrastructure: the cross-detector benchmark
+    harness, the A/B testing framework with statistical significance and guardrail metrics, the sample
+    size calculator that determines how much traffic a test needs, and the online-offline divergence
+    analyser that quantifies the gap between the benchmark and production reality. This infrastructure
+    is the quality assurance that backs every model promotion decision with evidence.
+  position_in_chapter: |
+    Section 12.16 is the second integration section. It evaluates the ensemble from Section 12.15 and the
+    individual detectors against each other and against production reality, connecting to the model
+    registry experiment tracking from Section 12.13 so every configuration comparison is recorded. It
+    produces the evaluation infrastructure that justifies the Section 12.17 production gateway
+    configuration and that Chapter 17's monitoring and tuning extends.
+
+learning_objectives:
+
+  knowledge:
+    - 'Distinguish held-out test set evaluation from production traffic evaluation and explain why the two diverge'
+    - 'State the benchmark metrics for a detection system and explain why per-attack-family false positive rate matters beyond the aggregate'
+    - 'Explain why A/B testing is required for any detector update and what a single deployment without a control group cannot reveal'
+    - 'Explain statistical significance in an A/B test and why an observed improvement over a small sample may not be significant'
+    - 'Describe guardrail metrics and explain how a local accuracy improvement can still be a production regression'
+    - 'Explain why online and offline evaluation diverge and what the benchmark number actually guarantees'
+
+  skills:
+    - 'Build the cross-detector benchmark harness evaluating all four detectors and the ensemble on the same test set'
+    - 'Implement an A/B testing framework with traffic splitting, guardrail monitoring, and significance testing'
+    - 'Compute the required sample size for a detector A/B test given a minimum detectable effect'
+    - 'Implement a reproducible benchmark with deterministic seeding and result logging'
+    - 'Measure the online-offline divergence to quantify the gap between benchmark and production performance'
+
+  security_mindset:
+    - 'Treat offline metrics as a lower bound, not a guarantee: the production distribution differs from the test set, so the real-world performance is revealed only by production evaluation'
+    - 'Require statistical significance before promoting on an accuracy improvement: an improvement that is not significant may be noise, and promoting on noise carries regression risk for no real gain'
+    - 'Enforce guardrail metrics: a more accurate model with higher latency or a higher false positive rate is a production regression, not a win, regardless of the accuracy improvement'
+    - 'Measure the online-offline divergence continuously: a widening gap between benchmark and production performance is an early signal of distribution shift that the benchmark alone does not reveal'
+
+prerequisites:
+  - 'Section 12.05: supervised classification -- security_evaluator.py, the shared evaluation harness'
+  - 'Section 12.10: calibration -- the operating thresholds at which the detectors are benchmarked'
+  - 'Section 12.13: model registry -- the experiment tracking that records benchmark comparisons'
+  - 'Section 12.15: four-detector ensemble -- the ensemble benchmarked against the individual detectors'
+  - 'Chapter 1 Section 1.11: evaluation metrics -- precision, recall, F1, ROC-AUC, the metric foundations'
+  - 'Chapter 11 Section 11.16: gateway performance -- the production latency baseline the benchmark compares against'
+
+prose_content:
+
+  part_1:
+    title: 'Benchmarking Methodology: Held-Out Test Set vs Production Traffic'
+    body: |
+      A detection benchmark answers a comparative question: how do the detection configurations compare
+      on the same evaluation data. The benchmark evaluates each configuration -- the four individual
+      detectors, the ensemble, and the Chapter 11 rule-based gateway -- on the same temporal test set,
+      at each configuration's calibrated operating threshold, producing a comparison table that shows
+      which configuration performs best on which metric.
+
+      The held-out test set is the offline benchmark data. It is the temporal test split from Section
+      12.04, held out from training and from the calibration and threshold selection, so the benchmark
+      metrics reflect performance on data the detectors did not see during any stage of development. The
+      temporal split is essential: a random split would leak future attack patterns into the training
+      data, inflating the benchmark; the temporal split evaluates each configuration on attacks that
+      came after its training data, which is the production-realistic scenario.
+
+      Production traffic evaluation is the complement. The same configurations are evaluated on a sample
+      of production traffic with ground-truth labels from analyst review. The production evaluation
+      reflects the actual distribution the detectors face, including the attack variants and benign
+      patterns that the test set does not contain. The production metrics are typically lower than the
+      offline metrics, and the gap is the online-offline divergence that part 5 addresses.
+
+      The two evaluations serve different purposes. The held-out benchmark is repeatable, controlled,
+      and fast -- it can be run on demand to compare configurations during development, and it is
+      deterministic given a fixed test set and seed. The production evaluation is slow (it requires
+      accumulating labelled production traffic) and reflects reality. The development workflow uses the
+      offline benchmark to compare configurations and select candidates, then validates the selected
+      candidate on production traffic through A/B testing before full deployment. The ml_detection_benchmark.py
+      in deliverable_1 implements the offline benchmark harness.
+
+  part_2:
+    title: 'Benchmark Metrics: Beyond Aggregate Accuracy'
+    body: |
+      The benchmark reports more than aggregate accuracy because aggregate accuracy hides the failure
+      modes that matter for a security detector. The full benchmark metric set includes precision,
+      recall, and F1 at the operating threshold; ROC-AUC as a threshold-independent measure of
+      discrimination; the P99 latency from Section 12.12; and -- critically -- the per-attack-family
+      false positive rate and recall.
+
+      The per-attack-family breakdown is the metric that aggregate accuracy obscures. An ensemble with
+      0.92 aggregate recall may have 0.98 recall on prompt injection and 0.70 recall on multi-turn
+      escalation -- the aggregate hides the weak coverage of the multi-turn family. A security detector
+      that is excellent on common attacks and poor on a specific family has a coverage gap that an
+      adversary will exploit by using attacks from the weak family. The per-family breakdown surfaces
+      this gap so it can be addressed, while the aggregate would let it hide.
+
+      The per-attack-family false positive rate matters for the same reason in the benign direction. A
+      detector may have an acceptable aggregate false positive rate but a high false positive rate on a
+      specific class of benign traffic -- perhaps it flags legitimate code-generation requests as
+      injection attempts. The aggregate FPR averages this away; the per-family breakdown surfaces it, so
+      the false positive problem on the specific benign class can be fixed before it degrades the product
+      experience for users who make that kind of request.
+
+      Latency is a first-class benchmark metric, not an afterthought. A configuration that is more
+      accurate but slower may be a worse production choice, because the latency budget is a hard
+      constraint (Section 12.12). The benchmark reports the P99 latency alongside the accuracy metrics so
+      the accuracy-latency tradeoff is visible. A configuration is selected on the full metric profile --
+      accuracy, per-family coverage, false positive rate, and latency -- not on aggregate accuracy alone.
+
+  part_3:
+    title: 'A/B Testing: Traffic Splitting and Statistical Significance'
+    body: |
+      A/B testing compares two detector configurations on production traffic by routing a control group
+      to the current configuration and a treatment group to the new configuration, then comparing their
+      metrics. It is required for any detector update because the offline benchmark does not reflect the
+      production distribution, and a single deployment without a control group cannot isolate the new
+      configuration's effect from the natural day-to-day variation in traffic.
+
+      The traffic split is deterministic per request or per session: a consistent hash of the request or
+      session ID assigns each to the control or treatment group, so a given session always experiences
+      the same configuration during the test. The split fraction is typically balanced (50/50) for a
+      pure comparison, or weighted toward control (90/10) when the treatment configuration carries more
+      risk and the test should limit its exposure. The ab_test_detector.py in deliverable_2 implements
+      the split and the per-group metric collection.
+
+      Statistical significance is what separates a real improvement from noise. A treatment configuration
+      that shows 0.93 accuracy against the control's 0.91 over 1,000 examples has an observed 2%
+      improvement, but the improvement may not be statistically significant -- it may be within the
+      variation expected from sampling 1,000 examples. Promoting on a non-significant improvement carries
+      the regression risk of a deployment for an improvement that may not be real. The significance test
+      (a two-proportion z-test for accuracy, or the appropriate test for the metric) computes the
+      probability that the observed difference arose by chance; only when this probability is below the
+      significance level (typically 0.05) is the improvement treated as real.
+
+      The significance test depends on the sample size. A small sample cannot detect a small improvement
+      with significance, no matter how real the improvement is, because the sampling variation swamps the
+      effect. This is why the sample size must be calculated before the test, which part 4 addresses. An
+      A/B test run for too short a duration accumulates too few examples to reach significance, and its
+      inconclusive result is mistaken for no improvement.
+
+  part_4:
+    title: 'Sample Size and Guardrail Metrics'
+    body: |
+      The sample size calculation determines how much traffic an A/B test needs to detect a given
+      improvement with significance. It depends on three inputs: the baseline metric value (the control
+      group's expected accuracy), the minimum detectable effect (the smallest improvement worth detecting,
+      such as a 2% accuracy gain), and the desired statistical power (the probability of detecting the
+      effect if it is real, typically 0.8). From these, the calculation produces the minimum number of
+      examples per group required for the test to detect the minimum effect with significance.
+
+      The calculation is consequential for test planning. A test to detect a 5% improvement needs fewer
+      examples than a test to detect a 1% improvement, because the smaller effect requires more data to
+      distinguish from noise. At a given traffic rate, the sample size translates to a test duration: if
+      the test needs 10,000 examples per group and the treatment group receives 500 attack-relevant
+      examples per day, the test must run 20 days to reach the required sample. Running the test for
+      fewer days produces an underpowered test whose inconclusive result is uninformative. The
+      sample_size_calculator.py in deliverable_3 computes the required sample size and the corresponding
+      test duration.
+
+      Guardrail metrics prevent a local accuracy improvement from causing a production regression. A new
+      configuration may improve the accuracy by 3% but increase the P99 latency by 10ms, breaching the
+      latency budget -- this is a regression, not a win, because the latency budget is a hard constraint.
+      Or the new configuration may improve recall but increase the false positive rate beyond the analyst
+      capacity -- also a regression, because the flooded analyst queue degrades the detection system. The
+      guardrail metrics -- latency and false positive rate -- are monitored alongside the primary metric
+      during the A/B test, and the test fails if any guardrail is breached regardless of the primary
+      metric improvement.
+
+      The guardrails encode the principle that a detector update is judged on the full production impact,
+      not on a single metric. The ab_test_detector.py monitors the guardrails continuously during the
+      test and flags a guardrail breach, so a configuration that wins on accuracy but breaches a guardrail
+      is rejected before it is promoted. The guardrail is the mechanism that prevents the metric tunnel
+      vision where an accuracy improvement is pursued at the cost of a latency or false positive
+      regression.
+
+  part_5:
+    title: 'Online-Offline Divergence and Reproducibility'
+    body: |
+      The benchmark number is a lower bound on production performance, not a guarantee, because the
+      offline test set distribution differs from the production traffic distribution. The online-offline
+      divergence quantifies this gap: it compares the metrics measured offline on the held-out test set
+      against the metrics measured online on labelled production traffic, for the same configuration. A
+      configuration that scores 0.93 F1 offline and 0.85 F1 online has a 0.08 divergence, which means the
+      benchmark overestimated the production performance by that amount.
+
+      The divergence has two implications. First, the benchmark should be interpreted as a lower bound
+      adjusted by the divergence: a configuration that scores 0.93 offline can be expected to score around
+      0.85 online given a 0.08 historical divergence, and the deployment decision should use the adjusted
+      estimate. Second, a widening divergence over time is a signal of distribution shift: if the offline
+      benchmark stays at 0.93 but the online performance drops from 0.85 to 0.78, the production
+      distribution has shifted away from the test set, and the test set (and the training data behind it)
+      needs refreshing through the Section 12.14 curation. The online_offline_divergence_analyser.py in
+      deliverable_5 measures the divergence and tracks it over time as a distribution-shift signal.
+
+      Reproducibility is the property that the benchmark produces the same results across runs given the
+      same inputs. A benchmark that produces different numbers on each run -- because of unseeded
+      randomness in the data sampling, the model inference, or the metric computation -- cannot be used to
+      compare configurations reliably, because the run-to-run variation is confounded with the
+      configuration difference. The benchmark must be deterministic: fixed random seeds for any sampling,
+      fixed test set, and logged results for cross-run comparison.
+
+      The benchmark_reproducibility_harness.py in deliverable_4 enforces the determinism: it seeds all
+      randomness, fixes the test set, and logs every benchmark run with its configuration and results, so
+      that a benchmark run can be reproduced exactly and compared against prior runs. The reproducibility
+      connects to the model registry experiment tracking from Section 12.13 -- every benchmark run is
+      recorded as an experiment, so the full history of configuration comparisons is retrievable and
+      auditable. Without reproducibility, the benchmark comparisons are anecdotes; with it, they are
+      evidence.
+
+reference_materials:
+
+  table_1:
+    title: 'Benchmark Metric Set for Detection Configurations'
+    description: 'The metrics the benchmark reports for each configuration, with what each reveals'
+    columns: ['Metric', 'What It Measures', 'Why It Matters', 'Granularity']
+    rows:
+      - ['Precision', 'Fraction of flagged that are real attacks', 'False positive burden on analysts', 'Aggregate and per-family']
+      - ['Recall', 'Fraction of attacks caught', 'Coverage of the attack surface', 'Aggregate and per-family']
+      - ['F1', 'Harmonic mean of precision and recall', 'Balanced single-number comparison', 'Aggregate']
+      - ['ROC-AUC', 'Threshold-independent discrimination', 'Quality independent of the operating point', 'Aggregate']
+      - ['P99 latency', 'Worst-case 1% inference latency', 'Hard SLO constraint (Section 12.12)', 'Aggregate']
+      - ['Per-family FPR', 'False positive rate per benign class', 'Surfaces FP problems the aggregate hides', 'Per-family']
+
+  table_2:
+    title: 'A/B Test Components'
+    description: 'The components of a production detector A/B test and the role of each'
+    columns: ['Component', 'Role', 'Failure If Omitted']
+    rows:
+      - ['Control group', 'Current configuration on a traffic fraction', 'Cannot isolate the new version effect from traffic variation']
+      - ['Treatment group', 'New configuration on a traffic fraction', 'No production data on the candidate']
+      - ['Deterministic split', 'Consistent-hash assignment per request/session', 'A session experiences both configs; inconsistent results']
+      - ['Significance test', 'Probability the difference is not chance', 'Promoting on noise; regression risk for no real gain']
+      - ['Guardrail metrics', 'Latency and FPR monitored alongside primary', 'Accuracy win that is a latency or FPR regression']
+      - ['Sample size plan', 'Required examples for significance', 'Underpowered test; inconclusive result mistaken for no effect']
+
+  table_3:
+    title: 'Guardrail Metrics and Breach Conditions'
+    description: 'The guardrail metrics that fail an A/B test regardless of the primary metric improvement'
+    columns: ['Guardrail', 'Breach Condition', 'Why It Is a Regression']
+    rows:
+      - ['P99 latency', 'Treatment P99 exceeds the budget slice', 'Breaches the hard SLO; the detector will be disabled under load']
+      - ['False positive rate', 'Treatment FPR exceeds analyst capacity', 'Floods the analyst queue; degrades the detection system']
+      - ['Per-family recall', 'Treatment regresses on any attack family', 'Opens a coverage gap an adversary will exploit']
+      - ['Calibration (ECE)', 'Treatment ECE exceeds threshold', 'Uncalibrated scores corrupt the ensemble combination']
+
+  table_4:
+    title: 'Online-Offline Divergence Interpretation'
+    description: 'How the gap between offline and online metrics is interpreted and acted on'
+    columns: ['Divergence', 'Interpretation', 'Action']
+    rows:
+      - ['Small and stable', 'Test set represents production well', 'Trust the benchmark as a near-accurate estimate']
+      - ['Large and stable', 'Consistent gap; test set is optimistic', 'Adjust the benchmark by the divergence for deployment decisions']
+      - ['Widening over time', 'Production distribution shifting from the test set', 'Refresh the test set and training data via Section 12.14 curation']
+      - ['Online exceeds offline', 'Unusual; production easier than test set, or label noise', 'Investigate; may indicate test set is adversarially hard or mislabelled']
+
+deliverables:
+
+  deliverable_1:
+    title: 'ML Detection Benchmark'
+    filename: 'ml_detection_benchmark.py'
+    description: 'Cross-detector benchmarking harness covering all four detectors and the ensemble on precision, recall, F1, ROC-AUC, and latency. Evaluates every configuration on the same temporal test set at each configuration calibrated threshold, with per-attack-family breakdown.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: numpy, scikit-learn. Imports security_evaluator.py from Section 12.05.'
+    code: |
+      # ml_detection_benchmark.py
+      # Section 12.16: Cross-Detector Benchmark Harness
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import time
+      from dataclasses import dataclass, field
+      from typing import Callable, Dict, List, Optional
+
+      import numpy as np
+      from sklearn.metrics import roc_auc_score
+
+
+      @dataclass
+      class BenchmarkMetrics:
+          config_name: str
+          precision: float
+          recall: float
+          f1: float
+          roc_auc: float
+          p99_latency_ms: float
+          per_family_recall: Dict[str, float] = field(default_factory=dict)
+          per_family_fpr: Dict[str, float] = field(default_factory=dict)
+
+
+      class MLDetectionBenchmark:
+          '''
+          Benchmarks detection configurations on the same temporal test set.
+          Each configuration is evaluated at its calibrated operating threshold.
+          '''
+
+          def __init__(self) -> None:
+              self._results: List[BenchmarkMetrics] = []
+
+          def _metrics_at_threshold(
+              self,
+              y_true: np.ndarray,
+              y_score: np.ndarray,
+              threshold: float,
+          ) -> tuple:
+              preds = (y_score >= threshold).astype(int)
+              tp = int(((preds == 1) & (y_true == 1)).sum())
+              fp = int(((preds == 1) & (y_true == 0)).sum())
+              fn = int(((preds == 0) & (y_true == 1)).sum())
+              precision = tp / max(tp + fp, 1)
+              recall = tp / max(tp + fn, 1)
+              f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+              return precision, recall, f1
+
+          def benchmark_config(
+              self,
+              config_name: str,
+              predict_fn: Callable,
+              y_true: np.ndarray,
+              test_inputs: List,
+              threshold: float,
+              families: Optional[List[str]] = None,
+          ) -> BenchmarkMetrics:
+              # Score with latency measurement
+              scores = []
+              latencies = []
+              for x in test_inputs:
+                  t0 = time.perf_counter()
+                  s = predict_fn(x)
+                  latencies.append((time.perf_counter() - t0) * 1000)
+                  scores.append(s)
+              y_score = np.array(scores)
+
+              precision, recall, f1 = self._metrics_at_threshold(y_true, y_score, threshold)
+              try:
+                  auc = float(roc_auc_score(y_true, y_score))
+              except ValueError:
+                  auc = 0.0
+              p99 = float(np.percentile(latencies, 99))
+
+              per_family_recall = {}
+              per_family_fpr = {}
+              if families is not None:
+                  fam_arr = np.array(families)
+                  preds = (y_score >= threshold).astype(int)
+                  for fam in sorted(set(families)):
+                      mask = fam_arr == fam
+                      fam_true = y_true[mask]
+                      fam_pred = preds[mask]
+                      n_attack = (fam_true == 1).sum()
+                      n_benign = (fam_true == 0).sum()
+                      if n_attack > 0:
+                          per_family_recall[fam] = float((fam_pred[fam_true == 1] == 1).mean())
+                      if n_benign > 0:
+                          per_family_fpr[fam] = float((fam_pred[fam_true == 0] == 1).mean())
+
+              metrics = BenchmarkMetrics(
+                  config_name=config_name,
+                  precision=precision, recall=recall, f1=f1,
+                  roc_auc=auc, p99_latency_ms=p99,
+                  per_family_recall=per_family_recall,
+                  per_family_fpr=per_family_fpr,
+              )
+              self._results.append(metrics)
+              return metrics
+
+          def comparison_table(self) -> None:
+              print('Cross-Detector Benchmark')
+              print('=' * 78)
+              fmt = '{:<20} {:>9} {:>9} {:>9} {:>9} {:>10}'
+              print(fmt.format('Configuration', 'Precision', 'Recall', 'F1', 'ROC-AUC', 'P99(ms)'))
+              print('-' * 78)
+              for m in self._results:
+                  print(fmt.format(
+                      m.config_name[:20],
+                      f'{m.precision:.3f}', f'{m.recall:.3f}', f'{m.f1:.3f}',
+                      f'{m.roc_auc:.3f}', f'{m.p99_latency_ms:.1f}',
+                  ))
+              # Highlight the best F1
+              if self._results:
+                  best = max(self._results, key=lambda m: m.f1)
+                  print('-' * 78)
+                  print(f'  Best F1: {best.config_name} ({best.f1:.3f})')
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(42)
+          n = 500
+          families = rng.choice(['injection', 'jailbreak', 'multiturn', 'benign'],
+                                n, p=[0.2, 0.15, 0.1, 0.55]).tolist()
+          y_true = np.array([0 if f == 'benign' else 1 for f in families])
+          inputs = list(range(n))
+
+          benchmark = MLDetectionBenchmark()
+
+          # Simulate detectors with different strengths
+          def make_detector(skill):
+              def predict(x):
+                  i = x
+                  base = rng.beta(skill * 8 + 1, 8) if y_true[i] == 1 else rng.beta(2, 8)
+                  return float(base)
+              return predict
+
+          for name, skill, thresh in [
+              ('isolation_forest', 0.4, 0.45),
+              ('xgboost', 0.7, 0.5),
+              ('gru', 0.6, 0.48),
+              ('embedding', 0.65, 0.52),
+              ('ensemble', 0.85, 0.55),
+          ]:
+              benchmark.benchmark_config(name, make_detector(skill), y_true, inputs, thresh, families)
+
+          benchmark.comparison_table()
+
+  deliverable_2:
+    title: 'A/B Test Detector'
+    filename: 'ab_test_detector.py'
+    description: 'Production A/B testing framework with traffic splitting, guardrail monitoring, and statistical significance computation. Routes control and treatment groups by deterministic hash, collects per-group metrics, and tests the significance of the difference while enforcing guardrails.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: numpy, scipy. Falls back to a normal-approximation z-test if scipy is unavailable.'
+    code: |
+      # ab_test_detector.py
+      # Section 12.16: Production A/B Testing Framework
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import hashlib
+      import math
+      from dataclasses import dataclass, field
+      from typing import Callable, Dict, List, Optional, Tuple
+
+      import numpy as np
+
+
+      @dataclass
+      class GroupMetrics:
+          n: int
+          tp: int = 0
+          fp: int = 0
+          tn: int = 0
+          fn: int = 0
+          latencies_ms: List[float] = field(default_factory=list)
+
+          @property
+          def accuracy(self) -> float:
+              total = self.tp + self.fp + self.tn + self.fn
+              return (self.tp + self.tn) / max(total, 1)
+
+          @property
+          def fpr(self) -> float:
+              return self.fp / max(self.fp + self.tn, 1)
+
+          @property
+          def recall(self) -> float:
+              return self.tp / max(self.tp + self.fn, 1)
+
+          @property
+          def p99_latency(self) -> float:
+              return float(np.percentile(self.latencies_ms, 99)) if self.latencies_ms else 0.0
+
+
+      @dataclass
+      class ABTestResult:
+          control_accuracy: float
+          treatment_accuracy: float
+          improvement: float
+          p_value: float
+          significant: bool
+          guardrail_breaches: List[str]
+          promote: bool
+
+
+      def two_proportion_z_test(p1: float, n1: int, p2: float, n2: int) -> float:
+          '''Two-proportion z-test; returns the two-sided p-value.'''
+          if n1 == 0 or n2 == 0:
+              return 1.0
+          p_pool = (p1 * n1 + p2 * n2) / (n1 + n2)
+          se = math.sqrt(p_pool * (1 - p_pool) * (1 / n1 + 1 / n2))
+          if se == 0:
+              return 1.0
+          z = (p2 - p1) / se
+          # Two-sided p-value from the normal CDF
+          p_value = 2 * (1 - 0.5 * (1 + math.erf(abs(z) / math.sqrt(2))))
+          return p_value
+
+
+      class ABTestDetector:
+          '''
+          A/B tests a treatment detector against a control on production traffic.
+          Deterministic split by request/session hash; guardrails on latency and FPR.
+          '''
+
+          def __init__(
+              self,
+              control_predict: Callable,
+              treatment_predict: Callable,
+              threshold: float = 0.5,
+              treatment_fraction: float = 0.5,
+              significance_level: float = 0.05,
+              latency_budget_ms: float = 10.0,
+              max_fpr: float = 0.01,
+          ) -> None:
+              self.control_predict = control_predict
+              self.treatment_predict = treatment_predict
+              self.threshold = threshold
+              self.treatment_fraction = treatment_fraction
+              self.significance_level = significance_level
+              self.latency_budget_ms = latency_budget_ms
+              self.max_fpr = max_fpr
+              self.control = GroupMetrics(n=0)
+              self.treatment = GroupMetrics(n=0)
+
+          def _in_treatment(self, request_id: str) -> bool:
+              h = int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16)
+              return (h % 1000) / 1000.0 < self.treatment_fraction
+
+          def process(self, request_id: str, model_input, is_attack: bool) -> bool:
+              import time
+              treatment = self._in_treatment(request_id)
+              predict = self.treatment_predict if treatment else self.control_predict
+              group = self.treatment if treatment else self.control
+
+              t0 = time.perf_counter()
+              score = predict(model_input)
+              group.latencies_ms.append((time.perf_counter() - t0) * 1000)
+
+              flagged = score >= self.threshold
+              group.n += 1
+              if flagged and is_attack:
+                  group.tp += 1
+              elif flagged and not is_attack:
+                  group.fp += 1
+              elif not flagged and not is_attack:
+                  group.tn += 1
+              else:
+                  group.fn += 1
+              return flagged
+
+          def evaluate(self) -> ABTestResult:
+              p_value = two_proportion_z_test(
+                  self.control.accuracy, self.control.n,
+                  self.treatment.accuracy, self.treatment.n,
+              )
+              significant = p_value < self.significance_level
+              improvement = self.treatment.accuracy - self.control.accuracy
+
+              breaches = []
+              if self.treatment.p99_latency > self.latency_budget_ms:
+                  breaches.append(f'latency P99 {self.treatment.p99_latency:.1f}ms > {self.latency_budget_ms}ms')
+              if self.treatment.fpr > self.max_fpr:
+                  breaches.append(f'FPR {self.treatment.fpr:.4f} > {self.max_fpr}')
+
+              promote = significant and improvement > 0 and not breaches
+
+              return ABTestResult(
+                  control_accuracy=self.control.accuracy,
+                  treatment_accuracy=self.treatment.accuracy,
+                  improvement=improvement,
+                  p_value=p_value,
+                  significant=significant,
+                  guardrail_breaches=breaches,
+                  promote=promote,
+              )
+
+
+      def print_ab_result(result: ABTestResult) -> None:
+          print('A/B Test Result')
+          print('=' * 50)
+          print(f'  Control accuracy:   {result.control_accuracy:.4f}')
+          print(f'  Treatment accuracy: {result.treatment_accuracy:.4f}')
+          print(f'  Improvement:        {result.improvement:+.4f}')
+          print(f'  p-value:            {result.p_value:.4f}')
+          print(f'  Significant:        {result.significant}')
+          if result.guardrail_breaches:
+              print('  GUARDRAIL BREACHES:')
+              for b in result.guardrail_breaches:
+                  print(f'    - {b}')
+          verdict = 'PROMOTE' if result.promote else 'DO NOT PROMOTE'
+          print(f'  Verdict: {verdict}')
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(42)
+
+          def control_model(x):
+              return rng.beta(3, 6)
+
+          def treatment_model(x):
+              return rng.beta(3, 5)   # slightly better discrimination
+
+          ab = ABTestDetector(control_model, treatment_model, treatment_fraction=0.5)
+          for i in range(5000):
+              is_attack = rng.random() < 0.1
+              ab.process(f'req_{i}', 'input', is_attack)
+
+          print_ab_result(ab.evaluate())
+
+  deliverable_3:
+    title: 'Sample Size Calculator'
+    filename: 'sample_size_calculator.py'
+    description: 'Computes the minimum detectable effect and required sample size for detector A/B tests. Given a baseline metric, a minimum detectable effect, and the desired power, returns the examples per group and the test duration at a given traffic rate.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: numpy, scipy (optional). Uses the normal approximation for the two-proportion test power.'
+    code: |
+      # sample_size_calculator.py
+      # Section 12.16: A/B Test Sample Size Calculation
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import math
+      from dataclasses import dataclass
+      from typing import Optional
+
+
+      # Normal-distribution critical values
+      def z_critical(alpha: float, two_sided: bool = True) -> float:
+          '''Inverse normal CDF for common significance levels.'''
+          p = 1 - alpha / 2 if two_sided else 1 - alpha
+          # Acklam's rational approximation for the inverse normal CDF
+          a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+               1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+          b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+               6.680131188771972e+01, -1.328068155288572e+01]
+          c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+               -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+          d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+               3.754408661907416e+00]
+          p_low, p_high = 0.02425, 1 - 0.02425
+          if p < p_low:
+              q = math.sqrt(-2 * math.log(p))
+              return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+          elif p <= p_high:
+              q = p - 0.5
+              r = q * q
+              return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
+          else:
+              q = math.sqrt(-2 * math.log(1 - p))
+              return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+
+
+      @dataclass
+      class SampleSizeResult:
+          baseline: float
+          minimum_detectable_effect: float
+          power: float
+          significance: float
+          n_per_group: int
+          test_days: Optional[float]
+
+
+      def required_sample_size(
+          baseline: float,
+          minimum_detectable_effect: float,
+          power: float = 0.8,
+          significance: float = 0.05,
+          daily_relevant_examples: Optional[int] = None,
+          treatment_fraction: float = 0.5,
+      ) -> SampleSizeResult:
+          '''
+          Required examples per group for a two-proportion test to detect the
+          minimum_detectable_effect with the given power and significance.
+          '''
+          p1 = baseline
+          p2 = baseline + minimum_detectable_effect
+          p_bar = (p1 + p2) / 2
+
+          z_alpha = z_critical(significance, two_sided=True)
+          z_beta = z_critical(2 * (1 - power), two_sided=True)  # one-sided power
+
+          # Standard two-proportion sample size formula
+          numerator = (z_alpha * math.sqrt(2 * p_bar * (1 - p_bar))
+                       + z_beta * math.sqrt(p1 * (1 - p1) + p2 * (1 - p2))) ** 2
+          denominator = (p2 - p1) ** 2
+          n_per_group = math.ceil(numerator / max(denominator, 1e-12))
+
+          test_days = None
+          if daily_relevant_examples:
+              # Each group receives a fraction of daily traffic
+              per_group_daily = daily_relevant_examples * (treatment_fraction
+                                                           if treatment_fraction <= 0.5
+                                                           else 1 - treatment_fraction)
+              test_days = n_per_group / max(per_group_daily, 1)
+
+          return SampleSizeResult(
+              baseline=baseline,
+              minimum_detectable_effect=minimum_detectable_effect,
+              power=power,
+              significance=significance,
+              n_per_group=n_per_group,
+              test_days=test_days,
+          )
+
+
+      def print_sample_size(result: SampleSizeResult) -> None:
+          print('A/B Test Sample Size')
+          print('=' * 50)
+          print(f'  Baseline metric:     {result.baseline:.3f}')
+          print(f'  Min detectable effect: {result.minimum_detectable_effect:.3f}')
+          print(f'  Power:               {result.power}')
+          print(f'  Significance:        {result.significance}')
+          print(f'  Required per group:  {result.n_per_group:,} examples')
+          if result.test_days is not None:
+              print(f'  Estimated duration:  {result.test_days:.1f} days')
+
+
+      if __name__ == '__main__':
+          # Detect a 2% accuracy improvement over a 0.91 baseline
+          for mde in [0.05, 0.02, 0.01]:
+              result = required_sample_size(
+                  baseline=0.91,
+                  minimum_detectable_effect=mde,
+                  power=0.8,
+                  significance=0.05,
+                  daily_relevant_examples=1000,
+                  treatment_fraction=0.5,
+              )
+              print_sample_size(result)
+              print()
+
+  deliverable_4:
+    title: 'Benchmark Reproducibility Harness'
+    filename: 'benchmark_reproducibility_harness.py'
+    description: 'Deterministic benchmark seeding and result logging for cross-run comparison. Seeds all randomness, fixes the test set, logs every benchmark run with its configuration and results, and verifies reproducibility across runs.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: numpy. Connects to the Section 12.13 registry experiment tracking.'
+    code: |
+      # benchmark_reproducibility_harness.py
+      # Section 12.16: Reproducible Benchmark Harness
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import hashlib
+      import json
+      import os
+      import random
+      import time
+      from dataclasses import dataclass, asdict, field
+      from pathlib import Path
+      from typing import Callable, Dict, List, Optional
+
+      import numpy as np
+
+
+      @dataclass
+      class BenchmarkRun:
+          run_id: str
+          seed: int
+          test_set_hash: str
+          config_name: str
+          metrics: Dict[str, float]
+          timestamp_ms: float
+
+
+      class BenchmarkReproducibilityHarness:
+          '''
+          Enforces benchmark determinism: fixed seeds, fixed test set, logged runs.
+          A reproducible benchmark produces identical results given identical inputs,
+          so configuration comparisons are evidence rather than anecdote.
+          '''
+
+          def __init__(self, log_path: str = 'benchmark_runs.jsonl', seed: int = 42) -> None:
+              self.log_path = Path(log_path)
+              self.seed = seed
+
+          def set_all_seeds(self) -> None:
+              '''Seed every source of randomness for determinism.'''
+              random.seed(self.seed)
+              np.random.seed(self.seed)
+              os.environ['PYTHONHASHSEED'] = str(self.seed)
+              # If torch is present, seed it too
+              try:
+                  import torch
+                  torch.manual_seed(self.seed)
+                  torch.use_deterministic_algorithms(True, warn_only=True)
+              except ImportError:
+                  pass
+
+          def test_set_hash(self, test_inputs: List, y_true: np.ndarray) -> str:
+              '''Hash the test set so a change in the data is detectable.'''
+              h = hashlib.sha256()
+              h.update(np.asarray(y_true).tobytes())
+              h.update(str(test_inputs[:100]).encode())
+              h.update(str(len(test_inputs)).encode())
+              return h.hexdigest()[:16]
+
+          def run_benchmark(
+              self,
+              config_name: str,
+              benchmark_fn: Callable,    # returns Dict[str, float]
+              test_inputs: List,
+              y_true: np.ndarray,
+          ) -> BenchmarkRun:
+              self.set_all_seeds()
+              ts_hash = self.test_set_hash(test_inputs, y_true)
+              metrics = benchmark_fn()
+              run = BenchmarkRun(
+                  run_id=f'{config_name}_{int(time.time())}',
+                  seed=self.seed,
+                  test_set_hash=ts_hash,
+                  config_name=config_name,
+                  metrics=metrics,
+                  timestamp_ms=time.time() * 1000,
+              )
+              with open(self.log_path, 'a') as f:
+                  f.write(json.dumps(asdict(run)) + '\n')
+              return run
+
+          def verify_reproducibility(
+              self,
+              config_name: str,
+              benchmark_fn: Callable,
+              test_inputs: List,
+              y_true: np.ndarray,
+              n_repeats: int = 3,
+          ) -> bool:
+              '''Run the benchmark multiple times; verify identical metrics.'''
+              results = []
+              for _ in range(n_repeats):
+                  self.set_all_seeds()
+                  results.append(benchmark_fn())
+              first = results[0]
+              reproducible = all(
+                  all(abs(r.get(k, None) - v) < 1e-9 for k, v in first.items())
+                  for r in results[1:]
+              )
+              return reproducible
+
+          def compare_runs(self, config_name: str) -> List[BenchmarkRun]:
+              '''Retrieve prior runs for a config to compare across time.'''
+              if not self.log_path.exists():
+                  return []
+              runs = []
+              with open(self.log_path) as f:
+                  for line in f:
+                      data = json.loads(line)
+                      if data['config_name'] == config_name:
+                          runs.append(BenchmarkRun(**data))
+              return runs
+
+
+      if __name__ == '__main__':
+          harness = BenchmarkReproducibilityHarness(log_path='/tmp/benchmark_runs.jsonl', seed=42)
+
+          y_true = np.array([0, 1, 0, 1, 1, 0, 0, 1])
+          inputs = list(range(8))
+
+          def deterministic_benchmark():
+              harness.set_all_seeds()
+              scores = np.random.beta(2, 5, len(inputs))
+              return {'mean_score': float(scores.mean()), 'f1': 0.876}
+
+          # Verify reproducibility
+          reproducible = harness.verify_reproducibility('ensemble', deterministic_benchmark, inputs, y_true)
+          print(f'Benchmark reproducible: {reproducible}')
+
+          run = harness.run_benchmark('ensemble', deterministic_benchmark, inputs, y_true)
+          print(f'Run logged: {run.run_id}')
+          print(f'  test_set_hash: {run.test_set_hash}')
+          print(f'  metrics: {run.metrics}')
+
+  deliverable_5:
+    title: 'Online-Offline Divergence Analyser'
+    filename: 'online_offline_divergence_analyser.py'
+    description: 'Compares online (production) and offline (held-out) evaluation metrics to detect distribution shift. Measures the divergence per metric, tracks it over time, and flags a widening divergence as a distribution-shift signal connecting to the Section 12.14 curation.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: numpy. The online metrics come from labelled production traffic; the offline from the held-out test set.'
+    code: |
+      # online_offline_divergence_analyser.py
+      # Section 12.16: Online-Offline Divergence Analysis
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      from collections import deque
+      from dataclasses import dataclass, field
+      from typing import Deque, Dict, List, Optional
+
+      import numpy as np
+
+
+      @dataclass
+      class DivergenceSnapshot:
+          timestamp_ms: float
+          metric: str
+          offline_value: float
+          online_value: float
+          divergence: float    # offline - online (positive = offline optimistic)
+
+
+      @dataclass
+      class DivergenceReport:
+          per_metric_divergence: Dict[str, float]
+          widening_metrics: List[str]
+          distribution_shift_signal: bool
+
+
+      class OnlineOfflineDivergenceAnalyser:
+          '''
+          Compares offline (held-out) and online (production) metrics.
+          A large stable divergence means the test set is optimistic;
+          a widening divergence signals distribution shift.
+          '''
+
+          def __init__(
+              self,
+              widening_threshold: float = 0.05,
+              history_window: int = 20,
+          ) -> None:
+              self.widening_threshold = widening_threshold
+              self._history: Dict[str, Deque[DivergenceSnapshot]] = {}
+
+          def record(
+              self,
+              timestamp_ms: float,
+              metric: str,
+              offline_value: float,
+              online_value: float,
+          ) -> DivergenceSnapshot:
+              snapshot = DivergenceSnapshot(
+                  timestamp_ms=timestamp_ms,
+                  metric=metric,
+                  offline_value=offline_value,
+                  online_value=online_value,
+                  divergence=offline_value - online_value,
+              )
+              if metric not in self._history:
+                  self._history[metric] = deque(maxlen=self._history_maxlen())
+              self._history[metric].append(snapshot)
+              return snapshot
+
+          def _history_maxlen(self) -> int:
+              return 20
+
+          def _is_widening(self, snapshots: List[DivergenceSnapshot]) -> bool:
+              '''Divergence is widening if recent divergence exceeds early divergence.'''
+              if len(snapshots) < 4:
+                  return False
+              early = np.mean([s.divergence for s in snapshots[:len(snapshots)//2]])
+              recent = np.mean([s.divergence for s in snapshots[len(snapshots)//2:]])
+              return (recent - early) > self.widening_threshold
+
+          def analyse(self) -> DivergenceReport:
+              per_metric = {}
+              widening = []
+              for metric, snaps in self._history.items():
+                  snaps_list = list(snaps)
+                  if snaps_list:
+                      per_metric[metric] = snaps_list[-1].divergence
+                      if self._is_widening(snaps_list):
+                          widening.append(metric)
+              return DivergenceReport(
+                  per_metric_divergence=per_metric,
+                  widening_metrics=widening,
+                  distribution_shift_signal=len(widening) > 0,
+              )
+
+
+      def print_divergence_report(report: DivergenceReport) -> None:
+          print('Online-Offline Divergence')
+          print('=' * 50)
+          for metric, div in report.per_metric_divergence.items():
+              flag = ' [WIDENING]' if metric in report.widening_metrics else ''
+              print(f'  {metric:12} divergence: {div:+.4f}{flag}')
+          if report.distribution_shift_signal:
+              print('  DISTRIBUTION SHIFT SIGNAL: refresh test set and training data')
+              print('  -> connect to Section 12.14 curation')
+          else:
+              print('  No distribution shift signal.')
+
+
+      if __name__ == '__main__':
+          import time
+          now = time.time() * 1000
+          analyser = OnlineOfflineDivergenceAnalyser(widening_threshold=0.03)
+
+          # Simulate f1 divergence widening over time (distribution shift)
+          rng = np.random.default_rng(42)
+          for i in range(12):
+              offline = 0.93
+              online = 0.88 - i * 0.008 + rng.normal(0, 0.005)   # online dropping
+              analyser.record(now + i * 86400000, 'f1', offline, online)
+              # recall stays stable
+              analyser.record(now + i * 86400000, 'recall', 0.90, 0.87 + rng.normal(0, 0.005))
+
+          report = analyser.analyse()
+          print_divergence_report(report)
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Promoting a new model on an offline accuracy improvement without A/B testing it against the current model on production traffic'
+    why_it_happens: |
+      The new model scores higher on the offline test set. The improvement looks clear and the offline
+      evaluation feels like sufficient evidence. A/B testing seems like unnecessary delay when the
+      offline benchmark already shows the new model is better.
+    consequence: |
+      The offline test set distribution differs from production. The new model that scored higher offline
+      performs worse on the production distribution -- perhaps it overfit to a pattern common in the test
+      set but rare in production. The new model is promoted on the offline improvement and degrades in
+      production, an outcome the A/B test would have caught by comparing the two on production traffic.
+    correct_approach: |
+      A/B test every model update against the current model on production traffic with the ab_test_detector.py.
+      The offline benchmark selects the candidate; the A/B test validates it against production reality
+      before promotion. Only an improvement that is statistically significant on production traffic, with
+      no guardrail breach, justifies promotion.
+
+  mistake_2:
+    description: 'Concluding a new model is better from an observed accuracy improvement that is not statistically significant'
+    why_it_happens: |
+      The A/B test shows the treatment at 0.93 accuracy and the control at 0.91 over 1,000 examples. The
+      2% improvement looks real, and the engineer concludes the treatment is better. The significance test
+      is not run, or its result is ignored because the improvement is visible.
+    consequence: |
+      The 2% improvement over 1,000 examples is within the sampling variation -- it is not statistically
+      significant. The treatment may be no better than the control; the observed difference may be noise.
+      Promoting on this non-significant improvement carries the full regression risk of a deployment for a
+      gain that may not be real, and the next A/B test may show the difference reversed.
+    correct_approach: |
+      Compute the statistical significance with the two-proportion test in ab_test_detector.py, and promote
+      only when the improvement is significant at the chosen level (typically p < 0.05). Calculate the
+      required sample size beforehand with the sample_size_calculator.py so the test runs long enough to
+      detect the minimum effect with significance. A non-significant result means the test was inconclusive,
+      not that the treatment is better.
+
+  mistake_3:
+    description: 'Running the A/B test for a fixed short duration without calculating whether the sample is large enough to detect the effect'
+    why_it_happens: |
+      The A/B test is run for a convenient duration -- a week -- without calculating whether a week of
+      traffic produces enough examples to detect the expected improvement. The duration is chosen by
+      convenience, not by the statistical requirement.
+    consequence: |
+      A week of traffic produces 700 attack-relevant examples per group, far short of the 10,000 needed to
+      detect a 1% improvement with significance. The test is underpowered: it cannot detect the improvement
+      even if it is real, so it returns a non-significant result. The inconclusive result is mistaken for
+      evidence that the treatment is no better, and a real improvement is discarded.
+    correct_approach: |
+      Calculate the required sample size with the sample_size_calculator.py before starting the test, given
+      the baseline, the minimum detectable effect, and the desired power. Translate the sample size to a
+      test duration at the production traffic rate, and run the test for that duration. An underpowered test
+      is worse than no test because its inconclusive result is misinterpreted.
+
+  mistake_4:
+    description: 'Promoting a model that wins on accuracy but breaches a guardrail, treating the accuracy improvement as the only metric that matters'
+    why_it_happens: |
+      The treatment model improves accuracy by 3% and the A/B test confirms the improvement is significant.
+      The engineer promotes it on the accuracy win without checking the guardrail metrics -- the latency
+      and the false positive rate -- because the accuracy improvement is the headline result.
+    consequence: |
+      The treatment model is 3% more accurate but has a 10ms higher P99 latency, breaching the latency
+      budget, or a higher false positive rate that floods the analyst queue. The accuracy win is a
+      production regression: the latency breach causes the detector to be disabled under load, or the
+      false positive flood degrades the detection system. The accuracy improvement was pursued at the cost
+      of a guardrail.
+    correct_approach: |
+      Enforce the guardrail metrics in the A/B test. The ab_test_detector.py monitors the latency and false
+      positive rate alongside the accuracy and fails the test if any guardrail is breached, regardless of
+      the accuracy improvement. A model update is judged on the full production impact: accuracy improvement
+      AND no latency regression AND no false positive regression.
+
+  mistake_5:
+    description: 'Reporting benchmark numbers from a non-reproducible harness, so configuration comparisons are confounded with run-to-run variation'
+    why_it_happens: |
+      The benchmark uses unseeded randomness in the data sampling or the model inference. Each run produces
+      slightly different numbers. The engineer reports the numbers from a single run as the benchmark result
+      without checking that the harness is reproducible.
+    consequence: |
+      The benchmark produces different numbers on each run because of the unseeded randomness. When two
+      configurations are compared, the difference between them is confounded with the run-to-run variation:
+      a configuration that appears 1% better may just have had a luckier run. The comparison is unreliable,
+      and decisions based on it are based on noise rather than a real configuration difference.
+    correct_approach: |
+      Make the benchmark reproducible with the benchmark_reproducibility_harness.py: seed all randomness, fix
+      the test set, and verify that repeated runs produce identical numbers. A reproducible benchmark isolates
+      the configuration difference from run-to-run variation, so the comparison reflects the real difference.
+      Log every run to the registry experiment tracking for cross-run comparison and audit.
+
+section_summary:
+
+  compact: |
+    Benchmarking and A/B testing are the quality assurance layer that backs every model promotion with
+    evidence rather than anecdote. The cross-detector benchmark evaluates the four detectors, the ensemble,
+    and the rule-based gateway on the same temporal test set, reporting precision, recall, F1, ROC-AUC, P99
+    latency, and -- critically -- the per-attack-family breakdown that the aggregate hides. The offline
+    benchmark is a lower bound, not a guarantee, because the test set distribution differs from production;
+    only A/B testing on production traffic reveals the real-world performance. A/B testing routes a control
+    group to the current configuration and a treatment group to the candidate, comparing them with a
+    statistical significance test so a non-significant improvement is not mistaken for a real one. The sample
+    size is calculated before the test so it runs long enough to detect the minimum effect with significance.
+    Guardrail metrics -- latency and false positive rate -- fail the test regardless of the accuracy
+    improvement, because a more accurate but slower or noisier model is a production regression. The
+    online-offline divergence quantifies the gap between the benchmark and production reality, and a widening
+    divergence signals distribution shift. Reproducibility -- fixed seeds, fixed test set, logged runs --
+    makes the comparisons evidence rather than noise.
+
+  key_takeaways:
+    - 'Offline metrics are a lower bound, not a guarantee: the test set distribution differs from production, so the real-world performance is revealed only by A/B testing on production traffic'
+    - 'A/B test every model update with a control group: a single deployment without a control cannot isolate the new version effect from the natural variation in traffic'
+    - 'Require statistical significance: an observed improvement over a small sample may be noise, and promoting on noise carries regression risk for no real gain -- compute the required sample size before the test'
+    - 'Enforce guardrail metrics: a more accurate model with higher latency or a higher false positive rate is a production regression, not a win, regardless of the accuracy improvement'
+    - 'Report the per-attack-family breakdown, not just the aggregate: an ensemble with strong aggregate recall may have a weak family an adversary will exploit, which the aggregate hides'
+    - 'Make the benchmark reproducible with fixed seeds, a fixed test set, and logged runs -- without reproducibility the configuration comparisons are confounded with run-to-run variation and the decisions are based on noise'
+
+preview_section_12_17:
+  title: 'Section 12.17: Production ML Gateway -- The Complete Detection System Capstone'
+  summary: |
+    Section 12.17 is the Chapter 12 capstone: it integrates everything built across the chapter into a
+    single production ML detection gateway. The four input-side detectors feed the Section 12.15 ensemble;
+    the PII scanner runs output-side; the feature pipeline (12.11) and inference optimisation (12.12) keep
+    the whole system within the 50ms P99 budget; the model registry (12.13) governs the deployed
+    configuration; the live curation (12.14) and benchmarking (12.16) keep it current and validated. The
+    section assembles the complete gateway as a seven-track architecture, wires the ensemble decision into
+    the block-flag-monitor response, adds the ATLAS AML.T0040 Sigma rule for the detection telemetry, and
+    presents the end-to-end request lifecycle from ingestion through detection to response. It is the
+    section where the ML detection layer built in Chapter 12 becomes a deployable system that slots into
+    the Chapter 11 gateway, and it is the bridge to the response and remediation of Chapter 13.
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 1 Section 1.11: evaluation metrics -- precision, recall, F1, ROC-AUC foundations'
+    - 'Chapter 11 Section 11.16: gateway performance -- the production latency baseline'
+    - 'Section 12.05: supervised classification -- security_evaluator.py, the shared evaluation harness'
+    - 'Section 12.10: calibration -- the operating thresholds at which detectors are benchmarked'
+    - 'Section 12.13: model registry -- the experiment tracking that records benchmark comparisons'
+    - 'Section 12.15: four-detector ensemble -- benchmarked against the individual detectors'
+  forward_references:
+    - 'Section 12.17: production gateway capstone -- the benchmark validates the deployed configuration'
+    - 'Section 12.18: chapter summary -- benchmarking is the quality assurance for the chapter deliverable'
+    - 'Chapter 17: monitoring and tuning -- benchmarking establishes the baseline Chapter 17 tracks'
+    - 'Chapter 13: response and remediation -- the validated detector feeds the response actions'
+  tags:
+    - benchmarking
+    - ab-testing
+    - statistical-significance
+    - sample-size-calculation
+    - guardrail-metrics
+    - online-offline-divergence
+    - reproducibility
+    - cross-detector-benchmark
+    - traffic-splitting
+    - two-proportion-test
+    - minimum-detectable-effect
+    - distribution-shift
+    - quality-assurance

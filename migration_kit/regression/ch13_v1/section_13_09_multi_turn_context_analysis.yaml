@@ -1,0 +1,792 @@
+# section_13_09_multi_turn_context_analysis.yaml
+
+---
+document_info:
+  title: 'Multi-Turn Context Analysis: Accumulation and Escalation Across a Conversation'
+  chapter: 13
+  section: 9
+  section_code: '1309'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-21'
+  estimated_pages: 7
+  estimated_reading_time: '50-60 minutes'
+
+section_overview:
+  one_line_summary: 'The multi-turn attack defeats per-turn classification by construction -- every turn passes, the trajectory is the attack; Section 13.09 builds the trajectory features, sequence modelling over the turn stream, the per-session threat accumulator, and the Crescendo-family detector that lift detection from the turn to the full session.'
+  why_this_section_exists: |
+    Section 13.01 named the multi-turn jailbreak as the canonical session-family attack, and 13.02 built
+    the session model and trajectory features it requires. Section 13.09 builds the detector itself.
+    The multi-turn attack is important enough to warrant its own section because it defeats per-turn
+    classification not by accident but by construction. The adversary designs each turn to be benign
+    enough to pass the per-turn classifier, and assembles the attack from the trajectory across turns.
+    No amount of improvement to the per-turn classifier closes this gap, because the per-turn classifier
+    is scoring the wrong unit: each turn really is benign, and the attack really is the path.
+
+    The attack comes in recognisable forms. The accumulation attack assembles a harmful capability from
+    individually benign pieces -- each turn extracts one innocuous fragment, and only the assembled
+    whole is harmful. The escalation attack ratchets a conversation steadily toward a constraint
+    boundary, each turn moving a little further than the last, never far enough in one step to trigger a
+    per-turn detector. Context-window manipulation fills the context with material that pushes the
+    system's constraints out of the model's effective attention. Published families -- Crescendo,
+    many-shot -- have characteristic behavioural signatures that recur across instances.
+
+    Detecting these requires reading the session as a sequence, not a set of independent turns. The
+    section applies sequence modelling over the turn stream -- the Chapter 12 GRU detector lifted from
+    the request level to the session level -- and the trajectory features from 13.02, and it maintains a
+    per-session threat accumulator that integrates risk across turns so that a conversation accumulating
+    many small risk increments crosses a threshold that no single turn reaches. Paired with the self-
+    consistency monitor of 13.06, which watches the model's response to the escalation, the section can
+    observe a multi-turn injection and its success together.
+  position_in_chapter: |
+    Section 13.09 is the second session-family section, building directly on the session model and
+    trajectory features of 13.02 and the Chapter 12 GRU sequence detector. It pairs with the self-
+    consistency monitor of 13.06: where 13.06 watched the model's output for the refusal reversal that
+    signals success, 13.09 watches the user's input trajectory for the escalation that drives it, and
+    together they observe the multi-turn injection and its outcome. Its per-session threat signal feeds
+    the entity profiler of 13.10 and the gateway integration of 13.11. It is the section that completes
+    the session family's coverage of the gradual attack.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain why the multi-turn attack defeats per-turn classification by construction, not by classifier weakness'
+    - 'Distinguish accumulation attacks from escalation attacks and describe the signature of each'
+    - 'Explain context-window manipulation and how it pushes system constraints out of the model attention'
+    - 'Describe sequence modelling over the turn stream and how the Chapter 12 GRU detector is lifted to the session level'
+    - 'Name the trajectory features that capture escalation: classifier-score slope, topic-drift velocity, refusal-then-retry'
+    - 'Describe the published Crescendo and many-shot multi-turn families and their behavioural signatures'
+    - 'Explain the per-session threat accumulator and how it integrates risk across turns to a threshold crossing'
+
+  skills:
+    - 'Extract trajectory features from a session: score slope, topic-drift velocity, refusal-then-retry patterns'
+    - 'Apply a sequence model over the turn stream to score a session trajectory'
+    - 'Maintain a per-session threat accumulator that integrates per-turn risk across the conversation'
+    - 'Detect the behavioural signature of published multi-turn jailbreak families'
+    - 'Pair the input-side escalation signal with the output-side self-consistency signal for multi-turn injection success'
+
+  security_mindset:
+    - 'Internalise that the multi-turn attack is the trajectory, not any turn, so improving the per-turn classifier cannot close the gap'
+    - 'Recognise that a per-session threat accumulator turns many individually-benign small risks into a threshold crossing no single turn reaches'
+    - 'Understand that distinguishing a persistent adversary from a persistent legitimate user requires the directedness of the trajectory, not its length'
+    - 'Treat the input-side escalation and the output-side refusal reversal as the strongest combined evidence of a successful multi-turn injection'
+
+prerequisites:
+  - 'Chapter 2 Section 2.17: LSTM and GRU sequence architectures -- the sequence model lifted to the session level here'
+  - 'Chapter 4 Section 4.07: prompt injection mechanics -- the attack escalated across turns here'
+  - 'Chapter 12 Section 12.06: sequence models -- the per-turn GRU detector this section operates at the session scope'
+  - 'Chapter 13 Section 13.02: session modelling -- the session object and trajectory features this section consumes'
+  - 'Chapter 13 Section 13.06: model behaviour monitoring -- the self-consistency signal this section pairs with'
+
+prose_content:
+
+  part_1:
+    title: 'Defeating Per-Turn Classification by Construction'
+    body: |
+      The multi-turn attack is the cleanest demonstration in the book of an attack designed around the
+      detector. A per-turn classifier scores each turn of a conversation independently and blocks the
+      turns it judges to be attacks. The multi-turn adversary's entire strategy is to ensure that no
+      individual turn is judged an attack, while the conversation as a whole achieves the attack's goal.
+      Each turn is crafted to be benign enough to pass -- a reasonable question, an innocuous request, a
+      small step -- and the attack is assembled from the sequence of these passing turns.
+
+      This is defeat by construction, not by classifier weakness. It is tempting to respond to a missed
+      multi-turn attack by trying to make the per-turn classifier stricter, but this does not work and
+      cannot work. The individual turns of a well-designed multi-turn attack are genuinely benign in
+      isolation: each one, considered alone, is a request a legitimate user might reasonably make. A per-
+      turn classifier strict enough to flag them would flag enormous numbers of legitimate single turns
+      too, because it would be flagging benign content. The per-turn classifier is scoring the wrong unit.
+      The attack does not live in any turn; it lives in the relationship between turns -- the trajectory --
+      and a detector that scores turns independently has thrown away exactly the information that contains
+      the attack.
+
+      The consequence is that multi-turn detection must operate at the session level, on the sequence of
+      turns, reading the trajectory that per-turn scoring discards. This is the session family's reason
+      for existing, and the multi-turn attack is its primary target. The session model of 13.02 produced
+      the trajectory features; this section builds the detector that reads them. The shift from per-turn
+      to per-session is not an enhancement of per-turn detection -- it is a different detector operating on
+      a different unit, necessary because the attack was designed to be invisible to the per-turn unit.
+
+  part_2:
+    title: 'Accumulation and Escalation: Two Multi-Turn Signatures'
+    body: |
+      Multi-turn attacks fall into two broad signatures that differ in how the trajectory carries the
+      attack.
+
+      The accumulation attack assembles a harmful whole from individually harmless parts. The adversary
+      extracts one innocuous fragment per turn -- a piece of information, a step of a process, a component
+      of a capability -- each of which is benign on its own and would be provided to any legitimate user.
+      Only the assembled collection is harmful. The signature is not escalation in any single dimension
+      but breadth of coverage of a harmful topic assembled across turns: the conversation systematically
+      gathers the pieces of something dangerous, no piece alarming, the assembly the attack. Accumulation
+      resembles the coverage-pattern signature of 13.07 but at the session scale -- a methodical gathering
+      of fragments rather than a sweep of an input space.
+
+      The escalation attack ratchets toward a constraint boundary. Each turn moves the conversation a
+      little further toward a harmful objective than the last, in a steady directed progression. The
+      signature is the trajectory's directedness and monotonicity: a conversation that begins benign and
+      moves consistently toward a sensitive target, each step small, the cumulative movement large. This
+      is the topic-drift signature of 13.02 -- monotonic, accumulating drift from the benign opening --
+      now recognised as the escalation attack. The escalation attack is what the topic-drift feature was
+      built to catch, and the score-slope trajectory feature captures it from the classifier-score side:
+      a session whose per-turn scores climb steadily is escalating even when no single score crosses the
+      per-turn threshold.
+
+      The two signatures often combine in a real attack -- an adversary both escalates the framing and
+      accumulates the fragments -- and the detector must catch both. Escalation is caught by the
+      directedness of the trajectory (score slope, topic-drift velocity, monotonicity); accumulation is
+      caught by the breadth of harmful-topic coverage assembled across the session. Both are session-level
+      properties invisible to per-turn scoring, and both feed the per-session threat accumulator that
+      integrates them into a single session threat signal.
+
+  part_3:
+    title: 'Context-Window Manipulation: Pushing Constraints Out of Attention'
+    body: |
+      A third multi-turn technique exploits the mechanics of the context window rather than the semantics
+      of the conversation. The model's system prompt and safety constraints occupy part of its context,
+      and the model's effective attention to them can be diluted by what else is in the context. Context-
+      window manipulation fills the conversation with material -- long turns, many turns, padding,
+      injected examples -- that pushes the system constraints toward the edge of the context or dilutes
+      their influence on the model's attention, so that by late in the conversation the model is attending
+      more to the accumulated conversation than to its original instructions.
+
+      The many-shot variant is the clearest example: the adversary fills the context with many examples of
+      the model complying with progressively less acceptable requests, so that the accumulated pattern of
+      compliance in the context steers the model toward continuing to comply. Each example turn is
+      individually mild, but the accumulated weight of dozens of compliance examples in the context shifts
+      the model's behaviour. This is a context-level attack -- its signal is the volume and pattern of the
+      accumulated context, not the content of any single turn -- and it has a behavioural signature the
+      session detector can read: an unusually long or example-dense context combined with a trajectory of
+      increasingly permissive model responses.
+
+      Detecting context-window manipulation combines a structural signal with the trajectory signal. The
+      structural signal is the context's size and composition: an abnormally long session, an unusual
+      density of example-like turns, a context that has grown far beyond the task's apparent needs. The
+      trajectory signal is the model's response pattern: a refusal rate that declines as the context fills,
+      a persona that drifts, the self-consistency signals of 13.06. A session that is both structurally
+      anomalous in its context accumulation and exhibits a declining-refusal trajectory is exhibiting the
+      context-manipulation signature, and the combination is far more specific than either signal alone --
+      a long session is not inherently an attack, and a single permissive response is not inherently a
+      compromise, but a long context-dense session with a declining-refusal trajectory is the many-shot
+      signature.
+
+  part_4:
+    title: 'Sequence Modelling Over the Turn Stream'
+    body: |
+      The natural model for a session, which is a sequence of turns, is a sequence model, and the Chapter
+      12 GRU detector is the tool, lifted from the request level to the session level. In Chapter 12 the
+      GRU operated over a sequence within a single request or a short window; here it operates over the
+      sequence of turns in a session, consuming the per-turn feature vectors -- the per-track classifier
+      scores, the trajectory features, the topic-drift values -- and producing a session-level score that
+      reflects the whole trajectory rather than any single turn.
+
+      The sequence model is the right tool because the multi-turn attack is fundamentally a sequential
+      pattern: the order of turns matters, the progression matters, and the relationship between a turn and
+      the turns before it carries the signal. A model that consumes the turns in order and maintains a
+      hidden state across them can represent the trajectory -- the escalation, the accumulation, the
+      declining refusals -- in a way that a model treating the turns as an unordered set cannot. The GRU's
+      hidden state is, in effect, a learned summary of the session so far, updated with each turn, and the
+      session score it produces reflects the developing trajectory.
+
+      Lifting the GRU to the session level inherits the streaming requirement from 13.02 and 13.04: the
+      model scores the session incrementally as each turn arrives, updating its hidden state with the new
+      turn and producing an updated session score, rather than waiting for the session to complete and
+      scoring it as a whole. This lets the multi-turn detector flag an escalating session mid-escalation,
+      before the attack completes, which is the operational point -- detecting the gradual attack only
+      after it succeeds is too late. The incremental session score is one input to the per-session threat
+      accumulator, alongside the explicit trajectory features and the structural context signals, and the
+      sequence model and the explicit features are complementary: the explicit features encode known
+      escalation signatures, and the learned model captures patterns the explicit features miss.
+
+  part_5:
+    title: 'Published Families: Crescendo and Many-Shot Signatures'
+    body: |
+      The multi-turn attack space is not unstructured; published jailbreak families have characteristic
+      behavioural signatures that recur across instances, and recognising these signatures is a high-value
+      complement to the general trajectory detection. Two families are particularly well-documented.
+
+      The Crescendo family is the escalation archetype: a conversation that begins with a benign request on
+      a topic and escalates step by step toward a harmful objective in the same topic, each turn building
+      on the model's previous answer to push slightly further. Its behavioural signature is a steadily
+      rising score slope and a monotonic topic drift in a consistent direction, with the model's own prior
+      responses being used as the foothold for each next step. The refusal-then-retry pattern is often
+      present -- when the model refuses, the adversary rephrases and retries from a slightly different
+      angle, producing a refusal followed by a continued push. A detector tuned for the Crescendo signature
+      watches for the combination of monotonic directed drift, rising score slope, and refusal-retry
+      sequences.
+
+      The many-shot family is the context-manipulation archetype described in Part 3: filling the context
+      with many examples of escalating compliance to steer the model. Its signature is structural -- an
+      example-dense, unusually long context -- combined with a declining model refusal rate as the context
+      fills. A detector tuned for the many-shot signature watches for the context-density and length
+      anomaly together with the declining-refusal trajectory.
+
+      Detecting these families by signature complements the general sequence model and accumulator the same
+      way signature detection complemented ML detection in Chapter 11: the signatures catch the known
+      families with high precision and a clear explanation, while the general trajectory detection and the
+      sequence model catch the novel and the variant attacks that do not match a known signature. A multi-
+      turn detector uses both -- the family signatures for the known attacks and the general trajectory
+      analysis for the rest -- and the family signatures also serve as labelled training examples that
+      sharpen the general detector. The published families are a moving target as new ones are discovered,
+      so the signature set is maintained and extended, but the general trajectory detection provides the
+      coverage that does not depend on having a signature for every family.
+
+  part_6:
+    title: 'The Per-Session Threat Accumulator and Pairing with Self-Consistency'
+    body: |
+      The unifying mechanism of multi-turn detection is the per-session threat accumulator: a running
+      integral of risk across the turns of a session. Each turn contributes a small increment of risk --
+      from its trajectory features, its sequence-model score, its structural context signal -- and the
+      accumulator sums these increments across the session. A conversation that accumulates many small risk
+      increments crosses the accumulator's threshold even though no single turn's risk is large, which is
+      precisely the multi-turn attack: many benign-looking turns whose cumulative risk is the attack. The
+      accumulator is the session-level analogue of the cumulative-volume feature from 13.07 -- it catches
+      the attack that never spikes but grinds steadily upward.
+
+      The accumulator is designed to distinguish the directed adversary from the persistent legitimate
+      user, which is the central false-positive challenge of multi-turn detection. A legitimate user can
+      have a long, persistent session -- many turns, sustained engagement -- without it being an attack.
+      The accumulator must not flag length alone. The discriminator is directedness: the legitimate long
+      session wanders, returns to topics, and does not progress monotonically toward a constraint boundary,
+      so its risk increments are small and non-cumulative and the accumulator stays low. The directed
+      adversary's session progresses consistently toward a target, so its increments accumulate in a
+      consistent direction and the accumulator climbs. The accumulator integrates the directed risk, not
+      the raw activity, so a persistent but undirected legitimate session does not cross the threshold while
+      a directed escalation does -- the same distinction the topic-drift monotonicity made in 13.02, now
+      integrated across the whole session.
+
+      The strongest multi-turn signal comes from pairing the input-side accumulator with the output-side
+      self-consistency monitor of 13.06. The accumulator watches the user's escalating trajectory; the
+      self-consistency monitor watches the model's response to it, flagging the refusal reversal where the
+      model complies with a class it refused earlier. A session where the user's threat accumulator climbs
+      and the model's refusals reverse is a near-unambiguous successful multi-turn injection: the input
+      side shows the attack escalating and the output side shows it succeeding, observed together. This
+      pairing is the behavioural layer's strongest evidence for a multi-turn injection, and it is the
+      session-family contribution to the gateway integration of 13.11. The per-session threat signal --
+      the accumulator value, the sequence-model score, the family-signature matches, paired with the self-
+      consistency signal -- feeds the entity profiler of 13.10, where a session that reached a high threat
+      accumulator elevates the entity's persistent risk, and the gateway of 13.11, where it becomes part of
+      the behavioural verdict and can trigger a session intervention mid-escalation.
+
+reference_materials:
+
+  table_1:
+    title: 'Why Multi-Turn Attacks Defeat Per-Turn Classification'
+    description: 'How the multi-turn attack is constructed to pass per-turn scoring and why a stricter per-turn classifier cannot close the gap'
+    columns: ['Property', 'Per-Turn Classifier', 'Multi-Turn Reality']
+    rows:
+      - ['Unit scored', 'One turn in isolation', 'The trajectory across turns']
+      - ['Each turn', 'Judged benign -- correctly', 'Genuinely benign in isolation']
+      - ['Attack location', 'Not in any single turn', 'In the relationship between turns']
+      - ['Stricter per-turn classifier', 'Flags benign single turns too', 'Cannot help -- wrong unit']
+      - ['Correct response', 'N/A', 'Score the session, not the turn']
+
+  table_2:
+    title: 'Multi-Turn Attack Signatures'
+    description: 'The multi-turn attack signatures and the session-level feature that catches each'
+    columns: ['Signature', 'How It Works', 'Session Feature That Catches It']
+    rows:
+      - ['Accumulation', 'Assembles harm from benign fragments', 'Breadth of harmful-topic coverage across turns']
+      - ['Escalation', 'Ratchets toward a constraint boundary', 'Monotonic topic drift + rising score slope']
+      - ['Context-window manipulation', 'Dilutes constraints in the context', 'Context length/density + declining refusal']
+      - ['Refusal-then-retry', 'Rephrase and retry after refusal', 'Refusal followed by continued push']
+
+  table_3:
+    title: 'Published Multi-Turn Families'
+    description: 'The well-documented multi-turn jailbreak families and their behavioural signatures'
+    columns: ['Family', 'Archetype', 'Behavioural Signature', 'Primary Detection']
+    rows:
+      - ['Crescendo', 'Step-by-step escalation', 'Monotonic directed drift + rising slope + refusal-retry', 'Trajectory features']
+      - ['Many-shot', 'Context-filling with compliance examples', 'Example-dense long context + declining refusal', 'Structural + trajectory']
+      - ['Novel / variant', 'Not matching a known signature', 'Varies', 'General sequence model + accumulator']
+
+  table_4:
+    title: 'Directed Adversary vs Persistent Legitimate User'
+    description: 'How the threat accumulator distinguishes a directed multi-turn attack from a long legitimate session'
+    columns: ['Property', 'Persistent Legitimate User', 'Directed Adversary']
+    rows:
+      - ['Session length', 'Can be long', 'Can be long']
+      - ['Trajectory direction', 'Wanders; returns to topics', 'Monotonic toward a target']
+      - ['Risk increments', 'Small and non-cumulative', 'Accumulate in a consistent direction']
+      - ['Accumulator value', 'Stays low', 'Climbs to threshold']
+      - ['Discriminator', 'Length alone -- not flagged', 'Directedness -- flagged']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Trajectory Feature Extractor'
+    filename: 'trajectory_feature_extractor.py'
+    description: 'Extracts the session trajectory features that capture multi-turn escalation: classifier-score slope, topic-drift velocity, refusal-then-retry rate, and monotonicity of the drift. Builds on the session model of 13.02. Implements the trajectory features from Section 13.09 Part 2.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # trajectory_feature_extractor.py
+      # Section 13.09: Multi-Turn Trajectory Feature Extractor
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from typing import List
+
+
+      @dataclass
+      class Turn:
+          jailbreak_score: float
+          topic_drift: float      # cosine distance from session opening anchor (13.02)
+          refused: bool
+
+
+      def _slope(values: List[float]) -> float:
+          n = len(values)
+          if n < 2:
+              return 0.0
+          xs = list(range(n))
+          mx = sum(xs) / n
+          my = sum(values) / n
+          num = sum((x - mx) * (y - my) for x, y in zip(xs, values))
+          den = sum((x - mx) ** 2 for x in xs) or 1.0
+          return num / den
+
+
+      @dataclass
+      class TrajectoryFeatures:
+          score_slope: float
+          drift_velocity: float
+          drift_monotonic_fraction: float
+          refusal_then_retry_rate: float
+          directed_escalation: bool
+
+
+      def extract_trajectory(turns: List[Turn]) -> TrajectoryFeatures:
+          n = len(turns)
+          if n < 2:
+              return TrajectoryFeatures(0.0, 0.0, 0.0, 0.0, False)
+
+          scores = [t.jailbreak_score for t in turns]
+          drifts = [t.topic_drift for t in turns]
+
+          score_slope = _slope(scores)
+          drift_velocity = _slope(drifts)
+          increases = sum(1 for i in range(1, n) if drifts[i] >= drifts[i - 1])
+          drift_monotonic = increases / (n - 1)
+
+          retry = 0
+          for i in range(1, n):
+              if turns[i - 1].refused and not turns[i].refused:
+                  retry += 1
+          retry_rate = retry / n
+
+          # Directed escalation: rising scores AND rising, mostly-monotonic drift
+          directed = score_slope > 0.02 and drift_velocity > 0.01 and drift_monotonic >= 0.7
+
+          return TrajectoryFeatures(
+              round(score_slope, 4), round(drift_velocity, 4),
+              round(drift_monotonic, 4), round(retry_rate, 4), directed,
+          )
+
+
+      if __name__ == '__main__':
+          crescendo = [
+              Turn(0.10, 0.00, False),
+              Turn(0.20, 0.12, False),
+              Turn(0.34, 0.25, True),
+              Turn(0.30, 0.30, False),  # refusal then retry
+              Turn(0.48, 0.42, False),
+              Turn(0.61, 0.55, False),
+          ]
+          benign = [
+              Turn(0.08, 0.00, False),
+              Turn(0.06, 0.30, False),  # jumps topic (benign switch) then stable
+              Turn(0.07, 0.31, False),
+              Turn(0.05, 0.10, False),  # wanders back
+          ]
+          print('Crescendo session:', extract_trajectory(crescendo))
+          print('Benign session:   ', extract_trajectory(benign))
+          print('The crescendo shows directed escalation; the benign wanders.')
+
+  deliverable_2:
+    title: 'Session Sequence Scorer'
+    filename: 'session_sequence_scorer.py'
+    description: 'Scores a session trajectory with a lightweight recurrent sequence model over the turn stream, maintaining a hidden state updated incrementally per turn -- the Chapter 12 GRU detector lifted to the session level. Implements the sequence modelling from Section 13.09 Part 4.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only; a small deterministic GRU-style recurrence is implemented without ML frameworks to keep the example runnable, standing in for the trained Chapter 12 GRU'
+    code: |
+      # session_sequence_scorer.py
+      # Section 13.09: Session Sequence Scorer (GRU lifted to session level)
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import math
+      from dataclasses import dataclass, field
+      from typing import List
+
+
+      def _sigmoid(x: float) -> float:
+          if x < -60:
+              return 0.0
+          if x > 60:
+              return 1.0
+          return 1.0 / (1.0 + math.exp(-x))
+
+
+      @dataclass
+      class SessionSequenceScorer:
+          # A minimal GRU-style scalar recurrence standing in for the trained
+          # Chapter 12 GRU. Production uses the learned weights from Section 12.06.
+          w_update: float = 1.2
+          w_reset: float = 0.8
+          w_candidate: float = 1.5
+          hidden: float = 0.0
+
+          def reset(self) -> None:
+              self.hidden = 0.0
+
+          def step(self, turn_risk: float) -> float:
+              # turn_risk is a per-turn risk scalar in [0, 1]
+              z = _sigmoid(self.w_update * turn_risk - 0.5)        # update gate
+              r = _sigmoid(self.w_reset * turn_risk - 0.5)         # reset gate
+              h_candidate = math.tanh(self.w_candidate * turn_risk + r * self.hidden)
+              self.hidden = (1 - z) * self.hidden + z * h_candidate
+              # session score is the squashed hidden state
+              return round(_sigmoid(4 * (self.hidden - 0.5)), 4)
+
+
+      def score_session(turn_risks: List[float]) -> List[float]:
+          scorer = SessionSequenceScorer()
+          return [scorer.step(r) for r in turn_risks]
+
+
+      if __name__ == '__main__':
+          # Escalating session: per-turn risk creeps up
+          escalating = [0.1, 0.2, 0.3, 0.45, 0.6, 0.72]
+          # Benign session: low, flat per-turn risk
+          benign = [0.08, 0.05, 0.09, 0.07, 0.06]
+
+          esc_scores = score_session(escalating)
+          ben_scores = score_session(benign)
+          print('Escalating session scores per turn:', esc_scores)
+          print('Benign session scores per turn:    ', ben_scores)
+          print('The recurrent state accumulates the escalation, so the session score')
+          print('climbs across turns even though no single turn risk is extreme.')
+
+  deliverable_3:
+    title: 'Session Threat Accumulator'
+    filename: 'session_threat_accumulator.py'
+    description: 'Integrates per-turn risk across a session into a running threat accumulator that crosses a threshold when many small directed increments accumulate, while a long undirected legitimate session stays below threshold. Implements the per-session threat accumulator from Section 13.09 Part 6.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # session_threat_accumulator.py
+      # Section 13.09: Per-Session Threat Accumulator
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import List, Optional
+
+
+      @dataclass
+      class TurnRisk:
+          turn_risk: float        # per-turn risk in [0, 1]
+          drift_increasing: bool  # is the trajectory moving in a consistent direction
+
+
+      @dataclass
+      class AccumulatorState:
+          value: float = 0.0
+          fired: bool = False
+          fired_at_turn: Optional[int] = None
+
+
+      @dataclass
+      class SessionThreatAccumulator:
+          threshold: float = 2.5
+          decay: float = 0.9              # undirected risk decays; directed accumulates
+          directed_gain: float = 1.0
+          undirected_gain: float = 0.3
+
+          def run(self, turns: List[TurnRisk]) -> AccumulatorState:
+              st = AccumulatorState()
+              for i, t in enumerate(turns):
+                  if t.drift_increasing:
+                      # directed risk accumulates without decay
+                      st.value += self.directed_gain * t.turn_risk
+                  else:
+                      # undirected risk is decayed -- a wandering session does not accumulate
+                      st.value = self.decay * st.value + self.undirected_gain * t.turn_risk
+                  if not st.fired and st.value >= self.threshold:
+                      st.fired = True
+                      st.fired_at_turn = i
+              st.value = round(st.value, 3)
+              return st
+
+
+      if __name__ == '__main__':
+          acc = SessionThreatAccumulator(threshold=2.5)
+
+          # Directed escalation: small risks, all in a consistent direction
+          directed = [TurnRisk(0.3, True) for _ in range(10)]
+          # Persistent but undirected legitimate session: similar risks, wandering
+          undirected = [TurnRisk(0.3, False) for _ in range(10)]
+
+          d = acc.run(directed)
+          u = acc.run(undirected)
+          print(f'Directed escalation:  accumulator={d.value}, fired={d.fired} at turn {d.fired_at_turn}')
+          print(f'Undirected long session: accumulator={u.value}, fired={u.fired}')
+          print('Directed small increments accumulate to the threshold; the undirected')
+          print('long session decays and never crosses it -- length alone is not flagged.')
+
+  deliverable_4:
+    title: 'Crescendo and Many-Shot Pattern Detector'
+    filename: 'crescendo_pattern_detector.py'
+    description: 'Detects the behavioural signatures of the published Crescendo and many-shot multi-turn families: monotonic directed drift with rising slope and refusal-retry for Crescendo, and example-dense long context with declining refusal for many-shot. Implements the family-signature detection from Section 13.09 Part 5.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # crescendo_pattern_detector.py
+      # Section 13.09: Crescendo and Many-Shot Family Detector
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from typing import List, Optional
+
+
+      @dataclass
+      class SessionSummary:
+          score_slope: float
+          drift_velocity: float
+          drift_monotonic_fraction: float
+          refusal_then_retry_rate: float
+          turn_count: int
+          example_density: float    # fraction of turns that look like provided examples
+          refusal_trajectory_slope: float  # negative = refusals declining over turns
+
+
+      @dataclass
+      class FamilyMatch:
+          family: str
+          matched: bool
+          detail: str
+
+
+      def detect_crescendo(s: SessionSummary) -> FamilyMatch:
+          matched = (
+              s.score_slope > 0.03
+              and s.drift_velocity > 0.01
+              and s.drift_monotonic_fraction >= 0.7
+              and s.refusal_then_retry_rate > 0.0
+          )
+          return FamilyMatch(
+              'Crescendo', matched,
+              f'slope={s.score_slope}, drift_vel={s.drift_velocity}, '
+              f'monotonic={s.drift_monotonic_fraction}, retry={s.refusal_then_retry_rate}',
+          )
+
+
+      def detect_many_shot(s: SessionSummary) -> FamilyMatch:
+          matched = (
+              s.turn_count >= 20
+              and s.example_density > 0.5
+              and s.refusal_trajectory_slope < -0.01
+          )
+          return FamilyMatch(
+              'Many-shot', matched,
+              f'turns={s.turn_count}, example_density={s.example_density}, '
+              f'refusal_slope={s.refusal_trajectory_slope}',
+          )
+
+
+      def detect_families(s: SessionSummary) -> List[FamilyMatch]:
+          return [detect_crescendo(s), detect_many_shot(s)]
+
+
+      if __name__ == '__main__':
+          crescendo_session = SessionSummary(
+              score_slope=0.09, drift_velocity=0.08, drift_monotonic_fraction=0.85,
+              refusal_then_retry_rate=0.2, turn_count=8, example_density=0.0,
+              refusal_trajectory_slope=0.0,
+          )
+          many_shot_session = SessionSummary(
+              score_slope=0.01, drift_velocity=0.0, drift_monotonic_fraction=0.4,
+              refusal_then_retry_rate=0.0, turn_count=40, example_density=0.8,
+              refusal_trajectory_slope=-0.03,
+          )
+          benign_session = SessionSummary(
+              score_slope=0.0, drift_velocity=0.0, drift_monotonic_fraction=0.4,
+              refusal_then_retry_rate=0.0, turn_count=6, example_density=0.0,
+              refusal_trajectory_slope=0.0,
+          )
+
+          for name, sess in (('Crescendo', crescendo_session), ('Many-shot', many_shot_session), ('Benign', benign_session)):
+              print(f'\n{name} session:')
+              for m in detect_families(sess):
+                  flag = 'MATCH' if m.matched else 'no'
+                  print(f'  {m.family:<12} {flag}: {m.detail}')
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Responding to a missed multi-turn attack by making the per-turn classifier stricter'
+    why_it_happens: |
+      When a multi-turn attack gets through, the per-turn classifier is the detector that was watching, so
+      it looks like the classifier failed and needs to be stronger. Tightening the per-turn classifier is
+      the intuitive fix -- make it catch more, and it will catch the multi-turn turns too.
+    consequence: |
+      The individual turns of a well-designed multi-turn attack are genuinely benign in isolation -- each
+      is a request a legitimate user might make. A per-turn classifier strict enough to flag them flags
+      enormous numbers of legitimate single turns too, because it is flagging benign content. The stricter
+      classifier raises false positives on legitimate traffic without catching the multi-turn attack, which
+      lives in the trajectory the per-turn classifier never sees. The fix targets the wrong unit.
+    correct_approach: |
+      Detect the multi-turn attack at the session level, on the trajectory across turns, with trajectory
+      features, a sequence model over the turn stream, and a threat accumulator -- not by tightening the
+      per-turn classifier. The attack is the path, so the detector must read the path. trajectory_feature_extractor.py
+      and session_sequence_scorer.py operate on the session sequence.
+
+  mistake_2:
+    description: 'Flagging long or persistent sessions as attacks, generating false positives on legitimate heavy users'
+    why_it_happens: |
+      Multi-turn attacks tend to be long, so session length correlates with attack in the obvious
+      examples, and flagging long sessions seems like a reasonable heuristic. It is simple -- just count
+      turns -- and catches the long attacks.
+    consequence: |
+      Legitimate users have long, persistent sessions all the time: sustained work, deep exploration,
+      extended troubleshooting. Flagging length alone floods the alert stream with false positives on
+      engaged legitimate users and trains analysts to ignore the multi-turn alert, while a short, efficient
+      multi-turn attack that reaches its goal in few turns is missed because it is not long. Length is not
+      the signal.
+    correct_approach: |
+      Discriminate by the directedness of the trajectory, not its length. A legitimate long session wanders
+      and returns to topics, so its risk increments are small and non-cumulative; a directed adversary
+      progresses consistently toward a target, so its increments accumulate. The threat accumulator
+      integrates directed risk and decays undirected risk, so a persistent legitimate session stays below
+      threshold while a directed escalation crosses it. session_threat_accumulator.py implements this
+      discrimination.
+
+  mistake_3:
+    description: 'Scoring the session only after it completes, detecting the multi-turn attack too late to intervene'
+    why_it_happens: |
+      Scoring a complete session is simpler than streaming: all the turns are available, the trajectory is
+      fully formed, and the features are easy to compute over the finished conversation. Offline evaluation
+      naturally works on complete sessions, and reusing that approach in production is the path of least
+      resistance.
+    consequence: |
+      A multi-turn attack scored only after the session completes is detected after it has already
+      succeeded -- the harmful output was produced, the capability assembled, the constraint breached,
+      before the detector ran. Detecting the gradual attack only at session end is detecting it too late to
+      prevent the harm, which defeats the purpose of catching the gradual attack at all.
+    correct_approach: |
+      Score the session incrementally as each turn arrives, updating the sequence-model hidden state and the
+      threat accumulator per turn, so an escalating session is flagged mid-escalation before the attack
+      completes and a session intervention can be triggered. session_sequence_scorer.py and
+      session_threat_accumulator.py update incrementally per turn for exactly this.
+
+  mistake_4:
+    description: 'Relying only on family signatures and missing novel multi-turn attacks that do not match a known family'
+    why_it_happens: |
+      The published families -- Crescendo, many-shot -- are well-documented with clear signatures, and
+      detecting them gives concrete, explainable catches. Once the family signatures are in place and
+      catching the known attacks, multi-turn detection can feel complete.
+    consequence: |
+      The multi-turn attack space is open and evolving, and adversaries develop novel techniques that do
+      not match any published family signature. A detector relying only on family signatures catches the
+      known families and is blind to the novel and variant attacks, which are exactly the ones a
+      sophisticated adversary will use precisely because they evade the known signatures. The signature set
+      is always behind the attack frontier.
+    correct_approach: |
+      Use family signatures for the known attacks alongside general trajectory detection -- the sequence
+      model and the threat accumulator -- for the novel and variant attacks that no signature covers, the
+      same way signature detection complemented ML detection in Chapter 11. The signatures give high-
+      precision catches on known families; the general detection provides coverage that does not depend on
+      having a signature. crescendo_pattern_detector.py handles the families while the sequence scorer and
+      accumulator provide general coverage.
+
+  mistake_5:
+    description: 'Watching only the input trajectory and ignoring the model output response to it, missing the success confirmation'
+    why_it_happens: |
+      Multi-turn detection is naturally framed as watching the user's escalating requests, so the input
+      trajectory is the obvious focus. The model's responses seem like the output side's concern, separate
+      from detecting the attack in the input.
+    consequence: |
+      The input trajectory shows the attack escalating but not whether it succeeded. A session where the
+      user escalates is suspicious, but a session where the user escalates and the model's refusals reverse
+      is a confirmed successful multi-turn injection. Watching only the input misses the success
+      confirmation that the output side provides, leaving the detector unable to distinguish an escalation
+      attempt that the model resisted from one that succeeded -- a large difference in severity.
+    correct_approach: |
+      Pair the input-side threat accumulator with the output-side self-consistency monitor of 13.06: the
+      accumulator shows the escalation, the self-consistency monitor shows the refusal reversal, and a
+      session where both fire is a near-unambiguous successful multi-turn injection. This pairing is the
+      behavioural layer's strongest multi-turn evidence and feeds the gateway of 13.11.
+
+section_summary:
+
+  compact: |
+    The multi-turn attack defeats per-turn classification by construction: the adversary crafts each turn
+    to be benign enough to pass and assembles the attack from the trajectory across turns, so improving the
+    per-turn classifier cannot help -- it is scoring the wrong unit. Section 13.09 detects the attack at the
+    session level. Two signatures recur: accumulation assembles a harmful whole from individually benign
+    fragments, caught by the breadth of harmful-topic coverage across turns, and escalation ratchets toward
+    a constraint boundary, caught by monotonic topic drift and a rising score slope. Context-window
+    manipulation, including the many-shot family, dilutes the model's constraints with accumulated context,
+    caught by context length and density together with a declining-refusal trajectory. A sequence model --
+    the Chapter 12 GRU lifted to the session level -- scores the turn stream incrementally, complementing the
+    explicit trajectory features, and the published Crescendo and many-shot family signatures give high-
+    precision catches on the known attacks while the general detection covers the novel ones. The unifying
+    mechanism is the per-session threat accumulator, which integrates directed risk across turns so many
+    small directed increments cross a threshold no single turn reaches, while decaying the undirected risk of
+    a long legitimate session so length alone is not flagged. Paired with the self-consistency monitor of
+    13.06, the input-side accumulator and the output-side refusal reversal together give the behavioural
+    layer's strongest evidence of a successful multi-turn injection, feeding the entity profiler and the
+    gateway with the ability to intervene mid-escalation.
+
+  key_takeaways:
+    - 'The multi-turn attack defeats per-turn classification by construction -- each turn is genuinely benign and the attack is the trajectory -- so a stricter per-turn classifier cannot close the gap; detection must operate at the session level'
+    - 'Accumulation assembles harm from benign fragments (caught by harmful-topic coverage breadth) and escalation ratchets toward a boundary (caught by monotonic topic drift and rising score slope), and the two often combine'
+    - 'A sequence model -- the Chapter 12 GRU lifted to the session level -- scores the turn stream incrementally and complements the explicit trajectory features, capturing patterns the explicit features miss'
+    - 'The per-session threat accumulator integrates directed risk across turns so many small increments cross a threshold no single turn reaches, while decaying undirected risk so a long legitimate session is not flagged by length alone'
+    - 'Family signatures (Crescendo, many-shot) give high-precision catches on known attacks while the general sequence model and accumulator cover the novel and variant attacks that no signature matches'
+    - 'Pairing the input-side threat accumulator with the output-side self-consistency refusal-reversal signal of 13.06 gives the strongest evidence of a successful multi-turn injection -- the escalation and its success observed together'
+
+preview_section_13_10:
+  title: 'Section 13.10: User Behaviour Profiling -- Entity Fingerprints and Persistent Risk Scoring'
+  summary: |
+    Section 13.10 builds the persistent entity profile that makes a requester history a first-class input to
+    every verdict, turning the per-session and per-window signals of the preceding sections into a durable
+    entity-level risk score. It builds entity-level behavioural fingerprinting -- the stable signature of how
+    an entity normally uses the service -- and a persistent profile schema of aggregated baselines, historical
+    risk events, and the fingerprint. It addresses cross-session risk scoring that integrates signals from
+    many sessions into one persistent score, risk-score decay and reinforcement so a clean entity recovers and
+    a repeat offender accumulates, account-compromise detection through fingerprint divergence where a
+    legitimate account suddenly behaves unlike itself, and entity resolution that links the same actor across
+    credentials, sessions, and sources. The entity risk score it produces is read inline by the smart rate
+    limiter of 13.08 and the gateway of 13.11, and it is the bridge from session-level detection to the graph-
+    level detection of 13.11.
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 2 Section 2.17: LSTM and GRU sequence architectures -- the sequence model lifted to the session level here'
+    - 'Chapter 4 Section 4.07: prompt injection mechanics -- the attack escalated across turns here'
+    - 'Chapter 12 Section 12.06: sequence models -- the per-turn GRU detector this section operates at the session scope'
+    - 'Chapter 13 Section 13.02: session modelling -- the session object and trajectory features this section consumes'
+    - 'Chapter 13 Section 13.06: model behaviour monitoring -- the self-consistency signal this section pairs with'
+  forward_references:
+    - 'Section 13.10: user behaviour profiling -- a high session threat accumulator elevates the persistent entity risk'
+    - 'Section 13.11: graph-based detection and the behavioural monitoring capstone integrating multi-turn analysis into the gateway'
+    - 'Chapter 12 Section 12.06: the GRU sequence detector lifted to the session level here'
+  tags:
+    - multi-turn-context-analysis
+    - accumulation-attack
+    - escalation-attack
+    - context-window-manipulation
+    - sequence-modelling
+    - gru-session-level
+    - trajectory-features
+    - score-slope
+    - topic-drift-velocity
+    - refusal-then-retry
+    - crescendo
+    - many-shot
+    - threat-accumulator
+    - multi-turn-injection
+    - owasp-llm01
+    - chapter-13-session-family

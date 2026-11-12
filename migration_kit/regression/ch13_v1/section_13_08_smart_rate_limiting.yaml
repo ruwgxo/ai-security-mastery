@@ -1,0 +1,725 @@
+# section_13_08_smart_rate_limiting.yaml
+
+---
+document_info:
+  title: 'Smart Rate Limiting: Adaptive Thresholds That Separate Power Users from Abuse'
+  chapter: 13
+  section: 8
+  section_code: '1308'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-21'
+  estimated_pages: 6
+  estimated_reading_time: '45-55 minutes'
+
+section_overview:
+  one_line_summary: 'A static rate limit is simultaneously too loose for low-and-slow abuse and too tight for legitimate power users; Section 13.08 builds the adaptive per-entity limiter -- learned thresholds, burst tolerance, risk weighting, and graduated response -- that enforces against the 13.07 rate signal without locking out heavy legitimate use.'
+  why_this_section_exists: |
+    Section 13.07 produced the rate-abuse signal: which entities are exhibiting the rate, acceleration,
+    coverage, and periodicity of a campaign. Section 13.08 acts on it. The detection-enforcement handoff
+    is the organising relationship between the two sections -- detection sets the adaptive threshold,
+    enforcement applies it -- and this section builds the enforcement.
+
+    The motivating problem is that the obvious enforcement mechanism, a static rate limit, fails in both
+    directions at once. A single global limit must be set at one number for all entities, and there is no
+    good number. Set it high enough that the legitimate heavy integration making thousands of requests an
+    hour is not throttled, and a low-and-slow exfiltration campaign that stays just under that high limit
+    runs unimpeded. Set it low enough to constrain the low-and-slow campaign, and every legitimate power
+    user trips it constantly, breaking real high-volume use. The static limit is simultaneously too loose
+    for the patient abuser and too tight for the power user, because it cannot tell them apart -- it sees
+    only the rate, and rate alone does not distinguish them.
+
+    Smart rate limiting resolves this by making the limit adaptive and per-entity. The threshold for each
+    entity is learned from its own baseline, so a power user is limited relative to its own established
+    normal and an exfiltration script is limited relative to its very different normal. The limit is
+    weighted by the entity's risk profile, so a suspicious entity gets a tighter limit than a trusted one
+    at the same rate. And the enforcement is graduated -- throttle, then challenge, then block -- rather
+    than a single hard cutoff, so a false positive has a recovery path and the adversary's throughput is
+    degraded progressively. The section also confronts the denial-of-service own-goal: a limiter that an
+    adversary can trip on behalf of a legitimate user becomes an attack tool, and avoiding that shapes how
+    the limit is composed across dimensions.
+  position_in_chapter: |
+    Section 13.08 is the enforcement counterpart to the rate-based detection of 13.07 and the second of
+    the entity-family sections. It consumes the rate-abuse signal of 13.07, the per-entity baselines of
+    13.03, and the entity risk score of 13.10 (read inline as a precomputed value, per the 13.01 latency
+    coupling). It is the section where the entity family produces an enforcement action rather than just a
+    signal, and it closes a feedback loop back into the entity profile of 13.10: enforcement outcomes
+    update the entity's risk. It precedes the multi-turn analysis of 13.09 and the profiling of 13.10 that
+    its risk weighting depends on.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain why a static rate limit is simultaneously too loose for low-and-slow abuse and too tight for power users'
+    - 'Describe adaptive per-entity thresholds learned from the baseline rather than set globally'
+    - 'Explain the token-bucket model and how per-entity refill rates provide burst tolerance'
+    - 'Describe risk-weighted rate limiting and how it composes with the entity risk profile'
+    - 'Explain graduated response -- throttle, challenge, block -- and why it beats a single hard cutoff'
+    - 'Describe rate-limit composition across user, endpoint, credential, and source dimensions'
+    - 'Explain the denial-of-service own-goal and how per-source composition avoids it'
+
+  skills:
+    - 'Compute adaptive per-entity rate thresholds from the entity baseline'
+    - 'Implement a token-bucket limiter with per-entity refill rates and burst tolerance'
+    - 'Weight rate limits by the entity risk score so suspicious entities get tighter limits'
+    - 'Implement graduated response with a false-positive recovery path'
+    - 'Compose limits across multiple dimensions while avoiding the denial-of-service own-goal'
+
+  security_mindset:
+    - 'Internalise that rate alone cannot distinguish a power user from an exfiltration script, so the limit must be per-entity and risk-weighted, not global'
+    - 'Recognise that a hard cutoff has no recovery path for false positives, while graduated response degrades the adversary and preserves legitimate recovery'
+    - 'Understand that risk weighting makes detection and enforcement reinforce each other: a suspicious entity is both flagged and constrained'
+    - 'Treat the denial-of-service own-goal as a design constraint: a limiter an adversary can trip for a legitimate user is an attack tool, so composition must isolate per-source effects'
+
+prerequisites:
+  - 'Chapter 9 Section 9.11: query monitor and API rate limiting -- the static rate limiting this section makes adaptive'
+  - 'Chapter 13 Section 13.01: behavioural detection taxonomy -- the latency coupling that lets the entity risk score be read inline'
+  - 'Chapter 13 Section 13.03: statistical baselines -- the per-entity baseline the adaptive threshold is learned from'
+  - 'Chapter 13 Section 13.07: rate-based detection -- the rate-abuse signal this section enforces against'
+  - 'Chapter 13 Section 13.10: user behaviour profiling -- the entity risk score that weights the limit (read inline)'
+
+prose_content:
+
+  part_1:
+    title: 'Why the Static Limit Fails in Both Directions'
+    body: |
+      A static rate limit is a single threshold applied to every entity: so many requests per minute,
+      the same number for all. It is the standard, simple enforcement mechanism, and it fails because
+      there is no single number that is correct for a population of entities with wildly different
+      legitimate normals.
+
+      Consider the two failure directions together. A legitimate heavy integration may make thousands of
+      requests an hour as its ordinary operation -- a batch pipeline, a high-traffic application, an
+      analytics consumer. To avoid throttling it, the static limit must be set above its rate. But a
+      low-and-slow exfiltration campaign deliberately keeps its rate just under whatever the limit is; if
+      the limit is set high to accommodate the power user, the patient campaign simply runs at a rate
+      below that high limit and is never throttled. The high limit that protects the power user also
+      shelters the abuser. Now lower the limit to constrain the abuser: the legitimate heavy integration
+      immediately trips it on every ordinary hour, its requests are throttled, and real high-volume use
+      breaks. The low limit that catches the abuser also breaks the power user.
+
+      There is no escape within a single global number, because the power user and the patient abuser can
+      have the same rate. Rate alone does not separate them -- the distinguishing features are the ones
+      13.07 built (periodicity, coverage) and the per-entity context of what is normal for each. A static
+      limit ignores all of that and sees only the rate, so it cannot do anything but fail in one direction
+      or the other. The resolution is not a better global number; it is to abandon the global number for a
+      per-entity, risk-weighted, adaptive threshold that incorporates the context rate alone lacks.
+
+  part_2:
+    title: 'Adaptive Per-Entity Thresholds from the Baseline'
+    body: |
+      The core of smart rate limiting is that each entity's limit is derived from its own baseline rather
+      than a global constant. The 13.03 per-entity rate baseline already captures what is normal for each
+      entity: its typical rate and the spread of that rate. The adaptive threshold is set relative to that
+      baseline -- a multiple of the entity's normal rate, or its normal rate plus a number of robust
+      spreads -- so the limit tracks the entity's established behaviour.
+
+      This immediately resolves the static-limit dilemma. The heavy integration's baseline rate is high,
+      so its adaptive limit is high, and its ordinary high-volume operation sits comfortably within it. The
+      casual user's baseline rate is low, so its adaptive limit is low, and a compromise that drives it to
+      a fraction of the heavy integration's rate still vastly exceeds its own low limit and is throttled.
+      The same absolute rate is within limit for one entity and far over limit for another, because the
+      limit is relative to each entity's own normal. The patient exfiltration campaign cannot hide under a
+      high global ceiling, because there is no global ceiling -- it is measured against the modest baseline
+      of whatever entity it operates through, and a rate well above that entity's baseline is throttled
+      regardless of how it compares to other entities' rates.
+
+      The adaptive threshold inherits the baseline's safeguards. It uses the robust statistics of 13.03 so
+      the threshold is not inflated by contamination, and it respects the cold-start backoff so a new
+      entity is limited relative to a population prior until its personal baseline accrues -- otherwise a
+      fresh entity could establish a permissive baseline and then operate at abuse volume within its own
+      inflated limit, the cold-start abuse from 13.03. The adaptive limit is, in effect, the baseline
+      deviation logic turned into an enforcement threshold: the same per-entity normal that scores
+      deviation now sets the rate at which deviation becomes a throttle.
+
+  part_3:
+    title: 'Token Buckets and Burst Tolerance'
+    body: |
+      A rate limit expressed as a flat maximum per window is too rigid for real traffic, because
+      legitimate use is bursty. A user who makes a quick sequence of requests and then pauses is normal,
+      and a limiter that rejects the burst because it momentarily exceeds the average rate punishes
+      legitimate bursty behaviour. The token-bucket model provides burst tolerance cleanly.
+
+      A token bucket holds tokens up to a capacity, refilled at a steady rate; each request consumes a
+      token, and a request with no token available is limited. The refill rate sets the sustained rate the
+      entity is allowed, and the bucket capacity sets how large a burst it can make before the sustained
+      rate constrains it. An entity that has been idle accumulates tokens up to capacity and can spend them
+      in a burst, then is held to the refill rate once the bucket empties. This matches legitimate
+      behaviour: bursts are tolerated up to the bucket capacity, and sustained excess is throttled to the
+      refill rate.
+
+      In smart rate limiting, both the refill rate and the bucket capacity are per-entity and adaptive. The
+      refill rate is the entity's adaptive sustained threshold from the baseline; the bucket capacity is
+      its tolerated burst size, also derived from the entity's normal burstiness. A heavy integration with
+      a high baseline gets a high refill rate and a large bucket; a casual user gets a low refill rate and a
+      small bucket. This lets the limiter tolerate each entity's characteristic burst pattern while
+      constraining sustained excess -- the power user's large legitimate bursts pass, while an exfiltration
+      script that tries to sustain a high rate empties its small bucket and is throttled to the refill rate.
+      The token bucket is the mechanism that makes the adaptive threshold tolerant of legitimate burstiness
+      without loosening the sustained constraint.
+
+  part_4:
+    title: 'Risk-Weighted Limiting: Detection and Enforcement Reinforce Each Other'
+    body: |
+      The adaptive threshold so far depends only on the entity's rate baseline. Risk-weighted limiting adds
+      a second input: the entity's risk score from the profile of 13.10. The limit is tightened for
+      entities with an elevated risk profile and loosened for entities with a clean, trusted history, so
+      that two entities with the same rate baseline are limited differently according to how suspicious
+      each is.
+
+      This makes detection and enforcement reinforce each other in a virtuous loop. An entity that the
+      behavioural layer has flagged -- for prior rate abuse, an injection-success signal from 13.06, a
+      fingerprint divergence, or membership in a coordinated cluster -- carries an elevated risk score, and
+      risk-weighted limiting translates that score into a tighter rate limit. The suspicious entity is thus
+      both flagged for analysts and operationally constrained, without waiting for a separate enforcement
+      decision. Conversely, an entity with a long clean history carries a low risk score and is granted a
+      more generous limit, so the system's trusted power users are not constrained by limits sized for the
+      general population. The risk score, read inline as a precomputed value per the 13.01 latency coupling,
+      modulates the adaptive threshold on every request cheaply.
+
+      Risk weighting also provides a graceful response to uncertainty. When an entity's behaviour is
+      ambiguous -- elevated but not conclusively abusive -- a hard block is too aggressive and doing nothing
+      is too permissive. Risk-weighted limiting tightens the limit proportionally to the risk, applying
+      pressure that scales with suspicion: a slightly elevated entity gets a slightly tighter limit, a
+      strongly suspect entity gets a sharply tighter one. This proportional response is more robust than a
+      binary block-or-allow decision, because it degrades gracefully across the spectrum of suspicion rather
+      than forcing every entity into one of two buckets, and it buys time for the slower, more confident
+      detectors to confirm or clear the entity while the tightened limit already constrains potential abuse.
+
+  part_5:
+    title: 'Graduated Response: Throttle, Challenge, Block'
+    body: |
+      A single hard cutoff -- block the entity the moment it exceeds its limit -- is the crudest
+      enforcement, and it has two defects. It offers no recovery path for a false positive: a legitimate
+      entity wrongly limited is simply cut off, with no way to demonstrate it is legitimate. And it gives
+      the adversary a clear, binary signal of exactly where the limit is, which they can probe and then
+      operate just beneath. Graduated response replaces the hard cutoff with a sequence of escalating
+      enforcement actions that degrade the adversary's throughput while preserving a path for the
+      legitimate entity to recover.
+
+      The first stage is throttling: the entity's requests are slowed rather than rejected, its effective
+      rate reduced toward its adaptive limit. Throttling degrades an exfiltration campaign's throughput --
+      making the campaign take far longer and raising its cost -- while a legitimate entity experiencing a
+      temporary spike is merely slowed, not broken. The second stage is challenge: the entity is asked to
+      prove it is legitimate -- a proof-of-work, a re-authentication, a CAPTCHA-equivalent for the API
+      context -- which a legitimate user or integration can satisfy and an automated abuse script generally
+      cannot, or can only at significant added cost. The challenge is the recovery path: it lets a wrongly-
+      limited legitimate entity demonstrate its legitimacy and have its limit restored. The third stage is
+      blocking, reserved for entities that fail the challenge or whose abuse is confirmed: a hard stop for
+      the cases where throttling and challenge have not resolved the situation.
+
+      The escalation through these stages is driven by the persistence and severity of the abuse signal and
+      by the risk score. An entity that briefly exceeds its limit and then returns to normal never advances
+      past throttling; an entity that sustains abuse through throttling is challenged; an entity that fails
+      the challenge is blocked. This graduated path means a false positive is recoverable at the throttle or
+      challenge stage, the adversary's throughput is degraded at every stage rather than only at a final
+      cutoff, and the hard block -- the only irrecoverable action -- is applied only after the softer stages
+      have failed to resolve the case. Graduated response is strictly better than a hard cutoff on both the
+      false-positive and the adversary-throughput dimensions.
+
+  part_6:
+    title: 'Multi-Dimensional Composition and the Denial-of-Service Own-Goal'
+    body: |
+      Rate limiting applies across several dimensions at once -- per user, per endpoint, per credential, per
+      source IP -- and these limits compose. An entity is constrained by its per-user limit, but also by the
+      per-endpoint limit on the endpoint it is hitting, the per-credential limit on the key it is using, and
+      the per-source limit on its origin. Composing these dimensions catches abuse that a single dimension
+      misses: the distributed campaign of 13.07 that stays under every per-account limit is caught by the
+      per-source or per-credential limit that aggregates across its accounts.
+
+      But multi-dimensional composition introduces a serious failure mode that must be designed against: the
+      denial-of-service own-goal. If a limit is applied at a dimension an adversary shares with legitimate
+      entities, the adversary can deliberately exhaust that shared limit to deny service to the legitimate
+      entities that share the dimension. The classic case is a per-source-IP limit applied to a shared NAT
+      or proxy: an adversary behind the same IP as many legitimate users can exhaust the per-IP limit and
+      lock out every legitimate user behind that IP. The limiter, intended to stop the adversary, becomes a
+      tool the adversary uses to deny service to others. A per-endpoint global limit has the same hazard: an
+      adversary can saturate a shared endpoint limit to lock out all users of that endpoint.
+
+      Avoiding the own-goal shapes how composition is done. Limits that an adversary can deliberately exhaust
+      to harm others must isolate per-entity effects rather than punishing a shared dimension collectively. A
+      shared-source limit, instead of a hard collective cap that one entity can exhaust for all, gives each
+      entity behind the source its own adaptive allocation and only the abusive entity is constrained, so an
+      adversary cannot consume the legitimate entities' share. Where a genuinely shared resource must be
+      protected with a collective limit, the limit is sized and the abusive contributors are identified and
+      throttled individually so the collective limit is reached by the abuser's traffic, not borne by the
+      legitimate users. The composition is designed so that tightening a limit in response to abuse
+      constrains the abuser specifically and does not hand the adversary a lever to deny service to others.
+      With this discipline, multi-dimensional composition catches the distributed and shared-resource abuse
+      that single-dimension limiting misses, without becoming an attack tool. The enforcement outcomes from
+      all dimensions feed back into the entity profile of 13.10, closing the loop: a throttle, challenge, or
+      block raises the entity's risk, which tightens its future adaptive limit, so the entity and rate
+      families continuously reinforce each other.
+
+reference_materials:
+
+  table_1:
+    title: 'Why the Static Limit Fails Both Ways'
+    description: 'How a single global rate limit fails simultaneously for the power user and the patient abuser'
+    columns: ['Limit Setting', 'Effect on Power User', 'Effect on Low-and-Slow Abuser']
+    rows:
+      - ['High (protects power user)', 'Not throttled -- correct', 'Runs just under the high limit -- not caught']
+      - ['Low (constrains abuser)', 'Throttled on every ordinary hour -- broken', 'Constrained -- but at the cost above']
+      - ['Any single global value', 'Wrong for entities with high baselines', 'Wrong for entities with low baselines']
+      - ['Per-entity adaptive (this section)', 'Limited relative to its own high baseline', 'Limited relative to its own low baseline']
+
+  table_2:
+    title: 'Adaptive Limit Inputs'
+    description: 'The inputs that compose the adaptive per-entity rate limit and what each contributes'
+    columns: ['Input', 'Source', 'Contributes', 'Effect']
+    rows:
+      - ['Baseline rate', 'Section 13.03 per-entity baseline', 'The entity normal sustained rate', 'Sets the refill rate']
+      - ['Baseline burstiness', 'Section 13.03 distribution', 'The entity normal burst size', 'Sets the bucket capacity']
+      - ['Risk score', 'Section 13.10 entity profile (inline)', 'How suspicious the entity is', 'Tightens or loosens the limit']
+      - ['Cold-start prior', 'Section 13.03 population prior', 'A cohort default for new entities', 'Limits new entities until baseline accrues']
+
+  table_3:
+    title: 'Graduated Response Stages'
+    description: 'The escalating enforcement stages, what each does, and the recovery path each preserves'
+    columns: ['Stage', 'Action', 'Effect on Abuser', 'Recovery for False Positive']
+    rows:
+      - ['Throttle', 'Slow requests toward the limit', 'Degrades campaign throughput', 'Merely slowed; self-recovers on return to normal']
+      - ['Challenge', 'Require proof of legitimacy', 'Costly or impossible for a script', 'Legitimate entity passes and is restored']
+      - ['Block', 'Hard stop', 'Stops the entity', 'None -- reserved for confirmed/failed-challenge cases']
+
+  table_4:
+    title: 'Rate-Limit Dimensions and the Denial-of-Service Own-Goal'
+    description: 'The composition dimensions, what each catches, and the own-goal hazard each carries'
+    columns: ['Dimension', 'Catches', 'Own-Goal Hazard', 'Safe Design']
+    rows:
+      - ['Per-user', 'Single-account abuse', 'Low', 'Adaptive per-entity threshold']
+      - ['Per-endpoint', 'Endpoint saturation', 'Adversary saturates shared endpoint', 'Per-entity allocation within endpoint']
+      - ['Per-credential', 'Key-family abuse', 'Low-medium', 'Aggregate per key family']
+      - ['Per-source IP', 'Distributed campaign', 'Adversary on shared NAT locks out others', 'Per-entity allocation behind the source']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Smart Rate Limiter with Adaptive Token Bucket'
+    filename: 'smart_rate_limiter.py'
+    description: 'An adaptive token-bucket rate limiter with per-entity refill rates and bucket capacities derived from the entity baseline, providing burst tolerance while constraining sustained excess. Implements the adaptive thresholds and token bucket from Section 13.08 Parts 2 and 3.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # smart_rate_limiter.py
+      # Section 13.08: Smart Rate Limiter (Adaptive Token Bucket)
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import Dict
+
+
+      @dataclass
+      class TokenBucket:
+          capacity: float
+          refill_per_s: float
+          tokens: float
+          last_ts: float
+
+          def allow(self, now: float, cost: float = 1.0) -> bool:
+              # Refill based on elapsed time
+              elapsed = max(0.0, now - self.last_ts)
+              self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_per_s)
+              self.last_ts = now
+              if self.tokens >= cost:
+                  self.tokens -= cost
+                  return True
+              return False
+
+
+      @dataclass
+      class AdaptiveRateLimiter:
+          # multipliers turning the baseline into refill rate and burst capacity
+          refill_multiplier: float = 1.5
+          burst_multiplier: float = 10.0
+          buckets: Dict[str, TokenBucket] = field(default_factory=dict)
+
+          def _bucket_for(self, entity: str, baseline_rate_per_s: float, now: float) -> TokenBucket:
+              if entity not in self.buckets:
+                  refill = max(baseline_rate_per_s * self.refill_multiplier, 0.001)
+                  capacity = max(refill * self.burst_multiplier, 1.0)
+                  self.buckets[entity] = TokenBucket(capacity, refill, capacity, now)
+              return self.buckets[entity]
+
+          def allow(self, entity: str, baseline_rate_per_s: float, now: float) -> bool:
+              return self._bucket_for(entity, baseline_rate_per_s, now).allow(now)
+
+
+      if __name__ == '__main__':
+          limiter = AdaptiveRateLimiter()
+
+          # Power user: high baseline (5/s) -- large bursts allowed
+          allowed_power = sum(1 for i in range(60) if limiter.allow('power', 5.0, 1000.0 + i * 0.05))
+          # Casual user: low baseline (0.2/s) -- a burst of the same shape is throttled
+          allowed_casual = sum(1 for i in range(60) if limiter.allow('casual', 0.2, 1000.0 + i * 0.05))
+
+          print(f'Power user (baseline 5/s):  {allowed_power}/60 rapid requests allowed')
+          print(f'Casual user (baseline 0.2/s): {allowed_casual}/60 rapid requests allowed')
+          print('The same burst is tolerated for the power user and throttled for the')
+          print('casual user, because the bucket is sized from each entity baseline.')
+
+  deliverable_2:
+    title: 'Risk-Weighted Limiter'
+    filename: 'risk_weighted_limiter.py'
+    description: 'Modulates the adaptive rate limit by the entity risk score, tightening the limit for suspicious entities and loosening it for trusted ones, so detection and enforcement reinforce each other. Implements the risk-weighted limiting from Section 13.08 Part 4.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only; the risk score is read as a precomputed inline value per the 13.01 latency coupling'
+    code: |
+      # risk_weighted_limiter.py
+      # Section 13.08: Risk-Weighted Rate Limiting
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+
+
+      @dataclass
+      class RiskWeightedLimit:
+          base_limit_per_s: float
+
+          def effective_limit(self, risk_score: float) -> float:
+              # risk_score in [0, 1]: 0 = trusted (loosen), 1 = highly suspect (tighten)
+              # Trusted entities get up to 1.5x; suspect entities down toward 0.1x
+              if risk_score <= 0.2:
+                  factor = 1.5 - risk_score  # 1.5 down to 1.3
+              elif risk_score >= 0.8:
+                  factor = max(0.1, 1.0 - risk_score)  # 0.2 down to 0.1
+              else:
+                  # linear interpolation in the middle band
+                  factor = 1.3 - (risk_score - 0.2) * (1.3 - 0.2) / 0.6
+              return round(self.base_limit_per_s * factor, 3)
+
+
+      if __name__ == '__main__':
+          rwl = RiskWeightedLimit(base_limit_per_s=10.0)
+          for risk in [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]:
+              print(f'risk={risk:.1f} -> effective limit {rwl.effective_limit(risk):>6} req/s')
+          print('Two entities with the same baseline get very different limits by risk:')
+          print('a trusted entity is loosened, a suspect entity is sharply tightened,')
+          print('so a flagged entity is both alerted and operationally constrained.')
+
+  deliverable_3:
+    title: 'Graduated Response Engine'
+    filename: 'graduated_response_engine.py'
+    description: 'Escalates enforcement through throttle, challenge, and block based on the persistence and severity of the abuse signal and the risk score, with a false-positive recovery path at the throttle and challenge stages. Implements the graduated response from Section 13.08 Part 5.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # graduated_response_engine.py
+      # Section 13.08: Graduated Response Engine
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from enum import Enum
+      from typing import Dict
+
+
+      class Stage(Enum):
+          NORMAL = 'normal'
+          THROTTLE = 'throttle'
+          CHALLENGE = 'challenge'
+          BLOCK = 'block'
+
+
+      @dataclass
+      class EntityEnforcement:
+          stage: Stage = Stage.NORMAL
+          over_limit_streak: int = 0
+          challenge_failed: bool = False
+
+
+      @dataclass
+      class GraduatedResponseEngine:
+          throttle_after: int = 1
+          challenge_after: int = 4
+          states: Dict[str, EntityEnforcement] = field(default_factory=dict)
+
+          def _state(self, entity: str) -> EntityEnforcement:
+              return self.states.setdefault(entity, EntityEnforcement())
+
+          def update(self, entity: str, over_limit: bool, risk_score: float, challenge_passed: bool = None) -> Stage:
+              st = self._state(entity)
+
+              # Challenge resolution path (recovery for false positives)
+              if st.stage == Stage.CHALLENGE and challenge_passed is not None:
+                  if challenge_passed:
+                      st.stage = Stage.NORMAL
+                      st.over_limit_streak = 0
+                      return st.stage
+                  st.challenge_failed = True
+                  st.stage = Stage.BLOCK
+                  return st.stage
+
+              if not over_limit:
+                  # Return toward normal when behaviour normalises
+                  st.over_limit_streak = max(0, st.over_limit_streak - 1)
+                  if st.over_limit_streak == 0 and st.stage == Stage.THROTTLE:
+                      st.stage = Stage.NORMAL
+                  return st.stage
+
+              st.over_limit_streak += 1
+              # High risk escalates faster
+              challenge_at = self.challenge_after - (2 if risk_score > 0.8 else 0)
+
+              if st.over_limit_streak >= challenge_at:
+                  st.stage = Stage.CHALLENGE
+              elif st.over_limit_streak >= self.throttle_after:
+                  st.stage = Stage.THROTTLE
+              return st.stage
+
+
+      if __name__ == '__main__':
+          eng = GraduatedResponseEngine()
+
+          print('Brief spike then normal (legitimate):')
+          for over in [True, False, False]:
+              print('  ', eng.update('user_a', over, risk_score=0.2).value)
+
+          print('Sustained abuse, high risk (escalates to challenge, fails, blocks):')
+          e = 'user_b'
+          for over in [True, True]:
+              print('  ', eng.update(e, over, risk_score=0.9).value)
+          print('  ', eng.update(e, True, risk_score=0.9, challenge_passed=False).value)
+          print('Graduated response recovers the legitimate spike and blocks only the')
+          print('sustained abuser that fails the challenge.')
+
+  deliverable_4:
+    title: 'Multi-Dimension Rate Composer'
+    filename: 'multi_dimension_rate_composer.py'
+    description: 'Composes rate limits across user, endpoint, credential, and source dimensions while isolating per-entity effects on shared dimensions to avoid the denial-of-service own-goal. Implements the multi-dimensional composition from Section 13.08 Part 6.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # multi_dimension_rate_composer.py
+      # Section 13.08: Multi-Dimension Rate Composer (DoS-Own-Goal-Safe)
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from typing import Dict, List, Tuple
+
+
+      @dataclass
+      class DimensionLimit:
+          name: str
+          shared: bool   # True if multiple entities share this dimension key
+
+
+      @dataclass
+      class CompositionResult:
+          allowed: bool
+          binding_dimension: str
+          detail: str
+
+
+      class MultiDimensionComposer:
+          def __init__(self) -> None:
+              # per-(dimension, key, entity) allocations; shared dims isolate by entity
+              self.usage: Dict[Tuple[str, str, str], float] = {}
+
+          def check(
+              self,
+              entity: str,
+              dims: List[Tuple[DimensionLimit, str, float]],  # (dim, key, per-entity allocation)
+              cost: float = 1.0,
+          ) -> CompositionResult:
+              # An entity is allowed only if it passes EVERY dimension.
+              # On shared dimensions, each entity has its OWN allocation, so one
+              # entity cannot exhaust the shared key to deny others.
+              for dim, key, allocation in dims:
+                  usage_key = (dim.name, key, entity)  # entity in key => per-entity isolation
+                  used = self.usage.get(usage_key, 0.0)
+                  if used + cost > allocation:
+                      return CompositionResult(False, dim.name, f'{dim.name}={key} allocation exhausted for {entity}')
+              # passed all -> commit usage
+              for dim, key, allocation in dims:
+                  usage_key = (dim.name, key, entity)
+                  self.usage[usage_key] = self.usage.get(usage_key, 0.0) + cost
+              return CompositionResult(True, '', 'allowed on all dimensions')
+
+
+      if __name__ == '__main__':
+          composer = MultiDimensionComposer()
+          source = DimensionLimit('source_ip', shared=True)
+          user = DimensionLimit('user', shared=False)
+
+          # An adversary and a legitimate user share a NAT source IP.
+          # Each has its OWN per-entity allocation on the shared source dimension.
+          adversary_dims = [(user, 'adversary', 5.0), (source, '203.0.113.9', 5.0)]
+          legit_dims = [(user, 'legit', 5.0), (source, '203.0.113.9', 5.0)]
+
+          # Adversary exhausts its own allocation
+          adv_results = [composer.check('adversary', adversary_dims) for _ in range(7)]
+          adv_allowed = sum(1 for r in adv_results if r.allowed)
+          # Legit user behind the SAME IP is unaffected
+          legit_results = [composer.check('legit', legit_dims) for _ in range(5)]
+          legit_allowed = sum(1 for r in legit_results if r.allowed)
+
+          print(f'Adversary allowed: {adv_allowed}/7 (exhausts its own source allocation)')
+          print(f'Legit user behind same IP allowed: {legit_allowed}/5 (unaffected)')
+          print('Per-entity allocation on the shared source prevents the adversary from')
+          print('denying service to the legitimate user behind the same IP.')
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Using a single global static rate limit and accepting that it fails for either power users or abusers'
+    why_it_happens: |
+      A static global limit is the default rate-limiting mechanism, trivially simple to configure and
+      reason about. It is what most API frameworks provide out of the box, and a single number feels like a
+      clean, fair policy that treats all entities equally.
+    consequence: |
+      A single number cannot serve a population of entities whose legitimate normals differ by orders of
+      magnitude. Set high to protect the power user, it shelters the low-and-slow abuser that runs just
+      beneath it; set low to catch the abuser, it throttles the legitimate power user on every ordinary
+      hour. The static limit fails in one direction or the other no matter where it is set, because it sees
+      only rate and the power user and the abuser can share a rate.
+    correct_approach: |
+      Derive each entity's limit from its own baseline so the limit is relative to that entity's normal --
+      high for the heavy integration, low for the casual user -- and the same absolute rate is within limit
+      for one and over limit for another. smart_rate_limiter.py sizes each entity's bucket from its baseline
+      rate, resolving the static-limit dilemma.
+
+  mistake_2:
+    description: 'Enforcing a flat per-window maximum with no burst tolerance, punishing legitimate bursty use'
+    why_it_happens: |
+      A flat maximum per window -- N requests per minute, rejected once exceeded -- is the most direct way
+      to express a rate limit. It is easy to implement with a simple counter, and it appears to enforce the
+      intended rate exactly.
+    consequence: |
+      Legitimate use is bursty: a user makes a quick sequence of requests and then pauses, which is normal
+      behaviour. A flat per-window maximum rejects the burst because it momentarily exceeds the average
+      rate, breaking legitimate bursty interaction, while still allowing a perfectly steady abuser at the
+      maximum sustained rate. The rigid limit punishes the bursty legitimate user and accommodates the
+      steady abuser.
+    correct_approach: |
+      Use a token bucket with per-entity capacity and refill rate: the capacity tolerates bursts up to the
+      entity's normal burst size, and the refill rate constrains sustained excess. Legitimate bursts pass
+      while sustained abuse empties the bucket and is throttled to the refill rate. smart_rate_limiter.py
+      implements the adaptive token bucket.
+
+  mistake_3:
+    description: 'Limiting purely on rate without incorporating the entity risk score, so detection and enforcement do not reinforce each other'
+    why_it_happens: |
+      Rate limiting is conceptually about rate, so limiting on rate alone feels complete. Wiring the entity
+      risk score into the limit adds a dependency on the profiling family and seems like mixing concerns
+      that are cleaner kept separate.
+    consequence: |
+      An entity the behavioural layer has flagged as suspicious -- for prior abuse, an injection success, a
+      fingerprint divergence -- gets the same rate limit as a trusted entity with the same baseline, so the
+      detection signal does not translate into enforcement. The suspicious entity operates at full allowance
+      until a separate enforcement decision is made, and the trusted power user is constrained by limits
+      sized for the general population. Detection and enforcement run in parallel without reinforcing each
+      other.
+    correct_approach: |
+      Weight the limit by the entity risk score, tightening it for suspicious entities and loosening it for
+      trusted ones, so a flagged entity is both alerted and operationally constrained and a clean power user
+      is granted headroom. The proportional response also handles ambiguous cases gracefully, applying
+      pressure that scales with suspicion. risk_weighted_limiter.py modulates the limit by risk.
+
+  mistake_4:
+    description: 'Applying a single hard cutoff at the limit, leaving no recovery path for false positives'
+    why_it_happens: |
+      A hard block at the limit is the simplest enforcement and feels the most decisive -- the entity
+      exceeded its limit, so stop it. It requires no challenge mechanism and no multi-stage state, and it
+      appears to be the strongest possible response to abuse.
+    consequence: |
+      A hard cutoff has no recovery path for a false positive: a legitimate entity wrongly limited is simply
+      cut off, breaking its access with no way to demonstrate legitimacy, which is a severe outcome for the
+      legitimate users a false positive inevitably hits. It also gives the adversary a clean binary signal
+      of exactly where the limit is, to probe and operate just beneath.
+    correct_approach: |
+      Use graduated response -- throttle, then challenge, then block -- so the adversary's throughput is
+      degraded at every stage while a wrongly-limited legitimate entity can recover by passing the challenge,
+      and the irrecoverable hard block is reserved for confirmed abuse or a failed challenge.
+      graduated_response_engine.py escalates through the stages with a recovery path.
+
+  mistake_5:
+    description: 'Composing limits on shared dimensions with a collective cap, creating a denial-of-service own-goal'
+    why_it_happens: |
+      A per-source-IP or per-endpoint limit is a natural way to catch distributed abuse and protect shared
+      resources, and a single collective cap on the shared key is the obvious implementation. It looks like
+      it correctly constrains the aggregate traffic on the shared dimension.
+    consequence: |
+      A collective cap on a shared dimension can be exhausted by an adversary to deny service to the
+      legitimate entities that share it. An adversary behind a shared NAT can saturate the per-IP collective
+      limit and lock out every legitimate user behind that IP; an adversary can saturate a shared per-
+      endpoint cap to lock out all users of the endpoint. The limiter meant to stop the adversary becomes a
+      tool the adversary uses to deny service to others.
+    correct_approach: |
+      On shared dimensions, give each entity its own allocation rather than a collective cap, so only the
+      abusive entity is constrained and an adversary cannot consume the legitimate entities' share. Where a
+      genuinely shared resource needs a collective limit, identify and throttle the abusive contributors
+      individually so the legitimate users are not collectively punished. multi_dimension_rate_composer.py
+      isolates per-entity allocations on shared dimensions to prevent the own-goal.
+
+section_summary:
+
+  compact: |
+    A static rate limit fails in both directions at once: set high to protect a legitimate power user it
+    shelters the low-and-slow abuser running just beneath it, and set low to constrain the abuser it
+    throttles the power user on every ordinary hour, because rate alone cannot separate two entities that
+    share a rate. Section 13.08 replaces it with an adaptive, per-entity, risk-weighted limiter. Each
+    entity's threshold is learned from its 13.03 baseline, so it is limited relative to its own normal, and
+    a token bucket with per-entity refill rate and capacity tolerates each entity's characteristic
+    burstiness while constraining sustained excess. Risk-weighted limiting modulates the threshold by the
+    entity's risk score from 13.10 -- read inline as a precomputed value -- so a flagged entity is both
+    alerted and constrained while a trusted power user gets headroom, and detection and enforcement reinforce
+    each other. Graduated response escalates through throttle, challenge, and block rather than a single hard
+    cutoff, degrading the adversary's throughput at every stage while preserving a recovery path for false
+    positives at the throttle and challenge stages. Multi-dimensional composition across user, endpoint,
+    credential, and source catches distributed and shared-resource abuse, but must isolate per-entity
+    allocations on shared dimensions to avoid the denial-of-service own-goal where an adversary exhausts a
+    shared limit to deny service to others. Enforcement outcomes feed back into the entity profile, closing
+    the loop with the entity family.
+
+  key_takeaways:
+    - 'A static rate limit fails in both directions: set high it shelters the low-and-slow abuser, set low it throttles the power user, because rate alone cannot separate two entities that share a rate'
+    - 'The adaptive limit is learned per entity from its 13.03 baseline, so each entity is limited relative to its own normal and the same absolute rate is within limit for one entity and over limit for another'
+    - 'A token bucket with per-entity refill rate and capacity tolerates each entity characteristic burstiness while constraining sustained excess, where a flat per-window maximum would punish legitimate bursty use'
+    - 'Risk-weighted limiting modulates the threshold by the entity risk score so a flagged entity is both alerted and constrained, making detection and enforcement reinforce each other'
+    - 'Graduated response -- throttle, challenge, block -- degrades the adversary at every stage while preserving a false-positive recovery path, strictly better than a single hard cutoff on both dimensions'
+    - 'Multi-dimensional composition catches distributed and shared-resource abuse but must isolate per-entity allocations on shared dimensions to avoid the denial-of-service own-goal where an adversary exhausts a shared limit to deny others'
+
+preview_section_13_09:
+  title: 'Section 13.09: Multi-Turn Context Analysis -- Accumulation and Escalation Across a Conversation'
+  summary: |
+    Section 13.09 returns to the session family for the attack the per-turn classifiers were built to
+    miss: the multi-turn jailbreak where each turn passes the per-turn classifier and the trajectory across
+    turns is the attack. It builds detection for accumulation attacks that assemble a harmful capability
+    from individually benign turns, escalation attacks that ratchet steadily toward a constraint boundary,
+    and context-window manipulation that pushes system constraints out of the model attention. It applies
+    sequence modelling over the turn stream -- the Chapter 12 GRU detector lifted from the request to the
+    session level -- and extracts trajectory features (classifier-score slope, topic-drift velocity,
+    refusal-then-retry) building on the session model of 13.02. It covers the published Crescendo and
+    many-shot multi-turn families and their behavioural signatures, and maintains a per-session threat
+    accumulator that integrates risk across turns so a conversation of many small increments crosses a
+    threshold no single turn reaches -- pairing with the self-consistency monitor of 13.06 to observe a
+    multi-turn injection and its success together.
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 9 Section 9.11: query monitor and API rate limiting -- the static rate limiting this section makes adaptive'
+    - 'Chapter 13 Section 13.01: behavioural detection taxonomy -- the latency coupling that lets the entity risk score be read inline'
+    - 'Chapter 13 Section 13.03: statistical baselines -- the per-entity baseline the adaptive threshold is learned from'
+    - 'Chapter 13 Section 13.07: rate-based detection -- the rate-abuse signal this section enforces against'
+    - 'Chapter 13 Section 13.10: user behaviour profiling -- the entity risk score that weights the limit'
+  forward_references:
+    - 'Section 13.09: multi-turn context analysis -- the next session-family detector'
+    - 'Section 13.10: user behaviour profiling -- enforcement outcomes feed back into the entity risk score'
+    - 'Section 13.11: graph-based detection and the behavioural monitoring capstone integrating the limiter into the gateway'
+  tags:
+    - smart-rate-limiting
+    - adaptive-thresholds
+    - token-bucket
+    - burst-tolerance
+    - per-entity-limit
+    - risk-weighted-limiting
+    - graduated-response
+    - throttle-challenge-block
+    - multi-dimension-composition
+    - denial-of-service-own-goal
+    - enforcement-feedback-loop
+    - owasp-llm04
+    - owasp-llm10
+    - chapter-13-entity-family
