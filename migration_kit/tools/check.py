@@ -50,6 +50,7 @@ def v1_stream(d):
             for v in n:
                 if isinstance(v, str) or (isinstance(v, dict) and 'takeaway' in v): out.append('\u2022')
                 w(v, k, path)
+        elif isinstance(n, str) and k == 'rows': out.extend(words(n.replace("''", "'")))   # a table cell is a value, not a paragraph: '1. Schema' keeps its number
         elif isinstance(n, str): out.extend(words(norm_v1(n)))
         elif n is not None and not isinstance(n, bool): out.append(str(n))
     w(d); return out
@@ -121,6 +122,7 @@ def v1_slot(top, key, val, sc_family=None):
     if top == 'deliverables': return ('artifacts', 0) if key == 'items' else (('legacy', 0) if key == 'count' else ('deliverables', 0))
     if top == 'section_summary': return ('section_summary', 1) if key == 'key_takeaways' else ('section_summary', 0)
     if top == 'key_takeaways': return ('legacy', 0) if key == 'count' else ('section_summary', 1)
+    if top == 'assessment': return ('exercises', 0)                  # chapters 16 and 17
     if top.startswith('preview_'): return ('next', 0)
     if top == 'metadata' and not isinstance(val, (list, dict)): return ('legacy', 0)   # counts and ids
     if top in ('metadata', 'connections'): return ('connections', 0)
@@ -146,6 +148,7 @@ def leaves(n, skip_num_keys=('number', 'count')):
             for v in n:
                 if isinstance(v, str) or (isinstance(v, dict) and 'takeaway' in v): out.append(['\u2022'])
                 w(v, k)
+        elif isinstance(n, str) and k == 'rows': out.append(words(n.replace("''", "'")))   # table cell: no list-marker normalisation
         elif isinstance(n, str): out.append(words(norm_v1(n)))
         elif n is not None and not isinstance(n, bool) and k not in skip_num_keys: out.append([str(n)])
     w(n, None); return out
