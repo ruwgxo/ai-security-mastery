@@ -281,7 +281,9 @@ deliverables:
       running; the suite imports DetectionEvent from detection_event_schema.py. The transform is
       deliberately pure so the schema-to-document mapping is unit-tested separately from delivery;
       StubLogstashTransport captures indexed documents. Self-checks the daily index, @timestamp,
-      nested request, keyword mapping, and delivery.
+      nested request, that every schema field lands in the document, the keyword mapping, and
+      delivery. The Logstash config is built from the same field layout as the transform; it is
+      emitted and checked as text, not run against a Logstash instance.
     code: |
       # elastic_integration.py
       # Section 16.05: Elastic Stack Integration -- Logstash Pipelines
@@ -311,35 +313,44 @@ deliverables:
           }
 
 
+      # One field layout, used by both the Python transform and the Logstash config, so
+      # the two express the same mapping by construction.
+      REQUEST_FIELDS = ('request_id', 'session_id', 'source')      # nested under request
+      ECS_VERSION = '8.11'
+      INDEX_DATE = 'YYYY-MM-dd'                                     # Logstash (Joda) form of the daily index date
+
+
       def transform_to_es_document(event: Dict[str, Any], index_prefix: str = 'ai-detection') -> Dict[str, Any]:
           '''The transform a Logstash pipeline applies: a detection event becomes an
           Elasticsearch document with an @timestamp, keyword facet fields, a nested
-          request object, and a daily index. This is the field mapping.'''
-          return {
+          request object, and a daily index. Every other schema field -- scores,
+          latency, evidence, iocs, labels -- carries over unchanged.'''
+          doc: Dict[str, Any] = {
               '_index': f'{index_prefix}-{event["timestamp"][:10]}',
               '_id': event['event_id'],
               '@timestamp': event['timestamp'],
-              'detector': event['detector'], 'verdict': event['verdict'],
-              'severity': event['severity'], 'surface': event['surface'],
-              'score': event['score'], 'confidence': event['confidence'],
-              'request': {'request_id': event['request_id'], 'session_id': event['session_id'],
-                          'source': event['source']},
-              'evidence': event['evidence'], 'labels': event.get('labels', {}),
-              'ecs': {'version': '8.11'},
           }
+          for k, v in event.items():
+              if k != 'timestamp' and k not in REQUEST_FIELDS:
+                  doc[k] = v
+          doc['request'] = {k: event[k] for k in REQUEST_FIELDS}
+          doc['ecs'] = {'version': ECS_VERSION}
+          return doc
 
 
       def elasticsearch_mapping() -> Dict[str, Any]:
           '''Explicit index mapping. Keyword fields aggregate in Kibana; a guessed text
           field would not. Applied at index creation, before any detection lands.'''
+          kw = {'type': 'keyword'}
           return {'mappings': {'properties': {
-              '@timestamp': {'type': 'date'}, 'detector': {'type': 'keyword'},
-              'verdict': {'type': 'keyword'}, 'severity': {'type': 'keyword'},
-              'surface': {'type': 'keyword'}, 'score': {'type': 'float'},
-              'confidence': {'type': 'float'},
-              'request': {'properties': {'request_id': {'type': 'keyword'},
-                          'session_id': {'type': 'keyword'}, 'source': {'type': 'keyword'}}},
-              'evidence': {'type': 'object', 'enabled': True}}}}
+              '@timestamp': {'type': 'date'}, 'event_id': kw, 'schema_version': kw,
+              'detector': kw, 'verdict': kw, 'severity': kw, 'surface': kw,
+              'score': {'type': 'float'}, 'confidence': {'type': 'float'}, 'latency_ms': {'type': 'float'},
+              'request': {'properties': {f: kw for f in REQUEST_FIELDS}},
+              'evidence': {'type': 'object', 'enabled': True},
+              'iocs': {'properties': {'type': kw, 'value': kw, 'source': kw}},
+              'labels': {'type': 'flattened'},
+              'ecs': {'properties': {'version': kw}}}}}
 
 
       class LogstashTransport:
@@ -384,14 +395,22 @@ deliverables:
 
       def logstash_pipeline_config(cfg: ElasticConfig) -> str:
           '''Emit the equivalent Logstash pipeline config -- the artifact that runs in
-          production. The Python transform and this config express the same mapping.'''
-          return ('input {\n  http { port => 8080 codec => json }\n}\n'
+          production. It is built from the same field layout as the Python transform:
+          @timestamp from timestamp, the request fields nested, the event id as the
+          document id, the ECS version added, and the same daily index name.'''
+          renames = '\n'.join(f'      "{f}" => "[request][{f}]"' for f in REQUEST_FIELDS)
+          return ('# pipelines.yml: - pipeline.id: ' + cfg.pipeline + '\n'
+                  'input {\n  http { port => 8080 codec => json }\n}\n'
                   'filter {\n  date { match => ["timestamp", "ISO8601"] target => "@timestamp" }\n'
-                  '  mutate {\n    rename => { "source" => "[request][source]" }\n'
-                  '    add_field => { "[ecs][version]" => "8.11" }\n  }\n}\n'
+                  '  mutate {\n    rename => {\n' + renames + '\n    }\n'
+                  '    copy => { "event_id" => "[@metadata][_id]" }\n'
+                  '    add_field => { "[ecs][version]" => "' + ECS_VERSION + '" }\n  }\n'
+                  '  # drop the parsed timestamp and the metadata the http input adds\n'
+                  '  mutate { remove_field => ["timestamp", "@version", "host", "http", "url", "user_agent", "event"] }\n'
+                  '}\n'
                   'output {\n  elasticsearch {\n'
-                  '    index => "' + cfg.index_prefix + '-%{+YYYY.MM.dd}"\n'
-                  '    pipeline => "' + cfg.pipeline + '"\n  }\n}\n')
+                  '    index => "' + cfg.index_prefix + '-%{+' + INDEX_DATE + '}"\n'
+                  '    document_id => "%{[@metadata][_id]}"\n  }\n}\n')
 
 
       if __name__ == '__main__':
@@ -409,6 +428,7 @@ deliverables:
           assert doc['@timestamp'] == '2026-01-21T12:30:00Z'
           assert elasticsearch_mapping()['mappings']['properties']['verdict']['type'] == 'keyword'
           assert doc['request']['session_id'] == 'sess-77'
+          assert {k for k in doc if not k.startswith(('_', '@')) and k not in ('request', 'ecs')} | set(REQUEST_FIELDS) | {'timestamp'} == set(events[0])
           print('elastic transform + mapping + delivery: ok')
   - heading: 'Elastic Integration End-to-End Test'
     id: deliverable_2
@@ -417,9 +437,10 @@ deliverables:
     description: >
       Five tests over the full path on the stub transport: the transform produces the right daily
       index, @timestamp, nested request, and ECS version; the full detection is preserved; the
-      explicit mapping types the facet fields as keyword and @timestamp as date; delivery indexes
-      every document in a batch; and the emitted Logstash pipeline config has its input, filter, and
-      output stages. Proves the transform that decides whether Kibana can aggregate.
+      explicit mapping types the facet fields and IOC fields as keyword, @timestamp as date, and
+      every document field deliberately; delivery indexes every document in a batch; and the emitted
+      Logstash pipeline config has its input, filter, and output stages and expresses the same
+      mapping as the transform. Proves the transform that decides whether Kibana can aggregate.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library only, imports the
       connector under test. Testing the transform as a pure function is the point of the two-face
@@ -438,7 +459,7 @@ deliverables:
 
       from elastic_integration import (ElasticConnector, StubLogstashTransport, ElasticConfig,
                                        transform_to_es_document, elasticsearch_mapping,
-                                       logstash_pipeline_config, sample_event)
+                                       logstash_pipeline_config, sample_event, REQUEST_FIELDS)
 
 
       def test_transform_document() -> None:
@@ -452,8 +473,17 @@ deliverables:
 
       def test_full_detection_preserved() -> None:
           doc = transform_to_es_document(sample_event())
-          for key in ('score', 'confidence', 'evidence', 'surface'):
-              assert key in doc, key
+          event = {**sample_event(), 'iocs': [{'type': 'ip', 'value': '198.51.100.7', 'source': 'behavioural_context'}],
+                   'labels': {'entity_id': 'entity-42'}}
+          doc = transform_to_es_document(event)
+          # Every schema field lands somewhere in the document, with its value intact.
+          for key, value in event.items():
+              if key == 'timestamp':
+                  assert doc['@timestamp'] == value
+              elif key in REQUEST_FIELDS:
+                  assert doc['request'][key] == value, key
+              else:
+                  assert doc[key] == value, key
           assert doc['evidence'][0]['label'] == 'canary_triggered'
 
 
@@ -461,6 +491,11 @@ deliverables:
           props = elasticsearch_mapping()['mappings']['properties']
           for f in ('detector', 'verdict', 'severity', 'surface'):
               assert props[f]['type'] == 'keyword', f
+          for f in ('type', 'value', 'source'):
+              assert props['iocs']['properties'][f]['type'] == 'keyword', f
+          doc = transform_to_es_document(sample_event())
+          unmapped = {k for k in doc if not k.startswith('_')} - set(props)
+          assert not unmapped, unmapped              # every document field is typed deliberately
           assert props['@timestamp']['type'] == 'date'
           assert props['score']['type'] == 'float'
 
@@ -477,6 +512,13 @@ deliverables:
           text = logstash_pipeline_config(cfg)
           assert 'input {' in text and 'filter {' in text and 'output {' in text
           assert cfg.pipeline in text and 'elasticsearch {' in text
+          # The config expresses the same mapping as the Python transform.
+          for f in REQUEST_FIELDS:
+              assert f'"{f}" => "[request][{f}]"' in text, f
+          assert 'target => "@timestamp"' in text and '"event_id" => "[@metadata][_id]"' in text
+          assert f'index => "{cfg.index_prefix}-%{{+YYYY-MM-dd}}"' in text
+          assert transform_to_es_document(sample_event(), cfg.index_prefix)['_index'] == f'{cfg.index_prefix}-2026-01-21'
+          assert 'pipeline =>' not in text           # no reference to an undefined ingest pipeline
 
 
       if __name__ == '__main__':
@@ -533,7 +575,7 @@ deliverables:
           def validate(self) -> None:
               assert self.logstash_url.startswith('http'), 'logstash_url must be an http(s) URL'
               assert self.index_prefix and self.pipeline, 'index prefix and pipeline required'
-              assert self.ilm_retention_days >= self.ilm_rollover_days, 'retention must exceed rollover'
+              assert self.ilm_retention_days > self.ilm_rollover_days, 'retention must exceed rollover'
 
           def ilm_policy(self) -> Dict[str, Any]:
               return {'policy': {'phases': {
@@ -554,6 +596,11 @@ deliverables:
               cfg.validate()
               print(f'{name:16} retention={cfg.ilm_retention_days}d')
           print('ilm delete phase:', PRODUCTION.ilm_policy()['policy']['phases']['delete']['min_age'])
+          try:
+              ElasticDeploymentConfig(ilm_rollover_days=30, ilm_retention_days=30).validate()
+              raise SystemExit('retention equal to rollover should be rejected')
+          except AssertionError:
+              print('retention equal to rollover: rejected')
           print('api key resolves:', bool(PRODUCTION.resolve_api_key()))
           print('all elastic profiles valid')
 common_mistakes:

@@ -270,12 +270,14 @@ deliverables:
       DatadogConnector pushes both channels behind a swappable transport. Runs standalone on an
       in-memory stub.
     notes: >
-      Python 3.12, single quotes throughout per book convention, standard-library json, time,
-      dataclasses, and typing only. The DetectionEvent is a dict via sample_event for standalone
-      running; in the suite it imports DetectionEvent from detection_event_schema.py.
-      StubDatadogTransport captures both channels; the real transport POSTs to the Logs API and the
-      series endpoint with a DD-API-KEY header. Self-checks that identical detections aggregate into
-      one series with the summed count and that severity maps to the right status.
+      Python 3.12, single quotes throughout per book convention, standard-library calendar, json,
+      time, dataclasses, and typing only. The DetectionEvent is a dict via sample_event for
+      standalone running; in the suite it imports DetectionEvent from detection_event_schema.py.
+      StubDatadogTransport captures both channels; the real transport POSTs to the Logs API and to
+      the v2 series endpoint, whose count series carry type 1 and timestamp/value points, with a
+      DD-API-KEY header. Timestamps are read as UTC, so the millisecond epoch is the same on any
+      host. Self-checks that identical detections aggregate into one series with the summed count
+      and that severity maps to the right status.
     code: |
       # datadog_integration.py
       # Section 16.04: Datadog Integration -- Logs API and Metrics
@@ -288,6 +290,7 @@ deliverables:
       # interface. The logs give per-detection detail; the metrics give the aggregate
       # picture that connects to the Chapter 14 Section 14.08 observability signals.
 
+      import calendar
       import json
       import time
       from dataclasses import dataclass
@@ -337,7 +340,8 @@ deliverables:
 
 
       def _iso_to_epoch(ts: str) -> int:
-          return int(time.mktime(time.strptime(ts, '%Y-%m-%dT%H:%M:%SZ')))
+          # UTC ('Z') timestamp read as UTC; time.mktime would read it as host local time.
+          return calendar.timegm(time.strptime(ts, '%Y-%m-%dT%H:%M:%SZ'))
 
 
       def _dd_status(severity: str) -> str:
@@ -355,6 +359,9 @@ deliverables:
                   'status': _dd_status(event['severity']), 'message': json.dumps(event, sort_keys=True)}
 
 
+      METRIC_TYPE_COUNT = 1          # Datadog v2 metric intake type: 0 unspecified, 1 count, 2 rate, 3 gauge
+
+
       def to_datadog_metrics(events: List[Dict[str, Any]], cfg: DatadogConfig) -> List[Dict[str, Any]]:
           '''Aggregate events into Datadog count series: one per (detector, verdict,
           severity). These aggregate rates connect to the Chapter 14 observability signals.'''
@@ -365,8 +372,9 @@ deliverables:
               counts[key] = counts.get(key, 0) + 1
           series: List[Dict[str, Any]] = []
           for (detector, verdict, severity), n in sorted(counts.items()):
-              series.append({'metric': f'{cfg.metric_namespace}.count', 'type': 'count',
-                             'points': [[now, n]],
+              # Metrics API v2 series shape (POST /api/v2/series): type 1 is count.
+              series.append({'metric': f'{cfg.metric_namespace}.count', 'type': METRIC_TYPE_COUNT,
+                             'points': [{'timestamp': now, 'value': n}],
                              'tags': [f'detector:{detector}', f'verdict:{verdict}', f'severity:{severity}']})
           return series
 
@@ -400,11 +408,13 @@ deliverables:
                      'event_id': 'req-2003:pii', 'request_id': 'req-2003'}]
           result = conn.send(events)
           print('result:', result)
+          print('jailbreak/block series:', [s['points'][0]['value'] for s in stub.metrics if 'detector:jailbreak' in s['tags']], 'events')
           jb = [s for s in stub.metrics if 'detector:jailbreak' in s['tags'] and 'verdict:block' in s['tags']]
-          assert len(jb) == 1 and jb[0]['points'][0][1] == 2
+          assert len(jb) == 1 and jb[0]['points'][0]['value'] == 2
           assert result['logs_sent'] == 3 and result['metric_series'] == 2
           assert result['logs_ok'] and result['metrics_ok']
           assert stub.logs[0]['status'] == 'error'
+          assert stub.logs[0]['timestamp'] == 1768993200000     # 2026-01-21T11:00:00Z in ms, on any host
           print('datadog logs + metrics aggregation: ok')
   - heading: 'Datadog Integration End-to-End Test'
     id: deliverable_2
@@ -440,6 +450,7 @@ deliverables:
           assert log['status'] == 'error'
           assert '"score": 0.88' in log['message'] or '"score":0.88' in log['message']
           assert isinstance(log['timestamp'], int)
+          assert log['timestamp'] == 1768993200000      # 2026-01-21T11:00:00Z in milliseconds
 
 
       def test_metric_aggregation() -> None:
@@ -447,8 +458,9 @@ deliverables:
                     {**sample_event(), 'detector': 'toxicity_detector', 'verdict': 'flag', 'severity': 'medium'}]
           series = to_datadog_metrics(events, DatadogConfig())
           assert len(series) == 2
-          jb = [s['points'][0][1] for s in series if any('detector:jailbreak' in t for t in s['tags'])][0]
+          jb = [s['points'][0]['value'] for s in series if any('detector:jailbreak' in t for t in s['tags'])][0]
           assert jb == 2
+          assert all(s['type'] == 1 for s in series)       # v2 intake: 1 is count
 
 
       def test_both_channels_delivered() -> None:
@@ -461,7 +473,8 @@ deliverables:
 
 
       def test_severity_status_mapping() -> None:
-          for sev, status in [('info', 'info'), ('medium', 'warning'), ('high', 'error'), ('critical', 'critical')]:
+          for sev, status in [('info', 'info'), ('low', 'notice'), ('medium', 'warning'), ('high', 'error'),
+                              ('critical', 'critical')]:
               log = to_datadog_log({**sample_event(), 'severity': sev}, DatadogConfig())
               assert log['status'] == status, (sev, log['status'])
 

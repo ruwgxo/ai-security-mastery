@@ -276,16 +276,18 @@ deliverables:
     lang: python
     description: >
       The generic delivery path: build_webhook_payload wraps detection events in a versioned
-      envelope; sign_payload and verify_signature implement HMAC-SHA256 signing and constant-time
-      verification; CustomSiemWebhook delivers the signed payload behind a swappable transport. The
-      stub receiver verifies every delivery and rejects a tampered one, exercising the contract as a
-      real endpoint should.
+      envelope; sign_body and verify_signature implement HMAC-SHA256 signing of the request body and
+      constant-time verification; CustomSiemWebhook delivers the signed payload behind a swappable
+      transport. The stub receiver verifies every delivery and rejects a tampered one, exercising
+      the contract as a real endpoint should.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library hashlib, hmac,
-      json, time, dataclasses, and typing only. The canonical JSON (sorted keys, tight separators)
-      makes the signature reproducible on the receiver. The signing secret is read from the
-      environment via the config; the endpoint must be https. Self-checks that a valid signature
-      verifies and a tampered payload is rejected.
+      json, os, time, dataclasses, and typing only. The body is canonical JSON (sorted keys, tight
+      separators); the signature covers those exact bytes, travels in an X-Signature-SHA256
+      header, and the receiver checks it before parsing. The signing secret is read from the
+      environment via the config; the endpoint must be https. Self-checks, through the stub
+      receiver, that a valid delivery is accepted and that a tampered body or a wrong-secret
+      signature is rejected.
     code: |
       # custom_siem_webhook.py
       # Section 16.06: Custom SIEM Integration -- Webhook Contract
@@ -301,6 +303,7 @@ deliverables:
       import hashlib
       import hmac
       import json
+      import os
       import time
       from dataclasses import dataclass
       from typing import Any, Dict, List, Optional
@@ -330,6 +333,11 @@ deliverables:
           def validate(self) -> None:
               assert self.endpoint_url.startswith('https'), 'webhook endpoint must be https'
 
+          def resolve_secret(self) -> str:
+              secret = os.environ.get(self.signing_secret_env_var, '')
+              assert secret, f'{self.signing_secret_env_var} is not set -- signing secret required'
+              return secret
+
 
       def build_webhook_payload(events: List[Dict[str, Any]], *,
                                 contract_version: str = WEBHOOK_CONTRACT_VERSION,
@@ -345,34 +353,47 @@ deliverables:
           }
 
 
-      def sign_payload(payload: Dict[str, Any], secret: str) -> str:
-          '''HMAC-SHA256 over the canonical JSON payload. The receiver recomputes this
-          to verify the delivery is authentic and unmodified.'''
-          body = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+      SIGNATURE_HEADER = 'X-Signature-SHA256'
+
+
+      def canonical_body(payload: Dict[str, Any]) -> bytes:
+          '''The exact bytes POSTed: canonical JSON (sorted keys, tight separators).'''
+          return json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+
+
+      def sign_body(body: bytes, secret: str) -> str:
+          '''HMAC-SHA256 over the request body bytes. The receiver recomputes this over
+          the bytes it received to verify the delivery is authentic and unmodified.'''
           return hmac.new(secret.encode('utf-8'), body, hashlib.sha256).hexdigest()
 
 
-      def verify_signature(payload: Dict[str, Any], secret: str, signature: str) -> bool:
-          return hmac.compare_digest(sign_payload(payload, secret), signature)
+      def sign_payload(payload: Dict[str, Any], secret: str) -> str:
+          return sign_body(canonical_body(payload), secret)
+
+
+      def verify_signature(body: bytes, secret: str, signature: str) -> bool:
+          '''Constant-time check of a received body against its signature header.'''
+          return hmac.compare_digest(sign_body(body, secret), signature)
 
 
       class WebhookTransport:
-          def post(self, url: str, payload: Dict[str, Any], signature: str) -> Dict[str, Any]:
+          def post(self, url: str, body: bytes, headers: Dict[str, str]) -> Dict[str, Any]:
               raise NotImplementedError
 
 
       class StubWebhookTransport(WebhookTransport):
           '''In-memory receiver that verifies the signature exactly as a real endpoint
-          should, so the contract is exercised end to end.'''
+          should: over the raw request body, before parsing it, so the contract is
+          exercised end to end.'''
           def __init__(self, secret: str) -> None:
               self._secret = secret
               self.received: List[Dict[str, Any]] = []
               self.rejected: int = 0
-          def post(self, url, payload, signature):
-              if not verify_signature(payload, self._secret, signature):
+          def post(self, url, body, headers):
+              if not verify_signature(body, self._secret, headers.get(SIGNATURE_HEADER, '')):
                   self.rejected += 1
                   return {'status': 401, 'ok': False}
-              self.received.append(payload)
+              self.received.append(json.loads(body))
               return {'status': 202, 'ok': True}
 
 
@@ -391,28 +412,41 @@ deliverables:
           def deliver(self, events: List[Dict[str, Any]]) -> Dict[str, Any]:
               self._cfg.validate()
               payload = build_webhook_payload(events, contract_version=self._cfg.contract_version)
-              signature = sign_payload(payload, self._secret)
-              resp = self._transport.post(self._cfg.endpoint_url, payload, signature)
+              body = canonical_body(payload)
+              headers = {'Content-Type': 'application/json', SIGNATURE_HEADER: sign_body(body, self._secret)}
+              resp = self._transport.post(self._cfg.endpoint_url, body, headers)
               return {'delivered': resp.get('ok', False), 'status': resp.get('status'),
                       'event_count': payload['event_count'], 'delivery_id': payload['delivery_id']}
 
 
       if __name__ == '__main__':
-          secret = 'shared-signing-secret'
+          cfg = WebhookConfig()
+          os.environ.setdefault(cfg.signing_secret_env_var, 'demo-secret-not-real')
+          secret = cfg.resolve_secret()
           stub = StubWebhookTransport(secret)
-          hook = CustomSiemWebhook(secret, transport=stub)
+          hook = CustomSiemWebhook(secret, transport=stub, config=cfg)
           events = [sample_event(),
                     {**sample_event(), 'event_id': 'req-4002:pii', 'detector': 'pii_scanner',
                      'verdict': 'flag', 'severity': 'medium', 'request_id': 'req-4002'}]
           result = hook.deliver(events)
-          print('deliver result:', result)
-          good = build_webhook_payload(events)
-          good_sig = sign_payload(good, secret)
-          tampered = {**good, 'event_count': 999}
+          print('deliver result:', {k: result[k] for k in ('delivered', 'status', 'event_count')})
+          # A forged delivery through the same receiver: a valid body and signature, then
+          # the body altered in transit, and a body signed with the wrong secret.
+          body = canonical_body(build_webhook_payload(events, delivery_id='dlv-test', emitted_at='2026-01-21T13:45:01Z'))
+          sig = sign_body(body, secret)
+          tampered = body.replace(b'"event_count":2', b'"event_count":999')
+          assert tampered != body
+          r_ok = stub.post(cfg.endpoint_url, body, {SIGNATURE_HEADER: sig})
+          r_tampered = stub.post(cfg.endpoint_url, tampered, {SIGNATURE_HEADER: sig})
+          r_wrong_key = stub.post(cfg.endpoint_url, body, {SIGNATURE_HEADER: sign_body(body, 'wrong-secret')})
+          print('receiver      :', {'valid': r_ok['status'], 'tampered': r_tampered['status'],
+                                    'wrong_secret': r_wrong_key['status'],
+                                    'accepted': len(stub.received), 'rejected': stub.rejected})
           assert result['delivered'] and result['event_count'] == 2
-          assert verify_signature(good, secret, good_sig)
-          assert not verify_signature(tampered, secret, good_sig)
-          print('valid signature verifies, tampered payload rejected: ok')
+          assert r_ok['ok'] and not r_tampered['ok'] and not r_wrong_key['ok']
+          assert len(stub.received) == 2 and stub.rejected == 2
+          assert stub.received[0]['events'] == events
+          print('receiver verifies every delivery and rejects tampered or forged ones: ok')
   - heading: 'The Alert Enrichment Pipeline'
     id: deliverable_2
     filename: alert_enrichment_pipeline.py
@@ -429,7 +463,8 @@ deliverables:
       deterministic StubContextSource for standalone running and the real 13.11 store injected in
       production. The pipeline writes only into existing schema slots, never new top-level fields,
       so enrichment composes with every connector. Self-checks full enrichment for a high-risk
-      session and minimal enrichment for a low-risk unknown, asserting the schema is preserved.
+      session and minimal enrichment for a low-risk unknown, asserting the event keeps the same
+      fields and only labels and iocs change; the output names the stub context source.
     code: |
       # alert_enrichment_pipeline.py
       # Section 16.06: Alert Enrichment Pipeline
@@ -575,13 +610,19 @@ deliverables:
           pipeline = AlertEnrichmentPipeline()
 
           # High-risk session: full enrichment, coordinated-group escalation, IOCs.
+          print('context source: StubContextSource (a stand-in for the Chapter 13 Section 13.11 store)')
           enriched = pipeline.enrich(sample_event())
           print('labels        :')
           for k, v in sorted(enriched['labels'].items()):
               print(f'    {k} = {v}')
           print('iocs          :', enriched['iocs'])
 
-          # The enriched alert is still a DetectionEvent -- every connector delivers it.
+          # The enriched alert is still a DetectionEvent -- every connector delivers it:
+          # the same fields, and nothing but labels and iocs changed.
+          raw = sample_event()
+          assert set(enriched) == set(raw)
+          assert {k: v for k, v in enriched.items() if k not in ('labels', 'iocs')} == \
+              {k: v for k, v in raw.items() if k not in ('labels', 'iocs')}
           assert enriched['event_id'] == 'req-5001:exfiltration_detector'
           assert enriched['labels']['entity_id'] == 'entity-42'
           assert enriched['labels']['coordinated_group'] == 'cluster-3'
@@ -596,7 +637,9 @@ deliverables:
           assert 'coordinated_group' not in low['labels']
           assert 'quarantine_group' not in low['labels']['response_actions']
           assert low['iocs'] == []
-          print('\nenrichment: context, iocs, and response actions attached; schema preserved: ok')
+          assert low['labels']['response_actions'] == 'watch_entity,notify_soc'
+          print('low-risk flag : response_actions =', low['labels']['response_actions'])
+          print('\nenrichment: context, iocs, and response actions attached; same fields, only labels and iocs filled: ok')
 common_mistakes:
   - subject: 'Shipping a custom webhook with no signature, trusting any POST to the endpoint'
     id: mistake_1

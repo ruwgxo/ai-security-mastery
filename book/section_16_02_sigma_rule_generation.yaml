@@ -272,16 +272,20 @@ deliverables:
     lang: python
     description: >
       The generator that turns detector descriptors into portable Sigma rules. A DetectorDescriptor
-      names the detector, its alerting verdicts, its level, and its attack references;
-      build_sigma_rule fills the logsource-detection-condition taxonomy from it; and
-      SigmaRuleGenerator registers the six suite detectors and emits the whole rule set. Includes a
-      dependency-free Sigma YAML emitter so the file runs standalone.
+      names the detector, its attack references, and any narrowing of the alerting verdicts or
+      escalation of a level; build_sigma_rule fills the logsource-detection-condition taxonomy from
+      it and the verdict mapping, one rule per alerting verdict; and SigmaRuleGenerator registers
+      the six suite detectors and emits the whole rule set. Includes a dependency-free Sigma YAML
+      emitter so the file runs standalone.
     notes: >
-      Python 3.12, single quotes throughout per book convention, standard-library dataclasses and
-      typing only. The SUITE_DESCRIPTORS mirror the six Chapter 15 detectors, with exfiltration
-      alerting only on block at critical. to_sigma_yaml is a tiny emitter for standalone running;
-      the suite uses PyYAML and the pySigma library to compile rules to each back end. Self-checks
-      that every rule carries the three governing keys and a verdict mapping.
+      Python 3.12, single quotes throughout per book convention, standard-library uuid,
+      dataclasses, and typing only, plus the verdict mapping from the second deliverable. The
+      SUITE_DESCRIPTORS mirror the six Chapter 15 detectors, with exfiltration alerting only on
+      block at critical. to_sigma_yaml is a tiny emitter for standalone running; the suite uses
+      PyYAML and the pySigma library to compile rules to each back end. Rule ids are UUIDs
+      derived from the rule name, as the Sigma specification requires, so they stay stable
+      across regeneration. Self-checks every rule's selection and level against the verdict
+      mapping.
     code: |
       # sigma_rule_generator.py
       # Section 16.02: Automated Sigma Rule Generation
@@ -294,8 +298,15 @@ deliverables:
       # rather than hand-authored -- stays in sync with the deployed detectors. It
       # expresses the Chapter 11 signature layer as SIEM-deployable rules.
 
+      import uuid
       from dataclasses import dataclass, field
-      from typing import Any, Dict, List
+      from typing import Any, Dict, List, Optional
+
+      from sigma_verdict_mapping import alerting_verdicts, as_condition, level_for
+
+      # Rule ids are UUIDs, as the Sigma specification requires, derived from the rule
+      # name so the same detector and verdict always get the same id.
+      RULE_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, 'https://github.com/ruwgxo/ai-security-mastery/sigma')
 
 
       @dataclass
@@ -303,8 +314,8 @@ deliverables:
           detector: str
           title: str
           description: str
-          alert_verdicts: List[str]
-          level: str
+          only_verdicts: Optional[List[str]] = None             # narrow the mapping's alerting verdicts
+          escalate: Dict[str, str] = field(default_factory=dict)  # verdict -> level above the mapping's
           attack_refs: List[str] = field(default_factory=list)
 
 
@@ -312,23 +323,41 @@ deliverables:
           return name.replace('_', '-').replace(' ', '-').lower()
 
 
-      def build_sigma_rule(desc: DetectorDescriptor, *, product: str = 'ai_gateway',
+      def rule_verdicts(desc: DetectorDescriptor) -> List[str]:
+          '''The verdicts that get a rule for this detector: the verdict mapping's
+          alerting verdicts, narrowed by the descriptor. A descriptor can narrow but
+          never widen, so a verdict the mapping keeps quiet stays quiet everywhere.'''
+          alerting = alerting_verdicts()
+          if desc.only_verdicts is None:
+              return alerting
+          return [v for v in alerting if v in desc.only_verdicts]
+
+
+      def rule_level(desc: DetectorDescriptor, verdict: str) -> str:
+          return desc.escalate.get(verdict, level_for(verdict))
+
+
+      def build_sigma_rule(desc: DetectorDescriptor, verdict: str, *, product: str = 'ai_gateway',
                            service: str = 'detection') -> Dict[str, Any]:
-          '''Construct a Sigma rule (dict ready to serialise) from a detector
-          descriptor. Verdicts become the detection selection; the detection-event
-          fields become the logsource and field references.'''
+          '''Construct a Sigma rule (dict ready to serialise) for one detector and one
+          alerting verdict. A Sigma rule carries a single level, and the verdict mapping
+          gives flag and block different levels, so each alerting verdict is its own rule.
+          The selection comes from the mapping's as_condition, with the detector added.'''
+          name = f'ai-sec-{_slug(desc.detector)}-{verdict}'
+          cond = as_condition([verdict])
           rule: Dict[str, Any] = {
-              'title': desc.title,
-              'id': f'ai-sec-{_slug(desc.detector)}',
+              'title': f'{desc.title} ({verdict})',
+              'id': str(uuid.uuid5(RULE_NAMESPACE, name)),
+              'name': name,
               'status': 'experimental',
               'description': desc.description,
               'author': 'ai-security-mastery (generated)',
               'logsource': {'product': product, 'service': service},
               'detection': {
-                  'selection': {'detector': desc.detector, 'verdict': list(desc.alert_verdicts)},
-                  'condition': 'selection',
+                  'selection': {'detector': desc.detector, **cond['selection']},
+                  'condition': cond['condition'],
               },
-              'level': desc.level,
+              'level': rule_level(desc, verdict),
           }
           if desc.attack_refs:
               rule['tags'] = list(desc.attack_refs)
@@ -359,9 +388,9 @@ deliverables:
 
 
       class SigmaRuleGenerator:
-          '''Generates and versions a Sigma rule set from detector descriptors. Because
-          the rules are generated from the descriptors, regenerating after a detector
-          change keeps the SIEM logic in sync with the detectors.'''
+          '''Generates and versions a Sigma rule set from detector descriptors and the
+          verdict mapping. Because the rules are generated from both, regenerating after
+          a detector or mapping change keeps the SIEM logic in sync with the detectors.'''
 
           def __init__(self, version: str = '1.0') -> None:
               self.version = version
@@ -370,33 +399,29 @@ deliverables:
           def register(self, desc: DetectorDescriptor) -> None:
               self._descriptors.append(desc)
 
+          def rules(self) -> List[Dict[str, Any]]:
+              return [build_sigma_rule(desc, v) for desc in self._descriptors for v in rule_verdicts(desc)]
+
           def generate(self) -> Dict[str, str]:
-              out: Dict[str, str] = {}
-              for desc in self._descriptors:
-                  rule = build_sigma_rule(desc)
-                  out[rule['id']] = to_sigma_yaml(rule)
-              return out
+              return {rule['name']: to_sigma_yaml(rule) for rule in self.rules()}
 
 
       SUITE_DESCRIPTORS: List[DetectorDescriptor] = [
           DetectorDescriptor('prompt_injection', 'AI Prompt Injection Detected',
                              'The prompt injection detector flagged or blocked a request.',
-                             ['flag', 'block'], 'high', ['attack.atlas.aml-t0051']),
+                             attack_refs=['attack.atlas.aml-t0051']),
           DetectorDescriptor('jailbreak', 'AI Jailbreak Attempt Detected',
                              'The jailbreak detector flagged or blocked a request.',
-                             ['flag', 'block'], 'high', ['attack.atlas.aml-t0054']),
+                             attack_refs=['attack.atlas.aml-t0054']),
           DetectorDescriptor('pii_scanner', 'PII Exposure Detected',
-                             'The PII scanner flagged or blocked personal data on input or output.',
-                             ['flag', 'block'], 'medium'),
+                             'The PII scanner flagged or blocked personal data on input or output.'),
           DetectorDescriptor('toxicity_detector', 'Toxic Content Detected',
-                             'The toxicity detector flagged or blocked content.',
-                             ['flag', 'block'], 'medium'),
+                             'The toxicity detector flagged or blocked content.'),
           DetectorDescriptor('exfiltration_detector', 'Data Exfiltration Detected',
-                             'The exfiltration detector flagged or blocked an output.',
-                             ['block'], 'critical'),
+                             'The exfiltration detector blocked an output.',
+                             only_verdicts=['block'], escalate={'block': 'critical'}),
           DetectorDescriptor('combined_pipeline', 'AI Detection Pipeline Alert',
-                             'The combined detection pipeline produced an aggregate alert.',
-                             ['flag', 'block'], 'high'),
+                             'The combined detection pipeline produced an aggregate alert.'),
       ]
 
 
@@ -404,14 +429,25 @@ deliverables:
           gen = SigmaRuleGenerator(version='1.0')
           for d in SUITE_DESCRIPTORS:
               gen.register(d)
-          rules = gen.generate()
-          print(f'generated {len(rules)} sigma rules:')
-          for rid in rules:
-              print(f'  - {rid}')
-          for rid, text in rules.items():
-              assert 'logsource:' in text and 'detection:' in text and 'condition:' in text, rid
-              assert 'verdict:' in text, rid
-          print('all rules have logsource/detection/condition and a verdict mapping: ok')
+          rules = gen.rules()
+          print(f'generated {len(rules)} sigma rules for {len(SUITE_DESCRIPTORS)} detectors:')
+          for r in rules:
+              print(f'  - {r["name"]:42} level={r["level"]}')
+          # Every rule against the verdict mapping: the governing keys are present, the
+          # selection is one alerting verdict, and the level is the mapping's level or
+          # the descriptor's stated escalation.
+          for desc in SUITE_DESCRIPTORS:
+              mine = [r for r in rules if r['detection']['selection']['detector'] == desc.detector]
+              assert [r['detection']['selection']['verdict'] for r in mine] == [[v] for v in rule_verdicts(desc)]
+              for r in mine:
+                  v = r['detection']['selection']['verdict'][0]
+                  assert {'logsource', 'detection', 'level'} <= set(r) and r['detection']['condition'] == 'selection'
+                  assert v in alerting_verdicts() and v != 'allow', r['name']
+                  assert r['level'] == desc.escalate.get(v, level_for(v)), r['name']
+          ids = [r['id'] for r in rules]
+          assert len(set(ids)) == len(ids) and all(str(uuid.UUID(i)) == i for i in ids)
+          assert ids == [r['id'] for r in gen.rules()], 'ids must be stable across regeneration'
+          print('every rule selects one alerting verdict at its mapped level, with a stable UUID: ok')
   - heading: 'Detector-Verdict-to-Sigma-Condition Mapping'
     id: deliverable_2
     filename: sigma_verdict_mapping.py
@@ -493,9 +529,9 @@ deliverables:
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library hashlib,
       dataclasses, and typing only. Imports the generator from the first deliverable. The __main__
-      block walks the full loop -- first deploy, no-change no-op, and a detector change that
-      regenerates, changes the hash, and re-triggers deployment -- asserting the drift detection
-      works.
+      block walks the full loop -- first deploy, no-change no-op, a detector change, and a
+      verdict-mapping change that silences flags; each regenerates the rules, changes the hash,
+      and re-triggers deployment -- asserting the drift detection works.
     code: |
       # sigma_deployment_config.py
       # Section 16.02: Sigma Rule Versioning and Deployment Configuration
@@ -546,23 +582,36 @@ deliverables:
 
 
       if __name__ == '__main__':
+          from dataclasses import replace
+          import sigma_verdict_mapping
           from sigma_rule_generator import SigmaRuleGenerator, SUITE_DESCRIPTORS
-          gen = SigmaRuleGenerator()
-          for d in SUITE_DESCRIPTORS:
-              gen.register(d)
-          rules = gen.generate()
+
+          def generate(descriptors):
+              gen = SigmaRuleGenerator()
+              for d in descriptors:
+                  gen.register(d)
+              return gen.generate()
+
           cfg = SigmaDeploymentConfig()
+          rules = generate(SUITE_DESCRIPTORS)
           plan1 = deployment_plan(rules, cfg, previous_hash='')
-          print('first run :', {k: plan1[k] for k in ('rule_count', 'changed', 'deploy_now')})
-          plan2 = deployment_plan(rules, cfg, previous_hash=plan1['current_hash'])
-          print('no change :', {k: plan2[k] for k in ('changed', 'deploy_now')})
-          SUITE_DESCRIPTORS[2].alert_verdicts = ['flag', 'block', 'allow']
-          gen2 = SigmaRuleGenerator()
-          for d in SUITE_DESCRIPTORS:
-              gen2.register(d)
-          plan3 = deployment_plan(gen2.generate(), cfg, previous_hash=plan1['current_hash'])
-          print('detector changed:', {k: plan3[k] for k in ('changed', 'deploy_now')})
-          assert plan1['deploy_now'] and not plan2['deploy_now'] and plan3['deploy_now']
+          print('first run       :', {k: plan1[k] for k in ('rule_count', 'changed', 'deploy_now')})
+          plan2 = deployment_plan(generate(SUITE_DESCRIPTORS), cfg, previous_hash=plan1['current_hash'])
+          print('no change       :', {k: plan2[k] for k in ('rule_count', 'changed', 'deploy_now')})
+          # A detector change: the PII scanner now alerts on blocks only.
+          narrowed = [replace(d, only_verdicts=['block']) if d.detector == 'pii_scanner' else d
+                      for d in SUITE_DESCRIPTORS]
+          plan3 = deployment_plan(generate(narrowed), cfg, previous_hash=plan1['current_hash'])
+          print('detector changed:', {k: plan3[k] for k in ('rule_count', 'changed', 'deploy_now')})
+          # A mapping change: the deployment silences flags by editing the data, not the generator.
+          saved = list(sigma_verdict_mapping.MAPPING)
+          sigma_verdict_mapping.MAPPING[:] = [replace(m, alerts=False) if m.verdict == 'flag' else m for m in saved]
+          plan4 = deployment_plan(generate(SUITE_DESCRIPTORS), cfg, previous_hash=plan1['current_hash'])
+          sigma_verdict_mapping.MAPPING[:] = saved
+          print('flags silenced  :', {k: plan4[k] for k in ('rule_count', 'changed', 'deploy_now')})
+          assert plan1['deploy_now'] and not plan2['deploy_now'] and plan3['deploy_now'] and plan4['deploy_now']
+          assert plan3['rule_count'] == plan1['rule_count'] - 1
+          assert plan4['rule_count'] == sum(1 for d in SUITE_DESCRIPTORS if 'block' in (d.only_verdicts or ['block']))
           print('drift detection works: ok')
 common_mistakes:
   - subject: 'Writing detection rules in one platform''s query language instead of portable Sigma'

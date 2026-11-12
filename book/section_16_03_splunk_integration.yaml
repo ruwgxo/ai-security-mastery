@@ -264,12 +264,13 @@ deliverables:
       events into one newline-delimited POST; to_splunk_envelope does the schema mapping including
       the ISO-to-epoch timestamp conversion. Runs standalone on an in-memory StubHECTransport.
     notes: >
-      Python 3.12, single quotes throughout per book convention, standard-library json, time,
-      dataclasses, and typing only. The DetectionEvent is represented as a dict via sample_event so
-      the file runs standalone; in the suite it imports DetectionEvent from
+      Python 3.12, single quotes throughout per book convention, standard-library calendar, json,
+      time, dataclasses, and typing only. The DetectionEvent is represented as a dict via
+      sample_event so the file runs standalone; in the suite it imports DetectionEvent from
       detection_event_schema.py. StubHECTransport records POSTs and returns Splunk's success
       envelope; the real transport POSTs to the HEC endpoint with an Authorization: Splunk <token>
-      header. Self-checks the mapping, promoted fields, and batched delivery.
+      header. The UTC timestamp is converted with calendar.timegm, so the epoch is the same on any
+      host. Self-checks the mapping, promoted fields, epoch time, and batched delivery.
     code: |
       # splunk_integration.py
       # Section 16.03: Splunk Integration -- HEC and Add-on
@@ -281,6 +282,7 @@ deliverables:
       # envelope so a detection becomes a searchable, alertable Splunk event. A push
       # integration: the gateway owns delivery and POSTs each event to HEC.
 
+      import calendar
       import json
       import time
       from dataclasses import dataclass
@@ -329,7 +331,9 @@ deliverables:
 
 
       def _iso_to_epoch(ts: str) -> float:
-          return time.mktime(time.strptime(ts, '%Y-%m-%dT%H:%M:%SZ'))
+          # The schema timestamp is UTC ('Z'). calendar.timegm reads it as UTC;
+          # time.mktime would read it as the host's local time and shift every event.
+          return float(calendar.timegm(time.strptime(ts, '%Y-%m-%dT%H:%M:%SZ')))
 
 
       def to_splunk_envelope(event: Dict[str, Any], cfg: SplunkConfig) -> Dict[str, Any]:
@@ -373,20 +377,23 @@ deliverables:
           result = conn.send(events)
           print('send result :', {k: result[k] for k in ('sent', 'ok')})
           print('indexed fields:', stub.sent[0]['fields'])
+          print('epoch time    :', stub.sent[0]['time'], 'for', events[0]['timestamp'])
           assert result['sent'] == 2 and result['ok']
           assert stub.sent[0]['index'] == 'ai_security' and stub.sent[0]['sourcetype'] == 'ai:detection'
           assert stub.sent[0]['fields']['severity'] == 'critical'
           assert stub.sent[1]['event']['detector'] == 'pii_scanner'
+          assert stub.sent[0]['time'] == 1768990503.0       # 2026-01-21T10:15:03Z on any host
           print('splunk hec mapping + delivery: ok')
   - heading: 'Splunk Integration End-to-End Test'
     id: deliverable_2
     filename: splunk_integration_test.py
     lang: python
     description: >
-      Four tests over the full path on the stub transport: the envelope mapping carries the right
-      index, sourcetype, promoted fields, and epoch time; batches all deliver; the full detection
-      body stays searchable (not just the promoted fields); and an invalid config is rejected.
-      Proves the detection reaches Splunk in a searchable, alertable form.
+      Five tests over the full path on the stub transport: the envelope mapping carries the right
+      index, sourcetype, promoted fields, and epoch time; the epoch time is the same whatever the
+      host time zone; batches all deliver; the full detection body stays searchable (not just the
+      promoted fields); and an invalid config is rejected. Proves the detection reaches Splunk in
+      a searchable, alertable form.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library only, imports the
       connector under test. The body-preservation test is the important one: it asserts the scores,
@@ -413,6 +420,26 @@ deliverables:
           assert env['fields']['severity'] == 'critical'
           assert env['event']['request_id'] == 'req-1001'
           assert isinstance(env['time'], float)
+          assert env['time'] == 1768990503.0          # 2026-01-21T10:15:03Z
+
+
+      def test_epoch_independent_of_host_timezone() -> None:
+          # The HEC time must be the same instant whatever zone the gateway host runs in.
+          import os, time
+          if not hasattr(time, 'tzset'):
+              return
+          saved = os.environ.get('TZ')
+          try:
+              for tz in ('UTC', 'America/New_York', 'Asia/Kolkata'):
+                  os.environ['TZ'] = tz
+                  time.tzset()
+                  assert to_splunk_envelope(sample_event(), SplunkConfig())['time'] == 1768990503.0, tz
+          finally:
+              if saved is None:
+                  os.environ.pop('TZ', None)
+              else:
+                  os.environ['TZ'] = saved
+              time.tzset()
 
 
       def test_delivery_batches() -> None:
@@ -439,7 +466,7 @@ deliverables:
 
 
       if __name__ == '__main__':
-          tests = [test_envelope_mapping, test_delivery_batches,
+          tests = [test_envelope_mapping, test_epoch_independent_of_host_timezone, test_delivery_batches,
                    test_searchable_body_preserved, test_bad_config_rejected]
           for t in tests:
               t()
