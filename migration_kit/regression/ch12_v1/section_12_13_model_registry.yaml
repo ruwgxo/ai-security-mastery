@@ -1,0 +1,1241 @@
+# section_12_13_model_registry.yaml
+
+---
+document_info:
+  title: 'Model Registry: Versioning, Staging, and Promoting Detection Classifiers'
+  chapter: 12
+  section: 13
+  section_code: '1213'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-06'
+  estimated_pages: 5
+  estimated_reading_time: '40-50 minutes'
+
+section_overview:
+  one_line_summary: 'The model registry is the control plane that makes every detector update safe and reversible: without it, the first retraining after attack-distribution shift is a manual, unrepeatable redeployment that reintroduces the skew it was meant to fix.'
+  why_this_section_exists: |
+    The detectors built in Chapter 12 are not deployed once and left untouched. The attack
+    distribution shifts, new attack families emerge, the threshold monitor (Section 12.10)
+    fires a drift alert, and the detector must be retrained and redeployed. This happens
+    repeatedly over the life of the detection system. Each redeployment is an opportunity to
+    introduce a regression: a retrained model that is worse than the one it replaces, a model
+    deployed with the wrong feature schema, a calibration that was not re-applied, a latency
+    regression that breaches the SLO.
+
+    Without a model registry, each redeployment is a manual process. The engineer trains the
+    new model, copies it to the production servers, and restarts the gateway. If the new model
+    is worse, the rollback is another manual process: find the previous model file, copy it
+    back, restart again, hoping the previous model file still exists and matches the previous
+    configuration. This manual process is where regressions reach production undetected and
+    where rollbacks fail because the previous state was not preserved.
+
+    The model registry makes every model update a governed, reversible operation. It tracks
+    model versions through Staging, Production, and Archived stages. It enforces stage
+    transition gates: a model cannot reach Production without passing the accuracy regression,
+    latency, and calibration checks. It stores the full lineage needed to reproduce any model.
+    It supports shadow mode and canary promotion to validate a candidate on live traffic before
+    full promotion, and instant rollback to the previous Production version when a regression is
+    detected.
+
+    Section 12.13 builds this registry once, and every subsequent model update for every detector
+    becomes a safe, repeatable operation rather than a manual incident.
+  position_in_chapter: |
+    Section 12.13 is the fourth operational infrastructure section. It consumes the model cards
+    from Section 12.08, the calibration and thresholds from Section 12.10, the schema versions
+    from Section 12.11, and the latency validation from Section 12.12 -- all of which become
+    stage transition gate conditions. It produces the registry that the Section 12.14 retraining
+    cycle and the Section 12.17 gateway capstone use to govern model deployment.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain why model versioning is non-negotiable for a production detection system and describe the failure mode of manual redeployment without a registry'
+    - 'Describe the MLflow model registry: experiment tracking, model versioning, and the Staging-Production-Archived stage model'
+    - 'State the model metadata that a security classifier must carry in the registry and explain why each field is required'
+    - 'Describe the stage transition gates and state what validation must pass before a model moves from Staging to Production'
+    - 'Explain shadow mode and canary promotion and state the difference in how each validates a candidate model'
+    - 'Describe the rollback procedure and explain why model lineage is an audit requirement'
+
+  skills:
+    - 'Register a trained model in MLflow with experiment logging, stage transition, and model card attachment'
+    - 'Implement automated stage transition gates that check accuracy regression, latency, and calibration before promotion'
+    - 'Implement shadow mode that logs candidate model decisions on live traffic without routing them'
+    - 'Implement canary promotion with a traffic split and automated rollback on metric degradation'
+    - 'Track model lineage connecting each production model to its dataset version, pipeline version, and evaluation run'
+
+  security_mindset:
+    - 'Treat the model registry as the control plane for the detection system: an ungoverned model deployment is the most common path for a regression to reach production undetected'
+    - 'Require stage transition gates to pass automatically: a manual promotion decision is where the calibration check or the latency check gets skipped under deadline pressure'
+    - 'Validate candidates on live traffic before promotion: a model that passed offline evaluation can still regress on the production distribution, which only shadow mode and canary reveal'
+    - 'Preserve model lineage as an audit requirement: when a detector decision is challenged, the registry must identify exactly which model version made it and on what training data'
+
+prerequisites:
+  - 'Section 12.08: neural classifier -- the model card that is a Staging entry gate condition'
+  - 'Section 12.10: calibration -- the calibration and threshold that are stage transition gate conditions'
+  - 'Section 12.11: production feature pipeline -- the feature schema version stored in the model lineage'
+  - 'Section 12.12: inference optimisation -- the latency validation that is a Production gate condition'
+  - 'Section 12.04: dataset curation -- the dataset version tag stored in the model lineage'
+  - 'Chapter 11 Section 11.02: detection-as-code -- the versioning and review discipline applied to models'
+
+prose_content:
+
+  part_1:
+    title: 'Why Model Versioning Is Non-Negotiable'
+    body: |
+      A detection system that cannot roll back a bad model update is one bad update away from
+      a production incident. The model registry exists to make rollback a single safe operation
+      rather than a manual recovery under pressure.
+
+      Consider the redeployment without a registry. The threshold monitor fires a drift alert.
+      The engineer retrains the Random Forest on the updated dataset, evaluates it (showing
+      improved metrics on the new test set), copies the model file to the production servers,
+      and restarts the gateway. The new model is now live. Three hours later, the false positive
+      rate has tripled -- the retrained model regressed on a class of benign traffic that was
+      underrepresented in the new test set. The analyst queue is flooding. The engineer needs to
+      roll back immediately.
+
+      Without a registry, the rollback requires finding the previous model file. Was it backed
+      up before the overwrite? Does it match the previous calibration and threshold configuration,
+      or were those changed too? Was the previous feature schema version compatible? Each of these
+      questions is a point where the manual rollback can fail, and each failure extends the
+      incident. The rollback that should take seconds takes the duration of a manual investigation
+      under the pressure of a live false-positive flood.
+
+      With a registry, the rollback is one operation: demote the regressed model from Production
+      and re-promote the previous version, which the registry preserved with its full
+      configuration. The previous model, its calibration, its threshold, and its schema version
+      are all restored together because the registry tracked them as a unit. The rollback takes
+      seconds and is reliable because the previous state was never lost.
+
+      This is why model versioning is non-negotiable. The registry is not an optimisation or a
+      convenience; it is the difference between a recoverable update and an unrecoverable incident.
+
+  part_2:
+    title: 'The MLflow Model Registry and Stage Model'
+    body: |
+      MLflow is an open-source platform for the machine learning lifecycle, and its model
+      registry component provides the versioning and staging that the Chapter 12 detection
+      system needs. The registry organises models into named entries (one per detector), each
+      with multiple versions, and tracks each version through a stage lifecycle.
+
+      The stage model has three stages relevant to the detection system. Staging is where a
+      newly registered model lands after training. A model in Staging has been trained and
+      registered but has not passed the stage transition gates and is not serving production
+      traffic. Production is where the model serving live traffic resides. Only one version of
+      each detector is in Production at a time. Archived is where superseded models go after
+      they are demoted from Production -- they are retained for rollback and audit but are not
+      serving traffic.
+
+      The stage transitions are the governed operations. Staging to Production is the promotion,
+      gated by the stage transition checks. Production to Archived is the demotion, which happens
+      when a new version is promoted (the old version is archived) or when a regression is
+      detected (the regressed version is archived and the previous version is re-promoted from
+      Archived to Production). The registry enforces that these transitions happen explicitly and
+      records who or what triggered each transition and when.
+
+      Experiment tracking complements the registry. Every training run logs its hyperparameters,
+      metrics, and artefacts to an MLflow experiment. The registered model version links back to
+      the experiment run that produced it, so the full training context of any model version is
+      retrievable. This is the foundation of the model lineage that the audit requirement depends
+      on. The model_registry.py in deliverable_1 implements the MLflow integration with experiment
+      logging, stage transitions, and model card attachment.
+
+  part_3:
+    title: 'Stage Transition Gates: What Must Pass Before Production'
+    body: |
+      The stage transition gate from Staging to Production is the quality control that prevents
+      a regressed or untested model from reaching live traffic. The gate is a set of automated
+      checks that must all pass before the promotion is permitted. A manual promotion that
+      bypasses the gate is the failure mode the gate exists to prevent -- it is where, under
+      deadline pressure, the calibration check or the latency check gets skipped.
+
+      Four gate conditions are required for a Chapter 12 detector. The accuracy regression check
+      compares the candidate model against the current Production model on the same temporal test
+      set: the candidate must not regress on recall at the operating threshold, and ideally
+      improves it. A candidate that is worse than the model it would replace is rejected. The
+      latency check runs the candidate through the Section 12.12 profiler and verifies its P99
+      latency is within the budget slice for that detector. A candidate that breaches the latency
+      budget is rejected even if its accuracy is better. The calibration check verifies the
+      candidate's ECE is below the threshold (Section 12.10): an uncalibrated candidate cannot be
+      combined in the ensemble. The model card check verifies the model card is attached and
+      complete (Section 12.08): a model without documented training data, known limitations, and
+      recommended usage cannot be safely operated.
+
+      The gate conditions are checked automatically by the stage_transition_gates.py in
+      deliverable_2. The promotion request triggers the checks; if all pass, the promotion
+      proceeds; if any fails, the promotion is rejected with the specific failure logged. This
+      automation removes the manual judgement that is where checks get skipped. The gate is not
+      a recommendation; it is an enforced precondition for reaching Production.
+
+  part_4:
+    title: 'Shadow Mode and Canary Promotion'
+    body: |
+      A model that passed the offline stage transition gates can still regress on the production
+      traffic distribution, which differs from the test set in ways the offline evaluation did
+      not capture. Shadow mode and canary promotion validate the candidate on live traffic before
+      it affects any production decision.
+
+      Shadow mode runs the candidate model on production traffic in parallel with the Production
+      model, logging the candidate's decisions without acting on them. Every request is scored by
+      both the Production model (whose decision is acted on) and the shadow candidate (whose
+      decision is only logged). After a shadow period -- typically a few days to capture a
+      representative traffic sample -- the candidate's logged decisions are compared against the
+      Production model's decisions and against the eventual ground truth from analyst review. This
+      reveals how the candidate would have performed on real traffic without any production risk:
+      if the candidate would have produced a flood of false positives, the shadow logs show it,
+      and the candidate is rejected before it ever affected a decision.
+
+      Canary promotion is the next step after a successful shadow period. The candidate is promoted
+      to serve a small fraction of production traffic -- typically 5% -- while the Production model
+      serves the rest. The candidate's decisions on the canary traffic are now acted on, so the
+      canary is a real but limited production test. The canary metrics (false positive rate, recall
+      where measurable, latency) are monitored, and if they degrade relative to the Production model
+      on the remaining traffic, the canary is automatically rolled back: the traffic split reverts
+      to 100% Production model, and the candidate returns to Staging for investigation. If the canary
+      metrics hold over the canary period, the traffic split increases progressively to full
+      promotion.
+
+      The canary_promoter.py in deliverable_4 implements the traffic split and the automated
+      rollback trigger. The shadow_mode_runner.py in deliverable_3 implements the parallel logging.
+      Together they provide the graduated validation -- offline gates, then shadow, then canary,
+      then full -- that catches regressions at the earliest stage with the least production impact.
+
+  part_5:
+    title: 'Model Lineage and the Audit Requirement'
+    body: |
+      When a detector decision is challenged -- a blocked request that the user claims was
+      legitimate, a missed attack that caused an incident, a regulatory inquiry into an automated
+      decision -- the detection team must be able to answer precisely: which model version made
+      this decision, what data was it trained on, what was its evaluated performance, and what
+      were its known limitations at the time. This is the audit requirement, and model lineage
+      is what satisfies it.
+
+      Model lineage connects each production model version to the artefacts that produced it: the
+      dataset version (the Section 12.04 DVC tag), the feature pipeline schema version (the Section
+      12.11 FEATURE_SCHEMA_VERSION), the training code commit, the evaluation run, the calibration
+      parameters, and the model card. Given a model version, the lineage retrieves all of these, so
+      the full context of any decision can be reconstructed. Given a decision (logged with the model
+      version that made it), the lineage identifies the exact model and its training context.
+
+      The lineage is also what makes reproduction possible. To investigate a regression, the team
+      reproduces the model: check out the training code commit, restore the dataset version with
+      DVC pull, re-run the training, and verify the reproduced model matches the registered model.
+      Without the lineage, this reproduction is impossible -- the training conditions are lost, and
+      the investigation cannot isolate the cause. The model_lineage_tracker.py in deliverable_5
+      records and retrieves the lineage, connecting the registry to the dataset versioner from
+      Section 12.04 and the schema versioner from Section 12.11.
+
+      The lineage requirement extends across all four detectors plus their variants. The registry
+      manages the Isolation Forest, the Random Forest, the XGBoost, the GRU, the DistilBERT, the
+      embedding detector, and the PII scanner, each with its own version history, and the ablation
+      variants explored during development. The multi-model registry keeps these organised so that
+      the production configuration -- which version of each detector is live -- is always known and
+      auditable.
+
+reference_materials:
+
+  table_1:
+    title: 'Model Registry Stage Model'
+    description: 'The three registry stages with their meaning, traffic, and transition rules'
+    columns: ['Stage', 'Meaning', 'Serves Traffic', 'Transitions']
+    rows:
+      - ['Staging', 'Trained and registered; not yet validated for production', 'No (or shadow only)', 'Promote to Production via stage gates; or remain for shadow testing']
+      - ['Production', 'Validated and serving live traffic', 'Yes -- one version per detector', 'Demote to Archived on new promotion or rollback']
+      - ['Archived', 'Superseded; retained for rollback and audit', 'No', 'Re-promote to Production on rollback of a regressed version']
+
+  table_2:
+    title: 'Stage Transition Gate Conditions (Staging to Production)'
+    description: 'The four automated checks that must pass before a candidate is promoted to Production'
+    columns: ['Gate', 'Check', 'Source Section', 'Failure Action']
+    rows:
+      - ['Accuracy regression', 'Candidate recall at threshold >= current Production recall', 'Section 12.05 evaluator', 'Reject promotion; candidate is worse than incumbent']
+      - ['Latency', 'Candidate P99 within the detector budget slice', 'Section 12.12 profiler', 'Reject; candidate breaches the SLO contribution']
+      - ['Calibration', 'Candidate ECE below threshold', 'Section 12.10 calibrator', 'Reject; uncalibrated candidate cannot combine in ensemble']
+      - ['Model card', 'Complete model card attached (six fields)', 'Section 12.08 generator', 'Reject; undocumented model cannot be safely operated']
+
+  table_3:
+    title: 'Validation Stages from Offline to Full Production'
+    description: 'The graduated validation sequence with the traffic exposure and risk at each stage'
+    columns: ['Stage', 'Traffic Exposure', 'Decisions Acted On', 'Catches']
+    rows:
+      - ['Offline gates', 'None (test set)', 'No', 'Regressions on the held-out test set; latency and calibration failures']
+      - ['Shadow mode', '100% (logged only)', 'No', 'Regressions on the production distribution without production risk']
+      - ['Canary', '5% (then progressive)', 'Yes (limited)', 'Regressions that only appear when decisions are acted on, at limited scale']
+      - ['Full production', '100%', 'Yes', 'N/A -- fully promoted after canary holds']
+
+  table_4:
+    title: 'Model Lineage Fields'
+    description: 'The lineage artefacts connected to each registered model version and what each enables'
+    columns: ['Lineage Field', 'Source', 'Enables']
+    rows:
+      - ['Dataset version tag', 'Section 12.04 DVC tag', 'Reproduce the training data; assess distribution mismatch']
+      - ['Feature schema version', 'Section 12.11 FEATURE_SCHEMA_VERSION', 'Verify feature compatibility; enforce schema match at inference']
+      - ['Training code commit', 'Git commit hash', 'Reproduce the training run exactly']
+      - ['Evaluation run', 'MLflow experiment run ID', 'Retrieve the metrics and the temporal test set used']
+      - ['Calibration parameters', 'Section 12.10 calibrator output', 'Restore the calibration with the model on rollback']
+      - ['Model card', 'Section 12.08 generator', 'Retrieve known limitations and recommended usage for audit']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Model Registry'
+    filename: 'model_registry.py'
+    description: 'MLflow model registry integration with experiment logging, stage transitions, and model card attachment. Registers trained detectors, tracks versions through Staging-Production-Archived, and links each version to its experiment run. Falls back to a local file-based registry when MLflow is unavailable.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: mlflow (optional). Falls back to a JSON file-based registry for environments without MLflow.'
+    code: |
+      # model_registry.py
+      # Section 12.13: Model Registry with Stage Transitions
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import json
+      import time
+      from dataclasses import dataclass, asdict, field
+      from enum import Enum
+      from pathlib import Path
+      from typing import Dict, List, Optional
+
+
+      class Stage(Enum):
+          STAGING = 'Staging'
+          PRODUCTION = 'Production'
+          ARCHIVED = 'Archived'
+
+
+      @dataclass
+      class ModelVersion:
+          model_name: str
+          version: str
+          stage: str
+          created_at: str
+          dataset_version: str
+          feature_schema_version: str
+          training_commit: str
+          experiment_run_id: str
+          model_card_path: Optional[str]
+          metrics: Dict[str, float] = field(default_factory=dict)
+          artifact_path: str = ''
+
+
+      class ModelRegistry:
+          '''
+          Model registry with Staging-Production-Archived stages.
+          Uses MLflow when available; falls back to a JSON file-based registry.
+          '''
+
+          def __init__(self, registry_path: str = 'model_registry.json', use_mlflow: bool = True) -> None:
+              self.registry_path = Path(registry_path)
+              self._mlflow = None
+              if use_mlflow:
+                  self._init_mlflow()
+              self._versions: Dict[str, List[ModelVersion]] = self._load()
+
+          def _init_mlflow(self) -> None:
+              try:
+                  import mlflow
+                  self._mlflow = mlflow
+                  print('Model registry: MLflow backend initialised.')
+              except ImportError:
+                  print('WARN: mlflow not installed; using file-based registry.')
+
+          def _load(self) -> Dict[str, List[ModelVersion]]:
+              if not self.registry_path.exists():
+                  return {}
+              data = json.loads(self.registry_path.read_text())
+              return {
+                  name: [ModelVersion(**v) for v in versions]
+                  for name, versions in data.items()
+              }
+
+          def _save(self) -> None:
+              data = {
+                  name: [asdict(v) for v in versions]
+                  for name, versions in self._versions.items()
+              }
+              self.registry_path.write_text(json.dumps(data, indent=2))
+
+          def register(
+              self,
+              model_name: str,
+              version: str,
+              dataset_version: str,
+              feature_schema_version: str,
+              training_commit: str,
+              experiment_run_id: str,
+              metrics: Dict[str, float],
+              model_card_path: Optional[str] = None,
+              artifact_path: str = '',
+          ) -> ModelVersion:
+              '''Register a newly trained model in Staging.'''
+              mv = ModelVersion(
+                  model_name=model_name,
+                  version=version,
+                  stage=Stage.STAGING.value,
+                  created_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                  dataset_version=dataset_version,
+                  feature_schema_version=feature_schema_version,
+                  training_commit=training_commit,
+                  experiment_run_id=experiment_run_id,
+                  model_card_path=model_card_path,
+                  metrics=metrics,
+                  artifact_path=artifact_path,
+              )
+              self._versions.setdefault(model_name, []).append(mv)
+              self._save()
+              print(f'Registered {model_name} v{version} in Staging.')
+              return mv
+
+          def get_version(self, model_name: str, version: str) -> Optional[ModelVersion]:
+              for v in self._versions.get(model_name, []):
+                  if v.version == version:
+                      return v
+              return None
+
+          def get_production(self, model_name: str) -> Optional[ModelVersion]:
+              for v in self._versions.get(model_name, []):
+                  if v.stage == Stage.PRODUCTION.value:
+                      return v
+              return None
+
+          def transition(self, model_name: str, version: str, target_stage: Stage) -> None:
+              '''
+              Transition a model version to a target stage.
+              Promoting to Production archives the current Production version.
+              '''
+              mv = self.get_version(model_name, version)
+              if mv is None:
+                  raise ValueError(f'{model_name} v{version} not found.')
+
+              if target_stage == Stage.PRODUCTION:
+                  current = self.get_production(model_name)
+                  if current and current.version != version:
+                      current.stage = Stage.ARCHIVED.value
+                      print(f'Archived {model_name} v{current.version}.')
+
+              mv.stage = target_stage.value
+              self._save()
+              print(f'{model_name} v{version} -> {target_stage.value}')
+
+          def rollback(self, model_name: str, to_version: str) -> None:
+              '''Roll back: archive the current Production, re-promote a previous version.'''
+              current = self.get_production(model_name)
+              if current:
+                  current.stage = Stage.ARCHIVED.value
+                  print(f'Rolled back: archived {model_name} v{current.version}.')
+              self.transition(model_name, to_version, Stage.PRODUCTION)
+              print(f'Re-promoted {model_name} v{to_version} to Production.')
+
+          def list_versions(self, model_name: str) -> List[ModelVersion]:
+              return self._versions.get(model_name, [])
+
+
+      if __name__ == '__main__':
+          registry = ModelRegistry(registry_path='/tmp/model_registry.json', use_mlflow=False)
+
+          registry.register(
+              model_name='rf_injection', version='1.0.0',
+              dataset_version='dataset-v3.1', feature_schema_version='1.0.0',
+              training_commit='a3f8b21', experiment_run_id='run_001',
+              metrics={'recall': 0.91, 'precision': 0.88, 'ece': 0.03},
+              model_card_path='/tmp/card_rf_v1.json',
+          )
+          registry.transition('rf_injection', '1.0.0', Stage.PRODUCTION)
+
+          # New version
+          registry.register(
+              model_name='rf_injection', version='1.1.0',
+              dataset_version='dataset-v3.2', feature_schema_version='1.0.0',
+              training_commit='b7c9d33', experiment_run_id='run_002',
+              metrics={'recall': 0.93, 'precision': 0.89, 'ece': 0.02},
+              model_card_path='/tmp/card_rf_v1.1.json',
+          )
+          registry.transition('rf_injection', '1.1.0', Stage.PRODUCTION)
+          print(f'Production: v{registry.get_production("rf_injection").version}')
+
+          # Rollback
+          registry.rollback('rf_injection', '1.0.0')
+          print(f'Production after rollback: v{registry.get_production("rf_injection").version}')
+
+  deliverable_2:
+    title: 'Stage Transition Gates'
+    filename: 'stage_transition_gates.py'
+    description: 'Automated accuracy, latency, and calibration checks as stage transition gate conditions. Runs all four gate checks on a candidate model and permits or rejects the Staging-to-Production promotion based on the results.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: numpy. Imports the evaluation, latency, and calibration checks from prior sections.'
+    code: |
+      # stage_transition_gates.py
+      # Section 12.13: Stage Transition Gate Conditions
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      from dataclasses import dataclass, field
+      from pathlib import Path
+      from typing import Dict, List, Optional
+
+      import numpy as np
+
+
+      @dataclass
+      class GateResult:
+          gate_name: str
+          passed: bool
+          detail: str
+
+
+      @dataclass
+      class GateReport:
+          model_name: str
+          version: str
+          results: List[GateResult]
+          all_passed: bool
+
+          def failures(self) -> List[str]:
+              return [f'{r.gate_name}: {r.detail}' for r in self.results if not r.passed]
+
+
+      class StageTransitionGates:
+          '''
+          Automated gate checks for Staging -> Production promotion.
+          All four gates must pass for the promotion to be permitted.
+          '''
+
+          def __init__(
+              self,
+              latency_budget_ms: float = 10.0,
+              ece_threshold: float = 0.05,
+              min_recall: float = 0.85,
+          ) -> None:
+              self.latency_budget_ms = latency_budget_ms
+              self.ece_threshold = ece_threshold
+              self.min_recall = min_recall
+
+          def check_accuracy_regression(
+              self,
+              candidate_recall: float,
+              production_recall: Optional[float],
+          ) -> GateResult:
+              if candidate_recall < self.min_recall:
+                  return GateResult('accuracy_regression', False,
+                                    f'candidate recall {candidate_recall:.3f} below minimum {self.min_recall}')
+              if production_recall is not None and candidate_recall < production_recall - 0.01:
+                  return GateResult('accuracy_regression', False,
+                                    f'candidate recall {candidate_recall:.3f} regresses from '
+                                    f'production {production_recall:.3f}')
+              return GateResult('accuracy_regression', True,
+                                f'recall {candidate_recall:.3f} >= production/{self.min_recall}')
+
+          def check_latency(self, candidate_p99_ms: float) -> GateResult:
+              if candidate_p99_ms > self.latency_budget_ms:
+                  return GateResult('latency', False,
+                                    f'P99 {candidate_p99_ms:.1f}ms exceeds budget {self.latency_budget_ms}ms')
+              return GateResult('latency', True, f'P99 {candidate_p99_ms:.1f}ms within budget')
+
+          def check_calibration(self, candidate_ece: float) -> GateResult:
+              if candidate_ece > self.ece_threshold:
+                  return GateResult('calibration', False,
+                                    f'ECE {candidate_ece:.4f} exceeds threshold {self.ece_threshold}')
+              return GateResult('calibration', True, f'ECE {candidate_ece:.4f} within threshold')
+
+          def check_model_card(self, model_card_path: Optional[str]) -> GateResult:
+              if not model_card_path or not Path(model_card_path).exists():
+                  return GateResult('model_card', False, 'model card missing')
+              import json
+              try:
+                  card = json.loads(Path(model_card_path).read_text())
+                  required = ['training_data', 'evaluation_methodology', 'performance_metrics',
+                              'known_limitations', 'recommended_usage', 'lineage']
+                  missing = [f for f in required if f not in card]
+                  if missing:
+                      return GateResult('model_card', False, f'missing fields: {missing}')
+              except (json.JSONDecodeError, KeyError) as e:
+                  return GateResult('model_card', False, f'invalid model card: {e}')
+              return GateResult('model_card', True, 'complete model card attached')
+
+          def run_gates(
+              self,
+              model_name: str,
+              version: str,
+              candidate_recall: float,
+              production_recall: Optional[float],
+              candidate_p99_ms: float,
+              candidate_ece: float,
+              model_card_path: Optional[str],
+          ) -> GateReport:
+              results = [
+                  self.check_accuracy_regression(candidate_recall, production_recall),
+                  self.check_latency(candidate_p99_ms),
+                  self.check_calibration(candidate_ece),
+                  self.check_model_card(model_card_path),
+              ]
+              return GateReport(
+                  model_name=model_name,
+                  version=version,
+                  results=results,
+                  all_passed=all(r.passed for r in results),
+              )
+
+
+      def print_gate_report(report: GateReport) -> None:
+          print(f'\nStage Transition Gates: {report.model_name} v{report.version}')
+          print('=' * 60)
+          for r in report.results:
+              status = 'PASS' if r.passed else 'FAIL'
+              print(f'  [{status}] {r.gate_name}: {r.detail}')
+          print('-' * 60)
+          verdict = 'PROMOTION PERMITTED' if report.all_passed else 'PROMOTION REJECTED'
+          print(f'  {verdict}')
+
+
+      if __name__ == '__main__':
+          import json
+          # Create a valid mock model card
+          card = {f: {} for f in ['training_data', 'evaluation_methodology', 'performance_metrics',
+                                   'known_limitations', 'recommended_usage', 'lineage']}
+          Path('/tmp/valid_card.json').write_text(json.dumps(card))
+
+          gates = StageTransitionGates(latency_budget_ms=10.0, ece_threshold=0.05, min_recall=0.85)
+
+          # Passing candidate
+          report = gates.run_gates(
+              'rf_injection', '1.1.0',
+              candidate_recall=0.93, production_recall=0.91,
+              candidate_p99_ms=7.2, candidate_ece=0.03,
+              model_card_path='/tmp/valid_card.json',
+          )
+          print_gate_report(report)
+
+          # Failing candidate: latency breach + calibration
+          report2 = gates.run_gates(
+              'distilbert_injection', '2.0.0',
+              candidate_recall=0.95, production_recall=0.93,
+              candidate_p99_ms=14.0, candidate_ece=0.08,
+              model_card_path='/tmp/valid_card.json',
+          )
+          print_gate_report(report2)
+
+  deliverable_3:
+    title: 'Shadow Mode Runner'
+    filename: 'shadow_mode_runner.py'
+    description: 'Shadow mode deployment that runs a candidate model on live traffic alongside the Production model, logging the candidate decisions without acting on them. Compares shadow decisions against Production decisions and against eventual ground truth to validate the candidate on the production distribution.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: numpy. In production, the shadow log is written to durable storage for the comparison analysis.'
+    code: |
+      # shadow_mode_runner.py
+      # Section 12.13: Shadow Mode Deployment
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import json
+      import time
+      from dataclasses import dataclass, field
+      from pathlib import Path
+      from typing import Callable, Dict, List, Optional
+
+      import numpy as np
+
+
+      @dataclass
+      class ShadowDecision:
+          request_id: str
+          production_score: float
+          production_decision: bool
+          shadow_score: float
+          shadow_decision: bool
+          timestamp_ms: float
+          ground_truth: Optional[bool] = None
+
+
+      @dataclass
+      class ShadowComparison:
+          n_decisions: int
+          agreement_rate: float
+          shadow_only_flags: int       # shadow flags, production passes
+          production_only_flags: int   # production flags, shadow passes
+          shadow_recall: Optional[float]
+          shadow_fpr: Optional[float]
+          production_recall: Optional[float]
+          production_fpr: Optional[float]
+
+
+      class ShadowModeRunner:
+          '''
+          Runs a candidate model in shadow alongside Production.
+          The production decision is acted on; the shadow decision is only logged.
+          After the shadow period, compare to validate the candidate.
+          '''
+
+          def __init__(
+              self,
+              production_predict: Callable,
+              shadow_predict: Callable,
+              production_threshold: float,
+              shadow_threshold: float,
+              log_path: str = 'shadow_log.jsonl',
+          ) -> None:
+              self.production_predict = production_predict
+              self.shadow_predict = shadow_predict
+              self.production_threshold = production_threshold
+              self.shadow_threshold = shadow_threshold
+              self.log_path = Path(log_path)
+
+          def score(self, request_id: str, model_input) -> bool:
+              '''
+              Score with both models. Returns the PRODUCTION decision (the one acted on).
+              The shadow decision is logged only.
+              '''
+              prod_score = float(self.production_predict(model_input))
+              shadow_score = float(self.shadow_predict(model_input))
+              prod_decision = prod_score >= self.production_threshold
+              shadow_decision = shadow_score >= self.shadow_threshold
+
+              record = ShadowDecision(
+                  request_id=request_id,
+                  production_score=prod_score,
+                  production_decision=prod_decision,
+                  shadow_score=shadow_score,
+                  shadow_decision=shadow_decision,
+                  timestamp_ms=time.time() * 1000,
+              )
+              with open(self.log_path, 'a') as f:
+                  f.write(json.dumps(record.__dict__) + '\n')
+
+              return prod_decision   # only the production decision is acted on
+
+          def record_ground_truth(self, request_id: str, is_attack: bool) -> None:
+              '''Append ground truth (from analyst review) for later comparison.'''
+              with open(self.log_path, 'a') as f:
+                  f.write(json.dumps({'request_id': request_id, 'ground_truth': is_attack,
+                                      'type': 'ground_truth'}) + '\n')
+
+          def compare(self) -> ShadowComparison:
+              '''Analyse the shadow log to compare candidate against production.'''
+              decisions = []
+              ground_truth: Dict[str, bool] = {}
+              with open(self.log_path) as f:
+                  for line in f:
+                      r = json.loads(line)
+                      if r.get('type') == 'ground_truth':
+                          ground_truth[r['request_id']] = r['ground_truth']
+                      else:
+                          decisions.append(r)
+
+              n = len(decisions)
+              agreements = sum(1 for d in decisions
+                               if d['production_decision'] == d['shadow_decision'])
+              shadow_only = sum(1 for d in decisions
+                                if d['shadow_decision'] and not d['production_decision'])
+              prod_only = sum(1 for d in decisions
+                              if d['production_decision'] and not d['shadow_decision'])
+
+              # Compute recall/FPR where ground truth is available
+              def metrics(decision_key: str):
+                  labelled = [d for d in decisions if d['request_id'] in ground_truth]
+                  if not labelled:
+                      return None, None
+                  gt = np.array([ground_truth[d['request_id']] for d in labelled])
+                  pred = np.array([d[decision_key] for d in labelled])
+                  n_attack = (gt == True).sum()
+                  n_benign = (gt == False).sum()
+                  recall = ((pred & gt).sum() / n_attack) if n_attack else None
+                  fpr = ((pred & ~gt).sum() / n_benign) if n_benign else None
+                  return recall, fpr
+
+              s_recall, s_fpr = metrics('shadow_decision')
+              p_recall, p_fpr = metrics('production_decision')
+
+              return ShadowComparison(
+                  n_decisions=n,
+                  agreement_rate=agreements / max(n, 1),
+                  shadow_only_flags=shadow_only,
+                  production_only_flags=prod_only,
+                  shadow_recall=s_recall,
+                  shadow_fpr=s_fpr,
+                  production_recall=p_recall,
+                  production_fpr=p_fpr,
+              )
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(42)
+
+          def prod_model(x):
+              return rng.beta(2, 8)   # production scores
+
+          def shadow_model(x):
+              return rng.beta(2, 7)   # candidate scores (slightly higher)
+
+          runner = ShadowModeRunner(
+              prod_model, shadow_model,
+              production_threshold=0.5, shadow_threshold=0.5,
+              log_path='/tmp/shadow_log.jsonl',
+          )
+          Path('/tmp/shadow_log.jsonl').unlink(missing_ok=True)
+
+          for i in range(200):
+              rid = f'req_{i}'
+              runner.score(rid, 'request')
+              if i % 5 == 0:
+                  runner.record_ground_truth(rid, is_attack=(rng.random() < 0.1))
+
+          comparison = runner.compare()
+          print(f'Shadow comparison over {comparison.n_decisions} decisions:')
+          print(f'  Agreement rate:      {comparison.agreement_rate:.2%}')
+          print(f'  Shadow-only flags:   {comparison.shadow_only_flags}')
+          print(f'  Production-only:     {comparison.production_only_flags}')
+
+  deliverable_4:
+    title: 'Canary Promoter'
+    filename: 'canary_promoter.py'
+    description: 'Traffic-split canary promotion with automated rollback on metric degradation. Routes a configurable fraction of traffic to the candidate model, monitors the canary metrics against the Production model, and rolls back automatically if the canary degrades.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: numpy. Integrates with the model_registry.py rollback operation.'
+    code: |
+      # canary_promoter.py
+      # Section 12.13: Canary Promotion with Automated Rollback
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import hashlib
+      import time
+      from dataclasses import dataclass, field
+      from typing import Callable, Dict, List, Optional
+
+      import numpy as np
+
+
+      @dataclass
+      class CanaryMetrics:
+          n_requests: int
+          canary_fpr: float
+          production_fpr: float
+          canary_recall: Optional[float]
+          production_recall: Optional[float]
+          degraded: bool
+          reason: str = ''
+
+
+      class CanaryPromoter:
+          '''
+          Routes a fraction of traffic to the candidate (canary) model.
+          Monitors canary metrics and rolls back automatically on degradation.
+
+          Traffic routing is deterministic per request_id (consistent hashing)
+          so a given session always hits the same model during the canary.
+          '''
+
+          def __init__(
+              self,
+              production_predict: Callable,
+              canary_predict: Callable,
+              threshold: float = 0.5,
+              canary_fraction: float = 0.05,
+              fpr_degradation_ratio: float = 1.5,   # canary FPR > 1.5x production triggers rollback
+              recall_degradation: float = 0.05,     # canary recall < production - 0.05 triggers rollback
+              min_requests_before_check: int = 200,
+          ) -> None:
+              self.production_predict = production_predict
+              self.canary_predict = canary_predict
+              self.threshold = threshold
+              self.canary_fraction = canary_fraction
+              self.fpr_degradation_ratio = fpr_degradation_ratio
+              self.recall_degradation = recall_degradation
+              self.min_requests_before_check = min_requests_before_check
+              self._rolled_back = False
+              # Tracking for metric computation
+              self._canary_outcomes: List[tuple] = []     # (flagged, is_attack)
+              self._production_outcomes: List[tuple] = []
+
+          def _route_to_canary(self, request_id: str) -> bool:
+              '''Deterministic routing: hash the request_id to a fraction bucket.'''
+              if self._rolled_back:
+                  return False
+              h = int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16)
+              return (h % 1000) / 1000.0 < self.canary_fraction
+
+          def score(self, request_id: str, model_input) -> bool:
+              '''Route to canary or production and return the decision.'''
+              if self._route_to_canary(request_id):
+                  score = float(self.canary_predict(model_input))
+                  return score >= self.threshold
+              else:
+                  score = float(self.production_predict(model_input))
+                  return score >= self.threshold
+
+          def record_outcome(
+              self,
+              request_id: str,
+              flagged: bool,
+              is_attack: bool,
+          ) -> None:
+              '''Record a reviewed outcome for metric computation.'''
+              if self._route_to_canary(request_id):
+                  self._canary_outcomes.append((flagged, is_attack))
+              else:
+                  self._production_outcomes.append((flagged, is_attack))
+
+          def _fpr(self, outcomes: List[tuple]) -> float:
+              benign = [(f, a) for f, a in outcomes if not a]
+              if not benign:
+                  return 0.0
+              return sum(1 for f, _ in benign if f) / len(benign)
+
+          def _recall(self, outcomes: List[tuple]) -> Optional[float]:
+              attacks = [(f, a) for f, a in outcomes if a]
+              if not attacks:
+                  return None
+              return sum(1 for f, _ in attacks if f) / len(attacks)
+
+          def check_canary(self) -> CanaryMetrics:
+              n = len(self._canary_outcomes)
+              c_fpr = self._fpr(self._canary_outcomes)
+              p_fpr = self._fpr(self._production_outcomes)
+              c_recall = self._recall(self._canary_outcomes)
+              p_recall = self._recall(self._production_outcomes)
+
+              degraded = False
+              reason = ''
+              if n >= self.min_requests_before_check:
+                  if p_fpr > 0 and c_fpr > p_fpr * self.fpr_degradation_ratio:
+                      degraded = True
+                      reason = f'canary FPR {c_fpr:.4f} > {self.fpr_degradation_ratio}x production {p_fpr:.4f}'
+                  if (c_recall is not None and p_recall is not None
+                          and c_recall < p_recall - self.recall_degradation):
+                      degraded = True
+                      reason = f'canary recall {c_recall:.3f} < production {p_recall:.3f} - {self.recall_degradation}'
+
+              return CanaryMetrics(
+                  n_requests=n,
+                  canary_fpr=c_fpr,
+                  production_fpr=p_fpr,
+                  canary_recall=c_recall,
+                  production_recall=p_recall,
+                  degraded=degraded,
+                  reason=reason,
+              )
+
+          def rollback(self, registry=None, model_name: str = '', to_version: str = '') -> None:
+              '''Roll back the canary: route all traffic to production.'''
+              self._rolled_back = True
+              print(f'CANARY ROLLBACK triggered: routing 100% to production.')
+              if registry and model_name and to_version:
+                  registry.rollback(model_name, to_version)
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(42)
+
+          def prod_model(x):
+              return rng.beta(2, 10)   # production: low FPR
+
+          def canary_model(x):
+              return rng.beta(2, 5)    # canary: higher scores -> higher FPR (degraded)
+
+          promoter = CanaryPromoter(
+              prod_model, canary_model,
+              canary_fraction=0.10, min_requests_before_check=100,
+          )
+
+          for i in range(1000):
+              rid = f'req_{i}'
+              is_attack = rng.random() < 0.05
+              flagged = promoter.score(rid, 'request')
+              promoter.record_outcome(rid, flagged, is_attack)
+
+          metrics = promoter.check_canary()
+          print(f'Canary over {metrics.n_requests} canary requests:')
+          print(f'  Canary FPR:     {metrics.canary_fpr:.4f}')
+          print(f'  Production FPR: {metrics.production_fpr:.4f}')
+          print(f'  Degraded:       {metrics.degraded}')
+          if metrics.degraded:
+              print(f'  Reason: {metrics.reason}')
+              promoter.rollback()
+
+  deliverable_5:
+    title: 'Model Lineage Tracker'
+    filename: 'model_lineage_tracker.py'
+    description: 'Connects each production model to its dataset version, feature pipeline version, training code commit, and evaluation run. Provides the lineage retrieval that satisfies the audit requirement and enables model reproduction.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. No external dependencies beyond stdlib. Integrates with the Section 12.04 dataset versioner and the Section 12.11 schema versioner.'
+    code: |
+      # model_lineage_tracker.py
+      # Section 12.13: Model Lineage Tracking
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import json
+      from dataclasses import dataclass, asdict, field
+      from pathlib import Path
+      from typing import Dict, List, Optional
+
+
+      @dataclass
+      class ModelLineage:
+          model_name: str
+          version: str
+          dataset_version: str          # Section 12.04 DVC tag
+          feature_schema_version: str   # Section 12.11 FEATURE_SCHEMA_VERSION
+          training_commit: str          # Git commit
+          experiment_run_id: str        # MLflow run
+          calibration_params: Dict[str, float] = field(default_factory=dict)
+          model_card_path: Optional[str] = None
+          decision_log_ref: Optional[str] = None
+
+
+      class ModelLineageTracker:
+          '''
+          Records and retrieves model lineage for audit and reproduction.
+
+          Given a model version -> retrieve all artefacts that produced it.
+          Given a decision (logged with model version) -> identify the model
+          and its full training context.
+          '''
+
+          def __init__(self, lineage_path: str = 'model_lineage.json') -> None:
+              self.lineage_path = Path(lineage_path)
+              self._lineage: Dict[str, ModelLineage] = self._load()
+
+          def _key(self, model_name: str, version: str) -> str:
+              return f'{model_name}:{version}'
+
+          def _load(self) -> Dict[str, ModelLineage]:
+              if not self.lineage_path.exists():
+                  return {}
+              data = json.loads(self.lineage_path.read_text())
+              return {k: ModelLineage(**v) for k, v in data.items()}
+
+          def _save(self) -> None:
+              data = {k: asdict(v) for k, v in self._lineage.items()}
+              self.lineage_path.write_text(json.dumps(data, indent=2))
+
+          def record(self, lineage: ModelLineage) -> None:
+              self._lineage[self._key(lineage.model_name, lineage.version)] = lineage
+              self._save()
+              print(f'Recorded lineage for {lineage.model_name} v{lineage.version}')
+
+          def get(self, model_name: str, version: str) -> Optional[ModelLineage]:
+              return self._lineage.get(self._key(model_name, version))
+
+          def reproduce_instructions(self, model_name: str, version: str) -> List[str]:
+              '''Return the steps to reproduce a model from its lineage.'''
+              lin = self.get(model_name, version)
+              if lin is None:
+                  return [f'No lineage found for {model_name} v{version}']
+              return [
+                  f'1. git checkout {lin.training_commit}',
+                  f'2. dvc checkout {lin.dataset_version}  # restore the training dataset',
+                  f'3. verify FEATURE_SCHEMA_VERSION == {lin.feature_schema_version}',
+                  f'4. re-run training; compare against MLflow run {lin.experiment_run_id}',
+                  f'5. apply calibration params: {lin.calibration_params}',
+              ]
+
+          def audit_decision(self, model_name: str, version: str) -> Dict:
+              '''Given a decision logged with a model version, return the audit context.'''
+              lin = self.get(model_name, version)
+              if lin is None:
+                  return {'error': f'No lineage for {model_name} v{version}'}
+              return {
+                  'model': f'{model_name} v{version}',
+                  'trained_on_dataset': lin.dataset_version,
+                  'feature_schema': lin.feature_schema_version,
+                  'training_commit': lin.training_commit,
+                  'model_card': lin.model_card_path,
+                  'evaluation_run': lin.experiment_run_id,
+              }
+
+
+      if __name__ == '__main__':
+          tracker = ModelLineageTracker(lineage_path='/tmp/model_lineage.json')
+
+          lineage = ModelLineage(
+              model_name='distilbert_injection',
+              version='1.2.0',
+              dataset_version='dataset-v3.1',
+              feature_schema_version='1.0.0',
+              training_commit='a3f8b21',
+              experiment_run_id='run_042',
+              calibration_params={'platt_slope': 1.8, 'platt_intercept': -0.5},
+              model_card_path='/tmp/card_distilbert_v1.2.json',
+          )
+          tracker.record(lineage)
+
+          print('\nReproduction instructions:')
+          for step in tracker.reproduce_instructions('distilbert_injection', '1.2.0'):
+              print(f'  {step}')
+
+          print('\nAudit context for a decision:')
+          audit = tracker.audit_decision('distilbert_injection', '1.2.0')
+          for k, v in audit.items():
+              print(f'  {k}: {v}')
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Deploying models by copying files to production servers without a registry, making rollback a manual recovery rather than a single operation'
+    why_it_happens: |
+      The first model deployment is done by copying the model file to the server and restarting
+      the gateway. It works. The registry is seen as infrastructure overhead that can be added
+      later, once the detection system is proven. The file-copy deployment becomes the standard
+      process.
+    consequence: |
+      When a retrained model regresses in production, the rollback requires finding the previous
+      model file, verifying it matches the previous calibration and schema, and copying it back.
+      If the previous file was overwritten or the previous configuration was not preserved, the
+      rollback fails, and the incident extends while the engineer reconstructs the previous state
+      under the pressure of a live false-positive flood.
+    correct_approach: |
+      Build the model registry before the first production deployment, not after the first
+      incident. The model_registry.py makes every deployment a governed transition and every
+      rollback a single operation that restores the previous version with its full configuration.
+      The registry is the control plane; deploying without it is deploying without a safety net.
+
+  mistake_2:
+    description: 'Allowing manual promotion that bypasses the stage transition gates, letting an uncalibrated or slow model reach production'
+    why_it_happens: |
+      The stage gates are implemented but promotion can also be done manually for expediency.
+      Under deadline pressure, an engineer promotes a model directly, skipping the gate checks
+      because the model "obviously works" based on the offline evaluation. The manual path
+      exists as an escape hatch and gets used.
+    consequence: |
+      The manually promoted model has an ECE of 0.09 (it was never calibration-checked) and a
+      P99 of 14ms (it was never latency-checked). In production, its uncalibrated scores corrupt
+      the ensemble combination, and its latency breaches the budget slice. Both failures would
+      have been caught by the gates that the manual promotion bypassed.
+    correct_approach: |
+      Remove the manual promotion path. The only way to reach Production is through the
+      stage_transition_gates.py, which runs all four checks automatically and rejects the
+      promotion if any fails. The gate is an enforced precondition, not a recommendation. There
+      is no expedient manual override, because the manual override is exactly where the checks
+      get skipped.
+
+  mistake_3:
+    description: 'Promoting a candidate straight to full production based on offline evaluation, skipping shadow mode and canary'
+    why_it_happens: |
+      The candidate passed the stage gates with better offline metrics than the Production model.
+      The engineer promotes it to 100% production immediately, reasoning that the offline
+      evaluation already validated it and the graduated rollout is unnecessary delay.
+    consequence: |
+      The candidate regressed on a class of production traffic that was underrepresented in the
+      offline test set. At 100% production, the regression affects all traffic immediately,
+      producing a false-positive flood that requires an emergency rollback. Shadow mode or canary
+      would have revealed the regression on a fraction of traffic before it affected everything.
+    correct_approach: |
+      Use the graduated validation: offline gates, then shadow mode (100% traffic, logged only),
+      then canary (5% traffic, decisions acted on), then full promotion. Each stage catches
+      regressions at the earliest point with the least production impact. The shadow_mode_runner.py
+      and canary_promoter.py implement the graduated rollout; skipping them trades a small delay
+      for the risk of a full-traffic regression.
+
+  mistake_4:
+    description: 'Not recording model lineage, making it impossible to identify which model made a challenged decision or to reproduce a model for investigation'
+    why_it_happens: |
+      The registry tracks model versions but not the full lineage -- the dataset version, schema
+      version, training commit, and evaluation run are not recorded with each model. Recording
+      the lineage is extra work that does not seem necessary when the model is deployed and working.
+    consequence: |
+      A regulatory inquiry challenges an automated block decision. The team must identify which
+      model version made the decision, what it was trained on, and what its known limitations were.
+      Without the lineage, they cannot answer: the model version that made the decision is known,
+      but its training dataset, evaluation, and limitations are not recorded. The audit cannot be
+      satisfied, and the model cannot be reproduced for investigation.
+    correct_approach: |
+      Record the full lineage with every model version using the model_lineage_tracker.py: dataset
+      version, feature schema version, training commit, evaluation run, calibration parameters, and
+      model card. The lineage satisfies the audit requirement (identify the model and its context
+      for any decision) and enables reproduction (check out the commit, restore the dataset, re-run
+      the training).
+
+  mistake_5:
+    description: 'Treating the canary as a deployment formality with no automated rollback, so a degrading canary continues serving until manually noticed'
+    why_it_happens: |
+      The canary is set up to route 5% of traffic to the candidate, but the rollback is manual:
+      an engineer monitors the canary metrics and decides whether to roll back. The canary runs
+      over a weekend when no one is monitoring.
+    consequence: |
+      The canary candidate degrades on Saturday. With no automated rollback, it continues serving
+      the 5% canary traffic with a tripled false positive rate for the entire weekend until an
+      engineer notices on Monday. The 5% of traffic affected for two days is a smaller incident
+      than a full-production regression, but it is still an incident that the automated rollback
+      would have prevented within minutes.
+    correct_approach: |
+      Implement automated rollback in the canary. The canary_promoter.py monitors the canary
+      metrics continuously and rolls back automatically when the FPR exceeds the degradation ratio
+      or the recall drops below the threshold. The automated rollback fires within the monitoring
+      window regardless of whether a human is watching, capping the canary incident at the
+      detection window rather than the time-to-human-notice.
+
+section_summary:
+
+  compact: |
+    The model registry is the control plane that makes every detector update safe and reversible.
+    Without it, redeployment after attack-distribution shift is a manual, unrepeatable process
+    where regressions reach production undetected and rollbacks fail because the previous state was
+    not preserved. The registry tracks model versions through Staging, Production, and Archived
+    stages. The stage transition gate from Staging to Production enforces four automated checks --
+    accuracy regression, latency, calibration, and model card completeness -- and rejects any
+    candidate that fails, with no manual override that could skip them. Shadow mode runs the
+    candidate on 100% of traffic with decisions logged only, validating it on the production
+    distribution without risk; canary promotion then routes 5% of traffic to the candidate with
+    decisions acted on and automated rollback on degradation. Model lineage connects each version
+    to its dataset version, feature schema, training commit, and evaluation run, satisfying the
+    audit requirement and enabling reproduction. The registry is built once and makes every
+    subsequent model update a governed operation rather than a manual incident.
+
+  key_takeaways:
+    - 'Model versioning is non-negotiable: without a registry, rolling back a regressed detector is a manual recovery under pressure, and the rollback fails if the previous state was not preserved'
+    - 'The stage transition gate enforces four automated checks -- accuracy regression, latency, calibration, model card -- with no manual override, because the manual override is exactly where checks get skipped under deadline pressure'
+    - 'Validate candidates on live traffic before full promotion: offline gates, then shadow mode (logged only), then canary (5% acted on), then full -- each catches regressions at the earliest point with the least impact'
+    - 'Shadow mode reveals production-distribution regressions that offline evaluation misses, with zero production risk because the shadow decisions are logged but not acted on'
+    - 'Model lineage is an audit requirement: for any challenged decision, the registry must identify the exact model version, its training data, and its known limitations, and enable reproduction'
+    - 'Automate the canary rollback: a manual rollback fails when no one is monitoring, so the canary_promoter rolls back automatically on metric degradation, capping the incident at the detection window'
+
+preview_section_12_14:
+  title: 'Section 12.14: Live Dataset Curation and Active Learning -- Closing the Retraining Loop'
+  summary: |
+    Section 12.14 closes the loop that began with the anomaly-to-label pipeline in Section 12.03.
+    The detection system has been running, the threshold monitor has detected drift, and the model
+    registry can deploy a retrained model safely -- but what data is the retrained model trained on?
+    Section 12.14 builds the live dataset curation that continuously grows the labelled dataset from
+    production traffic. Active learning with uncertainty sampling prioritises the requests near the
+    decision boundary -- the ones where analyst labels add the most information -- rather than
+    labelling random samples. The retraining trigger connects the threshold drift monitor (Section
+    12.10), the feature drift monitor (Section 12.02), and a scheduled cadence into a single decision
+    about when to retrain. The full cycle -- detect drift, curate new labels with active learning,
+    retrain, validate through the registry gates, shadow, canary, promote -- is the self-improving
+    flywheel that keeps the detection system effective as the attack distribution evolves.
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 11 Section 11.02: detection-as-code -- the versioning and review discipline applied to models'
+    - 'Section 12.04: dataset curation -- the dataset version tag stored in the model lineage'
+    - 'Section 12.08: neural classifier -- the model card that is a Staging entry gate'
+    - 'Section 12.10: calibration -- the calibration and threshold that are stage transition gates'
+    - 'Section 12.11: production feature pipeline -- the feature schema version in the model lineage'
+    - 'Section 12.12: inference optimisation -- the latency validation that is a Production gate'
+  forward_references:
+    - 'Section 12.14: live dataset curation -- the retraining cycle uses the registry to deploy retrained models'
+    - 'Section 12.15: four-detector ensemble -- the registry manages all four detector versions'
+    - 'Section 12.16: benchmarking -- model versions compared via the registry experiment tracking'
+    - 'Section 12.17: production gateway capstone -- the registry governs the deployed detector configuration'
+  tags:
+    - model-registry
+    - model-versioning
+    - mlflow
+    - stage-transition-gates
+    - shadow-mode
+    - canary-promotion
+    - automated-rollback
+    - model-lineage
+    - audit-requirement
+    - staging-production-archived
+    - deployment-governance
+    - reproducibility
+    - detection-as-code

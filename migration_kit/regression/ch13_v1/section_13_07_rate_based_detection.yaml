@@ -1,0 +1,781 @@
+# section_13_07_rate_based_detection.yaml
+
+---
+document_info:
+  title: 'Rate-Based Detection: Abuse Patterns Invisible Per Request'
+  chapter: 13
+  section: 7
+  section_code: '1307'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-21'
+  estimated_pages: 6
+  estimated_reading_time: '45-55 minutes'
+
+section_overview:
+  one_line_summary: 'Exfiltration and enumeration campaigns have no per-request signal -- every query is benign and the entire signal is in the aggregate rate and pattern over time; Section 13.07 builds the rate, periodicity, coverage, and distributed-abuse detectors that see this class, and produces the signal the adaptive rate limiter of 13.08 acts on.'
+  why_this_section_exists: |
+    Section 13.07 opens the entity family with the attack class that most cleanly demonstrates why
+    behavioural detection exists: abuse that has no per-request signal at all. The Chapter 12
+    classifiers score each request, and for an exfiltration campaign there is nothing to score -- every
+    individual query is a reasonable, well-formed, benign request. The attacker reconstructing a
+    proprietary dataset issues ten thousand queries that each look exactly like legitimate use, because
+    each one is legitimate use in isolation. The attack exists only in the aggregate: the volume, the
+    rate, the periodicity, and the systematic coverage of an input space. No per-request detector can
+    see it, because the signal is not in any request.
+
+    This is the purest case of the taxonomy's central claim. Section 13.01 argued that some attacks
+    live entirely in the relationship between requests; rate-based abuse is the canonical example. The
+    entity issuing the queries is behaving abnormally only when its requests are considered together,
+    over time, as a pattern. Detecting it requires aggregating the per-request event stream by entity
+    and measuring properties of the aggregate -- rate, acceleration, periodicity, coverage -- that have
+    no meaning for a single request.
+
+    The section also handles the adversary's counter-move. Once per-account rate limits exist, the
+    sophisticated attacker distributes the campaign across many accounts, each staying under the
+    per-account limit, so the aggregate attack is reassembled from individually compliant accounts.
+    Detecting distributed abuse requires aggregating not just per account but per credential and per
+    source, looking for the campaign that is invisible at every individual account and visible only when
+    the accounts are considered together -- which begins to point toward the graph family of 13.11.
+  position_in_chapter: |
+    Section 13.07 is the first of the entity-family sections, following the temporal and output-
+    monitoring work and preceding the adaptive rate limiter of 13.08 that enforces against the signal it
+    produces. It consumes the per-request event stream and the per-entity baselines of 13.03, feeds the
+    rate features into the user profile of 13.10, and surfaces the cross-account patterns that the graph
+    detector of 13.11 develops. The relationship to 13.08 is the section's organising handoff: rate-based
+    detection produces the signal, smart rate limiting acts on it -- detection sets the adaptive
+    threshold, enforcement applies it.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain why exfiltration and enumeration attacks have no per-request signal and live entirely in the aggregate'
+    - 'Describe the aggregate rate features: request volume, periodicity, and acceleration over a time window'
+    - 'Explain coverage-pattern detection and how systematic input-space sweeping differs from normal use'
+    - 'Distinguish burst abuse from sustained abuse and the different detectors each requires'
+    - 'Explain distributed rate abuse and why detection must aggregate per credential and per source as well as per account'
+    - 'Describe periodicity detection and why a regular request interval is an automation signature'
+    - 'Explain the handoff from rate-based detection to smart rate limiting: detection sets the adaptive threshold'
+
+  skills:
+    - 'Aggregate the per-request event stream by entity and compute rate, acceleration, and periodicity features'
+    - 'Detect coverage patterns that indicate systematic enumeration of an input space'
+    - 'Detect distributed abuse by aggregating a campaign across accounts, credentials, and sources'
+    - 'Analyse request-interval regularity to detect the automation signature'
+    - 'Produce the rate-based signal that feeds the adaptive rate limiter and the user profile'
+
+  security_mindset:
+    - 'Internalise that an attack of ten thousand individually benign queries has no per-request signal and is invisible to per-request detection by construction'
+    - 'Recognise that periodicity is a high-signal automation feature because perfectly regular intervals are a script signature humans do not produce'
+    - 'Understand that per-account rate limits push the sophisticated adversary to distribute the campaign, so detection must aggregate above the account'
+    - 'Treat rate-based detection and rate limiting as a detection-enforcement pair: detection finds the pattern and sets the threshold, enforcement applies it'
+
+prerequisites:
+  - 'Chapter 9 Section 9.11: query monitor and API rate limiting -- the API-abuse monitoring this section extends to behavioural patterns'
+  - 'Chapter 13 Section 13.01: behavioural detection taxonomy -- the entity family this section opens'
+  - 'Chapter 13 Section 13.03: statistical baselines -- the per-entity rate baseline this section thresholds against'
+  - 'Chapter 13 Section 13.04: time-series anomaly detection -- the temporal rate signal this section uses'
+  - 'Chapter 13 Section 13.06: model behaviour monitoring -- the prior entity-relevant output signal'
+
+prose_content:
+
+  part_1:
+    title: 'Abuse With No Per-Request Signal'
+    body: |
+      The defining property of rate-based abuse is that there is nothing to detect in any single
+      request. Consider an attacker reconstructing a proprietary embedding model's behaviour by querying
+      it systematically, or extracting a private knowledge base one reasonable question at a time, or
+      enumerating which inputs a content filter blocks. Each individual query is well-formed, on-topic,
+      and indistinguishable from legitimate use, because in isolation it is legitimate use. The Chapter
+      12 injection classifier finds no injection; the jailbreak classifier finds no jailbreak; the
+      anomaly detector finds nothing anomalous about a single ordinary query. Every per-request detector
+      passes every query, correctly, because no query is individually an attack.
+
+      The attack is the aggregate. Ten thousand such queries from one entity over a day, systematically
+      covering an input space, constitute an exfiltration campaign even though no single query does. The
+      signal is in properties that only exist at the aggregate level: the total volume, the rate of
+      requests, how that rate accelerates, how regular the intervals are, and how the queries cover the
+      space of possible inputs. These are not features of a request; they are features of a sequence of
+      requests attributed to an entity. To compute them, the per-request event stream must be aggregated
+      by entity over a time window, and the aggregate must be measured.
+
+      This is why rate-based detection belongs to the entity family. The unit of detection is the entity
+      over time, not the request and not even the session. The session family of 13.02 caught the
+      multi-turn attack within a conversation; rate-based detection catches the campaign across all of an
+      entity's activity, which may span thousands of sessions. The shift from request to session to
+      entity is a shift in the aggregation unit, and rate-based abuse is the attack that becomes visible
+      precisely at the entity-over-time level and nowhere below it.
+
+  part_2:
+    title: 'Rate, Acceleration, and the Burst-Versus-Sustained Distinction'
+    body: |
+      The most basic aggregate feature is the request rate: requests per unit time from an entity,
+      scored against that entity's rate baseline from 13.03. A rate far above the entity's baseline is
+      the first-order signal. But rate alone is incomplete, because the two main rate-abuse signatures
+      differ in their temporal shape, and a detector tuned for one misses the other -- the same
+      burst-versus-ramp distinction from 13.04, now applied to the entity's request volume.
+
+      Burst abuse is a sudden high-rate flood: a rapid enumeration that fires thousands of requests in
+      minutes. Its signature is high rate and high acceleration -- the rate not only exceeds baseline but
+      climbs steeply. Acceleration, the rate of change of the rate, is the distinguishing feature: a
+      legitimate increase in usage tends to ramp gently, while a burst attack's rate jumps. Monitoring
+      acceleration alongside rate catches the burst at its onset, before the full volume has accumulated.
+
+      Sustained abuse is the opposite: a moderate rate held steadily for a long time, the patient
+      exfiltration that never spikes but never stops. Its rate may sit only modestly above baseline --
+      low enough to avoid a rate threshold tuned for bursts -- but sustained for hours or days, it
+      accumulates an enormous total volume. The signature here is not the instantaneous rate but the
+      duration at an elevated rate and the cumulative volume over a long window. A detector that only
+      thresholds instantaneous rate misses sustained abuse because no single moment looks extreme; a
+      detector that also tracks cumulative volume over a long window and time-at-elevated-rate catches it.
+      The rate-based detector therefore monitors rate, acceleration, and cumulative volume together,
+      covering both the burst that spikes and the sustained campaign that grinds.
+
+  part_3:
+    title: 'Coverage Patterns: Sweeping an Input Space'
+    body: |
+      Volume and rate measure how much an entity queries; coverage measures what it queries, and
+      coverage reveals a signature that rate alone cannot: systematic enumeration. An attacker mapping a
+      system's behaviour does not query randomly. They sweep an input space methodically -- iterating
+      through a range of inputs, probing each region, covering the space to reconstruct the system's
+      responses across it. This systematic coverage is structurally different from legitimate use, which
+      clusters around the entity's actual needs and revisits a narrow region repeatedly rather than
+      sweeping broadly and uniformly.
+
+      Coverage-pattern detection measures how an entity's queries are distributed across the input space.
+      A legitimate user's queries cluster: they return to the same topics, the same endpoints, the same
+      regions of input space, because they have a bounded set of real needs. An enumerating attacker's
+      queries spread: they cover the space broadly and often uniformly, touching many regions once rather
+      than a few regions repeatedly, because their goal is coverage rather than use. The breadth and
+      uniformity of coverage is the signal. An entity whose queries suddenly fan out to cover a wide,
+      uniformly-sampled region of input space is exhibiting an enumeration signature, regardless of
+      whether its raw rate is extreme.
+
+      Coverage detection complements rate detection because the two catch different exfiltration styles.
+      A high-rate broad sweep trips both; but a low-and-slow enumeration that keeps its rate modest to
+      evade rate thresholds still trips coverage detection, because however slowly it proceeds, its
+      queries still fan out systematically across the space. Coverage is the feature that catches the
+      patient enumerator who has solved the rate problem by going slow -- the systematic breadth gives
+      them away even when the volume does not. The coverage signal feeds the same entity rate score and
+      the user profile, adding the what-they-query dimension to the how-much-they-query dimension.
+
+  part_4:
+    title: 'Periodicity: The Automation Signature'
+    body: |
+      A distinct and high-value aggregate feature is periodicity: the regularity of the intervals between
+      an entity's requests. Human use is irregular. People pause to read, to think, to do something else,
+      and the intervals between their requests vary widely and unpredictably. Automated use is regular. A
+      script issues requests on a timer or in a tight loop, and the intervals between its requests are
+      strikingly consistent -- the same gap, repeated, because a machine does not pause to think. This
+      regularity is a signature of automation that is hard for an attacker to disguise without
+      sacrificing the throughput that automation provides.
+
+      Periodicity detection measures the consistency of an entity's inter-request intervals. A low
+      variance in the intervals -- requests arriving like clockwork at a near-constant spacing -- is the
+      automation signature. The measure is the coefficient of variation of the intervals or a
+      spectral/autocorrelation analysis that detects a dominant period: a strong peak at a particular
+      interval means the entity is firing on that period, which humans do not do. The periodicity signal
+      is valuable because it separates automated abuse from heavy-but-human use: a power user who
+      legitimately makes many requests does so irregularly, with the natural variation of human activity,
+      while an exfiltration script makes its requests on a regular cadence. Two entities with the same
+      high request rate can be distinguished by periodicity -- the regular one is automated, the irregular
+      one is plausibly a busy human.
+
+      Periodicity has a subtlety: a sophisticated attacker can add jitter, randomising the intervals to
+      mimic human irregularity. This raises the attacker's cost -- jitter reduces throughput and
+      complicates the automation -- but it can defeat a naive periodicity detector that looks only for
+      near-constant intervals. The robust response is to look for structure beyond simple regularity:
+      even jittered automation often retains a detectable periodic component, a burst-and-pause rhythm, or
+      a coverage pattern that betrays the underlying script. Periodicity is one signal among several, and
+      it is strongest in combination with the rate, acceleration, and coverage features rather than relied
+      on alone, since each can be individually evaded but evading all of them simultaneously is expensive.
+
+  part_5:
+    title: 'Distributed Abuse: The Campaign Across Many Accounts'
+    body: |
+      Per-account rate detection invites an obvious counter-move, and the sophisticated adversary takes
+      it: distribute the campaign across many accounts so that each account stays under the per-account
+      threshold and the aggregate attack is reassembled from individually compliant accounts. If the
+      per-account limit is a thousand requests an hour, the attacker uses fifty accounts at nine hundred
+      requests an hour each, and every account is individually within bounds while the campaign runs at
+      forty-five thousand requests an hour. Per-account detection sees fifty compliant accounts and
+      nothing wrong.
+
+      Detecting distributed abuse requires aggregating above the account. The campaign that is invisible
+      per account becomes visible when the accounts are considered together, and the key is to find the
+      shared attribute that links them. Distributed campaigns typically share something: a source IP or
+      IP range, a credential or API key family, a creation-time cohort, a behavioural fingerprint, or a
+      coverage pattern that, combined across accounts, sweeps the input space the way a single enumerator
+      would. Aggregating the rate signal per source, per credential, and per behavioural cluster -- not
+      only per account -- surfaces the campaign whose total rate is anomalous even though no member
+      account's rate is.
+
+      This is where the entity family begins to point toward the graph family. Distributed-abuse
+      detection by shared attribute is a coarse, attribute-keyed version of the relationship analysis that
+      13.11 develops fully: linking accounts by shared infrastructure and synchronised behaviour to find
+      the coordinated network. Rate-based detection handles the cases where a single shared attribute --
+      a common source, a common credential family -- reassembles the campaign, and hands the harder cases,
+      where the linkage is structural rather than a single shared field, to the graph detector. The rate-
+      based view of distributed abuse is the aggregate rate across a linking attribute; the graph view is
+      the full relationship structure. Together they cover the distributed campaign from the simple shared-
+      source case to the sophisticated structurally-coordinated one.
+
+  part_6:
+    title: 'The Handoff to Smart Rate Limiting'
+    body: |
+      Rate-based detection produces a signal; it does not, by itself, act on it. The action -- throttling,
+      challenging, or blocking the abusive entity -- is the job of the smart rate limiter in 13.08, and the
+      relationship between the two sections is the organising handoff of this part. Detection sets the
+      adaptive threshold; enforcement applies it.
+
+      The handoff matters because the alternative -- a static rate limit applied without detection -- fails
+      in the ways the next section opens with. A static limit set globally is simultaneously too loose for
+      the low-and-slow campaign that stays under it and too tight for the legitimate power user that
+      exceeds it. The detection built in this section is what makes the limit adaptive: the per-entity rate
+      baseline defines what is normal for each entity, the rate, acceleration, coverage, and periodicity
+      signals identify which entities are abusing, and these together set a per-entity adaptive threshold
+      that the limiter enforces. An entity whose rate, periodicity, and coverage all indicate automated
+      enumeration gets a tight limit; a legitimate power user with an irregular, clustered, human pattern
+      keeps a loose one, even at the same raw rate.
+
+      The detection signal also flows beyond the limiter. It feeds the user profile of 13.10, where a
+      history of rate-abuse signals contributes to the entity's persistent risk score, so that an entity
+      with a record of enumeration is scored more suspiciously on future activity. And the distributed-
+      abuse linkage feeds the graph detector of 13.11. Rate-based detection is thus both the producer of an
+      enforcement threshold for the next section and a contributor to the entity and graph families that
+      follow. Its output is a per-entity rate-abuse signal -- composed from rate, acceleration, coverage,
+      and periodicity, aggregated per account and per linking attribute -- that is the input to enforcement,
+      profiling, and graph analysis alike.
+
+reference_materials:
+
+  table_1:
+    title: 'Why Rate-Based Abuse Is Invisible Per Request'
+    description: 'The rate-abuse attack classes and why no per-request detector can see them'
+    columns: ['Attack', 'Each Request Looks Like', 'Aggregate Signal', 'Per-Request Detector Sees']
+    rows:
+      - ['Data exfiltration', 'A reasonable benign query', 'Volume + coverage over time', 'Nothing -- each query is legitimate']
+      - ['Model enumeration', 'An ordinary on-topic request', 'Systematic input-space sweep', 'Nothing -- no query is anomalous']
+      - ['Filter mapping', 'A normal request near a boundary', 'Methodical probing of the boundary', 'Nothing -- individual probes pass']
+      - ['Credential stuffing of prompts', 'A single varied request', 'High rate + regular periodicity', 'Nothing -- one request is benign']
+
+  table_2:
+    title: 'Aggregate Rate Features and What Each Detects'
+    description: 'The aggregate features computed per entity over a window and the abuse signature each carries'
+    columns: ['Feature', 'Measures', 'Detects', 'Evaded By']
+    rows:
+      - ['Request rate', 'Requests per unit time vs baseline', 'High-volume abuse', 'Going low-and-slow']
+      - ['Acceleration', 'Rate of change of the rate', 'Burst onset', 'Ramping gently']
+      - ['Cumulative volume', 'Total over a long window', 'Sustained slow exfiltration', 'Very long, very slow campaigns']
+      - ['Coverage breadth', 'Spread across the input space', 'Systematic enumeration', 'Narrowing the sweep']
+      - ['Periodicity', 'Regularity of inter-request intervals', 'Automation signature', 'Adding interval jitter']
+
+  table_3:
+    title: 'Burst vs Sustained Rate Abuse'
+    description: 'The two rate-abuse signatures and the features that catch each'
+    columns: ['Property', 'Burst Abuse', 'Sustained Abuse']
+    rows:
+      - ['Rate', 'Very high', 'Modestly above baseline']
+      - ['Acceleration', 'High (rate jumps)', 'Low (rate steady)']
+      - ['Duration', 'Short (minutes)', 'Long (hours-days)']
+      - ['Cumulative volume', 'High quickly', 'High eventually']
+      - ['Caught by', 'Rate + acceleration', 'Cumulative volume + time-at-elevated-rate']
+
+  table_4:
+    title: 'Distributed Abuse Linking Attributes'
+    description: 'The shared attributes that reassemble a distributed campaign and where each is handled'
+    columns: ['Linking Attribute', 'Shared Across Accounts', 'Reassembles Campaign By', 'Handled In']
+    rows:
+      - ['Source IP / range', 'Common origin', 'Aggregating rate per source', 'This section (13.07)']
+      - ['Credential / key family', 'Common API key cohort', 'Aggregating rate per credential', 'This section (13.07)']
+      - ['Creation-time cohort', 'Accounts created together', 'Cohort rate aggregation', 'This section + graph (13.11)']
+      - ['Behavioural fingerprint', 'Similar usage pattern', 'Clustering by behaviour', 'Profiling (13.10) + graph (13.11)']
+      - ['Structural coordination', 'Synchronised timing, shared graph edges', 'Full relationship analysis', 'Graph detector (13.11)']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Rate-Based Detector'
+    filename: 'rate_based_detector.py'
+    description: 'Aggregates the per-request event stream by entity over sliding windows and computes rate, acceleration, and cumulative volume, scoring against the per-entity baseline to detect both burst and sustained abuse. Implements the rate and acceleration detection from Section 13.07 Parts 1 and 2.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # rate_based_detector.py
+      # Section 13.07: Rate-Based Detector (Rate, Acceleration, Volume)
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from collections import deque
+      from dataclasses import dataclass, field
+      from typing import Deque, Dict, List, Tuple
+
+
+      @dataclass
+      class RateWindow:
+          window_s: float
+          timestamps: Deque[float] = field(default_factory=deque)
+
+          def add(self, ts: float) -> None:
+              self.timestamps.append(ts)
+              self._evict(ts)
+
+          def _evict(self, now: float) -> None:
+              while self.timestamps and now - self.timestamps[0] > self.window_s:
+                  self.timestamps.popleft()
+
+          def rate(self, now: float) -> float:
+              self._evict(now)
+              return len(self.timestamps) / (self.window_s / 60.0)  # per minute
+
+
+      @dataclass
+      class EntityRateState:
+          short: RateWindow
+          long: RateWindow
+          prev_rate: float = 0.0
+          cumulative: int = 0
+
+
+      @dataclass
+      class RateVerdict:
+          rate_per_min: float
+          acceleration: float
+          cumulative: int
+          burst: bool
+          sustained: bool
+
+
+      class RateBasedDetector:
+          def __init__(self, baseline_rate_per_min: float, short_s: float = 60, long_s: float = 3600) -> None:
+              self.baseline = baseline_rate_per_min
+              self.short_s = short_s
+              self.long_s = long_s
+              self.states: Dict[str, EntityRateState] = {}
+
+          def _state(self, entity: str) -> EntityRateState:
+              if entity not in self.states:
+                  self.states[entity] = EntityRateState(RateWindow(self.short_s), RateWindow(self.long_s))
+              return self.states[entity]
+
+          def observe(self, entity: str, ts: float) -> RateVerdict:
+              st = self._state(entity)
+              st.short.add(ts)
+              st.long.add(ts)
+              st.cumulative += 1
+
+              rate = st.short.rate(ts)
+              accel = rate - st.prev_rate
+              st.prev_rate = rate
+
+              long_rate = st.long.rate(ts)
+              burst = rate > 5 * self.baseline and accel > 2 * self.baseline
+              # sustained: long-window rate elevated and large cumulative volume
+              sustained = long_rate > 1.5 * self.baseline and st.cumulative > 500
+
+              return RateVerdict(round(rate, 2), round(accel, 2), st.cumulative, burst, sustained)
+
+
+      if __name__ == '__main__':
+          det = RateBasedDetector(baseline_rate_per_min=2.0)
+          base = 1_000_000.0
+
+          # Burst: 100 requests in 30 seconds
+          last = None
+          for i in range(100):
+              last = det.observe('user_burst', base + i * 0.3)
+          print('Burst entity:', last)
+
+          # Sustained: steady modest rate over a long period, high volume
+          det2 = RateBasedDetector(baseline_rate_per_min=2.0)
+          last2 = None
+          for i in range(600):
+              last2 = det2.observe('user_sustained', base + i * 6.0)  # ~10/min for an hour
+          print('Sustained entity:', last2)
+          print('Burst trips on rate+acceleration; sustained trips on long-window rate+volume.')
+
+  deliverable_2:
+    title: 'Coverage Pattern Detector'
+    filename: 'coverage_pattern_detector.py'
+    description: 'Detects systematic input-space enumeration by measuring the breadth and uniformity of an entity coverage across input-space buckets, distinguishing a methodical sweep from the clustered pattern of legitimate use. Implements the coverage-pattern detection from Section 13.07 Part 3.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only; input-space position is abstracted as a bucket id supplied per request'
+    code: |
+      # coverage_pattern_detector.py
+      # Section 13.07: Coverage Pattern Detector (Enumeration Sweep)
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import math
+      from collections import Counter
+      from dataclasses import dataclass, field
+      from typing import Dict, List
+
+
+      @dataclass
+      class CoverageState:
+          bucket_counts: Counter = field(default_factory=Counter)
+          total: int = 0
+
+          def add(self, bucket_id: int) -> None:
+              self.bucket_counts[bucket_id] += 1
+              self.total += 1
+
+
+      @dataclass
+      class CoverageVerdict:
+          distinct_buckets: int
+          breadth: float        # fraction of space covered
+          uniformity: float     # normalised entropy of the coverage
+          enumeration_suspected: bool
+
+
+      class CoveragePatternDetector:
+          def __init__(self, space_size: int, breadth_threshold: float = 0.5, uniformity_threshold: float = 0.85) -> None:
+              self.space_size = space_size
+              self.breadth_threshold = breadth_threshold
+              self.uniformity_threshold = uniformity_threshold
+              self.states: Dict[str, CoverageState] = {}
+
+          def observe(self, entity: str, bucket_id: int) -> CoverageVerdict:
+              st = self.states.setdefault(entity, CoverageState())
+              st.add(bucket_id)
+
+              distinct = len(st.bucket_counts)
+              breadth = distinct / self.space_size
+              # normalised entropy: 1.0 = perfectly uniform coverage (sweep signature)
+              if distinct > 1:
+                  probs = [c / st.total for c in st.bucket_counts.values()]
+                  entropy = -sum(p * math.log(p) for p in probs)
+                  uniformity = entropy / math.log(distinct)
+              else:
+                  uniformity = 0.0
+
+              suspected = breadth > self.breadth_threshold and uniformity > self.uniformity_threshold
+              return CoverageVerdict(distinct, round(breadth, 3), round(uniformity, 3), suspected)
+
+
+      if __name__ == '__main__':
+          # Legitimate user: returns to a few buckets repeatedly (clustered)
+          legit = CoveragePatternDetector(space_size=100)
+          import random
+          random.seed(5)
+          last_l = None
+          for _ in range(200):
+              last_l = legit.observe('user_legit', random.choice([3, 4, 5, 4, 3, 7]))
+          print('Legitimate (clustered):', last_l)
+
+          # Enumerator: sweeps the space uniformly and broadly
+          enum = CoveragePatternDetector(space_size=100)
+          last_e = None
+          for b in range(100):
+              last_e = enum.observe('user_enum', b)  # one query per bucket -- uniform sweep
+          print('Enumerator (sweep):    ', last_e)
+          print('The enumerator trips on high breadth and near-uniform coverage,')
+          print('even though its per-request rate may be modest.')
+
+  deliverable_3:
+    title: 'Periodicity Analyser'
+    filename: 'periodicity_analyser.py'
+    description: 'Analyses the regularity of an entity inter-request intervals to detect the automation signature, using the coefficient of variation and a simple dominant-period check, robust to mild jitter. Implements the periodicity detection from Section 13.07 Part 4.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # periodicity_analyser.py
+      # Section 13.07: Periodicity Analyser (Automation Signature)
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+      from typing import List
+
+
+      def _mean(values: List[float]) -> float:
+          return sum(values) / len(values) if values else 0.0
+
+
+      def _std(values: List[float]) -> float:
+          if len(values) < 2:
+              return 0.0
+          m = _mean(values)
+          return (sum((v - m) ** 2 for v in values) / (len(values) - 1)) ** 0.5
+
+
+      @dataclass
+      class PeriodicityVerdict:
+          n_intervals: int
+          mean_interval: float
+          cv: float                 # coefficient of variation
+          automation_suspected: bool
+          detail: str
+
+
+      def analyse_periodicity(timestamps: List[float], cv_threshold: float = 0.25) -> PeriodicityVerdict:
+          if len(timestamps) < 5:
+              return PeriodicityVerdict(0, 0.0, 0.0, False, 'insufficient data')
+          ts = sorted(timestamps)
+          intervals = [ts[i] - ts[i - 1] for i in range(1, len(ts))]
+          m = _mean(intervals)
+          cv = (_std(intervals) / m) if m > 0 else 0.0
+          # Low CV = clockwork regularity = automation signature
+          suspected = cv < cv_threshold
+          detail = f'mean interval {m:.2f}s, CV {cv:.3f}'
+          return PeriodicityVerdict(len(intervals), round(m, 3), round(cv, 3), suspected, detail)
+
+
+      if __name__ == '__main__':
+          import random
+          random.seed(8)
+          base = 1000.0
+
+          # Automated script: near-constant 5s interval (tiny jitter)
+          script = [base + i * 5.0 + random.uniform(-0.1, 0.1) for i in range(60)]
+          print('Automated script: ', analyse_periodicity(script))
+
+          # Human: highly irregular intervals
+          human_ts = [base]
+          for _ in range(60):
+              human_ts.append(human_ts[-1] + random.uniform(2, 90))
+          print('Human user:       ', analyse_periodicity(human_ts))
+          print('The script low CV is the automation signature; the human high CV is not.')
+
+  deliverable_4:
+    title: 'Distributed Abuse Detector'
+    filename: 'distributed_abuse_detector.py'
+    description: 'Aggregates rate across accounts by shared linking attributes (source, credential, cohort) to surface a distributed campaign whose total rate is anomalous even though no member account exceeds its per-account limit. Implements the distributed-abuse detection from Section 13.07 Part 5.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention, standard library only'
+    code: |
+      # distributed_abuse_detector.py
+      # Section 13.07: Distributed Abuse Detector (Cross-Account Aggregation)
+      # 20260621 | AI Security Mastery -- Chapter 13 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from collections import defaultdict
+      from dataclasses import dataclass, field
+      from typing import Dict, List, Set, Tuple
+
+
+      @dataclass
+      class AccountRequest:
+          account_id: str
+          source_ip: str
+          credential_family: str
+          rate_per_min: float
+
+
+      @dataclass
+      class CampaignVerdict:
+          linking_attribute: str
+          linking_value: str
+          member_accounts: int
+          aggregate_rate: float
+          per_account_max: float
+          campaign_suspected: bool
+
+
+      class DistributedAbuseDetector:
+          def __init__(self, per_account_limit: float, campaign_multiplier: float = 3.0) -> None:
+              self.per_account_limit = per_account_limit
+              self.campaign_multiplier = campaign_multiplier
+
+          def detect(self, requests: List[AccountRequest]) -> List[CampaignVerdict]:
+              verdicts = []
+              for attr_name, key in (('source_ip', lambda r: r.source_ip), ('credential_family', lambda r: r.credential_family)):
+                  groups: Dict[str, List[AccountRequest]] = defaultdict(list)
+                  for r in requests:
+                      groups[key(r)].append(r)
+                  for value, members in groups.items():
+                      accounts = {m.account_id for m in members}
+                      agg_rate = sum(m.rate_per_min for m in members)
+                      per_acct_max = max(m.rate_per_min for m in members)
+                      # Campaign: each account compliant, aggregate far over the limit
+                      suspected = (
+                          per_acct_max <= self.per_account_limit
+                          and agg_rate > self.campaign_multiplier * self.per_account_limit
+                          and len(accounts) >= 3
+                      )
+                      if suspected:
+                          verdicts.append(CampaignVerdict(
+                              attr_name, value, len(accounts),
+                              round(agg_rate, 1), round(per_acct_max, 1), True,
+                          ))
+              return verdicts
+
+
+      if __name__ == '__main__':
+          limit = 100.0
+          # 5 accounts, each at 90/min (under the 100 limit), all from one source range
+          reqs = [AccountRequest(f'acct_{i}', '203.0.113.10', 'keyfam_A', 90.0) for i in range(5)]
+          # plus some unrelated legitimate accounts
+          reqs += [AccountRequest('acct_x', '198.51.100.4', 'keyfam_B', 30.0)]
+
+          det = DistributedAbuseDetector(per_account_limit=limit)
+          for v in det.detect(reqs):
+              print(f'Campaign on {v.linking_attribute}={v.linking_value}: '
+                    f'{v.member_accounts} accounts, aggregate {v.aggregate_rate}/min, '
+                    f'per-account max {v.per_account_max}/min (limit {limit})')
+          print('Each account is under the per-account limit, but the aggregate over')
+          print('the shared source reveals the distributed campaign.')
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Relying on per-request detection for exfiltration and enumeration, which have no per-request signal'
+    why_it_happens: |
+      The Chapter 12 per-request classifiers are the primary detection investment, and they catch the
+      attacks that have a per-request signal well. It is easy to assume they cover all attacks, and an
+      exfiltration campaign of benign-looking queries does not obviously announce that it needs a
+      different detection layer.
+    consequence: |
+      Exfiltration and enumeration consist of individually benign queries -- each is well-formed,
+      on-topic, and legitimate in isolation -- so every per-request detector passes every query
+      correctly. The attack exists only in the aggregate volume, rate, and coverage, which no per-request
+      detector computes. The entire class of rate-based abuse is invisible, and the system has no idea it
+      is being systematically queried to reconstruct a model or extract a dataset.
+    correct_approach: |
+      Aggregate the per-request event stream by entity over time and detect on the aggregate features --
+      rate, acceleration, cumulative volume, coverage, periodicity -- that only exist at the entity-over-
+      time level. rate_based_detector.py and coverage_pattern_detector.py compute these aggregate signals
+      that per-request detection structurally cannot.
+
+  mistake_2:
+    description: 'Thresholding only the instantaneous rate, missing both the sustained slow campaign and the burst onset'
+    why_it_happens: |
+      Instantaneous request rate is the obvious rate feature, and a single threshold on it is simple to
+      configure. It catches the loud high-rate floods, which are the most visible rate abuse, so it feels
+      like adequate rate detection.
+    consequence: |
+      The two main rate-abuse signatures both evade an instantaneous-rate threshold. The sustained slow
+      campaign keeps its rate modestly above baseline -- below a threshold tuned for floods -- but runs for
+      hours, accumulating an enormous total volume that the instantaneous rate never reflects. And a burst
+      is caught only after its volume has accumulated, not at onset, because the threshold reacts to rate,
+      not its rate of change. The detector catches the obvious flood and misses the patient campaign and
+      the early burst.
+    correct_approach: |
+      Monitor rate, acceleration, and cumulative volume together. Acceleration catches the burst at onset
+      before the full volume accumulates; cumulative volume over a long window catches the sustained
+      campaign that never spikes. rate_based_detector.py tracks all three so both burst and sustained abuse
+      are covered.
+
+  mistake_3:
+    description: 'Treating a high request rate as proof of abuse and throttling legitimate power users'
+    why_it_happens: |
+      High rate is the most intuitive abuse signal, and an entity making far more requests than average
+      looks suspicious. Acting on rate alone is the straightforward response, and it does catch real abuse.
+    consequence: |
+      Legitimate power users -- heavy integrations, batch consumers, busy analysts -- make many requests
+      at a high rate as a matter of normal operation. Treating rate alone as abuse throttles them, breaking
+      legitimate high-volume use to defend against abuse, and floods the alert stream with false positives
+      on the system's best customers. Rate without context cannot distinguish the power user from the
+      exfiltration script.
+    correct_approach: |
+      Combine rate with the features that distinguish automated abuse from human heavy use: periodicity
+      (the script regular, the human irregular) and coverage (the enumerator broad sweep, the user clustered
+      pattern). Two entities at the same rate are distinguished by these -- the regular, broad-sweeping one
+      is abuse, the irregular, clustered one is a power user. periodicity_analyser.py and
+      coverage_pattern_detector.py provide the distinguishing context.
+
+  mistake_4:
+    description: 'Applying only per-account rate detection, leaving distributed campaigns across many accounts undetected'
+    why_it_happens: |
+      Per-account rate limiting and detection is the standard, well-understood approach, and it works
+      against the unsophisticated attacker using one account. Once per-account detection is in place, the
+      rate problem feels solved.
+    consequence: |
+      The sophisticated adversary distributes the campaign across many accounts, each staying under the
+      per-account threshold, so the aggregate attack is reassembled from individually compliant accounts.
+      Per-account detection sees a set of compliant accounts and nothing wrong, while the campaign runs at
+      many times the per-account limit in total. The per-account approach is exactly the constraint the
+      distributed attack is designed to satisfy.
+    correct_approach: |
+      Aggregate the rate signal above the account -- per source, per credential family, per cohort -- to
+      surface the campaign whose total rate is anomalous even though no member account exceeds its limit.
+      distributed_abuse_detector.py aggregates by shared linking attributes, and the harder structurally-
+      coordinated cases hand off to the graph detector of 13.11.
+
+  mistake_5:
+    description: 'Building a naive periodicity detector that looks only for near-constant intervals and is defeated by simple jitter'
+    why_it_happens: |
+      The cleanest automation signature is a perfectly regular interval, and a detector that flags
+      near-constant spacing catches the unsophisticated script. It is the most direct implementation of the
+      periodicity idea and works against naive automation.
+    consequence: |
+      A sophisticated attacker adds jitter -- randomising the intervals to mimic human irregularity -- which
+      defeats a detector that looks only for near-constant spacing. The jittered script passes the
+      periodicity check while still operating as automation, and a periodicity detector relied on alone is
+      evaded by a cheap modification.
+    correct_approach: |
+      Treat periodicity as one signal among several rather than a sole detector, and look for structure
+      beyond simple regularity -- a dominant periodic component, a burst-and-pause rhythm, or a coverage
+      pattern that persists despite jitter. Each individual signal can be evaded, but evading rate,
+      acceleration, coverage, and periodicity simultaneously is expensive, so the composite is robust where
+      any single feature is not. periodicity_analyser.py contributes to the composite rather than standing
+      alone.
+
+section_summary:
+
+  compact: |
+    Rate-based abuse is the purest case of an attack with no per-request signal: exfiltration and
+    enumeration campaigns consist of individually benign queries, and the entire signal lives in the
+    aggregate rate, acceleration, cumulative volume, coverage, and periodicity that only exist when the
+    per-request event stream is aggregated by entity over time. Section 13.07 opens the entity family by
+    building these aggregate detectors. Rate and acceleration catch the burst at onset; cumulative volume
+    over a long window catches the sustained slow campaign that never spikes. Coverage-pattern detection
+    catches systematic input-space enumeration -- the broad, uniform sweep that distinguishes an enumerator
+    from the clustered pattern of legitimate use -- and catches the patient enumerator who keeps rate modest
+    to evade rate thresholds. Periodicity detection identifies the automation signature in regular inter-
+    request intervals, distinguishing an exfiltration script from a heavy-but-human power user at the same
+    rate, though it must be combined with the other features to resist jitter. Distributed-abuse detection
+    aggregates above the account -- per source, per credential, per cohort -- to reassemble the campaign
+    spread across many individually-compliant accounts, pointing toward the graph family. The composite
+    rate-abuse signal feeds the user profile of 13.10, the graph detector of 13.11, and above all the
+    adaptive rate limiter of 13.08: detection sets the per-entity adaptive threshold, enforcement applies it.
+
+  key_takeaways:
+    - 'Exfiltration and enumeration have no per-request signal: every query is individually benign and the entire attack lives in the aggregate rate, volume, coverage, and periodicity computed per entity over time'
+    - 'Rate and acceleration catch the burst at onset while cumulative volume over a long window catches the sustained slow campaign -- thresholding instantaneous rate alone misses both the slow campaign and the early burst'
+    - 'Coverage-pattern detection catches systematic enumeration through the broad, uniform sweep that distinguishes an enumerator from the clustered pattern of legitimate use, even when rate is kept modest'
+    - 'Periodicity is the automation signature -- regular intervals are a script tell humans do not produce -- and it distinguishes an exfiltration script from a heavy-but-human power user at the same rate'
+    - 'Per-account detection invites distribution across many compliant accounts, so detection must aggregate above the account by source, credential, and cohort to reassemble the campaign, pointing toward the graph family'
+    - 'Rate-based detection and rate limiting are a detection-enforcement pair: detection composes the per-entity rate-abuse signal and sets the adaptive threshold, and the smart rate limiter of 13.08 applies it'
+
+preview_section_13_08:
+  title: 'Section 13.08: Smart Rate Limiting -- Adaptive Thresholds That Separate Power Users from Abuse'
+  summary: |
+    Section 13.08 takes the rate-abuse signal produced here and turns it into enforcement, building the
+    adaptive rate limiter that a static limit cannot match. It opens with why a static limit is
+    simultaneously too loose for low-and-slow abuse and too tight for legitimate power users, and replaces
+    it with per-entity thresholds learned from the 13.03 baseline. It builds burst tolerance through a
+    token-bucket model with per-entity refill rates, risk-weighted limiting that tightens limits for
+    entities with elevated risk profiles from 13.10, graduated response -- throttle, challenge, block -- as
+    escalating enforcement with a false-positive recovery path rather than a single hard cutoff, and
+    rate-limit composition across user, endpoint, credential, and source. It addresses the denial-of-
+    service own-goal of a limiter an adversary can trip on behalf of a legitimate user, and closes the
+    feedback loop where enforcement outcomes feed back into the entity risk profile.
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 9 Section 9.11: query monitor and API rate limiting -- the API-abuse monitoring this section extends to behavioural patterns'
+    - 'Chapter 13 Section 13.01: behavioural detection taxonomy -- the entity family this section opens'
+    - 'Chapter 13 Section 13.03: statistical baselines -- the per-entity rate baseline this section thresholds against'
+    - 'Chapter 13 Section 13.04: time-series anomaly detection -- the temporal rate signal this section uses'
+    - 'Chapter 13 Section 13.06: model behaviour monitoring -- the prior entity-relevant output signal'
+  forward_references:
+    - 'Section 13.08: smart rate limiting -- enforces against the rate-abuse signal produced here'
+    - 'Section 13.10: user behaviour profiling -- a history of rate-abuse signals feeds the persistent entity risk score'
+    - 'Section 13.11: graph-based detection -- develops the distributed-abuse linkage into full relationship analysis'
+  tags:
+    - rate-based-detection
+    - exfiltration
+    - enumeration
+    - request-rate
+    - acceleration
+    - cumulative-volume
+    - coverage-pattern
+    - input-space-sweep
+    - periodicity
+    - automation-signature
+    - distributed-abuse
+    - cross-account-aggregation
+    - owasp-llm04
+    - owasp-llm10
+    - chapter-13-entity-family

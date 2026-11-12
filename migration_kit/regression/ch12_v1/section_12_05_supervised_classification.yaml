@@ -1,0 +1,1353 @@
+# section_12_05_supervised_classification.yaml
+
+---
+document_info:
+  title: 'Supervised Classification: Random Forest and XGBoost for Labelled Attack Detection'
+  chapter: 12
+  section: 5
+  section_code: '1205'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-06'
+  estimated_pages: 7
+  estimated_reading_time: '55-65 minutes'
+
+section_overview:
+  one_line_summary: 'Random Forest and XGBoost are the workhorse classifiers of production security ML -- they train in seconds, expose analyst-readable SHAP explanations, and reach 90%+ accuracy once the Section 12.04 dataset crosses 200 labelled examples per class.'
+  why_this_section_exists: |
+    The anomaly detector in Section 12.03 has been running for four to eight weeks. The
+    annotation queue has accumulated 200+ confirmed attack examples. The Section 12.04
+    dataset builder has produced a temporally split, SMOTE-treated training set. The
+    detection system is ready for its first supervised classifier -- a model that learns
+    explicit feature boundaries between attack and benign traffic rather than flagging
+    statistical outliers.
+
+    Random Forest and XGBoost are the correct first supervised classifiers for three
+    reasons. Both train in seconds on CPU, enabling fast iteration cycles during feature
+    engineering and hyperparameter tuning. Both produce full SHAP explainability: every
+    prediction comes with a ranked list of the features that drove it, readable by any
+    security analyst in under a minute without ML expertise. Both handle the 20-feature
+    security vector from Section 12.02 without requiring normalisation or embedding
+    infrastructure. And at 200-2000 labelled examples -- the data availability window
+    that follows 4-12 weeks of anomaly alert collection -- both outperform the neural
+    classifier from Section 12.08, which requires 2000+ examples to generalise reliably.
+
+    Section 12.05 builds both classifiers, trains them on the Section 12.04 dataset,
+    evaluates them with the security_evaluator.py harness that every subsequent section
+    reuses, and establishes the SHAP explainability pipeline that the Section 12.15
+    ensemble uses for analyst-facing alert triage. The benchmark from Section 12.03
+    (anomaly detector vs supervised classifier) is completed here: after Section 12.05,
+    the detection system has a precision improvement over the anomaly detector that
+    justifies the annotation investment.
+  position_in_chapter: |
+    Section 12.05 is the first supervised training section. It establishes the evaluation
+    harness (security_evaluator.py) and explainability pipeline (shap_explainer.py) that
+    every subsequent classifier section reuses. Sections 12.06 through 12.09 each import
+    security_evaluator.py and compare their classifier against the Section 12.05 Random
+    Forest baseline.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain the Random Forest training algorithm: why decorrelated trees are constructed, how Gini impurity drives feature splits, and why ensemble averaging reduces variance'
+    - 'Explain the XGBoost training algorithm: how gradient boosting corrects residual errors sequentially and how L1/L2 regularisation prevents overfitting on small security datasets'
+    - 'Describe the scale_pos_weight parameter in XGBoost and explain how it addresses class imbalance as an alternative to SMOTE oversampling'
+    - 'Explain what SHAP values decompose and why a SHAP waterfall plot is more useful to a security analyst than a global feature importance bar chart'
+    - 'State the four evaluation metrics that matter for security classifiers and explain why accuracy is misleading on imbalanced datasets'
+    - 'Describe stratified temporal k-fold cross-validation and explain how it prevents leakage while maintaining the temporal ordering of the dataset'
+
+  skills:
+    - 'Train a Random Forest classifier on the Section 12.04 temporally split dataset and produce a SHAP summary plot and per-prediction waterfall'
+    - 'Train an XGBoost classifier with scale_pos_weight calibrated to the training set imbalance ratio'
+    - 'Run an Optuna Bayesian hyperparameter search for both classifiers with a recall-at-precision objective'
+    - 'Evaluate both classifiers with security_evaluator.py and produce a comparison report covering precision, recall, F1, ROC-AUC, and inference latency'
+    - 'Select the operating threshold from the precision-recall curve at the target false positive rate for the deployment context'
+
+  security_mindset:
+    - 'Maximise recall first -- catching more attacks is more important than minimising false positives in the initial deployment; adjust the threshold to bring FPR to an acceptable level after training'
+    - 'Treat SHAP explanations as an audit tool: if the top-3 SHAP features for an attack prediction are not structural attack signals, the classifier is detecting an artifact and the feature set needs revision'
+    - 'Recognise that 90%+ accuracy on the temporal test set is a floor, not a ceiling -- the production false positive rate is the metric that determines whether the detection system is operationally sustainable'
+    - 'Understand that hyperparameter tuning for security classifiers optimises recall at a precision constraint, not raw accuracy -- Optuna must be configured with this objective or it optimises the wrong quantity'
+
+prerequisites:
+  - 'Section 12.04: dataset curation -- the temporal split, SMOTE-treated training set, and DatasetConfig consumed throughout'
+  - 'Section 12.02: security feature engineering -- SecurityFeatureVector.to_array() is the classifier input'
+  - 'Section 12.03: anomaly detection -- IsolationForestDetector baseline that Section 12.05 must outperform'
+  - 'Chapter 1 Section 1.07: classification algorithms -- Random Forest and decision tree foundations'
+  - 'Chapter 1 Section 1.11: evaluation metrics -- precision, recall, F1, ROC-AUC used throughout'
+  - 'Chapter 1 Section 1.13: ensemble methods -- bagging (Random Forest) and boosting (XGBoost) concepts'
+
+prose_content:
+
+  part_1:
+    title: 'When Supervised Classification Supersedes Anomaly Detection'
+    body: |
+      The transition from anomaly detection to supervised classification is not a replacement
+      but an augmentation. The trigger is the size of the labelled dataset from Section 12.04.
+      At 200+ labelled attack examples and 200+ labelled benign examples, a Random Forest
+      trained on the temporal split training set will outperform the Isolation Forest in
+      precision at matched recall by 2-5 percentage points. At 500+ per class, the advantage
+      grows to 5-10 percentage points. The operational consequence is significant: at 10,000
+      requests per day, a 5 percentage point precision improvement at matched recall reduces
+      the daily false positive alert volume from 200 to 100 -- halving the analyst review
+      burden.
+
+      The supervised classifier replaces the anomaly detector in the primary detection
+      position (highest-confidence, first-response alert) while the anomaly detector
+      continues running in the background for novel-variant detection and dataset collection.
+      This is the dual-layer architecture that the Section 12.15 ensemble formalises: the
+      supervised classifier handles known attack patterns with precision; the anomaly detector
+      handles unknown variants with coverage.
+
+      The data readiness check before training has three gates. First, 200+ labelled attack
+      examples in the temporal training split (not counting SMOTE-generated synthetics).
+      Second, the temporal test set must contain attack examples collected after all training
+      examples -- not just the newest 15% of the dataset by count, but the newest 15% by
+      timestamp. Third, the inter-annotator agreement from Section 12.04 must have passed
+      kappa >= 0.80 on the calibration set. If any gate fails, the Section 12.03 anomaly
+      detector continues as the sole ML detector until the gate condition is met.
+
+  part_2:
+    title: 'Random Forest: Algorithm, Configuration, and Security Application'
+    body: |
+      Random Forest trains an ensemble of decision trees where each tree is trained on a
+      bootstrap sample of the training data and each split considers only a random subset
+      of features. These two sources of randomness -- bootstrap sampling and feature
+      subsetting -- decorrelate the individual trees. The ensemble prediction (majority vote
+      for classification, mean probability for probability output) averages over the
+      decorrelated trees, reducing variance relative to any single tree without increasing
+      bias. The result is a robust classifier that handles noisy features, collinear features,
+      and moderate class imbalance without special treatment beyond class_weight.
+
+      For the security feature vector from Section 12.02, the key hyperparameters are
+      n_estimators (number of trees), max_depth (maximum tree depth per tree), and
+      min_samples_split (minimum samples required to split an internal node). n_estimators
+      should be set high enough that the ensemble has stabilised -- 200 trees is the practical
+      minimum; performance marginal improvement above 500. max_depth controls overfitting:
+      deep trees memorise the training set; shallow trees underfit. For the 20-feature security
+      vector with 200-2000 training examples, max_depth between 5 and 15 is the appropriate
+      range. min_samples_split prevents the tree from splitting on single-example nodes,
+      which is important for preventing overfitting on the sparse attack class.
+
+      Gini impurity is the standard split criterion for Random Forest classification. At each
+      split, the algorithm selects the feature and split value that minimise the weighted
+      average Gini impurity of the resulting child nodes. For the security feature vector,
+      role_boundary_marker (a binary feature) will typically produce a near-perfect Gini split
+      when it is present in the training data -- it is zero for almost all benign examples
+      and non-zero for most injection attacks. This makes it a dominant first-level split
+      feature, which is the correct behaviour: a role boundary marker in a user-turn message
+      is a strong binary signal.
+
+      class_weight='balanced' is the standard imbalance treatment for Random Forest when
+      SMOTE was not applied to the training set. It computes weights inversely proportional
+      to class frequency and applies them during the Gini impurity computation, effectively
+      overweighting misclassified attack examples relative to misclassified benign examples.
+      When SMOTE was applied (the default recommendation from Section 12.04 for 100+ attack
+      examples), class_weight is not needed -- the SMOTE-augmented training set is already
+      more balanced.
+
+  part_3:
+    title: 'XGBoost: Gradient Boosting with Regularisation for Security Detection'
+    body: |
+      XGBoost fits an ensemble of decision trees sequentially, where each new tree corrects
+      the residual errors of the previous ensemble. At each iteration, the algorithm computes
+      the gradient and Hessian of the loss function with respect to the current ensemble's
+      predictions, and fits the next tree to minimise the loss using these second-order
+      statistics. The result is a classifier that iteratively reduces bias while the
+      regularisation terms (L1 and L2 penalties on tree weights) control overfitting.
+
+      For security datasets where the training set is small (200-1000 examples) and the
+      attack class is underrepresented, XGBoost's regularisation terms are the primary
+      hyperparameter concern. A high learning rate with many estimators overfits rapidly.
+      The correct configuration is a low learning rate (0.05-0.10), a high number of
+      estimators (500-1000), and early stopping based on validation set performance.
+      This configuration is equivalent to shrinkage regularisation: the model learns slowly
+      and stops before it memorises the training set.
+
+      The scale_pos_weight parameter is XGBoost's built-in class imbalance treatment.
+      Setting scale_pos_weight to the ratio of negative (benign) examples to positive
+      (attack) examples in the training set is equivalent to class_weight='balanced' in
+      scikit-learn: it upweights the gradient contribution of misclassified attack examples.
+      For a 1:20 imbalanced training set, scale_pos_weight=20 is the correct starting point.
+      When SMOTE has already been applied to the training set, scale_pos_weight should be
+      left at its default (1.0) -- applying both SMOTE and scale_pos_weight double-counts
+      the imbalance treatment and pushes the classifier toward excessive attack predictions.
+
+      XGBoost typically outperforms Random Forest on security datasets when the number of
+      labelled examples is between 500 and 2000 per class, the feature interactions are
+      non-linear (which the sequential boosting captures better than the averaging ensemble),
+      and regularisation is tuned correctly. Below 500 examples, Random Forest's robustness
+      to noise tends to produce lower false positive rates on the test set. Above 2000
+      examples, DistilBERT from Section 12.08 becomes competitive. The hyperparameter tuner
+      in deliverable_3 evaluates both simultaneously and selects the best model for the
+      current dataset size.
+
+  part_4:
+    title: 'SHAP Explainability: From Feature Importance to Analyst-Readable Alerts'
+    body: |
+      Global feature importance -- the Gini-based or gain-based ranking of which features
+      contributed most to the model across all training examples -- tells the detection
+      engineer which features the model relies on most. It does not tell the analyst why a
+      specific request was flagged. An analyst who receives an alert with only a probability
+      score and a global feature importance ranking cannot reproduce the detection reasoning
+      or explain it to a security operations team.
+
+      SHAP (SHapley Additive exPlanations, Lundberg and Lee 2017) decomposes each individual
+      prediction into additive feature contributions: the prediction is the base rate (mean
+      training prediction) plus the sum of each feature's SHAP value. A positive SHAP value
+      for a feature means that feature pushed the prediction toward attack; a negative SHAP
+      value means it pushed toward benign. The magnitude indicates how much.
+
+      For a flagged request with anomaly_score=0.87, the SHAP waterfall shows:
+      base_rate=0.12 (the average attack probability in the training set), plus
+      role_boundary_marker=+0.41 (the role marker strongly indicates attack), plus
+      instruction_keyword_freq=+0.22 (elevated keyword frequency), plus
+      prior_refusal_count=+0.08 (one prior refusal in the session), plus
+      sequence_length=-0.05 (the request is shorter than typical attacks), equals 0.78
+      (the model's attack probability before thresholding). This decomposition is immediately
+      readable by a security analyst who knows the feature names: the request was flagged
+      primarily because it contains a role boundary marker and elevated instruction keyword
+      frequency, with a prior refusal providing additional context.
+
+      SHAP TreeExplainer is the correct explainer class for Random Forest and XGBoost. It
+      uses the tree structure to compute exact SHAP values in polynomial time without
+      sampling approximations. For the 20-feature security vector with 200-tree Random
+      Forest, SHAP value computation takes 2-5ms per prediction on CPU -- within the
+      gateway latency budget when computed asynchronously after the alert decision is made.
+      SHAP values are computed for every alert-tier prediction (not for pass-through requests)
+      and stored alongside the prediction in the annotation queue.
+
+  part_5:
+    title: 'Evaluation: Metrics That Matter for Security Classifiers'
+    body: |
+      The four metrics that matter for security classifiers are precision, recall, ROC-AUC,
+      and the false positive rate at the production operating threshold. Accuracy is excluded
+      because it is misleading on imbalanced datasets: a classifier that predicts benign for
+      every request achieves 95-99% accuracy on a 1:20 to 1:100 imbalanced test set while
+      providing zero detection value.
+
+      Recall (true positive rate) is the primary optimisation target. Every attack that
+      the classifier misses is an attack that reaches the model undetected. The cost of a
+      missed attack -- a successful jailbreak, an executed injection -- is higher than the
+      cost of a false positive alert that an analyst reviews and dismisses. The correct
+      operating posture for a security classifier is to maximise recall subject to a false
+      positive rate constraint, not to balance precision and recall symmetrically.
+
+      The false positive rate at the operating threshold determines the analyst alert volume.
+      At 10,000 requests per day and a 1% false positive rate, the classifier generates 100
+      false positive alerts per day. If analyst review capacity is 50 alerts per day, a 1%
+      FPR is unsustainable. The operating threshold must be set to bring the FPR below the
+      analyst capacity limit, even if this reduces recall. The precision-recall curve from
+      security_evaluator.py plots the full tradeoff and the threshold_tuner from Section
+      12.10 formalises the threshold selection.
+
+      Stratified temporal k-fold cross-validation extends the temporal split methodology
+      from Section 12.04 to hyperparameter tuning. For each fold, the training split
+      contains earlier examples and the validation split contains later examples, maintaining
+      temporal ordering within each fold. Stratification ensures the attack class is
+      represented in each validation fold -- without stratification, a fold whose validation
+      window coincides with a low-attack period will have no attack examples and produce
+      useless recall measurements.
+
+  part_6:
+    title: 'Model Selection: Random Forest vs XGBoost for the Current Dataset'
+    body: |
+      The hyperparameter tuner in deliverable_3 produces the best configuration for both
+      Random Forest and XGBoost on the current dataset. The model selection decision is made
+      from the evaluation harness output on the temporal test set, not from the cross-
+      validation objective alone. The cross-validation objective guides hyperparameter
+      selection within each model family; the test set result determines which family to
+      deploy.
+
+      Three test set metrics determine the selection. First, precision at 90% recall: the
+      classifier with higher precision at 90% recall produces fewer false positive alerts
+      for the same attack coverage. Second, inference latency: both classifiers should be
+      sub-5ms for the 20-feature vector, but XGBoost with many estimators can be 2-3x
+      slower than Random Forest on CPU due to the sequential tree structure. Third,
+      calibration quality: the classifier whose predicted probabilities better match the
+      actual attack rate in the test set requires less post-hoc calibration work in
+      Section 12.10.
+
+      In practice, Random Forest is the more reliable default for security datasets in the
+      200-500 example range. Its variance reduction through averaging makes it robust to
+      the label noise that is common in early-stage annotation queues. XGBoost's sequential
+      boosting amplifies the signal from every training example -- including mislabelled
+      ones -- which can reduce performance when inter-annotator agreement is imperfect.
+      Above 500 examples with confirmed high annotation quality (kappa > 0.85), XGBoost
+      typically matches or exceeds Random Forest performance and should be evaluated
+      alongside it.
+
+      Both classifiers are retained in the Section 12.15 ensemble regardless of which
+      performs better individually. The ensemble benefits from their different error
+      profiles: Random Forest makes errors on edge cases near the decision boundary;
+      XGBoost makes errors on training-distribution tail examples. Their errors are
+      partially independent, and the ensemble's combined precision exceeds either
+      classifier alone.
+
+reference_materials:
+
+  table_1:
+    title: 'Random Forest vs XGBoost: Selection Guide for Security Datasets'
+    description: 'Seven-dimension comparison for choosing between Random Forest and XGBoost given dataset size, annotation quality, and operational requirements'
+    columns: ['Dimension', 'Random Forest', 'XGBoost', 'Recommended When']
+    rows:
+      - ['Dataset size', 'Better at 200-500 examples per class', 'Better at 500-2000 examples per class', 'RF for early deployment; XGB after more data']
+      - ['Label noise tolerance', 'High -- averaging reduces impact of mislabelled examples', 'Low -- boosting amplifies mislabelled examples', 'RF when annotation quality is uncertain (kappa 0.60-0.80)']
+      - ['Training speed', 'Parallelisable -- all trees trained simultaneously (n_jobs=-1)', 'Sequential -- trees trained one at a time', 'RF for fast iteration during feature engineering']
+      - ['Inference latency', '1-3ms for 200 trees, 20 features', '2-5ms for 500 estimators, 20 features', 'RF under tight latency budgets; XGB acceptable for both']
+      - ['Calibration quality', 'Poorly calibrated by default -- Platt scaling required', 'Better calibrated by default with use_label_encoder=False', 'XGB if calibration is a priority before Section 12.10']
+      - ['Imbalance treatment', 'class_weight="balanced" or SMOTE on training set', 'scale_pos_weight=n_benign/n_attack or SMOTE', 'Either with SMOTE; scale_pos_weight for XGB without SMOTE']
+      - ['Explainability', 'SHAP TreeExplainer; exact values; 2-3ms per prediction', 'SHAP TreeExplainer; exact values; 3-5ms per prediction', 'Both fully explainable; RF slightly faster']
+
+  table_2:
+    title: 'Key Hyperparameters and Their Security Detection Effect'
+    description: 'Critical hyperparameters for both classifiers with their effect on precision, recall, and false positive rate in security detection'
+    columns: ['Classifier', 'Hyperparameter', 'Low Value Effect', 'High Value Effect', 'Recommended Range']
+    rows:
+      - ['Random Forest', 'n_estimators', 'High variance; unstable predictions', 'Stable but slower inference', '200-500']
+      - ['Random Forest', 'max_depth', 'Underfitting; misses complex patterns', 'Overfitting; high FPR on test set', '5-15']
+      - ['Random Forest', 'min_samples_split', 'Overfitting; splits on single examples', 'Underfitting; coarse boundaries', '5-20']
+      - ['XGBoost', 'learning_rate', 'Slow convergence; needs more estimators', 'Overfitting; high FPR', '0.05-0.10']
+      - ['XGBoost', 'max_depth', 'Underfitting; weak individual trees', 'Overfitting on small datasets', '3-8']
+      - ['XGBoost', 'scale_pos_weight', 'Bias toward benign; low recall', 'Bias toward attack; high FPR', 'n_benign/n_attack']
+      - ['XGBoost', 'subsample', 'High variance at very low values', 'No regularisation effect', '0.7-0.9']
+
+  table_3:
+    title: 'Security Classifier Evaluation Metrics Reference'
+    description: 'Four metrics that matter for security classifiers with computation, interpretation, and the common mistake for each'
+    columns: ['Metric', 'Computation', 'Security Interpretation', 'Common Mistake']
+    rows:
+      - ['Recall (TPR)', 'TP / (TP + FN)', 'Fraction of attacks the classifier catches; primary optimisation target', 'Optimising F1 instead of recall; F1 balances precision equally, which is wrong for detection']
+      - ['Precision', 'TP / (TP + FP)', 'Fraction of alerts that are real attacks; determines analyst alert volume', 'Maximising precision at the cost of recall; missed attacks are more costly than false alerts']
+      - ['ROC-AUC', 'Area under TPR vs FPR curve', 'Classifier discrimination ability across all thresholds; threshold-independent', 'Reporting ROC-AUC on imbalanced test set without noting PR-AUC; PR-AUC is more informative under imbalance']
+      - ['FPR at operating threshold', 'FP / (FP + TN) at selected threshold', 'Daily false positive alert volume; determines operational sustainability', 'Setting threshold at default 0.5; the operating threshold must be calibrated to the analyst capacity constraint']
+
+  table_4:
+    title: 'Data Readiness Gates Before First Supervised Classifier Training'
+    description: 'Three gates that must pass before training is initiated; if any gate fails, continue anomaly detection until the condition is met'
+    columns: ['Gate', 'Condition', 'Measurement', 'Failure Action']
+    rows:
+      - ['Labelled data volume', '200+ attack examples in temporal training split (real, not SMOTE-synthetic)', 'Count rows with label=1 in train_df from Section 12.04', 'Continue Section 12.03 anomaly alert collection; do not train yet']
+      - ['Temporal ordering', 'Test set collected_at_ms min > training set collected_at_ms max', 'Assert on the two timestamps after Section 12.04 build()', 'Re-run Section 12.04 build() with correct temporal split parameters']
+      - ['Annotation quality', 'Cohen kappa >= 0.80 on calibration set from Section 12.04', 'inter_annotator_agreement.py output', 'Revise annotation guidelines; re-measure on new calibration set before proceeding']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Random Forest Classifier'
+    filename: 'random_forest_classifier.py'
+    description: 'Random Forest prompt injection and jailbreak classifier for LLM API security. Trains on the Section 12.04 temporally split dataset, produces calibrated probability scores, generates SHAP feature importance, and exports the trained model to the Section 12.13 registry. Includes a predict_with_explanation() method that returns both the alert decision and its SHAP waterfall for analyst review.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: scikit-learn, shap, numpy, pandas. Imports from security_feature_extractor.py (Section 12.02) and security_dataset_builder.py (Section 12.04).'
+    code: |
+      # random_forest_classifier.py
+      # Section 12.05: Random Forest Security Classifier
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import time
+      from dataclasses import dataclass
+      from pathlib import Path
+      from typing import Dict, List, Optional, Tuple
+
+      import numpy as np
+      import pandas as pd
+      import shap
+      from sklearn.ensemble import RandomForestClassifier
+      from sklearn.metrics import (
+          precision_score, recall_score, f1_score,
+          roc_auc_score, confusion_matrix,
+      )
+
+      from security_feature_extractor import (
+          APIRequestContext,
+          SecurityFeatureVector,
+          extract_features,
+          FEATURE_SCHEMA_VERSION,
+      )
+
+
+      @dataclass
+      class ClassifierPrediction:
+          request_text: str
+          attack_probability: float
+          is_attack: bool
+          threshold: float
+          feature_schema_version: str
+          shap_contributions: Optional[Dict[str, float]]
+          inference_ms: float
+
+
+      class RandomForestSecurityClassifier:
+          '''
+          Random Forest classifier for LLM API security detection.
+
+          Trains on the Section 12.04 temporally split dataset.
+          Produces calibrated probability scores and SHAP explanations.
+          '''
+
+          def __init__(
+              self,
+              n_estimators: int = 300,
+              max_depth: Optional[int] = 10,
+              min_samples_split: int = 10,
+              class_weight: str = 'balanced',
+              random_state: int = 42,
+              operating_threshold: float = 0.5,
+          ) -> None:
+              self.model = RandomForestClassifier(
+                  n_estimators=n_estimators,
+                  max_depth=max_depth,
+                  min_samples_split=min_samples_split,
+                  class_weight=class_weight,
+                  random_state=random_state,
+                  n_jobs=-1,
+              )
+              self.operating_threshold = operating_threshold
+              self._trained = False
+              self._feature_names: List[str] = []
+              self._explainer: Optional[shap.TreeExplainer] = None
+              self._schema_version = FEATURE_SCHEMA_VERSION
+
+          # ------------------------------------------------------------------
+          # Training
+          # ------------------------------------------------------------------
+
+          def fit(
+              self,
+              train_df: pd.DataFrame,
+              feature_names: List[str],
+          ) -> 'RandomForestSecurityClassifier':
+              '''
+              Train on the temporal training split from Section 12.04.
+              train_df must have columns matching feature_names plus 'label'.
+              '''
+              self._feature_names = feature_names
+              X = train_df[feature_names].values.astype(np.float32)
+              y = train_df['label'].values
+
+              start = time.time()
+              self.model.fit(X, y)
+              elapsed = time.time() - start
+
+              self._trained = True
+              self._explainer = shap.TreeExplainer(self.model)
+
+              n_attack = int((y == 1).sum())
+              n_benign = int((y == 0).sum())
+              print(
+                  f'RandomForestClassifier trained in {elapsed:.2f}s '
+                  f'({n_attack} attack, {n_benign} benign, '
+                  f'{self.model.n_estimators} trees, max_depth={self.model.max_depth})'
+              )
+              return self
+
+          # ------------------------------------------------------------------
+          # Inference
+          # ------------------------------------------------------------------
+
+          def predict_proba_array(self, X: np.ndarray) -> np.ndarray:
+              assert self._trained
+              return self.model.predict_proba(X)[:, 1]
+
+          def predict(self, ctx: APIRequestContext, explain: bool = True) -> ClassifierPrediction:
+              assert self._trained
+              t0 = time.time()
+              fv = extract_features(ctx)
+              arr = fv.to_array().reshape(1, -1)
+              prob = float(self.model.predict_proba(arr)[0, 1])
+              is_attack = prob >= self.operating_threshold
+
+              shap_contribs: Optional[Dict[str, float]] = None
+              if explain and is_attack and self._explainer is not None:
+                  raw = self._explainer.shap_values(arr)
+                  # For binary classification, shap_values returns [class_0, class_1]
+                  sv = raw[1][0] if isinstance(raw, list) else raw[0]
+                  shap_contribs = dict(zip(self._feature_names, sv.tolist()))
+
+              return ClassifierPrediction(
+                  request_text=ctx.message_text[:200],
+                  attack_probability=prob,
+                  is_attack=is_attack,
+                  threshold=self.operating_threshold,
+                  feature_schema_version=fv.schema_version,
+                  shap_contributions=shap_contribs,
+                  inference_ms=(time.time() - t0) * 1000,
+              )
+
+          # ------------------------------------------------------------------
+          # Evaluation
+          # ------------------------------------------------------------------
+
+          def evaluate(
+              self,
+              test_df: pd.DataFrame,
+              feature_names: List[str],
+          ) -> Dict[str, float]:
+              assert self._trained
+              X = test_df[feature_names].values.astype(np.float32)
+              y_true = test_df['label'].values
+              y_prob = self.predict_proba_array(X)
+              y_pred = (y_prob >= self.operating_threshold).astype(int)
+
+              metrics = {
+                  'precision': float(precision_score(y_true, y_pred, zero_division=0)),
+                  'recall': float(recall_score(y_true, y_pred, zero_division=0)),
+                  'f1': float(f1_score(y_true, y_pred, zero_division=0)),
+                  'roc_auc': float(roc_auc_score(y_true, y_prob)),
+                  'fpr': float((y_pred[y_true == 0] == 1).mean()) if (y_true == 0).any() else 0.0,
+                  'threshold': self.operating_threshold,
+                  'n_test': len(y_true),
+                  'n_attack_test': int((y_true == 1).sum()),
+              }
+              return metrics
+
+          def feature_importance_ranking(self, top_n: int = 10) -> List[Tuple[str, float]]:
+              assert self._trained
+              importances = self.model.feature_importances_
+              ranked = sorted(
+                  zip(self._feature_names, importances),
+                  key=lambda x: x[1], reverse=True,
+              )
+              return ranked[:top_n]
+
+          # ------------------------------------------------------------------
+          # Persistence
+          # ------------------------------------------------------------------
+
+          def save(self, path: str) -> None:
+              import pickle
+              with open(path, 'wb') as f:
+                  pickle.dump(self, f)
+              print(f'Saved RandomForestClassifier -> {path}')
+
+          @staticmethod
+          def load(path: str) -> 'RandomForestSecurityClassifier':
+              import pickle
+              with open(path, 'rb') as f:
+                  return pickle.load(f)
+
+
+      if __name__ == '__main__':
+          from security_feature_extractor import APIRequestContext, extract_features
+          import numpy as np
+
+          rng = np.random.default_rng(42)
+          feature_names = [
+              'sequence_length', 'word_count', 'special_char_density',
+              'instruction_keyword_freq', 'token_entropy', 'uppercase_ratio',
+              'role_boundary_marker', 'code_block_count', 'code_block_density',
+              'bracket_density', 'quotation_density',
+              'centroid_cosine_dist_min', 'benign_cosine_dist', 'embedding_l2_norm',
+              'turn_number', 'prior_refusal_count', 'session_request_rate',
+              'temperature', 'streaming_flag', 'is_default_model',
+          ]
+          n_benign, n_attack = 400, 100
+          X_b = rng.normal(0.1, 0.05, (n_benign, len(feature_names)))
+          X_a = rng.normal(0.6, 0.1, (n_attack, len(feature_names)))
+          X_a[:, 6] = 1.0  # role_boundary_marker always set for attacks
+          X = np.vstack([X_b, X_a])
+          y = np.array([0] * n_benign + [1] * n_attack)
+
+          train_df = pd.DataFrame(X[:400], columns=feature_names)
+          train_df['label'] = y[:400]
+          test_df = pd.DataFrame(X[400:], columns=feature_names)
+          test_df['label'] = y[400:]
+
+          clf = RandomForestSecurityClassifier(n_estimators=200, max_depth=8)
+          clf.fit(train_df, feature_names)
+          metrics = clf.evaluate(test_df, feature_names)
+          print('\nEvaluation:')
+          for k, v in metrics.items():
+              print(f'  {k}: {v:.4f}' if isinstance(v, float) else f'  {k}: {v}')
+
+          print('\nTop feature importances:')
+          for feat, imp in clf.feature_importance_ranking(5):
+              print(f'  {feat}: {imp:.4f}')
+
+  deliverable_2:
+    title: 'XGBoost Classifier'
+    filename: 'xgboost_classifier.py'
+    description: 'XGBoost attack classifier with scale_pos_weight imbalance handling, early stopping, and SHAP explainability. Same evaluate() and predict() interface as the Random Forest classifier for direct comparison in the Section 12.16 benchmark harness.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: xgboost, shap, numpy, pandas, scikit-learn.'
+    code: |
+      # xgboost_classifier.py
+      # Section 12.05: XGBoost Security Classifier
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      import time
+      from dataclasses import dataclass
+      from typing import Dict, List, Optional, Tuple
+
+      import numpy as np
+      import pandas as pd
+      import shap
+      import xgboost as xgb
+      from sklearn.metrics import (
+          precision_score, recall_score, f1_score,
+          roc_auc_score,
+      )
+
+      from security_feature_extractor import (
+          APIRequestContext, extract_features, FEATURE_SCHEMA_VERSION,
+      )
+      from random_forest_classifier import ClassifierPrediction
+
+
+      class XGBoostSecurityClassifier:
+          '''
+          XGBoost classifier for LLM API security detection.
+
+          scale_pos_weight handles class imbalance without SMOTE.
+          Do NOT set scale_pos_weight when the training set has already been
+          SMOTE-augmented -- use the default value of 1.0 instead.
+          '''
+
+          def __init__(
+              self,
+              n_estimators: int = 500,
+              max_depth: int = 5,
+              learning_rate: float = 0.05,
+              subsample: float = 0.8,
+              colsample_bytree: float = 0.8,
+              scale_pos_weight: float = 1.0,
+              reg_alpha: float = 0.1,
+              reg_lambda: float = 1.0,
+              operating_threshold: float = 0.5,
+              early_stopping_rounds: int = 30,
+              random_state: int = 42,
+          ) -> None:
+              self.params = dict(
+                  n_estimators=n_estimators,
+                  max_depth=max_depth,
+                  learning_rate=learning_rate,
+                  subsample=subsample,
+                  colsample_bytree=colsample_bytree,
+                  scale_pos_weight=scale_pos_weight,
+                  reg_alpha=reg_alpha,
+                  reg_lambda=reg_lambda,
+                  random_state=random_state,
+                  eval_metric='aucpr',
+                  use_label_encoder=False,
+                  verbosity=0,
+              )
+              self.early_stopping_rounds = early_stopping_rounds
+              self.operating_threshold = operating_threshold
+              self.model = xgb.XGBClassifier(**self.params)
+              self._trained = False
+              self._feature_names: List[str] = []
+              self._explainer: Optional[shap.TreeExplainer] = None
+              self._schema_version = FEATURE_SCHEMA_VERSION
+
+          @staticmethod
+          def compute_scale_pos_weight(y_train: np.ndarray) -> float:
+              '''Compute scale_pos_weight from training label array.'''
+              n_neg = int((y_train == 0).sum())
+              n_pos = int((y_train == 1).sum())
+              spw = n_neg / max(n_pos, 1)
+              print(f'  Computed scale_pos_weight: {spw:.2f} ({n_neg} benign / {n_pos} attack)')
+              return spw
+
+          def fit(
+              self,
+              train_df: pd.DataFrame,
+              val_df: pd.DataFrame,
+              feature_names: List[str],
+              auto_scale_pos_weight: bool = True,
+          ) -> 'XGBoostSecurityClassifier':
+              self._feature_names = feature_names
+              X_train = train_df[feature_names].values.astype(np.float32)
+              y_train = train_df['label'].values
+              X_val = val_df[feature_names].values.astype(np.float32)
+              y_val = val_df['label'].values
+
+              if auto_scale_pos_weight and self.params['scale_pos_weight'] == 1.0:
+                  spw = self.compute_scale_pos_weight(y_train)
+                  self.model.set_params(scale_pos_weight=spw)
+
+              t0 = time.time()
+              self.model.fit(
+                  X_train, y_train,
+                  eval_set=[(X_val, y_val)],
+                  early_stopping_rounds=self.early_stopping_rounds,
+                  verbose=False,
+              )
+              elapsed = time.time() - t0
+              self._trained = True
+              self._explainer = shap.TreeExplainer(self.model)
+
+              print(
+                  f'XGBoostClassifier trained in {elapsed:.2f}s '
+                  f'(best_iteration={self.model.best_iteration})'
+              )
+              return self
+
+          def predict_proba_array(self, X: np.ndarray) -> np.ndarray:
+              assert self._trained
+              return self.model.predict_proba(X)[:, 1]
+
+          def predict(self, ctx: APIRequestContext, explain: bool = True) -> ClassifierPrediction:
+              assert self._trained
+              t0 = time.time()
+              fv = extract_features(ctx)
+              arr = fv.to_array().reshape(1, -1)
+              prob = float(self.model.predict_proba(arr)[0, 1])
+              is_attack = prob >= self.operating_threshold
+
+              shap_contribs = None
+              if explain and is_attack and self._explainer is not None:
+                  sv = self._explainer.shap_values(arr)[0]
+                  shap_contribs = dict(zip(self._feature_names, sv.tolist()))
+
+              return ClassifierPrediction(
+                  request_text=ctx.message_text[:200],
+                  attack_probability=prob,
+                  is_attack=is_attack,
+                  threshold=self.operating_threshold,
+                  feature_schema_version=fv.schema_version,
+                  shap_contributions=shap_contribs,
+                  inference_ms=(time.time() - t0) * 1000,
+              )
+
+          def evaluate(self, test_df: pd.DataFrame, feature_names: List[str]) -> Dict[str, float]:
+              assert self._trained
+              X = test_df[feature_names].values.astype(np.float32)
+              y_true = test_df['label'].values
+              y_prob = self.predict_proba_array(X)
+              y_pred = (y_prob >= self.operating_threshold).astype(int)
+              return {
+                  'precision': float(precision_score(y_true, y_pred, zero_division=0)),
+                  'recall': float(recall_score(y_true, y_pred, zero_division=0)),
+                  'f1': float(f1_score(y_true, y_pred, zero_division=0)),
+                  'roc_auc': float(roc_auc_score(y_true, y_prob)),
+                  'fpr': float((y_pred[y_true == 0] == 1).mean()) if (y_true == 0).any() else 0.0,
+                  'threshold': self.operating_threshold,
+                  'n_test': len(y_true),
+                  'n_attack_test': int((y_true == 1).sum()),
+              }
+
+          def save(self, path: str) -> None:
+              import pickle
+              with open(path, 'wb') as f:
+                  pickle.dump(self, f)
+              print(f'Saved XGBoostClassifier -> {path}')
+
+          @staticmethod
+          def load(path: str) -> 'XGBoostSecurityClassifier':
+              import pickle
+              with open(path, 'rb') as f:
+                  return pickle.load(f)
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(42)
+          n_features = 20
+          feature_names = [f'feat_{i}' for i in range(n_features)]
+          n_b, n_a = 400, 80
+          X = np.vstack([rng.normal(0.1, 0.05, (n_b, n_features)), rng.normal(0.6, 0.1, (n_a, n_features))])
+          y = np.array([0] * n_b + [1] * n_a)
+
+          train_df = pd.DataFrame(X[:380], columns=feature_names); train_df['label'] = y[:380]
+          val_df = pd.DataFrame(X[380:430], columns=feature_names); val_df['label'] = y[380:430]
+          test_df = pd.DataFrame(X[430:], columns=feature_names); test_df['label'] = y[430:]
+
+          clf = XGBoostSecurityClassifier(n_estimators=300, learning_rate=0.05)
+          clf.fit(train_df, val_df, feature_names, auto_scale_pos_weight=True)
+          metrics = clf.evaluate(test_df, feature_names)
+          print('\nXGBoost evaluation:')
+          for k, v in metrics.items():
+              print(f'  {k}: {v:.4f}' if isinstance(v, float) else f'  {k}: {v}')
+
+  deliverable_3:
+    title: 'Hyperparameter Tuner'
+    filename: 'hyperparameter_tuner.py'
+    description: 'Optuna Bayesian hyperparameter search for Random Forest and XGBoost classifiers with a recall-at-precision objective. Evaluates both model families simultaneously on the temporal validation set and returns the best configuration and model family for the current dataset.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: optuna, scikit-learn, xgboost, numpy, pandas.'
+    code: |
+      # hyperparameter_tuner.py
+      # Section 12.05: Optuna Hyperparameter Tuner for Security Classifiers
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      from typing import Any, Dict, List, Optional, Tuple
+
+      import numpy as np
+      import optuna
+      import pandas as pd
+      from sklearn.ensemble import RandomForestClassifier
+      from sklearn.metrics import precision_score, recall_score
+      import xgboost as xgb
+
+      optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+      # Optimise recall subject to precision >= this value.
+      # Adjust based on the deployment's analyst FP capacity.
+      PRECISION_FLOOR = 0.70
+
+
+      def _rf_objective(
+          trial: optuna.Trial,
+          X_train: np.ndarray, y_train: np.ndarray,
+          X_val: np.ndarray, y_val: np.ndarray,
+      ) -> float:
+          params = {
+              'n_estimators': trial.suggest_int('rf_n_estimators', 100, 600),
+              'max_depth': trial.suggest_int('rf_max_depth', 3, 20),
+              'min_samples_split': trial.suggest_int('rf_min_samples_split', 2, 30),
+              'class_weight': 'balanced',
+              'random_state': 42,
+              'n_jobs': -1,
+          }
+          model = RandomForestClassifier(**params)
+          model.fit(X_train, y_train)
+          y_prob = model.predict_proba(X_val)[:, 1]
+
+          # Sweep thresholds; find best recall at precision >= floor
+          best_recall = 0.0
+          for t in np.linspace(0.1, 0.9, 50):
+              y_pred = (y_prob >= t).astype(int)
+              prec = precision_score(y_val, y_pred, zero_division=0)
+              rec = recall_score(y_val, y_pred, zero_division=0)
+              if prec >= PRECISION_FLOOR and rec > best_recall:
+                  best_recall = rec
+          return best_recall
+
+
+      def _xgb_objective(
+          trial: optuna.Trial,
+          X_train: np.ndarray, y_train: np.ndarray,
+          X_val: np.ndarray, y_val: np.ndarray,
+      ) -> float:
+          spw = float((y_train == 0).sum()) / max(float((y_train == 1).sum()), 1)
+          params = {
+              'n_estimators': trial.suggest_int('xgb_n_estimators', 100, 800),
+              'max_depth': trial.suggest_int('xgb_max_depth', 2, 10),
+              'learning_rate': trial.suggest_float('xgb_lr', 0.01, 0.2, log=True),
+              'subsample': trial.suggest_float('xgb_subsample', 0.6, 1.0),
+              'colsample_bytree': trial.suggest_float('xgb_colsample', 0.6, 1.0),
+              'reg_alpha': trial.suggest_float('xgb_alpha', 1e-3, 10.0, log=True),
+              'reg_lambda': trial.suggest_float('xgb_lambda', 1e-3, 10.0, log=True),
+              'scale_pos_weight': spw,
+              'random_state': 42,
+              'eval_metric': 'aucpr',
+              'verbosity': 0,
+          }
+          model = xgb.XGBClassifier(**params)
+          model.fit(X_train, y_train, eval_set=[(X_val, y_val)],
+                    early_stopping_rounds=20, verbose=False)
+          y_prob = model.predict_proba(X_val)[:, 1]
+
+          best_recall = 0.0
+          for t in np.linspace(0.1, 0.9, 50):
+              y_pred = (y_prob >= t).astype(int)
+              prec = precision_score(y_val, y_pred, zero_division=0)
+              rec = recall_score(y_val, y_pred, zero_division=0)
+              if prec >= PRECISION_FLOOR and rec > best_recall:
+                  best_recall = rec
+          return best_recall
+
+
+      def tune(
+          train_df: pd.DataFrame,
+          val_df: pd.DataFrame,
+          feature_names: List[str],
+          n_trials: int = 50,
+          precision_floor: float = PRECISION_FLOOR,
+      ) -> Tuple[str, Dict[str, Any], float]:
+          '''
+          Run Optuna hyperparameter search for both RF and XGBoost.
+          Returns (best_model_family, best_params, best_recall_at_precision).
+          '''
+          global PRECISION_FLOOR
+          PRECISION_FLOOR = precision_floor
+
+          X_train = train_df[feature_names].values.astype(np.float32)
+          y_train = train_df['label'].values
+          X_val = val_df[feature_names].values.astype(np.float32)
+          y_val = val_df['label'].values
+
+          results = {}
+          for family, obj in [('RandomForest', _rf_objective), ('XGBoost', _xgb_objective)]:
+              study = optuna.create_study(direction='maximize')
+              study.optimize(
+                  lambda t, o=obj: o(t, X_train, y_train, X_val, y_val),
+                  n_trials=n_trials // 2,
+                  show_progress_bar=False,
+              )
+              results[family] = (study.best_value, study.best_params)
+              print(f'{family}: best_recall@precision>={precision_floor:.2f} = {study.best_value:.4f}')
+
+          best_family = max(results, key=lambda k: results[k][0])
+          best_value, best_params = results[best_family]
+          print(f'\nSelected: {best_family} (recall={best_value:.4f})')
+          return best_family, best_params, best_value
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(42)
+          n_features, n_b, n_a = 20, 300, 60
+          feature_names = [f'feat_{i}' for i in range(n_features)]
+          X = np.vstack([rng.normal(0.1, 0.05, (n_b, n_features)), rng.normal(0.6, 0.1, (n_a, n_features))])
+          y = np.array([0] * n_b + [1] * n_a)
+          train_df = pd.DataFrame(X[:300], columns=feature_names); train_df['label'] = y[:300]
+          val_df = pd.DataFrame(X[300:], columns=feature_names); val_df['label'] = y[300:]
+
+          family, params, score = tune(train_df, val_df, feature_names, n_trials=20)
+          print(f'\nBest params: {params}')
+
+  deliverable_4:
+    title: 'Security Evaluator'
+    filename: 'security_evaluator.py'
+    description: 'Imbalance-aware evaluation harness for security classifiers. Produces precision, recall, F1, ROC-AUC, PR-AUC, confusion matrix, and FPR at the operating threshold. Imported by every subsequent section (12.06 through 12.17) for consistent cross-section benchmarking.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: scikit-learn, numpy, matplotlib.'
+    code: |
+      # security_evaluator.py
+      # Section 12.05: Security Classifier Evaluation Harness
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      from dataclasses import dataclass
+      from typing import Dict, List, Optional, Tuple
+
+      import numpy as np
+      import matplotlib.pyplot as plt
+      from sklearn.metrics import (
+          precision_score, recall_score, f1_score,
+          roc_auc_score, precision_recall_curve, auc,
+          confusion_matrix, ConfusionMatrixDisplay,
+      )
+
+
+      @dataclass
+      class EvaluationReport:
+          classifier_name: str
+          n_test: int
+          n_attack: int
+          n_benign: int
+          imbalance_ratio: float
+          precision: float
+          recall: float
+          f1: float
+          roc_auc: float
+          pr_auc: float
+          fpr_at_threshold: float
+          operating_threshold: float
+          confusion: List[List[int]]
+
+          def summary_line(self) -> str:
+              return (
+                  f'{self.classifier_name:<35} '
+                  f'P={self.precision:.3f}  R={self.recall:.3f}  '
+                  f'F1={self.f1:.3f}  AUC={self.roc_auc:.3f}  '
+                  f'FPR={self.fpr_at_threshold:.3f}'
+              )
+
+
+      def evaluate(
+          classifier_name: str,
+          y_true: np.ndarray,
+          y_prob: np.ndarray,
+          operating_threshold: float = 0.5,
+      ) -> EvaluationReport:
+          y_pred = (y_prob >= operating_threshold).astype(int)
+          prec_arr, rec_arr, _ = precision_recall_curve(y_true, y_prob)
+
+          n_attack = int((y_true == 1).sum())
+          n_benign = int((y_true == 0).sum())
+          fpr = float((y_pred[y_true == 0] == 1).mean()) if n_benign > 0 else 0.0
+          cm = confusion_matrix(y_true, y_pred).tolist()
+
+          return EvaluationReport(
+              classifier_name=classifier_name,
+              n_test=len(y_true),
+              n_attack=n_attack,
+              n_benign=n_benign,
+              imbalance_ratio=n_benign / max(n_attack, 1),
+              precision=float(precision_score(y_true, y_pred, zero_division=0)),
+              recall=float(recall_score(y_true, y_pred, zero_division=0)),
+              f1=float(f1_score(y_true, y_pred, zero_division=0)),
+              roc_auc=float(roc_auc_score(y_true, y_prob)),
+              pr_auc=float(auc(rec_arr, prec_arr)),
+              fpr_at_threshold=fpr,
+              operating_threshold=operating_threshold,
+              confusion=cm,
+          )
+
+
+      def print_report(report: EvaluationReport) -> None:
+          print(f'\nEvaluation: {report.classifier_name}')
+          print(f'  Test set:   {report.n_test} examples '
+                f'(attack={report.n_attack}, benign={report.n_benign}, '
+                f'ratio={report.imbalance_ratio:.1f}:1)')
+          print(f'  Threshold:  {report.operating_threshold:.3f}')
+          print(f'  Precision:  {report.precision:.4f}')
+          print(f'  Recall:     {report.recall:.4f}')
+          print(f'  F1:         {report.f1:.4f}')
+          print(f'  ROC-AUC:    {report.roc_auc:.4f}')
+          print(f'  PR-AUC:     {report.pr_auc:.4f}')
+          print(f'  FPR:        {report.fpr_at_threshold:.4f}')
+          tn, fp, fn, tp = (report.confusion[0][0], report.confusion[0][1],
+                            report.confusion[1][0], report.confusion[1][1])
+          print(f'  Confusion:  TP={tp}  FP={fp}  FN={fn}  TN={tn}')
+
+
+      def compare_classifiers(reports: List[EvaluationReport]) -> None:
+          print('\nClassifier Comparison:')
+          print('-' * 80)
+          for r in sorted(reports, key=lambda x: -x.recall):
+              print(f'  {r.summary_line()}')
+          print('-' * 80)
+          best_recall = max(reports, key=lambda x: x.recall)
+          best_prec = max(reports, key=lambda x: x.precision)
+          print(f'  Best recall:    {best_recall.classifier_name}')
+          print(f'  Best precision: {best_prec.classifier_name}')
+
+
+      def plot_pr_curve(
+          reports: List[Tuple[str, np.ndarray, np.ndarray]],
+          save_path: str = 'pr_comparison.png',
+      ) -> None:
+          '''reports: list of (name, y_true, y_prob) tuples'''
+          plt.figure(figsize=(8, 6))
+          for name, y_true, y_prob in reports:
+              p, r, _ = precision_recall_curve(y_true, y_prob)
+              plt.plot(r, p, lw=2, label=f'{name} (AUC={auc(r, p):.3f})')
+          plt.xlabel('Recall'); plt.ylabel('Precision')
+          plt.title('Precision-Recall Comparison'); plt.legend(); plt.grid(alpha=0.3)
+          plt.tight_layout(); plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
+          print(f'Saved PR comparison: {save_path}')
+
+
+      if __name__ == '__main__':
+          rng = np.random.default_rng(42)
+          y_true = np.array([0] * 190 + [1] * 10)
+          rf_prob = np.concatenate([rng.beta(1, 9, 190), rng.beta(7, 3, 10)])
+          xgb_prob = np.concatenate([rng.beta(1, 8, 190), rng.beta(8, 2, 10)])
+
+          rf_report = evaluate('RandomForest', y_true, rf_prob, operating_threshold=0.4)
+          xgb_report = evaluate('XGBoost', y_true, xgb_prob, operating_threshold=0.4)
+          print_report(rf_report)
+          print_report(xgb_report)
+          compare_classifiers([rf_report, xgb_report])
+
+  deliverable_5:
+    title: 'SHAP Explainer'
+    filename: 'shap_explainer.py'
+    description: 'SHAP summary plots and per-prediction waterfall charts for analyst-readable security classifier explanations. Produces a global importance summary, a per-prediction waterfall for any flagged request, and a security audit report checking whether structural features outrank surface token features in the global ranking.'
+    implementation_notes: 'Python 3.12, single quotes throughout per book convention. Requires: shap, matplotlib, numpy.'
+    code: |
+      # shap_explainer.py
+      # Section 12.05: SHAP Explainability for Security Classifiers
+      # 20260606 | AI Security Mastery -- Chapter 12 by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from __future__ import annotations
+
+      from typing import Any, Dict, List, Optional, Tuple
+
+      import numpy as np
+      import matplotlib.pyplot as plt
+      import shap
+
+      STRUCTURAL_FEATURES = {'role_boundary_marker', 'code_block_density', 'code_block_count', 'bracket_density'}
+      SURFACE_FEATURES = {'sequence_length', 'word_count', 'token_entropy'}
+
+
+      def compute_shap_values(
+          model: Any,
+          X: np.ndarray,
+          feature_names: List[str],
+      ) -> Tuple[shap.TreeExplainer, np.ndarray]:
+          explainer = shap.TreeExplainer(model)
+          sv = explainer.shap_values(X)
+          if isinstance(sv, list):
+              sv = sv[1]  # binary classification: take attack class
+          return explainer, sv
+
+
+      def global_importance(
+          shap_values: np.ndarray,
+          feature_names: List[str],
+          top_n: int = 15,
+      ) -> List[Tuple[str, float]]:
+          mean_abs = np.abs(shap_values).mean(axis=0)
+          ranked = sorted(zip(feature_names, mean_abs), key=lambda x: -x[1])
+          return ranked[:top_n]
+
+
+      def plot_summary(
+          shap_values: np.ndarray,
+          X: np.ndarray,
+          feature_names: List[str],
+          save_path: str = 'shap_summary.png',
+          top_n: int = 15,
+      ) -> None:
+          shap.summary_plot(shap_values, X, feature_names=feature_names,
+                            max_display=top_n, show=False)
+          plt.tight_layout()
+          plt.savefig(save_path, dpi=150, bbox_inches='tight')
+          plt.close()
+          print(f'Saved SHAP summary: {save_path}')
+
+
+      def plot_waterfall(
+          explainer: shap.TreeExplainer,
+          X_single: np.ndarray,
+          feature_names: List[str],
+          save_path: str = 'shap_waterfall.png',
+      ) -> Dict[str, float]:
+          '''Plot SHAP waterfall for a single prediction. Returns feature contribution dict.'''
+          sv = explainer.shap_values(X_single)
+          if isinstance(sv, list):
+              sv = sv[1]
+          contrib = dict(zip(feature_names, sv[0].tolist()))
+
+          # Sort by absolute contribution for waterfall
+          sorted_contribs = sorted(contrib.items(), key=lambda x: abs(x[1]), reverse=True)[:10]
+          names = [c[0] for c in sorted_contribs]
+          values = [c[1] for c in sorted_contribs]
+          colours = ['#ff6b6b' if v > 0 else '#51cf66' for v in values]
+
+          fig, ax = plt.subplots(figsize=(9, 5))
+          ax.barh(names[::-1], values[::-1], color=colours[::-1])
+          ax.axvline(0, color='black', lw=0.8)
+          ax.set_xlabel('SHAP value (contribution to attack probability)')
+          ax.set_title('SHAP Waterfall: Per-Feature Contribution')
+          plt.tight_layout()
+          plt.savefig(save_path, dpi=150, bbox_inches='tight')
+          plt.close()
+          print(f'Saved SHAP waterfall: {save_path}')
+          return contrib
+
+
+      def security_audit(ranking: List[Tuple[str, float]]) -> Dict[str, Any]:
+          top_10 = {name for name, _ in ranking[:10]}
+          structural_present = STRUCTURAL_FEATURES & top_10
+          surface_dominant = len(SURFACE_FEATURES & {name for name, _ in ranking[:3]}) >= 2
+          findings = []
+          if not structural_present:
+              findings.append('WARN: No structural features in top 10 -- classifier may be detecting length artifacts.')
+          if surface_dominant:
+              findings.append('WARN: Surface features dominate top 3 -- easily evaded by payload padding.')
+          if structural_present and not surface_dominant:
+              findings.append('OK: Structural features present in top 10; surface features not dominant.')
+          return {
+              'passed': bool(structural_present) and not surface_dominant,
+              'structural_in_top_10': sorted(structural_present),
+              'findings': findings,
+          }
+
+
+      def print_shap_report(
+          ranking: List[Tuple[str, float]],
+          audit: Dict[str, Any],
+      ) -> None:
+          print('SHAP Global Importance:')
+          for i, (name, val) in enumerate(ranking, 1):
+              tag = ' [STRUCTURAL]' if name in STRUCTURAL_FEATURES else (' [SURFACE]' if name in SURFACE_FEATURES else '')
+              bar = '#' * min(int(val * 200), 40)
+              print(f'  {i:>2}. {name:<35} {val:.4f}  {bar}{tag}')
+          print(f'\nSecurity Audit: {"PASS" if audit["passed"] else "FAIL"}')
+          for f in audit['findings']:
+              print(f'  {f}')
+
+
+      if __name__ == '__main__':
+          from sklearn.ensemble import RandomForestClassifier
+          rng = np.random.default_rng(42)
+          n_features = 20
+          feature_names = [
+              'sequence_length', 'word_count', 'special_char_density',
+              'instruction_keyword_freq', 'token_entropy', 'uppercase_ratio',
+              'role_boundary_marker', 'code_block_count', 'code_block_density',
+              'bracket_density', 'quotation_density',
+              'centroid_cosine_dist_min', 'benign_cosine_dist', 'embedding_l2_norm',
+              'turn_number', 'prior_refusal_count', 'session_request_rate',
+              'temperature', 'streaming_flag', 'is_default_model',
+          ]
+          X = np.vstack([rng.normal(0.1, 0.05, (200, n_features)), rng.normal(0.6, 0.1, (40, n_features))])
+          X[:, 6] = np.where(np.arange(240) >= 200, 1.0, 0.0)  # role_boundary_marker
+          y = np.array([0] * 200 + [1] * 40)
+          model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
+          model.fit(X, y)
+
+          explainer, sv = compute_shap_values(model, X, feature_names)
+          ranking = global_importance(sv, feature_names)
+          audit = security_audit(ranking)
+          print_shap_report(ranking, audit)
+
+          # Waterfall for a single attack example
+          plot_waterfall(explainer, X[200:201], feature_names)
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Applying both SMOTE on the training set and scale_pos_weight in XGBoost, double-counting the imbalance treatment and pushing the classifier toward excessive attack predictions'
+    why_it_happens: |
+      The engineer reads the Section 12.04 recommendation to apply SMOTE and the XGBoost
+      documentation recommending scale_pos_weight for imbalanced datasets. Both seem like
+      good ideas; applying both seems like belt-and-suspenders safety. It is not.
+    consequence: |
+      After SMOTE the training set attack:benign ratio is approximately 1:2. Setting
+      scale_pos_weight=20 (the original imbalance ratio) tells XGBoost to upweight attack
+      examples by a factor of 20 on an already nearly balanced dataset. The classifier
+      aggressively predicts attack, producing recall near 1.0 and precision near the base
+      rate of attacks in the test set. The false positive rate on production traffic
+      is unsustainably high.
+    correct_approach: |
+      Apply one imbalance treatment, not both. If SMOTE was applied to the training set,
+      set scale_pos_weight=1.0 in XGBoost (the default). If SMOTE was not applied (fewer
+      than 100 attack examples), set scale_pos_weight=n_benign/n_attack and do not run
+      SMOTE. The auto_scale_pos_weight parameter in xgboost_classifier.py handles this
+      correctly when called after a SMOTE-treated training set is passed.
+
+  mistake_2:
+    description: 'Reporting accuracy as the primary evaluation metric and claiming 98% accuracy as production-ready performance'
+    why_it_happens: |
+      The security_evaluator.py harness computes six metrics. The engineer focuses on
+      accuracy because it is the metric they are most familiar with and the one that
+      produces the highest-looking number on an imbalanced test set.
+    consequence: |
+      A test set with 190 benign and 10 attack examples has a 95% accuracy baseline for
+      a classifier that predicts benign for every request. A genuinely trained classifier
+      may reach 98% accuracy while catching only 5 of 10 attacks (50% recall). The 98%
+      accuracy is reported as production-ready; the 50% recall that means half of all
+      attacks reach the model undetected is not reported.
+    correct_approach: |
+      Report recall, precision, and FPR at the operating threshold as the primary metrics.
+      Accuracy is not reported for security classifiers. The security_evaluator.py harness
+      intentionally does not compute accuracy. The compare_classifiers() function sorts
+      by recall, not accuracy, to enforce the c
+
+  mistake_3:
+    description: 'Setting the operating threshold at the default 0.5 without calibrating it to the analyst capacity constraint'
+    why_it_happens: |
+      The classifier is trained with a default threshold of 0.5. The evaluation harness
+      uses 0.5. The production gateway uses 0.5. This is the sklearn convention and it
+      carries through every step without being questioned.
+    consequence: |
+      At 0.5 threshold and 10,000 requests per day, the false positive rate at 0.5 may
+      produce 300 FP alerts per day against a 50-alert analyst capacity. The gateway is
+      flooded with alerts, analysts stop reviewing them, and the detection system is
+      effectively disabled within a week.
+    correct_approach: |
+      Use the precision-recall curve from security_evaluator.py to select the operating
+      threshold explicitly. The threshold_tuner.py in Section 12.10 formalises this
+      selection. Always set the threshold before the first production deployment, not
+      after the first alert flood.
+
+  mistake_4:
+    description: 'Using standard k-fold cross-validation instead of temporal k-fold, allowing future examples to appear in training folds'
+    why_it_happens: |
+      Optuna default cross-validation uses sklearn KFold with shuffle=True. The engineer
+      uses the Optuna example code without modifying the cross-validation strategy and
+      produces optimistically-biased hyperparameter selection results.
+    consequence: |
+      Hyperparameters selected by standard k-fold are optimised for generalisation to
+      data from the same time window as training data, not to future traffic. The selected
+      hyperparameters produce a classifier that performs well on cross-validation and
+      degrades on the temporal test set. The temporal test set performance is the correct
+      proxy for production performance; cross-validation performance is not.
+    correct_approach: |
+      The hyperparameter_tuner.py in deliverable_3 uses the validation split from the
+      Section 12.04 temporal split as the evaluation set for every Optuna trial, not
+      cross-validation. This ensures hyperparameter selection is evaluated on data that
+      is temporally later than the training data for every trial.
+
+  mistake_5:
+    description: 'Treating classifier training as a one-time activity without setting up the retraining infrastructure before the attack distribution shifts'
+    why_it_happens: |
+      Training takes a day of engineering work. Once deployed, the classifier performs
+      well for 4-8 weeks. The engineer moves on to other sections and does not set up
+      the retraining infrastructure before the classifier needs it.
+    consequence: |
+      When the attack distribution shifts, the classifier recall drops silently. The
+      feature distribution monitor fires, but the retraining infrastructure does not
+      exist to act on it. Retraining is done manually without registry integration,
+      without shadow-mode validation, without canary promotion. One step produces a
+      regression; without the registry there is no rollback.
+    correct_approach: |
+      Set up the Section 12.13 model registry before the first classifier is deployed.
+      Set up the Section 12.14 live curation pipeline before the first retraining
+      trigger fires. The correct sequencing: train classifier (12.05), register it
+      (12.13), deploy curation pipeline (12.14), then continue detection engineering
+      knowing the retraining infrastructure is in place.
+
+section_summary:
+
+  compact: |
+    Random Forest and XGBoost are the first supervised classifiers in Chapter 12 and the
+    workhorses of the detection system for the 200-2000 labelled example range. Random
+    Forest trains an ensemble of decorrelated trees via bootstrap sampling and feature
+    subsetting, is robust to label noise, and trains in seconds. XGBoost fits trees
+    sequentially with gradient boosting and regularisation, reaching higher accuracy
+    above 500 labelled examples at the cost of sensitivity to label noise. Both produce
+    full SHAP explainability via TreeExplainer: every prediction decomposes into signed
+    per-feature contributions readable by a security analyst without ML expertise.
+    Evaluation uses precision, recall, ROC-AUC, and FPR at the operating threshold --
+    never accuracy. The operating threshold is calibrated to the analyst capacity
+    constraint, not left at the default 0.5. The security_evaluator.py harness is
+    imported by every subsequent section for consistent cross-classifier benchmarking.
+
+  key_takeaways:
+    - 'Random Forest is the correct default for 200-500 labelled examples: robust to label noise, sub-3ms inference, and full SHAP explainability -- all three properties matter more than peak accuracy in the early deployment stage'
+    - 'XGBoost outperforms Random Forest above 500 labelled examples when annotation quality is high (kappa > 0.85); below this, its boosting amplifies label noise and degrades precision'
+    - 'Apply one imbalance treatment only: SMOTE on the training set OR scale_pos_weight in XGBoost -- never both; double-counting pushes the classifier to predict attack for the majority of requests'
+    - 'The operating threshold must be calibrated to the analyst capacity constraint before the first production deployment -- a default 0.5 threshold on a 1:20 imbalanced dataset will flood the annotation queue'
+    - 'SHAP explanations are an audit tool: if role_boundary_marker and code_block_density are not in the top-5 SHAP features for attack predictions, the classifier is measuring an artifact rather than the attack mechanism'
+    - 'The security_evaluator.py harness is the benchmark baseline for every classifier section through 12.17 -- every new detector must outperform Random Forest on recall at matched precision to justify its additional complexity'
+
+preview_section_12_06:
+  title: 'Section 12.06: Sequence Models -- LSTM and GRU for Multi-Turn Conversation Threat Detection'
+  summary: |
+    Section 12.06 extends supervised classification into the temporal dimension. Random
+    Forest and XGBoost from Section 12.05 classify individual API requests in isolation.
+    Multi-turn jailbreak attacks fragment the payload across turns, each innocuous
+    individually but constituting an attack in sequence. The GRU sequence detector reads
+    the full conversation history as a variable-length sequence of SecurityFeatureVectors
+    and classifies the conversation, not the turn. Attention weights over turns identify
+    which turns carried the attack signal. The LSTM covers the more expressive gating
+    mechanism; the GRU is preferred for conversations shorter than 20 turns due to faster
+    training and matched accuracy with fewer parameters.
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 1 Section 1.07: classification algorithms -- Random Forest and decision tree foundations'
+    - 'Chapter 1 Section 1.11: evaluation metrics -- precision, recall, F1, ROC-AUC used throughout'
+    - 'Chapter 1 Section 1.13: ensemble methods -- bagging (RF) and boosting (XGBoost) concepts'
+    - 'Section 12.02: security feature engineering -- SecurityFeatureVector.to_array() is the classifier input'
+    - 'Section 12.03: anomaly detection -- IsolationForestDetector baseline that this section must outperform'
+    - 'Section 12.04: dataset curation -- temporal split and SMOTE-treated training set consumed here'
+  forward_references:
+    - 'Section 12.06: sequence models -- imports security_evaluator.py for cross-section benchmarking'
+    - 'Section 12.10: calibration and threshold tuning -- both classifiers calibrated with Platt scaling'
+    - 'Section 12.13: model registry -- both classifiers registered with dataset version tags'
+    - 'Section 12.15: four-detector ensemble -- RF and XGBoost are two of the four ensemble components'
+    - 'Section 12.16: benchmarking -- security_evaluator.py used for all cross-section comparisons'
+  tags:
+    - supervised-classification
+    - random-forest
+    - xgboost
+    - gradient-boosting
+    - shap-explainability
+    - security-evaluation
+    - imbalance-treatment
+    - scale-pos-weight
+    - optuna-hyperparameter-tuning
+    - temporal-cross-validation
+    - precision-recall
+    - operating-threshold
+    - owasp-llm01
+    - owasp-llm02
+    - atlas-aml-t0051
+    - atlas-aml-t0054

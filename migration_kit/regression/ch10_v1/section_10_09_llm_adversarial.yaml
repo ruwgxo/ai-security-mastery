@@ -1,0 +1,1331 @@
+# section_10_09_llm_adversarial.yaml
+
+---
+document_info:
+  title: 'Adversarial Attacks on LLMs: Token Substitution, HotFlip, and Semantic Perturbation'
+  chapter: 10
+  section: 9
+  section_code: '1009'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-05-24'
+  estimated_pages: 6
+  estimated_reading_time: '45-55 minutes'
+
+section_overview:
+  one_line_summary: 'Text adversarial attacks substitute tokens or characters such that the text remains semantically valid to humans but fools classifiers -- the discrete-space analogue of FGSM and universal patches, and the automated implementation of Chapter 7 jailbreaks.'
+  why_this_section_exists: |
+    Every attack in Sections 10.3-10.8 operates in continuous pixel space where Lp norms are
+    natural perturbation metrics. Text is discrete: tokens are integer indices into a vocabulary,
+    and perturbing an index by a real-valued delta produces a non-token. Section 10.9 establishes
+    the discrete-text attack framework -- the different search methods, constraint analogues, and
+    target classifiers that apply when the input is tokenised text rather than pixel grids. It
+    also closes the loop between Chapter 10 (automated adversarial attacks) and Chapter 7
+    (human-crafted jailbreaks): universal adversarial triggers are the automated adversary that
+    produces jailbreaks at scale. Section 10.12 consistency checking -- introduced for image
+    adversarial examples -- extends directly to text via back-translation and paraphrase, and
+    Section 10.9 establishes why.
+  position_in_chapter: |
+    Section 10.9 fills the text modality cells of the Section 10.2 taxonomy matrix. It completes
+    the attack catalogue (Sections 10.3-10.9 cover all taxonomy cells) before the incident
+    analysis (10.10), detection primitives (10.11-10.12), and production gateway (10.13) sections.
+
+learning_objectives:
+
+  knowledge:
+    - 'Explain why Lp norm constraints do not apply to discrete text and state the text analogues: token edit distance (L0) and semantic similarity (L2)'
+    - 'Describe HotFlip and explain how the Jacobian of the classifier w.r.t. the one-hot token vector identifies the best character substitution'
+    - 'Describe TextFooler: word importance ranking by deletion, synonym substitution with cosine similarity constraint, and POS filter'
+    - 'Explain the BERT-Attack approach: why masked language model predictions produce more contextually natural substitutions than synonym lookup'
+    - 'Describe universal adversarial triggers: fixed token sequences that universally fool classifiers when appended to any input, and connect them to Section 10.8 universal patches and Chapter 7 jailbreaks'
+    - 'State the detection approach: semantic consistency check (back-translation) catches adversarial text that changes classification but preserves meaning'
+
+  skills:
+    - 'Implement TextFooler-style word importance ranking and greedy synonym substitution on a toy text classifier'
+    - 'Implement HotFlip character-level substitution using the gradient of loss w.r.t. character embeddings'
+    - 'Implement greedy universal adversarial trigger search by iteratively replacing trigger tokens with the highest-loss candidates'
+    - 'Generate character-level homoglyph and zero-width character attacks against regex and ML-based classifiers'
+    - 'Implement semantic similarity and Unicode anomaly detection for adversarial text identification'
+
+  security_mindset:
+    - 'Recognise that universal adversarial triggers are automated jailbreaks at scale -- the same attack surface as Chapter 7, with automated search replacing human creativity'
+    - 'Understand that character-level attacks (homoglyphs, zero-width injection) bypass ML classifiers by exploiting tokeniser preprocessing -- the attack is at the tokenisation layer, not the model'
+    - 'Appreciate that text adversarial detection requires a different primitive from image adversarial detection: back-translation preserves semantics but changes token identities, so adversarial text that is fragile to token changes is detectable'
+
+prerequisites:
+  - 'Section 10.3: FGSM (HotFlip is the text analogue -- Jacobian w.r.t. one-hot token is the text version of gradient w.r.t. pixel)'
+  - 'Section 10.8: universal adversarial patches (universal adversarial triggers are the text analogue)'
+  - 'Section 10.2: text modality cells in the adversarial taxonomy (Section 10.9 fills these cells)'
+  - 'Chapter 6: prompt injection (character-level attacks share obfuscation techniques with Section 6.6)'
+  - 'Chapter 7: jailbreak techniques (Section 7.7 adversarial prompts; universal triggers are the automated implementation)'
+  - 'Chapter 3: LLM tokenisation and embedding space (prerequisite for HotFlip and token-level attacks)'
+
+prose_content:
+
+  part_1:
+    title: 'The Discrete Text Challenge: Why Pixel Perturbation Methods Break'
+    body: |
+      FGSM computes nabla_x J(theta, x, y) and takes a step in the gradient sign direction. This
+      works because x is a continuous vector -- each feature x_i is a real number and x_i +
+      epsilon * sign(g_i) is also a valid real number. Text inputs are not continuous vectors.
+      A text string, after tokenisation, becomes a sequence of integer indices into a finite
+      vocabulary. If token index 342 ("cat") is perturbed to 342.7, the result is not in the
+      vocabulary and is not a valid text input.
+
+      This discreteness problem fundamentally changes the attack formulation. The adversary
+      cannot take a gradient step in token space -- there is no continuous path from one token
+      to another. They must instead search over discrete substitutions: replace token t_i with
+      a different token t_j from the vocabulary such that the text remains semantically coherent
+      to a human reader but causes the classifier to produce a wrong output.
+
+      The constraint analogues for text are: token edit distance (the number of token substitutions,
+      analogous to L0), and semantic similarity (the cosine distance between sentence embedding
+      vectors, analogous to L2). A text adversarial attack is constrained when the edit distance
+      is at most k substitutions and the semantic similarity to the original text is above a
+      threshold theta. These constraints ensure the adversarial text remains meaningful and
+      approximately semantically equivalent to a human reader while fooling the classifier.
+
+      The search strategy also changes. Continuous-space attacks use gradient descent to find the
+      optimal perturbation. Discrete-space attacks use gradient information to guide search (HotFlip)
+      or use greedy combinatorial search with a black-box classifier oracle (TextFooler) or use a
+      language model to propose natural substitutions (BERT-Attack). Each approach makes a different
+      trade-off between naturalness, query budget, and required access to the target classifier.
+
+  part_2:
+    title: 'HotFlip: The Text Analogue of FGSM'
+    body: |
+      HotFlip (Ebrahimi et al. 2018) is the closest text analogue to FGSM: a gradient-based
+      attack that identifies the single token substitution that most increases the classifier loss,
+      and applies it. The key insight is that while token indices are discrete, the classifier
+      operates on token embeddings which are continuous. The gradient of the loss with respect to
+      the embedding at position i provides the direction in embedding space that most increases loss.
+
+      For a classifier that operates on character-level one-hot encodings, the Jacobian
+      J_i = nabla_{e_i} L gives the loss sensitivity with respect to the embedding at position i.
+      Flipping character t_i to character t_j changes the embedding from e_{t_i} to e_{t_j},
+      producing a change in loss of approximately (e_{t_j} - e_{t_i})^T * J_i. The best flip at
+      position i is: argmax_j (e_{t_j} - e_{t_i})^T * J_i -- the token t_j whose embedding is
+      most aligned with the gradient direction from the current embedding e_{t_i}.
+
+      HotFlip evaluates all vocabulary tokens at each position and finds the (position, token)
+      pair that maximally increases the loss in a single substitution. It then applies that
+      substitution and iterates. Like FGSM, it is fast (one forward-backward pass per step)
+      and like FGSM, it is suboptimal because it does not account for interactions between
+      multiple substitutions. TextFooler''s word-level greedy search typically produces
+      more semantically coherent adversarial examples, and BERT-Attack produces more
+      contextually natural ones, but HotFlip is the analytically cleanest text attack
+      and the most direct translation of the FGSM primitive.
+
+  part_3:
+    title: 'TextFooler: Greedy Word Substitution with Semantic Constraint'
+    body: |
+      TextFooler (Jin et al. 2020) is a black-box word-substitution attack that requires only
+      the classifier''s output probabilities, no gradient access. The algorithm has three phases.
+
+      Phase 1 -- Word importance ranking: for each word w_i in the input text, delete w_i from
+      the text and measure how much the classifier''s confidence in the correct class drops. Words
+      whose deletion causes the largest confidence drop are the most important to the classifier''s
+      decision and should be substituted first.
+
+      Phase 2 -- Candidate substitution generation: for each important word w_i, find candidate
+      synonyms from a pre-built counter-fitted word vector space (embeddings trained to push
+      antonyms apart and pull synonyms together). Rank candidates by cosine similarity to w_i.
+      Filter candidates that: (a) change the Part-Of-Speech tag of w_i (substituting a noun with
+      a verb typically breaks grammaticality), or (b) produce a sentence whose overall semantic
+      similarity to the original sentence falls below a threshold (typically 0.84 cosine similarity
+      between sentence embeddings).
+
+      Phase 3 -- Greedy substitution: for the remaining candidates, find the substitution that
+      most reduces the classifier''s confidence in the correct class. Apply it. Repeat for the
+      next most important word until the classifier is fooled or all important words have been
+      processed.
+
+      TextFooler produces adversarial text that is grammatically valid, semantically similar to
+      the original, and POS-preserving -- it passes human evaluation as natural text in most
+      cases. Its black-box nature (requires only output probabilities) makes it the relevant
+      attack model for production safety classifiers and content moderation systems that expose
+      confidence scores.
+
+  part_4:
+    title: 'BERT-Attack and Character-Level Attacks'
+    body: |
+      BERT-Attack (Li et al. 2020) improves on TextFooler''s candidate generation by using a masked
+      language model (BERT) rather than a static synonym dictionary. The attack replaces each target
+      word with [MASK] and queries BERT for the most likely tokens at that position. These candidates
+      are contextually appropriate -- BERT considers the surrounding words and produces substitutions
+      that fit grammatically and semantically into the sentence -- producing adversarial examples
+      that are more natural-sounding than synonym substitution alone. The remaining attack structure
+      (importance ranking, similarity filtering, greedy search) is similar to TextFooler.
+
+      Character-level attacks operate below the word level and exploit a different vulnerability:
+      classifier tokenisers and preprocessing pipelines that normalise text differently from how
+      a human reads it. Three character-level attack families are practically relevant.
+
+      Homoglyph substitution replaces visually identical Unicode characters for ASCII characters:
+      the Cyrillic lowercase "а" (U+0430) looks identical to the Latin "a" (U+0061) but is a
+      different byte sequence. A simple regex or keyword filter that matches "bad" does not match
+      "bаd" (Cyrillic а). Many ML classifiers that were trained on ASCII/UTF-8 normalised text
+      will tokenise the Cyrillic character differently (or map it to an out-of-vocabulary token),
+      changing the input embedding and potentially evading the classifier.
+
+      Zero-width character injection inserts invisible Unicode codepoints (zero-width joiner U+200D,
+      zero-width non-joiner U+200C, zero-width no-break space U+FEFF) between characters. The
+      text appears identical when rendered but contains different byte sequences. Regex-based
+      detection is trivially bypassed; ML classifiers may or may not tokenise zero-width characters
+      as separate tokens depending on the tokeniser implementation.
+
+      Typosquatting introduces deliberate character transpositions, doubling, or omissions that
+      preserve readability ("definately" for "definitely", "bomm" for "bomb") while evading
+      exact-match detection. Combined with semantic similarity constraints, these produce adversarial
+      text that humans consider equivalent to the original.
+
+  part_5:
+    title: 'Universal Adversarial Triggers: Automated Jailbreaks at Scale'
+    body: |
+      Wallace, Feng, Kandpal, Gardner, and Singh (2019) demonstrated universal adversarial triggers
+      for NLP models: fixed sequences of tokens that, when appended to any input, cause the model
+      to consistently output a specific wrong answer regardless of the input content. The attack is
+      the text analogue of universal adversarial patches (Section 10.8): one perturbation that works
+      universally rather than being optimised per input.
+
+      The trigger search algorithm is gradient-guided. For each position in the trigger, compute the
+      average gradient of the loss across many input examples with respect to the embedding at that
+      trigger position. The best token for that position is the one whose embedding is most aligned
+      with the gradient direction. Formally: for trigger position k, the best replacement is
+      argmin_{t in V} ||e_t - (e_{trigger_k} + alpha * g_k)||_2 where g_k is the average gradient
+      at position k across the batch. Iterate over all trigger positions and repeat until convergence.
+
+      The resulting trigger is typically gibberish -- semantically meaningless token sequences that
+      activate adversarial behaviour in the model. When appended to a sentiment analysis input, the
+      trigger causes every sentence to be classified as negative regardless of its actual sentiment.
+      When appended to a reading comprehension question, the trigger causes the model to produce a
+      specific target answer regardless of the passage content.
+
+      The connection to Chapter 7 is direct. Universal adversarial triggers are the automated
+      implementation of what Chapter 7 Section 7.7 called "adversarial prompts (automated
+      generation)": fixed text sequences that, when added to any user prompt, cause an LLM safety
+      classifier to classify the content as safe regardless of what the content actually says.
+      The human jailbreak engineer crafts triggers by intuition and iteration; the Wallace et al.
+      algorithm searches for them automatically using gradients. Both produce the same class of
+      adversarial input; the algorithm simply does it at scale.
+
+  part_6:
+    title: 'Adversarial Attacks on LLM Safety Classifiers'
+    body: |
+      LLM safety classifiers (content moderation, intent classifiers, safety filters) are the
+      highest-value targets for text adversarial attacks in production. A successful adversarial
+      attack on a safety classifier bypasses a security control rather than merely fooling a
+      prediction -- the consequences are operational, not just academic.
+
+      TextFooler-style attacks against content moderation systems substitute harmful content with
+      synonyms or paraphrases that preserve the harmful intent but change the specific tokens
+      that trigger the classifier. The adversarial text "I want to detonate an explosive device"
+      becomes "I intend to ignite a combustive apparatus" -- the tokens are different, the semantic
+      content is essentially identical, but a token-matching or TF-IDF-based classifier may not
+      flag the second version.
+
+      Universal adversarial triggers for safety filters are the most dangerous variant: a fixed
+      token sequence (the trigger) can be prepended or appended to any harmful content, causing the
+      safety classifier to classify the combined text as safe regardless of the harmful content.
+      If such a trigger is discovered and published, any adversary can use it against any deployment
+      using the same classifier.
+
+      Character-level attacks (homoglyphs, zero-width characters) are particularly effective against
+      safety filters that rely on keyword matching or have simple tokenisation: the harmful keywords
+      are present in the text but are encoded differently. LLMs themselves typically handle Unicode
+      normalisation correctly, but upstream preprocessing layers and regex-based filters may not.
+
+      The connection to OWASP LLM01 (Section 6.2) is significant: adversarial attacks on safety
+      classifiers are, from the defence perspective, a form of prompt injection where the injection
+      is crafted by an automated optimiser rather than a human. The defences are different at the
+      detection level (Track 7 semantic consistency checking vs Track 1-5 injection classifiers)
+      but the upstream control (normalise and sanitise input before classification) overlaps.
+
+  part_7:
+    title: 'Detection: Semantic Consistency and Linguistic Anomaly Analysis'
+    body: |
+      The Track 7 consistency checker for text adversarial examples uses semantic consistency
+      rather than pixel perturbation. For image inputs, the consistency checker submits N randomly
+      perturbed image variants and checks if the prediction is stable. For text inputs, the
+      analogue is back-translation: translate the text to an intermediate language (e.g., French)
+      and back to English, producing a text that preserves semantic content but changes token
+      identities. An adversarial text that is fragile -- whose adversarial classification depends
+      on specific token choices rather than on the semantic content -- will have its classification
+      restored by back-translation. A text whose classification reflects its genuine semantic
+      content will survive back-translation with the same classification.
+
+      A simpler consistency check is paraphrase: use a paraphrase generation model (or a round-trip
+      through an LLM) to rephrase the input and check if the classification changes. TextFooler
+      adversarial examples that succeeded by substituting specific synonyms often fail when the
+      text is paraphrased, because the paraphrase introduces different synonyms. Universal adversarial
+      triggers may survive paraphrase if the trigger tokens are preserved, but often the trigger is
+      removed or modified by the paraphrase step.
+
+      Unicode anomaly detection is the character-level counterpart. Check the input text for:
+      non-ASCII characters in positions expected to contain ASCII (homoglyph detection), zero-width
+      Unicode codepoints between characters, unusual byte sequences for the declared encoding, and
+      character sequences that render visually as ASCII but are not ASCII. These patterns are
+      strongly indicative of character-level adversarial text attacks and can be detected by
+      byte-level analysis without any model forward pass.
+
+      The combined detection ensemble for text adversarial examples uses: semantic consistency
+      check (back-translation or paraphrase), Unicode anomaly analysis (byte-level), and the
+      adversarial classifier trained to distinguish adversarial from natural text. Section 10.12
+      extends the adversarial classifier to text features and Section 10.13 wires both text and
+      image detection into the Track 7 gateway.
+
+reference_materials:
+
+  table_1:
+    title: 'Text Adversarial Attack Families'
+    description: 'Four attack families with method, access required, perturbation constraint, and Chapter 10 deliverable'
+    columns: ['Attack', 'Reference', 'Access required', 'Perturbation constraint', 'Deliverable']
+    rows:
+      - ['HotFlip', 'Ebrahimi et al. 2018', 'White-box (gradient w.r.t. embedding)', 'Token edit distance <= k; character-level', 'hotflip_attack.py']
+      - ['TextFooler', 'Jin et al. 2020', 'Black-box (soft-label)', 'Edit distance <= k; semantic similarity > 0.84; POS preserved', 'token_substitution_attack.py']
+      - ['BERT-Attack', 'Li et al. 2020', 'Black-box (soft-label) + masked LM access', 'Edit distance <= k; contextual naturalness', '(reference in token_substitution_attack.py notes)']
+      - ['Universal trigger', 'Wallace et al. 2019', 'White-box (gradient) or black-box (greedy)', 'Trigger length T; no semantic constraint on trigger tokens', 'universal_trigger_search.py']
+      - ['Homoglyph/ZWC', 'Folklore + Boucher et al. 2021', 'Black-box (hard-label)', 'Visual indistinguishability; byte-level modification', 'character_level_attack.py']
+
+  table_2:
+    title: 'Lp Norm Analogues for Text Adversarial Attacks'
+    description: 'Image-domain Lp norms and their discrete-text analogues with constraint interpretation and typical thresholds'
+    columns: ['Image norm', 'Text analogue', 'Constraint interpretation', 'Typical threshold', 'Detection via']
+    rows:
+      - ['L0 (feature count)', 'Token edit distance', 'Number of word/character substitutions', '<= 20% of words modified', 'Edit distance count; highlights unusual substitutions']
+      - ['L2 (Euclidean)', 'Semantic similarity (cosine)', 'Cosine distance between sentence embeddings', '>= 0.84 cosine similarity', 'Back-translation consistency check']
+      - ['L-inf (max feature)', 'Max individual word semantic shift', 'No single word changes meaning by more than threshold', 'Cosine > 0.7 per substituted word', 'Per-word embedding distance check']
+      - ['Perceptibility (human)', 'Naturalness / grammaticality', 'Text reads naturally to human reader', 'POS preserved; fluency score', 'Human evaluation; language model perplexity']
+
+  table_3:
+    title: 'Text Adversarial Detection Approaches'
+    description: 'Detection primitives for text adversarial attacks with mechanism, attack families covered, and track 7 integration'
+    columns: ['Detection primitive', 'Mechanism', 'Covers', 'Track 7 stage', 'Gap']
+    rows:
+      - ['Back-translation consistency', 'Translate to intermediate language and back; check if classification changes', 'TextFooler, BERT-Attack; token-substitution attacks that are fragile to paraphrase', 'Post-inference', 'Universal triggers may survive back-translation if trigger tokens are preserved']
+      - ['Paraphrase consistency', 'Rephrase input via LM; check classification stability', 'TextFooler, soft semantic attacks', 'Post-inference', 'More expensive than back-translation; requires paraphrase model']
+      - ['Unicode anomaly analysis', 'Scan for non-ASCII in ASCII-expected positions; detect zero-width characters', 'Homoglyph attacks, zero-width character injection', 'Pre-inference (no model needed)', 'Does not cover word-level substitution attacks using standard Unicode']
+      - ['Adversarial text classifier', 'Trained binary classifier on adversarial vs natural text features', 'All attack families present in training data', 'Post-inference', 'Degrades on novel attack families not in training data']
+      - ['Linguistic feature anomaly', 'Detect unusual POS patterns, vocabulary distribution shifts, perplexity spikes', 'Low-fluency attacks; character-level attacks', 'Pre-inference', 'High-quality TextFooler attacks have normal perplexity']
+
+deliverables:
+
+  deliverable_1:
+    title: 'TextFooler-Style Token Substitution Attack'
+    filename: 'token_substitution_attack.py'
+    description: 'TextFooler-style word importance ranking and greedy synonym substitution on a toy character-level text classifier; demonstrates the discrete greedy search with semantic similarity constraint'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Uses a ToyTextClassifier (character-level embedding + mean pool + linear).
+      Synonym map is a small hardcoded dictionary for demo purposes.
+      In production: use counter-fitted word vectors (Mrkšić et al. 2016) for synonym lookup.
+    code: |
+      # token_substitution_attack.py
+      # Section 10.9: TextFooler-Style Token Substitution Attack
+      # 20260524 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+      # Reference: Jin et al. 2020 "Is BERT Really Robust?"
+
+      import torch
+      import torch.nn as nn
+      from typing import List, Tuple, Dict
+
+
+      # Small synonym dictionary for demonstration
+      # In production: use counter-fitted word vectors
+      SYNONYM_MAP: Dict[str, List[str]] = {
+          'bad': ['terrible', 'awful', 'poor', 'dreadful'],
+          'good': ['great', 'excellent', 'fine', 'superb'],
+          'happy': ['joyful', 'pleased', 'content', 'glad'],
+          'sad': ['unhappy', 'sorrowful', 'miserable', 'gloomy'],
+          'kill': ['eliminate', 'terminate', 'destroy', 'neutralise'],
+          'bomb': ['device', 'explosive', 'detonator', 'charge'],
+          'attack': ['strike', 'assault', 'raid', 'hit'],
+          'hate': ['dislike', 'despise', 'loathe', 'detest'],
+          'love': ['adore', 'cherish', 'treasure', 'admire'],
+          'stupid': ['foolish', 'unwise', 'ignorant', 'naive'],
+      }
+
+
+      class ToyTextClassifier(nn.Module):
+          '''Character-level text classifier for demonstration.'''
+          def __init__(self, vocab_size: int = 128, embed_dim: int = 32, n_classes: int = 2):
+              super().__init__()
+              self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+              self.classifier = nn.Linear(embed_dim, n_classes)
+
+          def forward(self, x: torch.Tensor) -> torch.Tensor:
+              # x: (batch, seq_len) character indices
+              embedded = self.embedding(x)   # (batch, seq_len, embed_dim)
+              mask = (x != 0).float().unsqueeze(-1)  # ignore padding
+              pooled = (embedded * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+              return self.classifier(pooled)
+
+
+      def text_to_tensor(text: str, max_len: int = 64) -> torch.Tensor:
+          '''Encode text as ASCII character indices (0-padded to max_len).'''
+          indices = [min(ord(c), 127) for c in text[:max_len]]
+          indices += [0] * (max_len - len(indices))
+          return torch.tensor(indices, dtype=torch.long).unsqueeze(0)
+
+
+      def classifier_confidence(model: nn.Module, text: str, true_class: int) -> float:
+          '''Confidence score for the true class.'''
+          x = text_to_tensor(text)
+          with torch.no_grad():
+              probs = torch.softmax(model(x), dim=1)
+          return probs[0, true_class].item()
+
+
+      def word_importance_ranking(
+          model: nn.Module,
+          text: str,
+          true_class: int,
+      ) -> List[Tuple[int, str, float]]:
+          '''
+          Rank words by importance to classifier decision.
+          Importance = confidence drop when word is deleted.
+          Returns list of (word_index, word, importance_score) sorted by importance desc.
+          '''
+          words = text.split()
+          base_conf = classifier_confidence(model, text, true_class)
+          rankings = []
+          for i, word in enumerate(words):
+              ablated = ' '.join(words[:i] + words[i+1:])
+              ablated_conf = classifier_confidence(model, ablated, true_class)
+              importance = base_conf - ablated_conf
+              rankings.append((i, word, importance))
+          return sorted(rankings, key=lambda t: t[2], reverse=True)
+
+
+      def semantic_similarity(word1: str, word2: str) -> float:
+          '''
+          Simplified semantic similarity using character n-gram overlap.
+          In production: use sentence embedding cosine similarity.
+          '''
+          def ngrams(s, n=3):
+              return set(s[i:i+n] for i in range(len(s) - n + 1))
+          g1, g2 = ngrams(word1.lower()), ngrams(word2.lower())
+          if not g1 and not g2:
+              return 1.0
+          intersection = len(g1 & g2)
+          union = len(g1 | g2)
+          return intersection / union if union > 0 else 0.0
+
+
+      def textfooler_attack(
+          model: nn.Module,
+          text: str,
+          true_class: int,
+          sim_threshold: float = 0.30,
+          max_substitutions: int = 5,
+      ) -> Tuple[str, int, bool]:
+          '''
+          TextFooler-style greedy word substitution attack.
+          Returns (adversarial_text, n_substitutions, success).
+          '''
+          words = text.split()
+          adv_words = words.copy()
+          n_subs = 0
+
+          rankings = word_importance_ranking(model, text, true_class)
+
+          for word_idx, orig_word, importance in rankings:
+              if n_subs >= max_substitutions:
+                  break
+              orig_word_lower = orig_word.lower()
+              if orig_word_lower not in SYNONYM_MAP:
+                  continue
+
+              # Try each synonym
+              best_sub = None
+              best_conf = classifier_confidence(
+                  model, ' '.join(adv_words), true_class,
+              )
+              for synonym in SYNONYM_MAP[orig_word_lower]:
+                  sim = semantic_similarity(orig_word_lower, synonym)
+                  if sim < sim_threshold:
+                      continue
+                  test_words = adv_words.copy()
+                  test_words[word_idx] = synonym
+                  conf = classifier_confidence(model, ' '.join(test_words), true_class)
+                  if conf < best_conf:
+                      best_conf = conf
+                      best_sub = synonym
+
+              if best_sub is not None:
+                  adv_words[word_idx] = best_sub
+                  n_subs += 1
+
+          adv_text = ' '.join(adv_words)
+          with torch.no_grad():
+              x_adv = text_to_tensor(adv_text)
+              pred = model(x_adv).argmax(dim=1).item()
+          success = (pred != true_class)
+          return adv_text, n_subs, success
+
+
+      def demo() -> None:
+          torch.manual_seed(42)
+          model = ToyTextClassifier()
+          model.eval()
+          texts = [
+              'I hate this terrible product it is awful and bad',
+              'This bomb attack killed many people and it was sad',
+              'I love this good happy experience it is great',
+          ]
+          true_classes = [0, 0, 1]
+          print('TextFooler-style attack demo on ToyTextClassifier')
+          print(f'{"Original":<50} {"Adversarial":<50} {"Subs":<6} {"Success"}')
+          print('-' * 115)
+          for text, tc in zip(texts, true_classes):
+              adv, n_subs, success = textfooler_attack(model, text, tc)
+              print(f'{text[:48]:<50} {adv[:48]:<50} {n_subs:<6} {success}')
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_2:
+    title: 'HotFlip: Gradient-Based Character Substitution'
+    filename: 'hotflip_attack.py'
+    description: 'HotFlip character-level attack using the gradient of loss w.r.t. character embeddings to identify the best single-character substitution at each step; text analogue of FGSM'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Import ToyTextClassifier, text_to_tensor from token_substitution_attack.py.
+      Best substitution: argmax_j (e_j - e_i)^T * grad_i -- character whose embedding is most
+      aligned with the gradient direction from the current character embedding.
+    code: |
+      # hotflip_attack.py
+      # Section 10.9: HotFlip Character-Level Attack
+      # 20260524 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+      # Reference: Ebrahimi et al. 2018 "HotFlip: White-Box Attacks for Text Classification"
+
+      import torch
+      import torch.nn as nn
+      from typing import Tuple, List
+
+
+      def hotflip_best_flip(
+          model: nn.Module,
+          text_indices: torch.Tensor,
+          y_true: torch.Tensor,
+          n_candidates: int = 26,
+      ) -> Tuple[int, int]:
+          '''
+          Find the single (position, char) substitution that maximally increases loss.
+          Uses gradient of loss w.r.t. embedding at each position.
+
+          Args:
+              text_indices: (1, seq_len) character index tensor
+              y_true:       true class label (1,)
+              n_candidates: number of candidate characters to evaluate per position
+
+          Returns:
+              (best_pos, best_char_idx): the (position, character) substitution
+          '''
+          seq_len = text_indices.size(1)
+          criterion = nn.CrossEntropyLoss()
+
+          # Get embeddings with gradient enabled
+          embeddings = model.embedding(text_indices)  # (1, seq_len, embed_dim)
+          embeddings = embeddings.detach().requires_grad_(True)
+
+          # Forward through classifier without re-embedding (use the gradient-enabled embeddings)
+          mask = (text_indices != 0).float().unsqueeze(-1)
+          pooled = (embeddings * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+          logits = model.classifier(pooled)
+          loss = criterion(logits, y_true)
+          loss.backward()
+
+          grad = embeddings.grad  # (1, seq_len, embed_dim)
+
+          best_pos, best_char = 0, 0
+          best_loss_increase = float('-inf')
+
+          # All character embeddings (ASCII 32-127)
+          char_range = range(32, 32 + n_candidates)
+          all_char_indices = torch.tensor(list(char_range), dtype=torch.long)
+          all_embeddings = model.embedding(all_char_indices)  # (n_candidates, embed_dim)
+
+          for pos in range(seq_len):
+              if text_indices[0, pos].item() == 0:  # skip padding
+                  continue
+              grad_pos = grad[0, pos]  # (embed_dim,)
+              curr_emb = embeddings[0, pos].detach()  # (embed_dim,)
+
+              # Change in loss: (e_j - e_i)^T * grad_i for each candidate j
+              delta_emb = all_embeddings - curr_emb.unsqueeze(0)  # (n_cand, embed_dim)
+              loss_change = (delta_emb * grad_pos.unsqueeze(0)).sum(dim=1)  # (n_cand,)
+
+              best_cand_idx = loss_change.argmax().item()
+              if loss_change[best_cand_idx].item() > best_loss_increase:
+                  best_loss_increase = loss_change[best_cand_idx].item()
+                  best_pos = pos
+                  best_char = char_range[best_cand_idx]
+
+          return best_pos, best_char
+
+
+      def hotflip_attack(
+          model: nn.Module,
+          text: str,
+          true_class: int,
+          n_flips: int = 5,
+          max_len: int = 64,
+      ) -> Tuple[str, bool]:
+          '''
+          HotFlip attack: iteratively apply best single-character flip until misclassification.
+          Returns (adversarial_text, success).
+          '''
+          from token_substitution_attack import text_to_tensor
+
+          indices = [min(ord(c), 127) for c in text[:max_len]]
+          indices += [0] * (max_len - len(indices))
+          current = torch.tensor(indices, dtype=torch.long).unsqueeze(0)
+          y = torch.tensor([true_class])
+
+          for flip in range(n_flips):
+              model.zero_grad()
+              best_pos, best_char = hotflip_best_flip(model, current, y)
+              current[0, best_pos] = best_char
+
+              with torch.no_grad():
+                  pred = model(current).argmax(dim=1).item()
+              if pred != true_class:
+                  break
+
+          # Decode back to string (best effort)
+          chars = [chr(idx) if 32 <= idx <= 127 else '?' for idx in current[0].tolist() if idx != 0]
+          adv_text = ''.join(chars)
+          with torch.no_grad():
+              final_pred = model(current).argmax(dim=1).item()
+          return adv_text, final_pred != true_class
+
+
+      def demo() -> None:
+          try:
+              from token_substitution_attack import ToyTextClassifier
+          except ImportError:
+              print('Run from directory containing token_substitution_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyTextClassifier()
+          model.eval()
+
+          texts = [
+              'this product is terrible bad and awful',
+              'i love this excellent amazing product',
+          ]
+          true_classes = [0, 1]
+
+          print('HotFlip character-level attack (gradient-based, white-box)')
+          for text, tc in zip(texts, true_classes):
+              adv_text, success = hotflip_attack(model, text, tc, n_flips=8)
+              print(f'  Original:    {text}')
+              print(f'  Adversarial: {adv_text}')
+              print(f'  Success: {success}')
+              print()
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_3:
+    title: 'Universal Trigger Search'
+    filename: 'universal_trigger_search.py'
+    description: 'Greedy universal adversarial trigger search: iteratively replaces trigger tokens with the highest-loss candidates averaged over many input examples; the automated jailbreak generator'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Import ToyTextClassifier from token_substitution_attack.py.
+      Greedy search: for each trigger position, find token minimising distance to
+      (current_embedding + alpha * avg_gradient). Iterates until convergence or max_steps.
+    code: |
+      # universal_trigger_search.py
+      # Section 10.9: Universal Adversarial Trigger Search
+      # 20260524 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+      # Reference: Wallace et al. 2019 "Universal Adversarial Triggers for Attacking NLP"
+
+      import torch
+      import torch.nn as nn
+      from typing import List, Tuple
+
+
+      def prepend_trigger(
+          text_indices: torch.Tensor,
+          trigger_indices: torch.Tensor,
+          max_len: int = 64,
+      ) -> torch.Tensor:
+          '''Prepend trigger tokens to text indices, truncate to max_len.'''
+          combined = torch.cat([trigger_indices, text_indices[0]], dim=0)
+          combined = combined[:max_len]
+          # Pad to max_len
+          pad = torch.zeros(max_len - combined.size(0), dtype=torch.long)
+          return torch.cat([combined, pad], dim=0).unsqueeze(0)
+
+
+      def average_gradient_at_trigger(
+          model: nn.Module,
+          trigger_indices: torch.Tensor,
+          texts: List[torch.Tensor],
+          y_target: int,
+          trigger_pos: int,
+          max_len: int = 64,
+      ) -> torch.Tensor:
+          '''
+          Compute average gradient of loss w.r.t. trigger embedding at trigger_pos
+          across all texts in the batch. Used to find the best token replacement.
+          '''
+          criterion = nn.CrossEntropyLoss()
+          y_t = torch.tensor([y_target])
+          avg_grad = torch.zeros(model.embedding.embedding_dim)
+
+          for text in texts:
+              combined = prepend_trigger(text, trigger_indices, max_len)
+              trigger_len = trigger_indices.size(0)
+
+              embeddings = model.embedding(combined)  # (1, max_len, embed_dim)
+              embeddings_grad = embeddings.detach().requires_grad_(True)
+
+              mask = (combined != 0).float().unsqueeze(-1)
+              pooled = (embeddings_grad * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+              logits = model.classifier(pooled)
+
+              # Minimise loss for target class (trigger attack: force target_class output)
+              loss = criterion(logits, y_t)
+              loss.backward()
+
+              if embeddings_grad.grad is not None and trigger_pos < embeddings_grad.grad.size(1):
+                  avg_grad += embeddings_grad.grad[0, trigger_pos].detach()
+
+          return avg_grad / len(texts)
+
+
+      def best_token_for_position(
+          model: nn.Module,
+          avg_grad: torch.Tensor,
+          current_token: int,
+          candidate_range: range,
+      ) -> int:
+          '''
+          Find the token in candidate_range whose embedding is closest to
+          (current_embedding + alpha * avg_grad) -- the Wallace et al. update.
+          '''
+          curr_emb = model.embedding(torch.tensor([current_token])).squeeze(0)
+          target_emb = curr_emb + avg_grad  # direction of gradient
+          all_tokens = torch.tensor(list(candidate_range), dtype=torch.long)
+          all_embs = model.embedding(all_tokens)  # (n_cand, embed_dim)
+          distances = (all_embs - target_emb.unsqueeze(0)).pow(2).sum(dim=1)
+          best_idx = distances.argmin().item()
+          return candidate_range[best_idx]
+
+
+      def search_universal_trigger(
+          model: nn.Module,
+          texts: List[torch.Tensor],
+          y_target: int,
+          trigger_len: int = 4,
+          n_steps: int = 30,
+          candidate_range: range = None,
+      ) -> Tuple[torch.Tensor, float]:
+          '''
+          Search for universal adversarial trigger via greedy token replacement.
+          Returns (trigger_indices, attack_success_rate_across_texts).
+          '''
+          if candidate_range is None:
+              candidate_range = range(32, 122)  # printable ASCII
+
+          # Initialise with random printable characters
+          trigger = torch.randint(32, 122, (trigger_len,))
+          max_len = 64
+
+          for step in range(n_steps):
+              for pos in range(trigger_len):
+                  avg_g = average_gradient_at_trigger(
+                      model, trigger, texts, y_target, pos, max_len,
+                  )
+                  new_token = best_token_for_position(
+                      model, avg_g, trigger[pos].item(), candidate_range,
+                  )
+                  trigger[pos] = new_token
+
+          # Evaluate attack success rate
+          successes = 0
+          for text in texts:
+              combined = prepend_trigger(text, trigger, max_len)
+              with torch.no_grad():
+                  pred = model(combined).argmax(dim=1).item()
+              if pred == y_target:
+                  successes += 1
+
+          success_rate = successes / len(texts)
+          return trigger, success_rate
+
+
+      def trigger_to_string(trigger: torch.Tensor) -> str:
+          return ''.join(chr(idx.item()) if 32 <= idx.item() <= 127 else '?' for idx in trigger)
+
+
+      def demo() -> None:
+          try:
+              from token_substitution_attack import ToyTextClassifier, text_to_tensor
+          except ImportError:
+              print('Run from directory containing token_substitution_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyTextClassifier()
+          model.eval()
+
+          # Sample texts with true class 0
+          sample_texts = [
+              'this product is terrible and bad',
+              'i hate this awful experience',
+              'the service was poor and dreadful',
+              'very unhappy with this purchase',
+          ]
+          texts_encoded = [text_to_tensor(t) for t in sample_texts]
+
+          print('Universal adversarial trigger search')
+          print('Target: force all inputs to be classified as class 1')
+          trigger, rate = search_universal_trigger(
+              model, texts_encoded, y_target=1, trigger_len=4, n_steps=15,
+          )
+          trigger_str = trigger_to_string(trigger)
+          print(f'Found trigger: "{trigger_str}" (indices: {trigger.tolist()})')
+          print(f'Attack success rate across {len(texts_encoded)} texts: {rate:.3f}')
+          print()
+          print('Connection to Chapter 7: universal triggers are automated jailbreaks.')
+          print('The same search finds prompts that universally bypass safety classifiers.')
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_4:
+    title: 'Character-Level Attack: Homoglyph and Zero-Width Injection'
+    filename: 'character_level_attack.py'
+    description: 'Homoglyph substitution and zero-width character injection against regex-based and ML-based classifiers; demonstrates the byte-level attack surface that tokenisers may not normalise'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention. No external dependencies.
+      Homoglyph map: ASCII -> visually identical Unicode character.
+      Zero-width characters: U+200B (ZWSP), U+200C (ZWNJ), U+200D (ZWJ), U+FEFF (BOM).
+    code: |
+      # character_level_attack.py
+      # Section 10.9: Character-Level Adversarial Attacks
+      # 20260524 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import re
+      from typing import List, Tuple, Dict
+
+
+      # Homoglyph map: ASCII character -> visually similar Unicode character
+      # Attacker replaces ASCII with the Unicode lookalike to evade string matching
+      HOMOGLYPH_MAP: Dict[str, str] = {
+          'a': '\u0430',  # Cyrillic small letter a
+          'c': '\u0441',  # Cyrillic small letter es
+          'e': '\u0435',  # Cyrillic small letter ie
+          'o': '\u043e',  # Cyrillic small letter o
+          'p': '\u0440',  # Cyrillic small letter er
+          's': '\u0455',  # Cyrillic small letter dze
+          'x': '\u0445',  # Cyrillic small letter ha
+          'i': '\u0456',  # Cyrillic small letter byelorussian-ukrainian i
+          'A': '\u0391',  # Greek capital letter alpha
+          'B': '\u0392',  # Greek capital letter beta
+          'E': '\u0395',  # Greek capital letter epsilon
+          'H': '\u0397',  # Greek capital letter eta
+          'K': '\u039a',  # Greek capital letter kappa
+          'M': '\u039c',  # Greek capital letter mu
+          'N': '\u039d',  # Greek capital letter nu
+          'O': '\u039f',  # Greek capital letter omicron
+          'T': '\u03a4',  # Greek capital letter tau
+          'Z': '\u0396',  # Greek capital letter zeta
+      }
+
+      # Zero-width Unicode characters (invisible when rendered)
+      ZERO_WIDTH_CHARS = [
+          '\u200b',  # zero-width space
+          '\u200c',  # zero-width non-joiner
+          '\u200d',  # zero-width joiner
+          '\u2060',  # word joiner (invisible)
+      ]
+
+
+      def homoglyph_attack(
+          text: str,
+          target_words: List[str],
+          n_substitutions: int = 3,
+      ) -> str:
+          '''
+          Replace ASCII characters in target words with visually identical Unicode.
+          Evades exact-string matching while rendering identically to human readers.
+          '''
+          result = list(text)
+          subs_made = 0
+          for i, char in enumerate(result):
+              if subs_made >= n_substitutions:
+                  break
+              if char in HOMOGLYPH_MAP:
+                  # Only substitute if character is in a target word position
+                  word_start = text.rfind(' ', 0, i) + 1
+                  word_end = text.find(' ', i)
+                  if word_end == -1:
+                      word_end = len(text)
+                  word = text[word_start:word_end].lower()
+                  if any(word in tw.lower() or tw.lower() in word for tw in target_words):
+                      result[i] = HOMOGLYPH_MAP[char]
+                      subs_made += 1
+          return ''.join(result)
+
+
+      def zero_width_injection(text: str, positions: List[int] = None) -> str:
+          '''
+          Insert zero-width characters at specified positions.
+          Breaks regex keyword matching; text renders identically to humans.
+          Default: inject between every 3rd character.
+          '''
+          if positions is None:
+              positions = list(range(3, len(text), 3))
+          result = list(text)
+          offset = 0
+          zwc = ZERO_WIDTH_CHARS[0]  # zero-width space
+          for pos in positions:
+              result.insert(pos + offset, zwc)
+              offset += 1
+          return ''.join(result)
+
+
+      def test_regex_evasion(original: str, attacked: str, pattern: str) -> Tuple[bool, bool]:
+          '''Check if regex matches original but not attacked text.'''
+          orig_match = bool(re.search(pattern, original, re.IGNORECASE))
+          atk_match = bool(re.search(pattern, attacked, re.IGNORECASE))
+          return orig_match, atk_match
+
+
+      def detect_homoglyphs(text: str) -> Tuple[bool, List[Tuple[int, str, str]]]:
+          '''
+          Detect non-ASCII characters in positions expected to be ASCII.
+          Returns (detected, list of (position, char, unicode_name)).
+          '''
+          import unicodedata
+          anomalies = []
+          for i, char in enumerate(text):
+              code_point = ord(char)
+              if code_point > 127:
+                  try:
+                      name = unicodedata.name(char, 'UNKNOWN')
+                  except ValueError:
+                      name = 'UNKNOWN'
+                  anomalies.append((i, char, name))
+          return len(anomalies) > 0, anomalies
+
+
+      def detect_zero_width(text: str) -> Tuple[bool, int]:
+          '''Detect zero-width Unicode characters in text.'''
+          zwc_set = set(ZERO_WIDTH_CHARS)
+          count = sum(1 for c in text if c in zwc_set)
+          return count > 0, count
+
+
+      def demo() -> None:
+          test_cases = [
+              ('I want to bomb the building', ['bomb']),
+              ('send me the attack plans', ['attack']),
+              ('this is a completely safe message', ['bomb', 'attack']),
+          ]
+          pattern = r'\b(bomb|attack|kill|hate)\b'
+
+          print('Character-Level Attack: Homoglyph + Zero-Width Injection')
+          print(f'Regex pattern: {pattern}')
+          print()
+
+          for text, targets in test_cases:
+              # Homoglyph attack
+              hg_text = homoglyph_attack(text, targets, n_substitutions=4)
+              orig_match, hg_match = test_regex_evasion(text, hg_text, pattern)
+
+              # Zero-width attack
+              zw_text = zero_width_injection(text, positions=[3, 6, 9])
+              _, zw_match = test_regex_evasion(text, zw_text, pattern)
+
+              print(f'Original:       {repr(text)}')
+              print(f'Homoglyph:      {repr(hg_text)}')
+              print(f'Zero-width:     shows same but bytes differ')
+              print(f'Regex on orig:  {orig_match} | Regex on homoglyph: {hg_match} | Regex on zwc: {zw_match}')
+
+              detected, anomalies = detect_homoglyphs(hg_text)
+              if detected:
+                  print(f'Homoglyph detection: {len(anomalies)} non-ASCII chars at positions '
+                        f'{[a[0] for a in anomalies]}')
+              detected_zw, zw_count = detect_zero_width(zw_text)
+              print(f'Zero-width detection: {zw_count} invisible chars found')
+              print()
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_5:
+    title: 'LLM Adversarial Detection: Semantic Consistency and Linguistic Anomaly'
+    filename: 'llm_adversarial_detection.py'
+    description: 'Detects text adversarial examples using semantic consistency (paraphrase check via word-order swap), Unicode anomaly analysis (homoglyph and zero-width detection), and character distribution anomaly scoring'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch. Import ToyTextClassifier, text_to_tensor from token_substitution_attack.py.
+      Back-translation approximated by word-order shuffle (demonstrates fragility detection
+      without requiring a translation API).
+    code: |
+      # llm_adversarial_detection.py
+      # Section 10.9: Text Adversarial Detection
+      # 20260524 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import torch
+      import unicodedata
+      from typing import List, Tuple, Optional
+
+
+      # -- Detection primitive 1: Semantic consistency check --
+
+      def approximate_paraphrase(text: str) -> str:
+          '''
+          Approximate paraphrase by shuffling adjacent word pairs.
+          In production: use a real paraphrase model or back-translation API.
+          Demonstrates the consistency check concept without external dependencies.
+          '''
+          import random
+          words = text.split()
+          if len(words) < 2:
+              return text
+          shuffled = words.copy()
+          for i in range(0, len(shuffled) - 1, 2):
+              shuffled[i], shuffled[i + 1] = shuffled[i + 1], shuffled[i]
+          return ' '.join(shuffled)
+
+
+      def semantic_consistency_check(
+          model: torch.nn.Module,
+          text: str,
+          n_variants: int = 5,
+          max_len: int = 64,
+      ) -> Tuple[bool, float]:
+          '''
+          Semantic consistency check: does classification change under paraphrase?
+          Adversarial text that is fragile (depends on specific token choice) is
+          likely to change classification when the text is paraphrased.
+          Returns (inconsistent, inconsistency_rate).
+          '''
+          from token_substitution_attack import text_to_tensor
+
+          x_orig = text_to_tensor(text, max_len)
+          with torch.no_grad():
+              pred_orig = model(x_orig).argmax(dim=1).item()
+
+          changed = 0
+          for _ in range(n_variants):
+              variant = approximate_paraphrase(text)
+              x_var = text_to_tensor(variant, max_len)
+              with torch.no_grad():
+                  pred_var = model(x_var).argmax(dim=1).item()
+              if pred_var != pred_orig:
+                  changed += 1
+
+          inconsistency_rate = changed / n_variants
+          inconsistent = inconsistency_rate > 0.4  # threshold: >40% variants disagree
+          return inconsistent, inconsistency_rate
+
+
+      # -- Detection primitive 2: Unicode anomaly analysis --
+
+      def unicode_anomaly_score(text: str) -> dict:
+          '''
+          Detect Unicode anomalies: non-ASCII, zero-width, homoglyphs.
+          Returns structured anomaly report.
+          '''
+          zero_width_codepoints = {0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF}
+          non_ascii = []
+          zero_width = []
+          confusable = []  # Cyrillic/Greek that look like Latin
+
+          cyrillic_range = range(0x0400, 0x04FF)
+          greek_range = range(0x0370, 0x03FF)
+
+          for i, char in enumerate(text):
+              cp = ord(char)
+              if cp > 127:
+                  if cp in zero_width_codepoints:
+                      zero_width.append((i, char, f'U+{cp:04X}'))
+                  elif cp in cyrillic_range or cp in greek_range:
+                      confusable.append((i, char, f'U+{cp:04X}'))
+                  else:
+                      non_ascii.append((i, char, f'U+{cp:04X}'))
+
+          total_anomalies = len(zero_width) + len(confusable) + len(non_ascii)
+          return {
+              'zero_width': zero_width,
+              'confusable': confusable,
+              'non_ascii': non_ascii,
+              'total_anomaly_count': total_anomalies,
+              'anomaly_rate': total_anomalies / max(len(text), 1),
+              'flagged': total_anomalies > 0,
+          }
+
+
+      # -- Detection primitive 3: Character distribution anomaly --
+
+      def character_distribution_anomaly(text: str, threshold: float = 0.15) -> Tuple[bool, float]:
+          '''
+          Check if the character distribution of the text is anomalous.
+          Adversarial text with many rare characters has higher anomaly score.
+          Score = fraction of characters with Unicode code point > 127.
+          '''
+          if not text:
+              return False, 0.0
+          non_ascii_frac = sum(1 for c in text if ord(c) > 127) / len(text)
+          return non_ascii_frac > threshold, non_ascii_frac
+
+
+      # -- Combined detection --
+
+      def detect_adversarial_text(
+          model: torch.nn.Module,
+          text: str,
+          use_consistency: bool = True,
+          consistency_variants: int = 5,
+      ) -> dict:
+          '''
+          Combined text adversarial detection: consistency + Unicode anomaly + char distribution.
+          '''
+          unicode_report = unicode_anomaly_score(text)
+          char_flagged, char_score = character_distribution_anomaly(text)
+
+          consistency_flagged = False
+          inconsistency_rate = 0.0
+          if use_consistency:
+              consistency_flagged, inconsistency_rate = semantic_consistency_check(
+                  model, text, n_variants=consistency_variants,
+              )
+
+          detected = unicode_report['flagged'] or char_flagged or consistency_flagged
+          return {
+              'detected': detected,
+              'unicode_flagged': unicode_report['flagged'],
+              'unicode_anomaly_count': unicode_report['total_anomaly_count'],
+              'char_anomaly_rate': char_score,
+              'consistency_flagged': consistency_flagged,
+              'inconsistency_rate': inconsistency_rate,
+              'zero_width_count': len(unicode_report['zero_width']),
+              'confusable_count': len(unicode_report['confusable']),
+          }
+
+
+      def demo() -> None:
+          try:
+              from token_substitution_attack import ToyTextClassifier
+          except ImportError:
+              print('Run from directory containing token_substitution_attack.py')
+              return
+
+          torch.manual_seed(42)
+          model = ToyTextClassifier()
+          model.eval()
+
+          test_samples = [
+              ('this product is terrible bad and awful', 'natural text (class 0)'),
+              ('this product is terrible bаd and аwful', 'homoglyph attack (Cyrillic a)'),
+              ('this\u200b product\u200c is terrible bad and awful', 'zero-width injection'),
+              ('terrible bad awful product this is', 'TextFooler (word order changed)'),
+          ]
+
+          print('Text Adversarial Detection Demo')
+          print('=' * 60)
+          for text, label in test_samples:
+              result = detect_adversarial_text(model, text, use_consistency=True,
+                                               consistency_variants=5)
+              print(f'\nText ({label}):')
+              print(f'  repr: {repr(text[:60])}')
+              print(f'  detected:          {result["detected"]}')
+              print(f'  unicode_flagged:   {result["unicode_flagged"]} '
+                    f'(zero_width={result["zero_width_count"]}, '
+                    f'confusable={result["confusable_count"]})')
+              print(f'  consistency:       {result["consistency_flagged"]} '
+                    f'(inconsistency_rate={result["inconsistency_rate"]:.2f})')
+              print(f'  char_anomaly_rate: {result["char_anomaly_rate"]:.3f}')
+
+
+      if __name__ == '__main__':
+          demo()
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Applying L-infinity or L2 norm evaluation metrics to text adversarial examples, treating token indices as continuous values'
+    why_it_happens: |
+      Engineers familiar with image adversarial evaluation copy the L-infinity or L2 norm
+      measurement from image attacks and apply it to text: compute (adversarial_tokens -
+      original_tokens).abs().max() and report it as the perturbation norm. Token indices
+      are arbitrary integers with no geometric meaning -- token 342 ("cat") is not "close"
+      to token 343 ("can") by any meaningful metric.
+    consequence: |
+      Reported "perturbation norms" are meaningless numbers. Two adversarial texts may
+      have the same "L-infinity token norm" but one is semantically similar to the original
+      (synonym substitution) while the other is completely different (random token replacement).
+      Evaluation conclusions are invalid; defences calibrated against these metrics are
+      miscalibrated.
+    correct_approach: |
+      Use text-appropriate metrics: token edit distance (number of tokens changed, analogous
+      to L0), and semantic similarity (cosine distance between sentence embeddings, analogous
+      to L2). For character-level attacks also report: fraction of non-ASCII characters
+      introduced, and character edit distance. The llm_adversarial_detection.py deliverable
+      provides the correct measurement primitives.
+
+  mistake_2:
+    description: 'Generating TextFooler-style adversarial text without checking semantic similarity, producing nonsensical substitutions that humans immediately identify as adversarial'
+    why_it_happens: |
+      The semantic similarity filter is implemented as an optional threshold. Engineers
+      set the threshold to 0 (no filtering) to maximise attack success rate, not realising
+      that removing the filter produces adversarial text with grammatically valid but
+      semantically incoherent substitutions.
+    consequence: |
+      The adversarial text passes the classifier but is obviously anomalous to human reviewers.
+      Substitutions like "I hate this terrible product" -> "I despise this atrocious commodity
+      in the galaxy of stars" are detected immediately in human-in-the-loop review pipelines.
+      The attack evades automated detection but fails against any system with human review.
+    correct_approach: |
+      Always apply both the semantic similarity threshold (>0.8 cosine similarity for the full
+      sentence) and the POS filter (substitutions must preserve part-of-speech). These constraints
+      are what make adversarial text "adversarial but natural" -- the entire value of the attack
+      is that it evades both automated and human detection. The token_substitution_attack.py
+      deliverable enforces both filters.
+
+  mistake_3:
+    description: 'Treating universal adversarial triggers as prompt injection attacks and applying the same detection layer (Track 1-5 injection classifier) rather than Track 7 consistency checking'
+    why_it_happens: |
+      Universal adversarial triggers are text prepended to a prompt that causes misclassification.
+      Prompt injection (Chapter 6) is also text prepended to a prompt that causes misbehaviour.
+      The surface similarity leads engineers to route trigger detection to the injection classifier.
+    consequence: |
+      The injection classifier (Tracks 1-5) is trained on prompt injection patterns -- instruction
+      overrides, role-play setups, system prompt leaks. Universal adversarial triggers are typically
+      gibberish tokens with no semantic structure that matches prompt injection patterns. The
+      injection classifier is not trained to recognise them and achieves near-random accuracy on
+      trigger detection. Triggers evade the injection classifier while the Track 7 consistency
+      check (the correct primitive) is never applied.
+    correct_approach: |
+      Universal triggers are adversarial examples (Track 7 coverage), not prompt injections
+      (Track 1-5 coverage). Route trigger detection to Track 7 consistency checking: an input
+      containing a universal trigger will change classification when the trigger tokens are
+      removed or paraphrased, because the trigger tokens carry the adversarial signal. The
+      consistency check detects this fragility. The injection classifier detects instruction-
+      override intent; the consistency checker detects classification fragility.
+
+  mistake_4:
+    description: 'Assuming Unicode normalisation at the API boundary eliminates homoglyph attacks against downstream ML classifiers'
+    why_it_happens: |
+      Many web APIs normalise Unicode input (NFC/NFD normalisation) before processing. Engineers
+      assume this normalisation eliminates homoglyphs and do not add character-level anomaly
+      detection to Track 7.
+    consequence: |
+      Standard Unicode normalisation (NFC, NFD, NFKC, NFKD) does not merge homoglyphs.
+      Cyrillic "а" (U+0430) is a different code point from Latin "a" (U+0061); NFC normalisation
+      does not collapse them because they are not compatibility equivalents. The homoglyph attack
+      survives all standard normalisation forms. The ML classifier receives the Cyrillic character,
+      tokenises it to an out-of-vocabulary token or a different subword piece, and the homoglyph
+      attack succeeds even after "normalisation".
+    correct_approach: |
+      Apply confusable character detection (Unicode confusables database, ICU library) rather
+      than relying on standard normalisation. The unicode_anomaly_score function in
+      llm_adversarial_detection.py detects Cyrillic and Greek lookalikes by code point range.
+      For production: use the Unicode confusables.txt dataset to identify all visually similar
+      cross-script character pairs and normalise them to their canonical Latin equivalents.
+
+  mistake_5:
+    description: 'Not connecting universal trigger discovery to the adversarial training loop, leaving the model permanently vulnerable once a trigger is published'
+    why_it_happens: |
+      Universal triggers are found offline and the attack is considered theoretical until
+      a trigger is actually discovered and published. Engineers treat trigger defense as
+      a post-incident remediation rather than a continuous engineering concern.
+    consequence: |
+      When a universal trigger for a production safety classifier is discovered and published,
+      any adversary can immediately use it. The model must be retrained to remove the trigger
+      vulnerability -- which is expensive and slow. In the meantime, the classifier is
+      effectively bypassed for every input that includes the trigger.
+    correct_approach: |
+      Include trigger discovery as a continuous red-team exercise: periodically run
+      universal_trigger_search.py against the production classifier and any newly published
+      triggers. When a trigger is found: add inputs containing the trigger to the adversarial
+      training dataset (Section 10.15), retrain, and verify the trigger no longer works.
+      Track 7 consistency checking provides a real-time detection layer: inputs containing
+      known triggers will change classification when the trigger tokens are removed, making
+      them detectable without knowing the specific trigger tokens in advance.
+
+section_summary:
+
+  compact: |
+    Text adversarial attacks operate in discrete token space where Lp norms are undefined; token
+    edit distance (L0 analogue) and semantic similarity (L2 analogue) are the correct constraint
+    metrics. HotFlip uses the Jacobian of the loss w.r.t. character embeddings to find the best
+    single-character substitution -- the text analogue of FGSM. TextFooler ranks words by deletion
+    importance and greedily substitutes synonyms under semantic similarity and POS constraints.
+    Universal adversarial triggers are fixed token sequences (often gibberish) that, when prepended
+    or appended to any input, universally fool the classifier -- the text analogue of universal
+    adversarial patches and the automated implementation of Chapter 7 jailbreaks. Character-level
+    attacks (homoglyphs, zero-width characters) bypass regex and simple ML classifiers by exploiting
+    tokenisation preprocessing. Detection uses semantic consistency (paraphrase fragility) and
+    Unicode anomaly analysis -- distinct from the per-pixel squeezing for image adversarial examples.
+
+  key_takeaways:
+    - 'Text is discrete: use token edit distance and semantic similarity as constraints, not Lp norms'
+    - 'HotFlip: best_char = argmax_j (e_j - e_i)^T * grad_i -- Jacobian-guided discrete search, the text FGSM'
+    - 'TextFooler: word importance by deletion -> synonym candidates -> POS filter -> similarity filter -> greedy substitution'
+    - 'Universal triggers are automated jailbreaks: fixed gibberish tokens that universally bypass safety classifiers when appended to any input'
+    - 'Homoglyphs survive Unicode normalisation (NFC/NFD) -- use confusable character detection, not just normalisation'
+    - 'Detection: semantic consistency check (paraphrase fragility) for word-substitution attacks; Unicode anomaly analysis for character-level attacks'
+
+preview_section_10_10:
+  title: 'Section 10.10: Real-World Incident -- Adversarial Examples in Production'
+  summary: |
+    Section 10.10 grounds the Chapter 10 attack catalogue in documented reality, mirroring the
+    role Section 9.9 played in Chapter 9. Four incident classes are analysed: the Eykholt et al.
+    stop sign attack against autonomous vehicle detectors (physical, AML.T0029), documented
+    adversarial glasses-based facial recognition bypasses against commercial deployments (physical,
+    targeted), content moderation evasion via adversarial text rewrites against commercial API
+    classifiers (text, score-based), and malware adversarial examples against antivirus ML
+    classifiers (tabular/L0, black-box). For each incident: attack mechanism reconstruction,
+    root cause (no adversarial input detection, no adversarial training, no consistency checking),
+    detection opportunity mapping (where Track 7 primitives would have fired), and operator
+    response patterns. The section establishes that adversarial ML is a live production threat,
+    not a theoretical concern, and motivates the Track 7 production gateway in Section 10.13.
+
+metadata:
+  cross_chapter_references:
+    - 'Chapter 3: LLM tokenisation and embedding space (prerequisite for HotFlip and one-hot Jacobian)'
+    - 'Chapter 6 Section 6.6: obfuscation techniques (homoglyph and zero-width attacks share attack surface)'
+    - 'Chapter 7 Section 7.7: adversarial prompts automated generation (universal triggers are the implementation)'
+    - 'Section 10.3: FGSM (HotFlip is the discrete text analogue)'
+    - 'Section 10.8: universal adversarial patches (universal triggers are the text analogue)'
+  forward_references:
+    - 'Section 10.12: consistency checker extended to text via back-translation and paraphrase'
+    - 'Section 10.13: Track 7 gateway includes text adversarial detection alongside image detection'
+    - 'Section 10.15: adversarial training extended to text: train on adversarially substituted examples'
+  tags:
+    - hotflip
+    - textfooler
+    - bert-attack
+    - universal-adversarial-trigger
+    - homoglyph
+    - zero-width-character
+    - discrete-text
+    - token-edit-distance
+    - semantic-similarity
+    - back-translation-consistency
+    - automated-jailbreak
+    - llm-safety-classifier
+    - unicode-anomaly
+    - chapter-7-bridge

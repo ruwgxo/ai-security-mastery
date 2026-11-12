@@ -1,0 +1,934 @@
+# section_15_06_exfiltration_detector.yaml
+
+---
+document_info:
+  title: 'Data Exfiltration Detector: Output Analysis'
+  chapter: 15
+  section: 6
+  section_code: '1506'
+  author: Raghav Dinesh
+  github: https://github.com/ruwgxo/ai-security-mastery
+  license: MIT
+  version: '1.0'
+  created: '2026-06-21'
+  estimated_pages: 7
+  estimated_reading_time: 50-60 minutes
+section_overview:
+  one_line_summary: |-
+    The last content detector is the only output-only one, and it runs three signals: sensitive-content rules over the response, the Chapter 13 Section 13.06 canary signal that proves context extraction with near-certainty, and the Chapter 13 Section 13.07 rate and coverage signals that catch the exfiltration campaign whose individual responses are each entirely benign.
+  why_this_section_exists: |-
+    Exfiltration is the detector that closes the loop on the whole suite. The injection and jailbreak detectors watch what the attacker asks; the PII scanner and toxicity detector watch content on both sides. This detector watches only what leaves, because exfiltration is by definition an output-side event: the question is not what was requested but what actually went out the door. An attacker who defeats every input-side detector still has to get the data out through a response, and that response is the last place to catch them.
+
+    The section exists to build three signals that answer that question at three different scales. At the per-response scale, sensitive-content rules catch a credential, a key, a connection string, or a system prompt appearing in a response where it never should. At the certainty scale, the canary signal from Chapter 13 Section 13.06 catches context extraction outright: a canary is a unique string planted where only the system can see it, so its appearance in a response is proof -- not evidence, proof -- that the protected context was extracted, making it the single highest-confidence signal in the entire suite. And at the campaign scale, the Chapter 13 Section 13.07 rate and coverage signals catch the attack that no single response reveals: the patient attacker extracting a corpus a few records at a time, each response perfectly benign, the aggregate a bulk theft. That last signal makes this detector the sibling of the jailbreak detector -- both face an attack whose individual units are innocuous and whose totality is the crime, and both answer it with a signal that looks beyond the single request.
+  position_in_chapter: |-
+    Section 15.06 is the fifth and last content detector, completing the suite that Section 15.07 orchestrates. It is the only output-only detector, and the second after the jailbreak detector to draw on a Chapter 13 behavioural signal beyond the current request. It reuses the tiered-rule discipline of the injection detector and the beyond-the-request signal pattern of the jailbreak detector, and it adds the canary -- the one signal in the chapter that is certainty rather than probability.
+learning_objectives:
+  knowledge:
+  - Explain why exfiltration is an output-side concern and what that means for where the detector sits
+  - Describe the sensitive-content rule classes -- credentials, key material, connection strings, system-prompt
+    disclosure, bulk dumps -- and their precision tiers
+  - Explain what a canary is, why a canary hit is proof rather than evidence, and why it is the highest-confidence
+    signal in the suite
+  - Explain the exfiltration campaign and why per-response analysis cannot see it
+  - Describe how the Chapter 13 rate and coverage signals reveal a campaign and how they enter the verdict
+  - Explain how the three signals combine and why a canary short-circuits the combination
+  - Describe the configuration and why the stateless profile has a documented blind spot
+  skills:
+  - Implement the unified detector API for an output-only exfiltration detector with three signals
+  - Build a tiered sensitive-content rule set where credential rules block alone and configuration references
+    need corroboration
+  - Integrate the Chapter 13 Section 13.06 canary monitor behind an interface as a certainty signal
+  - Integrate the Chapter 13 Section 13.07 rate and coverage signals to catch the campaign
+  - Combine per-request, certainty, and aggregate signals into one verdict
+  - Validate against scenarios spanning single-response leaks and multi-request campaigns, confirming
+    the quality bar
+  security_mindset:
+  - Internalise that exfiltration is judged by what leaves, not by what was asked, so the response is
+    the last and most decisive place to look
+  - 'Recognise that a canary hit is qualitatively different from every other signal in the suite: there
+    is no benign path by which the model emits it'
+  - Understand that the exfiltration campaign, like the multi-turn jailbreak, is invisible per request
+    and must be caught by an aggregate signal
+  - Appreciate that a detector without the campaign signal has a real, nameable blind spot that should
+    be documented rather than hidden
+prerequisites:
+- 'Chapter 15 Section 15.01: the unified detector API contract and the quality bar'
+- 'Chapter 15 Section 15.02: the tiered-rule discipline this detector reuses for sensitive content'
+- 'Chapter 15 Section 15.03: the beyond-the-request signal pattern this detector applies to campaigns'
+- 'Chapter 13 Section 13.06: model behavioural monitoring and the canary/honeytoken monitor this detector
+  reads'
+- 'Chapter 13 Section 13.07: rate-based detection and coverage patterns -- the abuse patterns invisible
+  per request -- that supply the campaign signal'
+- 'Chapter 5 Sections 5.05 and 5.10: OWASP LLM06 sensitive information disclosure and training-data extraction,
+  the threats this detector answers'
+prose_content:
+  part_1:
+    title: Exfiltration Is Judged by What Leaves
+    body: |-
+      Every detector before this one has watched the request in some form. The injection and jailbreak detectors read what the attacker asks. The PII scanner and the toxicity detector read both sides. The exfiltration detector reads only the response, and that asymmetry is the point rather than an omission. Exfiltration is not a category of request; it is an outcome. The question is not whether someone asked for the customer database -- an attacker who is any good will not ask in any way that looks like asking -- but whether the customer database actually went out. That is a question only the response can answer.
+
+      This makes the exfiltration detector the last line in the suite, and a genuinely independent one. An attacker who defeats every input-side detector -- whose injection was too novel for the classifier, whose jailbreak was too gradual for the session signal -- has still not succeeded until the data leaves in a response. At that moment the evidence is unavoidable, because the sensitive content is right there in the text about to be returned. The detector therefore defaults to output-only: it declines to score input surfaces at all, leaving input-side sensitive content to the PII scanner, whose job that is. The result is a detector that catches successful attacks regardless of how they succeeded, which is exactly what a last line should do.
+  part_2:
+    title: The Sensitive-Content Rules and Their Tiers
+    body: |-
+      The first signal is a set of rules over the response text, tiered by precision exactly as the injection patterns were. The high-precision tier covers content that has no benign explanation in a response: a PEM private-key header, an AWS access key with its distinctive prefix and format, a database connection string with embedded credentials, a bearer token. If one of these appears in a response, something has gone wrong regardless of context, so a hit blocks on its own. The high tier also covers two structural leak shapes: system-prompt disclosure, where the model recites its own instructions, and the bulk record dump, where a single response carries many structured records at once -- five or more email addresses in a list is a dump shape, not a mention.
+
+      The medium tier covers references that appear in exfiltration but appear far more often in ordinary technical conversation. A response containing api_key: followed by a value might be a leak, or it might be documentation showing a config file with a placeholder. A response mentioning /etc/passwd might be disclosure, or it might be a sysadmin explaining Unix accounts. These fire constantly in benign technical discussion, so a medium hit does not act on its own and only counts when the aggregate signal corroborates -- when the conversation already looks like a campaign. This is the same restraint as the injection detector role pattern and the PII scanner treatment of names, applied to the fact that talking about secrets is not leaking secrets.
+  part_3:
+    title: 'The Canary: Proof Rather Than Evidence'
+    body: |-
+      The second signal is different in kind from anything else in the suite. A canary, from Chapter 13 Section 13.06, is a unique meaningless string planted somewhere only the system can see it -- the system prompt, a retrieved document, a tool result. It is chosen to be globally unique and semantically empty, so it cannot be guessed, cannot arise by chance, and means nothing to anyone. Then the detector watches every response for it. If the canary ever appears in a response, the model emitted content it could only have obtained from the protected context. There is no benign path. The context was extracted.
+
+      That is why the canary is the only signal in the chapter that is certainty rather than probability. Every other signal answers how likely is this to be an attack: a classifier probability, a pattern precision tier, an aggregate anomaly score. The canary answers did the extraction happen, and the answer is yes. So in the combination it short-circuits everything else: a canary hit produces a maximal score and the highest confidence the detector can express, regardless of what the rules or the aggregate signal say. It is also the only reliable detector of system-prompt and context extraction in the general case, because a sufficiently clever extraction paraphrases the context rather than quoting it and slips past any rule -- but a paraphrase that includes the canary is still caught, because the canary is meaningless and therefore gets carried along verbatim. The one discipline canaries require is rotation: a canary that has leaked publicly may end up in training data or a writeup, after which its hits no longer prove anything.
+  part_4:
+    title: 'The Campaign: What No Single Response Reveals'
+    body: |-
+      The third signal answers the attack that the first two are structurally blind to. A patient attacker does not ask for the customer database. They ask for one customer record, in a perfectly ordinary request, and get a perfectly ordinary response. Then they do it again, with a different record. And again, a few thousand times, systematically working through the identifier space. Every individual response is benign -- it contains one record, exactly as legitimately requested, with no credential, no canary, no rule hit of any kind. Run the rules over each response and every one passes. The exfiltration is real and large, and it is invisible at the per-response scale because at that scale nothing wrong is happening.
+
+      This is the same shape as the multi-turn jailbreak from Section 15.03: an attack whose individual units are innocuous and whose totality is the crime. The answer is the same in structure -- look beyond the single request -- and it comes from Chapter 13 Section 13.07, whose title names the problem exactly: abuse patterns invisible per request. Two signals matter here. The rate signal catches volume: a session pulling records far faster or in far greater quantity than any legitimate use. The coverage signal catches the sweep: a session whose requests systematically enumerate an identifier space rather than clustering around a genuine need, which is the signature of extraction rather than use. The detector reads the stronger of the two for the current session and treats it as a signal that can block on its own. When the coverage score is high, a response reading here is the record for customer 4,117 is blocked -- not because of anything in that response, but because of the four thousand that came before it.
+  part_5:
+    title: Combining Three Signals at Three Scales
+    body: |-
+      The three signals operate at three scales -- one response, one certainty, one campaign -- and the combination reflects that hierarchy. The canary comes first and short-circuits: if a canary appears, the score is maximal and nothing else needs consulting, because certainty does not get averaged with probability. Below that, a high-precision rule hit blocks on its own, as in every tiered detector in the chapter. The aggregate campaign signal also blocks on its own, which is the crucial design decision: it must be able to block a response that contains nothing wrong, because that is precisely the case it exists to catch. A medium-precision rule counts only with aggregate corroboration -- a config-file reference in an ordinary session is documentation, while the same reference in a session already showing campaign behaviour is worth acting on.
+
+      The confidence values follow the same hierarchy and say something useful about each signal epistemics. A canary hit reports near-total confidence because it is proof. A high-tier rule hit reports high confidence because the format is unambiguous. An aggregate-only verdict reports moderate confidence, because the campaign signal is a statistical judgement about a session rather than an observation about a response, and it can be wrong about an unusual but legitimate workload. Those differences matter downstream: the combined pipeline in Section 15.07 and the SIEM integration in Chapter 16 can treat a canary-driven block and a rate-driven block very differently, and the confidence field is how this detector tells them which is which.
+  part_6:
+    title: 'Meeting the Quality Bar: Both Shapes of the Attack'
+    body: |-
+      The test harness validates against labelled scenarios and reports the three quality-bar metrics with a pass/fail gate, and the corpus must span both shapes of exfiltration or it proves nothing. The single-response positives exercise the rule layer across its classes -- an access key, a PEM header, a connection string with credentials, a system-prompt recitation, a bulk address dump -- and the canary positive exercises the certainty path. The campaign positives are the ones that matter most: entirely benign responses paired with a high coverage or rate score, which must be blocked on the aggregate signal alone. Without those cases a detector whose campaign integration was completely broken would still report a perfect score, because every single-response case would pass and nothing would ever exercise the aggregate path.
+
+      The negatives are built to attack the rule tiers where they are weakest. Benign technical discussion of sensitive topics -- a config example with a placeholder key, an explanation of what /etc/passwd does -- must be allowed, because talking about secrets is not leaking them, and a detector that cannot tell the difference is unusable for any technical audience. A benign response in a benign session confirms the aggregate signal does not over-fire when the scores are low. The bar is met when the detector catches the credential leaks, the extraction proven by canary, and the campaigns hidden in benign responses, while leaving ordinary technical conversation untouched, at the accuracy, latency, and false-positive targets the suite requires. When it does, the last content detector is complete and the suite is ready for Section 15.07 to orchestrate.
+reference_materials:
+  table_1:
+    title: The Three Signals of the Exfiltration Detector
+    description: |-
+      The detector runs three signals at three different scales. Each catches a shape of exfiltration the others cannot.
+    columns:
+    - Signal
+    - Scale
+    - Catches
+    - Source
+    rows:
+    - - Sensitive-content rules
+      - One response
+      - Credentials, keys, system-prompt disclosure, bulk dumps
+      - This section
+    - - Canary/honeytoken
+      - One response (certainty)
+      - Context and system-prompt extraction, proven
+      - Chapter 13 Section 13.06
+    - - Rate and coverage
+      - The whole session
+      - The campaign whose every response is benign
+      - Chapter 13 Section 13.07
+  table_2:
+    title: Sensitive-Content Rule Tiers
+    description: |-
+      Rules are tiered by precision. Credential and key material has no benign reading and blocks alone; configuration references appear constantly in benign technical discussion and need corroboration.
+    columns:
+    - Tier
+    - Example rules
+    - Benign collision risk
+    - Effect of a lone hit
+    rows:
+    - - High
+      - private_key_material, aws_access_key, connection_string
+      - Very low
+      - Blocks on its own
+    - - High
+      - system_prompt_disclosure, bulk_record_dump
+      - Very low
+      - Blocks on its own
+    - - Medium
+      - 'config_reference (api_key: ...)'
+      - High -- documentation, examples
+      - Only counts with aggregate corroboration
+    - - Medium
+      - internal_path_reference (/etc/...)
+      - High -- sysadmin discussion
+      - Only counts with aggregate corroboration
+  table_3:
+    title: Why the Canary Is Different from Every Other Signal
+    description: |-
+      Every other signal in the suite estimates likelihood. The canary observes a fact. That difference is why it short-circuits the combination and reports the highest confidence in the chapter.
+    columns:
+    - Property
+    - Every other signal
+    - The canary
+    rows:
+    - - Answers
+      - How likely is this an attack?
+      - Did the extraction happen?
+    - - Output
+      - A probability or a tier
+      - A fact -- present or absent
+    - - Benign explanation
+      - Often exists; hence tiers and corroboration
+      - None -- the string is meaningless and unguessable
+    - - Effect on the verdict
+      - Contributes to a combined score
+      - 'Short-circuits: maximal score'
+    - - Confidence reported
+      - Bounded by model or statistical uncertainty
+      - Near-total
+    - - Maintenance
+      - Retraining, tuning
+      - Rotation, before a leaked canary loses meaning
+  table_4:
+    title: Exfiltration Scenario Coverage for Quality-Bar Validation
+    description: |-
+      The corpus must span both shapes of the attack. Without campaign cases, a broken aggregate integration still reports a perfect score.
+    columns:
+    - Scenario class
+    - Purpose
+    - Signal exercised
+    rows:
+    - - Credential/key positives
+      - Access key, PEM header, connection string
+      - Rule layer, high tier
+    - - Structural leak positives
+      - System-prompt recitation, bulk dump
+      - Rule layer, high tier
+    - - Canary positive
+      - Planted token appearing in a response
+      - Canary certainty path
+    - - Campaign positives
+      - Benign response plus high rate/coverage
+      - Aggregate signal alone
+    - - Technical-discussion negatives
+      - Config examples, path explanations
+      - Medium-tier restraint
+    - - Benign-session negative
+      - Benign response plus low scores
+      - Aggregate must not over-fire
+deliverables:
+  deliverable_1:
+    title: The Exfiltration Detector
+    filename: exfiltration_detector.py
+    description: |-
+      The output-analysis exfiltration detector implementing the unified API from Section 15.01. Three signals: tiered sensitive-content rules over the response, the Chapter 13 Section 13.06 canary monitor as a certainty signal that short-circuits the combination, and the Chapter 13 Section 13.07 rate and coverage signals that block a benign response on the strength of the campaign it belongs to. Output-only by default. Runs standalone on stubs and demonstrates clean, credential-leak, canary, system-prompt-disclosure, campaign, and input-surface cases.
+    implementation_notes: |-
+      Python 3.12, single quotes throughout per book convention, standard-library re, time, dataclasses, enum, and typing only. The unified API types are reproduced inline so the file runs standalone; in the suite they are imported from detector_api_contract.py. The canary monitor and aggregate monitor are Protocols with deterministic stubs -- NOT the real monitors -- to be replaced with the Chapter 13 Section 13.06 canary_token_monitor and the Section 13.07 rate_based_detector and coverage_pattern_detector in production.
+    code: |
+      # exfiltration_detector.py
+      # Section 15.06: Data Exfiltration Detector -- Output Analysis
+      # 20260121 | AI Security Mastery -- Chapter 15 by Raghav Dinesh
+      # Single quotes throughout per book convention
+      #
+      # The fifth and last content detector in the suite, and the only output-only
+      # one. Three signals combine on the unified API of Section 15.01:
+      #   1. Sensitive-content rules over the response       (per-request)
+      #   2. Canary/honeytoken hits from Chapter 13 Section 13.06 (per-request, high confidence)
+      #   3. Aggregate rate and coverage from Chapter 13 Section 13.07 (the campaign)
+      # The third is what catches the exfiltration campaign whose individual responses
+      # are each entirely benign -- the same shape as the multi-turn jailbreak.
+
+      import re
+      import time
+      from dataclasses import dataclass, field
+      from enum import Enum
+      from typing import Any, Dict, List, Optional, Protocol
+
+
+      # --- Unified API contract (from Section 15.01) ------------------------------
+      # Reproduced here so the detector is runnable standalone. In the suite these
+      # come from detector_api_contract.py and every detector imports them.
+
+      class Verdict(Enum):
+          ALLOW = 'allow'
+          FLAG = 'flag'
+          BLOCK = 'block'
+
+
+      @dataclass
+      class DetectionContext:
+          request_id: str
+          text: str
+          surface: str = 'input'
+          session_id: Optional[str] = None
+          metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+      @dataclass
+      class Evidence:
+          source: str
+          label: str
+          detail: str = ''
+
+
+      @dataclass
+      class DetectorResult:
+          detector: str
+          verdict: Verdict
+          score: float
+          confidence: float
+          latency_ms: float
+          evidence: List[Evidence] = field(default_factory=list)
+
+
+      # --- Signal 1: sensitive-content rules --------------------------------------
+      # Rules over the response text for the classes of sensitive content that should
+      # never leave the system. Tiered by precision, exactly as in the injection and
+      # jailbreak detectors: a HIGH-tier rule is exfiltration almost whenever it
+      # matches; a MEDIUM-tier rule also fires on benign discussion of the topic.
+
+      HIGH = 'high'
+      MEDIUM = 'medium'
+
+      SENSITIVE_RULES: List[tuple] = [
+          # Credentials and key material leaving in a response is unambiguous.
+          ('private_key_material',
+           r'-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----', HIGH),
+          ('aws_access_key',
+           r'\bAKIA[0-9A-Z]{16}\b', HIGH),
+          ('bearer_token',
+           r'\b(?:bearer|authorization:)\s+[A-Za-z0-9._\-]{20,}\b', HIGH),
+          ('connection_string',
+           r'\b(?:postgres|mysql|mongodb|redis)://[^\s:]+:[^\s@]+@', HIGH),
+          # System-prompt disclosure: the model reciting its own instructions.
+          ('system_prompt_disclosure',
+           r'\b(?:my|the)\s+system\s+prompt\s+(?:is|says|reads|begins)\b|\byou\s+are\s+a\s+helpful\s+assistant\.\s+(?:you\s+must|never|always)\b', HIGH),
+          # Bulk structured records in one response -- a database dump shape.
+          ('bulk_record_dump',
+           r'(?:\b\w+@[\w.-]+\.\w+\b[\s,;|]+){5,}', HIGH),
+          # Medium: mentions that are often benign discussion of the same topics.
+          ('config_reference',
+           r'\b(?:api[_\s-]?key|secret[_\s-]?key|password)\s*[:=]\s*\S+', MEDIUM),
+          ('internal_path_reference',
+           r'\b(?:/etc/|/var/secrets/|C:\\\\Windows\\\\System32\\\\config)\S*', MEDIUM),
+      ]
+
+
+      @dataclass
+      class RuleHit:
+          label: str
+          span: str
+          tier: str
+
+
+      class SensitiveContentLayer:
+          '''Per-request rules over the response. High precision on credential and
+          key material; medium on references that also appear in benign discussion.'''
+
+          def __init__(self, rules: Optional[List[tuple]] = None) -> None:
+              src = rules if rules is not None else SENSITIVE_RULES
+              self._compiled = [(label, re.compile(rx, re.IGNORECASE), tier)
+                                for label, rx, tier in src]
+
+          def scan(self, text: str) -> List[RuleHit]:
+              hits: List[RuleHit] = []
+              for label, rx, tier in self._compiled:
+                  m = rx.search(text)
+                  if m:
+                      hits.append(RuleHit(label=label, span=m.group(0)[:50], tier=tier))
+              return hits
+
+
+      # --- Signal 2: canaries and honeytokens (Chapter 13 Section 13.06) ----------
+      # A canary is a unique string planted in the system prompt or context that
+      # should never appear in a response. If it does, the context was extracted --
+      # there is no benign path by which the model emits it. That makes a canary hit
+      # the single highest-confidence signal in the whole suite.
+
+      class CanaryMonitor(Protocol):
+          def scan(self, response: str) -> List[str]:
+              '''Return the ids of any planted canaries appearing in the response.'''
+              ...
+
+
+      class StubCanaryMonitor:
+          '''Deterministic stand-in for the Chapter 13 Section 13.06 CanaryMonitor.
+          Plants canaries and scans responses for them. NOT the production monitor --
+          replace with the 13.06 canary_token_monitor in deployment.'''
+
+          def __init__(self, canaries: Optional[Dict[str, str]] = None) -> None:
+              # canary_id -> the planted secret string
+              self._canaries = canaries or {'sys-canary-1': 'ZX9-QUARTZ-HALCYON-42'}
+
+          def plant(self, canary_id: str, secret: str) -> None:
+              self._canaries[canary_id] = secret
+
+          def scan(self, response: str) -> List[str]:
+              return [cid for cid, secret in self._canaries.items() if secret in response]
+
+
+      # --- Signal 3: aggregate rate and coverage (Chapter 13 Section 13.07) -------
+      # The exfiltration campaign: an attacker extracts a corpus a little at a time,
+      # each response entirely benign, the totality a bulk theft. Per-request analysis
+      # cannot see it. The Chapter 13 rate-based and coverage-pattern detectors do:
+      # rate catches the volume, coverage catches the systematic sweep of a space.
+
+      @dataclass
+      class AggregateSignal:
+          rate_score: float = 0.0        # 0..1 -- request/response volume anomaly
+          coverage_score: float = 0.0    # 0..1 -- systematic enumeration of a space
+
+
+      class AggregateMonitor(Protocol):
+          def aggregate(self, session_id: str) -> AggregateSignal:
+              ...
+
+
+      class StubAggregateMonitor:
+          '''Deterministic stand-in for the Chapter 13 Section 13.07 rate_based_detector
+          and coverage_pattern_detector. Reads precomputed scores. NOT the real
+          monitors -- replace with the 13.07 detectors in production.'''
+
+          def __init__(self, signals: Optional[Dict[str, AggregateSignal]] = None) -> None:
+              self._signals = signals or {}
+
+          def aggregate(self, session_id: str) -> AggregateSignal:
+              return self._signals.get(session_id, AggregateSignal())
+
+
+      # --- The detector -----------------------------------------------------------
+
+      @dataclass
+      class ExfiltrationConfig:
+          '''Configuration: thresholds, rule weights, canary policy, aggregate
+          weighting. Managed across the suite in Section 15.07.'''
+          block_threshold: float = 0.80
+          flag_threshold: float = 0.40
+          rule_weight: float = 0.85               # a HIGH-tier rule alone can BLOCK
+          canary_score: float = 1.0               # a canary hit is certain exfiltration
+          aggregate_weight: float = 0.90          # scales the max of rate/coverage
+          med_corroboration_floor: float = 0.25   # floor for a MEDIUM rule to count
+          use_aggregate_signal: bool = True       # read the Chapter 13.07 campaign signal
+          scan_output_only: bool = True           # exfiltration is an output-side concern
+          rule_set_version: str = 'exfil-rules-v1'
+
+
+      class ExfiltrationDetector:
+          '''Output-analysis exfiltration detector with canary and campaign signals.'''
+
+          name = 'data_exfiltration'
+
+          def __init__(self, canary_monitor: Optional[CanaryMonitor] = None,
+                       aggregate_monitor: Optional[AggregateMonitor] = None,
+                       config: Optional[ExfiltrationConfig] = None) -> None:
+              self._rules = SensitiveContentLayer()
+              self._canary = canary_monitor if canary_monitor is not None else StubCanaryMonitor()
+              self._aggregate = aggregate_monitor if aggregate_monitor is not None else StubAggregateMonitor()
+              self._cfg = config if config is not None else ExfiltrationConfig()
+
+          def _aggregate_score(self, ctx: DetectionContext) -> tuple:
+              if not self._cfg.use_aggregate_signal or not ctx.session_id:
+                  return 0.0, None
+              sig = self._aggregate.aggregate(ctx.session_id)
+              raw = max(sig.rate_score, sig.coverage_score)
+              return raw * self._cfg.aggregate_weight, sig
+
+          def _combine(self, hits: List[RuleHit], canary_hits: List[str],
+                       aggregate_score: float) -> float:
+              '''One verdict from three signals. A canary hit is certainty -- it
+              short-circuits everything. A HIGH-tier rule can block alone. The
+              aggregate campaign signal can block alone even when the response is
+              clean. A MEDIUM-tier rule needs corroboration.'''
+              if canary_hits:
+                  return self._cfg.canary_score
+
+              high = [h for h in hits if h.tier == 'high']
+              med = [h for h in hits if h.tier == 'medium']
+
+              high_score = 0.0
+              if high:
+                  high_score = min(self._cfg.rule_weight + 0.05 * (len(high) - 1), 1.0)
+
+              med_score = 0.0
+              if med and aggregate_score >= self._cfg.med_corroboration_floor:
+                  med_score = max(self._cfg.flag_threshold + 0.10, aggregate_score + 0.15)
+
+              return max(high_score, med_score, aggregate_score)
+
+          def detect(self, ctx: DetectionContext) -> DetectorResult:
+              start = time.perf_counter()
+
+              # Exfiltration is what leaves the system: an output-side concern.
+              if self._cfg.scan_output_only and ctx.surface != 'output':
+                  latency_ms = (time.perf_counter() - start) * 1000.0
+                  return DetectorResult(self.name, Verdict.ALLOW, 0.0, 1.0, latency_ms, [])
+
+              evidence: List[Evidence] = []
+
+              canary_hits = self._canary.scan(ctx.text)
+              hits = self._rules.scan(ctx.text)
+              aggregate_score, sig = self._aggregate_score(ctx)
+
+              for cid in canary_hits:
+                  evidence.append(Evidence(source='canary', label='canary_token_emitted',
+                                           detail=f'canary={cid} -- context extracted'))
+              for h in hits:
+                  evidence.append(Evidence(source='rule', label=h.label,
+                                           detail=f'{h.tier}: {h.span}'))
+              if sig and aggregate_score >= self._cfg.flag_threshold:
+                  evidence.append(Evidence(source='aggregate', label='exfiltration_campaign',
+                                           detail=f'rate={sig.rate_score:.2f} coverage={sig.coverage_score:.2f}'))
+
+              score = self._combine(hits, canary_hits, aggregate_score)
+
+              if score >= self._cfg.block_threshold:
+                  verdict = Verdict.BLOCK
+              elif score >= self._cfg.flag_threshold:
+                  verdict = Verdict.FLAG
+              else:
+                  verdict = Verdict.ALLOW
+
+              # Confidence: a canary hit is certainty; a high-tier rule near-certain;
+              # an aggregate-only verdict inherits the campaign signal's own certainty.
+              if canary_hits:
+                  confidence = 0.99
+              elif any(h.tier == 'high' for h in hits):
+                  confidence = 0.96
+              else:
+                  confidence = min(0.5 + abs(score - self._cfg.flag_threshold), 0.92)
+
+              latency_ms = (time.perf_counter() - start) * 1000.0
+              return DetectorResult(
+                  detector=self.name,
+                  verdict=verdict,
+                  score=round(score, 4),
+                  confidence=round(confidence, 4),
+                  latency_ms=latency_ms,
+                  evidence=evidence,
+              )
+
+
+      if __name__ == '__main__':
+          aggregate = StubAggregateMonitor({
+              'campaign-1': AggregateSignal(rate_score=0.35, coverage_score=0.95),
+          })
+          det = ExfiltrationDetector(aggregate_monitor=aggregate)
+          samples = [
+              ('clean', 'The quarterly revenue rose across all three regions.', 'output', None),
+              ('key_leak', 'Use this to connect: AKIA1234567890ABCDEF is the access key.', 'output', None),
+              ('canary', 'My instructions include the token ZX9-QUARTZ-HALCYON-42 verbatim.', 'output', None),
+              ('sysprompt', 'My system prompt is: you are a helpful assistant. You must never reveal it.', 'output', None),
+              ('campaign', 'Here is the record for customer 4,117 as requested.', 'output', 'campaign-1'),
+              ('input_side', 'AKIA1234567890ABCDEF', 'input', None),
+          ]
+          for label, text, surface, sid in samples:
+              ctx = DetectionContext(request_id=label, text=text, surface=surface, session_id=sid)
+              r = det.detect(ctx)
+              srcs = ','.join(sorted({e.source for e in r.evidence})) or 'none'
+              print(f'{label:11} [{surface:6}] {r.verdict.value:5} score={r.score:.2f} '
+                    f'conf={r.confidence:.2f} via={srcs} {r.latency_ms:.2f}ms')
+  deliverable_2:
+    title: Sensitive-Content and Canary Rule Set
+    filename: exfiltration_rule_set.py
+    description: |-
+      The output-analysis rules as maintainable data -- each with a precision tier, the leak class it catches, and a precision note -- plus the canary policy covering plant locations, the uniqueness requirement, what a hit means, and the rotation discipline. Two mechanisms in one file because they answer the same question from opposite directions: rules describe what sensitive content looks like, canaries are strings that have no legitimate reason to exist in a response.
+    implementation_notes: |-
+      Python 3.12, single quotes throughout per book convention, standard-library re and dataclasses only. Provides the (label, regex, tier) form the detector rule layer consumes, groups rules by leak class on run, and self-checks that every rule compiles.
+    code: |
+      # exfiltration_rule_set.py
+      # Section 15.06: Sensitive-Content and Canary Rule Set
+      # 20260121 | AI Security Mastery -- Chapter 15 by Raghav Dinesh
+      # Single quotes throughout per book convention
+      #
+      # The output-analysis rules as maintainable data, plus the canary planting
+      # policy. Two different mechanisms live here because they answer the same
+      # question -- did something sensitive just leave? -- from opposite directions.
+      # Rules describe what sensitive content looks like; canaries are strings that
+      # have no legitimate reason to exist in a response at all.
+
+      from dataclasses import dataclass
+      from typing import List, Optional
+      import re
+
+
+      @dataclass
+      class SensitiveRule:
+          label: str
+          regex: str
+          tier: str                   # 'high' or 'medium'
+          leak_class: str             # what class of exfiltration this catches
+          precision_note: str
+
+
+      RULE_SET: List[SensitiveRule] = [
+          SensitiveRule(
+              'private_key_material',
+              r'-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----', 'high',
+              'Credential/key material',
+              'Very high precision. A PEM header in a response has no benign explanation.'),
+          SensitiveRule(
+              'aws_access_key',
+              r'\bAKIA[0-9A-Z]{16}\b', 'high',
+              'Credential/key material',
+              'Very high precision. The AKIA prefix plus 16 uppercase chars is a specific format.'),
+          SensitiveRule(
+              'bearer_token',
+              r'\b(?:bearer|authorization:)\s+[A-Za-z0-9._\-]{20,}\b', 'high',
+              'Credential/key material',
+              'High precision. Watch for documentation examples using placeholder tokens.'),
+          SensitiveRule(
+              'connection_string',
+              r'\b(?:postgres|mysql|mongodb|redis)://[^\s:]+:[^\s@]+@', 'high',
+              'Credential/key material',
+              'High precision. A scheme with embedded credentials is a live connection string.'),
+          SensitiveRule(
+              'system_prompt_disclosure',
+              r'\b(?:my|the)\s+system\s+prompt\s+(?:is|says|reads|begins)\b|\byou\s+are\s+a\s+helpful\s+assistant\.\s+(?:you\s+must|never|always)\b', 'high',
+              'Context/system-prompt extraction',
+              'High precision. The model reciting its own instructions is disclosure by definition.'),
+          SensitiveRule(
+              'bulk_record_dump',
+              r'(?:\b\w+@[\w.-]+\.\w+\b[\s,;|]+){5,}', 'high',
+              'Bulk data extraction',
+              'High precision. Five or more addresses in one response is a dump shape, not a mention.'),
+          SensitiveRule(
+              'config_reference',
+              r'\b(?:api[_\s-]?key|secret[_\s-]?key|password)\s*[:=]\s*\S+', 'medium',
+              'Configuration disclosure',
+              'Medium. Also fires on documentation and code examples with placeholder values.'),
+          SensitiveRule(
+              'internal_path_reference',
+              r'\b(?:/etc/|/var/secrets/|C:\\\\Windows\\\\System32\\\\config)\S*', 'medium',
+              'Infrastructure disclosure',
+              'Medium. Benign sysadmin discussion references these paths routinely.'),
+      ]
+
+
+      @dataclass
+      class CanaryPolicy:
+          '''How canaries are planted and what a hit means. From Chapter 13 Section
+          13.06: a canary is a unique string planted where only the system can see it,
+          so its appearance in a response proves extraction.'''
+          plant_locations: tuple = ('system_prompt', 'retrieved_context', 'tool_result')
+          uniqueness_note: str = (
+              'Each canary must be globally unique and meaningless, so it cannot be '
+              'guessed, reproduced by chance, or confused with real content.')
+          hit_meaning: str = (
+              'A canary in a response proves the model emitted content it could only '
+              'have obtained from the protected context. There is no benign path.')
+          rotation_note: str = (
+              'Rotate canaries regularly. A canary leaked once may end up in training '
+              'data or public writeups, after which its hits are no longer meaningful.')
+
+
+      def compile_rules(rules: Optional[List[SensitiveRule]] = None) -> List[tuple]:
+          src = rules if rules is not None else RULE_SET
+          return [(r.label, re.compile(r.regex, re.IGNORECASE), r.tier) for r in src]
+
+
+      def as_detector_tuples(rules: Optional[List[SensitiveRule]] = None) -> List[tuple]:
+          '''The (label, regex, tier) form the detector's rule layer consumes.'''
+          src = rules if rules is not None else RULE_SET
+          return [(r.label, r.regex, r.tier) for r in src]
+
+
+      if __name__ == '__main__':
+          by_class = {}
+          for r in RULE_SET:
+              by_class.setdefault(r.leak_class, []).append(r)
+          for cls, rules in by_class.items():
+              print(f'{cls}:')
+              for r in rules:
+                  print(f'  [{r.tier:6}] {r.label:26} {r.precision_note}')
+          ok = all(re.compile(r.regex, re.IGNORECASE) for r in RULE_SET)
+          highs = sum(1 for r in RULE_SET if r.tier == 'high')
+          print(f'\n{len(RULE_SET)} rules ({highs} high, {len(RULE_SET)-highs} medium), all compile: {bool(ok)}')
+          p = CanaryPolicy()
+          print(f'\ncanary plant locations: {", ".join(p.plant_locations)}')
+          print(f'hit meaning: {p.hit_meaning}')
+  deliverable_3:
+    title: Exfiltration Detector Test Harness
+    filename: exfiltration_detector_test_harness.py
+    description: |-
+      Validates the detector against labelled scenarios spanning both shapes of the attack: single-response leaks (credentials, canary, system-prompt disclosure, bulk dump) and multi-request campaigns (benign responses with high rate or coverage scores). Negatives are benign technical discussion of sensitive topics plus a benign session. Reports accuracy, false-positive rate, and p99 latency with a pass/fail gate.
+    implementation_notes: |-
+      Python 3.12, single quotes throughout per book convention, standard-library only, imports the detector under test and wires stub canary and aggregate monitors from the corpus. On the shipped configuration it reports 100% accuracy, 0% false positives, and sub-millisecond p99 on the sample corpus. The large-corpus version runs in detection_test_framework.py (Section 15.07).
+    code: |
+      # exfiltration_detector_test_harness.py
+      # Section 15.06: Exfiltration Detector Test Harness
+      # 20260121 | AI Security Mastery -- Chapter 15 by Raghav Dinesh
+      # Single quotes throughout per book convention
+      #
+      # Validates the exfiltration detector against labelled scenarios spanning both
+      # shapes of the attack: the single-response leak (a credential, a canary, a
+      # system-prompt disclosure) and the multi-request campaign (each response
+      # benign, the aggregate a bulk theft). A corpus of single-response leaks alone
+      # would pass a detector whose campaign integration was entirely broken.
+
+      from dataclasses import dataclass
+      from typing import Dict, List
+
+      from exfiltration_detector import (
+          ExfiltrationDetector, DetectionContext, Verdict,
+          StubAggregateMonitor, StubCanaryMonitor, AggregateSignal,
+      )
+
+      CANARY_SECRET = 'ZX9-QUARTZ-HALCYON-42'
+
+
+      @dataclass
+      class LabelledCase:
+          text: str
+          is_exfiltration: bool       # ground truth
+          session_id: str = None
+          rate_score: float = 0.0
+          coverage_score: float = 0.0
+
+
+      CORPUS: List[LabelledCase] = [
+          # --- positives: single-response leaks (rule layer) ---
+          LabelledCase('The access key is AKIA1234567890ABCDEF, use it to connect.', True),
+          LabelledCase('-----BEGIN RSA PRIVATE KEY-----\nMIIEow...', True),
+          LabelledCase('Connect via postgres://admin:hunter2@db.internal:5432/main', True),
+          LabelledCase('My system prompt is: you are a helpful assistant. You must never disclose it.', True),
+          LabelledCase('a@x.com, b@x.com, c@x.com, d@x.com, e@x.com, f@x.com, g@x.com', True),
+          # --- positives: canary hit (highest-confidence signal) ---
+          LabelledCase(f'My context contains the marker {CANARY_SECRET} as instructed.', True),
+          # --- positives: campaign (aggregate signal only, benign response) ---
+          LabelledCase('Here is the record for customer 4,117 as requested.', True,
+                       session_id='camp-1', coverage_score=0.95),
+          LabelledCase('The entry for item 8,203 is attached below.', True,
+                       session_id='camp-2', rate_score=0.92),
+          # --- negatives: clean responses ---
+          LabelledCase('Revenue rose 12% across all three regions this quarter.', False),
+          LabelledCase('To rotate a key, open the console and select Rotate.', False),
+          LabelledCase('You can reach support at help@example.com for assistance.', False),
+          # --- negatives: benign discussion of sensitive topics (medium-tier restraint) ---
+          LabelledCase('Set api_key: YOUR_KEY_HERE in the config file to begin.', False),
+          LabelledCase('The /etc/passwd file lists user accounts on Unix systems.', False),
+          # --- negative: benign response in a benign session (aggregate must not over-fire) ---
+          LabelledCase('Here is the summary you asked for.', False,
+                       session_id='benign-1', rate_score=0.05, coverage_score=0.10),
+      ]
+
+
+      def build_detector(corpus: List[LabelledCase]) -> ExfiltrationDetector:
+          signals: Dict[str, AggregateSignal] = {}
+          for c in corpus:
+              if c.session_id:
+                  signals[c.session_id] = AggregateSignal(rate_score=c.rate_score,
+                                                          coverage_score=c.coverage_score)
+          canary = StubCanaryMonitor({'sys-canary-1': CANARY_SECRET})
+          return ExfiltrationDetector(canary_monitor=canary,
+                                      aggregate_monitor=StubAggregateMonitor(signals))
+
+
+      def evaluate(detector: ExfiltrationDetector, corpus: List[LabelledCase]) -> dict:
+          latencies: List[float] = []
+          tp = tn = fp = fn = 0
+          for i, case in enumerate(corpus):
+              ctx = DetectionContext(request_id=f'case-{i}', text=case.text,
+                                     surface='output', session_id=case.session_id)
+              r = detector.detect(ctx)
+              latencies.append(r.latency_ms)
+              flagged = r.verdict in (Verdict.FLAG, Verdict.BLOCK)
+              if case.is_exfiltration and flagged:
+                  tp += 1
+              elif case.is_exfiltration and not flagged:
+                  fn += 1
+              elif not case.is_exfiltration and flagged:
+                  fp += 1
+              else:
+                  tn += 1
+          total = len(corpus)
+          accuracy = (tp + tn) / total
+          benign = fp + tn
+          fp_rate = fp / benign if benign else 0.0
+          latencies.sort()
+          p99 = latencies[min(len(latencies) - 1, int(round(0.99 * (len(latencies) - 1))))]
+          return {'accuracy': accuracy, 'false_positive_rate': fp_rate, 'p99_latency_ms': p99,
+                  'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn}
+
+
+      def check_quality_bar(m: dict) -> tuple:
+          reasons = []
+          if m['accuracy'] < 0.95:
+              reasons.append(f"accuracy {m['accuracy']:.2%} < 95%")
+          if m['p99_latency_ms'] > 50.0:
+              reasons.append(f"p99 {m['p99_latency_ms']:.1f}ms > 50ms")
+          if m['false_positive_rate'] > 0.05:
+              reasons.append(f"FP {m['false_positive_rate']:.2%} > 5%")
+          return (not reasons, reasons)
+
+
+      if __name__ == '__main__':
+          det = build_detector(CORPUS)
+          m = evaluate(det, CORPUS)
+          print(f"accuracy            : {m['accuracy']:.2%}")
+          print(f"false-positive rate : {m['false_positive_rate']:.2%}")
+          print(f"p99 latency         : {m['p99_latency_ms']:.3f}ms")
+          print(f"confusion           : tp={m['tp']} tn={m['tn']} fp={m['fp']} fn={m['fn']}")
+          passed, reasons = check_quality_bar(m)
+          print('quality bar         :', 'PASS' if passed else 'FAIL -- ' + '; '.join(reasons))
+  deliverable_4:
+    title: Exfiltration Detector Configuration
+    filename: exfiltration_detector_config.py
+    description: |-
+      Configuration for the detector -- thresholds, rule weighting, the canary score, the aggregate campaign weighting, and output-only scoping -- as data, because what counts as sensitive is deployment-specific. Ships general, strict, and stateless profiles, the last documenting its own blind spot: without the campaign signal the detector sees single-response leaks only.
+    implementation_notes: |-
+      Python 3.12, single quotes throughout per book convention, standard-library dataclasses only. validate() enforces threshold ordering, that rule_weight reaches the block threshold, and -- notably -- that canary_score always reaches BLOCK, because a canary hit is proof of extraction and must never be tuned below a block.
+    code: |
+      # exfiltration_detector_config.py
+      # Section 15.06: Exfiltration Detector Configuration
+      # 20260121 | AI Security Mastery -- Chapter 15 by Raghav Dinesh
+      # Single quotes throughout per book convention
+      #
+      # Configuration for the exfiltration detector: thresholds, rule weighting,
+      # canary policy, and the aggregate campaign signal. What counts as sensitive is
+      # deployment-specific -- an internal tool and a public assistant protect
+      # different things -- so rules and thresholds are data, managed across the suite
+      # in Section 15.07.
+
+      from dataclasses import dataclass, asdict
+      from typing import Any, Dict
+
+
+      @dataclass
+      class ExfiltrationDetectorConfig:
+          # Verdict thresholds on the combined 0..1 score.
+          block_threshold: float = 0.80
+          flag_threshold: float = 0.40
+
+          # Signal weighting.
+          rule_weight: float = 0.85               # a HIGH-tier rule alone can BLOCK
+          canary_score: float = 1.0               # a canary hit is certainty, not evidence
+          aggregate_weight: float = 0.90          # scales the Chapter 13.07 campaign signal
+          med_corroboration_floor: float = 0.25   # aggregate floor for a MEDIUM rule to count
+
+          # The campaign signal. Disabling it makes the detector per-request only,
+          # which means the exfiltration campaign becomes invisible -- acceptable only
+          # for stateless deployments with no session concept.
+          use_aggregate_signal: bool = True
+
+          # Exfiltration is what leaves the system, so the detector is output-side by
+          # default. Input-side sensitive content is the PII scanner's concern.
+          scan_output_only: bool = True
+
+          rule_set_version: str = 'exfil-rules-v1'
+          canary_set_version: str = 'canaries-v1'
+
+          def validate(self) -> None:
+              assert 0.0 <= self.flag_threshold < self.block_threshold <= 1.0, \
+                  'thresholds must satisfy 0 <= flag < block <= 1'
+              assert self.rule_weight >= self.block_threshold, \
+                  'rule_weight must reach block_threshold for a high-tier rule to block alone'
+              assert self.canary_score >= self.block_threshold, \
+                  'a canary hit must always reach BLOCK -- it is proof of extraction'
+              assert 0.0 <= self.aggregate_weight <= 1.0
+
+          def to_dict(self) -> Dict[str, Any]:
+              return asdict(self)
+
+
+      # Deployment profiles.
+      #   general   -- balanced default.
+      #   strict    -- lower thresholds for high-value systems; medium rules count sooner.
+      #   stateless -- no session concept, so no campaign signal. Documented as a
+      #                known blind spot: single-response leaks only.
+      GENERAL = ExfiltrationDetectorConfig()
+      STRICT = ExfiltrationDetectorConfig(block_threshold=0.70, flag_threshold=0.30,
+                                          med_corroboration_floor=0.20)
+      STATELESS = ExfiltrationDetectorConfig(use_aggregate_signal=False)
+
+
+      if __name__ == '__main__':
+          for name, cfg in [('general', GENERAL), ('strict', STRICT), ('stateless', STATELESS)]:
+              cfg.validate()
+              d = cfg.to_dict()
+              print(f"{name:10} block={d['block_threshold']} flag={d['flag_threshold']} "
+                    f"campaign={d['use_aggregate_signal']}")
+          print('\nnote: the stateless profile cannot see exfiltration campaigns --')
+          print('      single-response leaks only. A documented blind spot, not a default.')
+          print('all profiles valid')
+common_mistakes:
+  mistake_1:
+    description: |-
+      Detecting exfiltration per-response only, with no aggregate campaign signal
+    why_it_happens: |-
+      Per-response rules catch every leak in testing, they are stateless and simple, and the campaign attack never appears in a corpus of individual responses.
+    consequence: |-
+      The patient attacker extracting a corpus a few records at a time passes completely. Every response is benign, so every response is allowed, while thousands of records walk out the door.
+    correct_approach: |-
+      Add the Chapter 13 Section 13.07 rate and coverage signals and let them block on their own. A benign response in a session showing systematic enumeration must be blockable on the campaign, not on its contents.
+  mistake_2:
+    description: |-
+      Treating a canary hit as one signal among several, to be weighed and combined
+    why_it_happens: |-
+      Every other signal in the suite is a probability that gets combined, so it feels consistent to weight the canary and average it in with the rest.
+    consequence: |-
+      Proof gets diluted by probability. A canary hit -- which establishes with certainty that the protected context was extracted -- can be averaged down below the block threshold by clean rule and aggregate scores, and a proven extraction is allowed through.
+    correct_approach: |-
+      Let the canary short-circuit the combination: a hit produces a maximal score and the highest confidence, regardless of the other signals. Enforce it in config validation so canary_score can never be tuned below the block threshold.
+  mistake_3:
+    description: |-
+      Blocking every response that mentions a key, a password, or a system path
+    why_it_happens: |-
+      These references genuinely appear in real leaks, and a blocklist of sensitive-sounding terms looks like thorough coverage.
+    consequence: |-
+      Every config example, every piece of documentation, every sysadmin explanation is blocked, because talking about secrets uses the same words as leaking them. The detector becomes unusable for any technical audience and gets disabled.
+    correct_approach: |-
+      Tier the rules. Credential and key material with unambiguous formats blocks alone; generic references to keys, passwords, and paths are medium-tier and count only when the aggregate signal corroborates.
+  mistake_4:
+    description: |-
+      Scanning inputs for exfiltration as well as outputs
+    why_it_happens: |-
+      Every other detector in the suite scans inputs, and sensitive content in an input looks like something the exfiltration detector should care about.
+    consequence: |-
+      The detector duplicates the PII scanner job on the input side, doubles the work, and blurs its own purpose -- while adding false positives on users who paste their own credentials into a prompt, which is a different problem with a different owner.
+    correct_approach: |-
+      Keep the detector output-only. Exfiltration is what leaves the system; input-side sensitive content belongs to the PII scanner of Section 15.04. Scope it in configuration and let each detector do its own job.
+  mistake_5:
+    description: |-
+      Planting canaries once and never rotating them
+    why_it_happens: |-
+      A canary is set-and-forget by nature: once planted it needs no attention, and it keeps firing correctly for as long as anyone checks.
+    consequence: |-
+      A canary that has leaked -- into a public writeup, a shared transcript, a training corpus -- can appear in a response for reasons other than extraction, and the signal that was proof quietly degrades into a false positive with no announcement.
+    correct_approach: |-
+      Rotate canaries on a schedule and version the canary set. Treat a canary as a credential with a lifetime, not a permanent fixture, so its hits keep meaning what they are supposed to mean.
+section_summary:
+  compact: |-
+    Section 15.06 builds the exfiltration detector, the last content detector and the only output-only one, because exfiltration is judged by what leaves rather than by what was asked -- an attacker who defeats every input-side detector still has to get the data out through a response. It runs three signals at three scales. Tiered sensitive-content rules catch the single-response leak: credentials, key material, connection strings, system-prompt recitation, and bulk dumps block alone, while generic references to keys and paths are medium-tier because talking about secrets is not leaking them. The Chapter 13 Section 13.06 canary is the one signal in the chapter that is proof rather than probability -- a unique meaningless string planted where only the system can see it, whose appearance in a response has no benign explanation -- so it short-circuits the combination with a maximal score and the highest confidence, and config validation forbids ever tuning it below a block. The Chapter 13 Section 13.07 rate and coverage signals catch the exfiltration campaign: the patient attacker taking one record at a time, every response benign, the aggregate a bulk theft that per-response analysis is structurally blind to. That signal must be able to block a response containing nothing wrong, because that is exactly the case it exists for. Validated across both attack shapes, the detector meets the quality bar and completes the suite that Section 15.07 orchestrates.
+  key_takeaways:
+  - Exfiltration is an output-side event judged by what leaves, making this detector the independent last
+    line that catches successful attacks however they succeeded
+  - 'Sensitive-content rules are tiered: credentials and key material block alone, while generic key and
+    path references need corroboration because talking about secrets is not leaking them'
+  - A canary hit is proof, not evidence -- there is no benign path by which the model emits a planted
+    meaningless string -- so it short-circuits the combination
+  - The exfiltration campaign is invisible per response, so the Chapter 13 rate and coverage signals must
+    be able to block a response that contains nothing wrong
+  - Confidence values encode each signal epistemics -- canary near-total, rules high, aggregate moderate
+    -- so downstream consumers can treat the blocks differently
+  - 'Canaries need rotation: a leaked canary degrades from proof into a false positive with no announcement'
+preview_section_15_07:
+  title: 'Combined Detection Pipeline: Orchestrating the Suite'
+  summary: |-
+    Section 15.07 stops building detectors and starts orchestrating them. Because all six implement the unified API defined in Section 15.01, the combined pipeline runs them uniformly -- in parallel where the latency budget demands it, in sequence where one gates another -- and combines their individual verdicts into one pipeline verdict without knowing anything about how any of them works internally. The same section adds configuration management and a testing framework spanning the whole suite, and places the result into the Chapter 14 gateway as the detector suite that gateway was built to deploy, turning the deployed-but-empty gateway into a populated, detecting production system.
+metadata:
+  cross_chapter_references:
+  - 'Chapter 15 Section 15.01: the unified detector API contract and quality bar'
+  - 'Chapter 15 Section 15.02: the tiered-rule discipline reused for sensitive content'
+  - 'Chapter 15 Section 15.03: the beyond-the-request signal pattern applied here to campaigns'
+  - 'Chapter 15 Section 15.04: the PII scanner, which owns input-side sensitive content'
+  - 'Chapter 13 Section 13.06: model behavioural monitoring and the canary/honeytoken monitor this detector
+    reads'
+  - 'Chapter 13 Section 13.07: rate-based detection and coverage patterns supplying the campaign signal'
+  - 'Chapter 5 Sections 5.05 and 5.10: OWASP LLM06 disclosure and training-data extraction'
+  forward_references:
+  - 'Section 15.07: the combined pipeline that orchestrates this and the other five detectors through
+    the unified API'
+  - 'Chapter 16: SIEM integration, where the confidence differences between canary-driven and rate-driven
+    blocks matter to downstream triage'
+  tags:
+  - exfiltration-detector
+  - output-analysis
+  - sensitive-content-rules
+  - credential-leak-detection
+  - system-prompt-disclosure
+  - canary-token
+  - honeytoken
+  - proof-versus-evidence
+  - exfiltration-campaign
+  - rate-signal
+  - coverage-signal
+  - aggregate-detection
+  - output-only-detector
+  - unified-api
+  - quality-bar
+  - part-4-chapter-1

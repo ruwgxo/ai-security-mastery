@@ -1,0 +1,927 @@
+# section_10_14_certified_robustness.yaml
+
+---
+document_info:
+  title: 'Certified Robustness: Randomised Smoothing and Formal Guarantees'
+  chapter: 10
+  section: 14
+  section_code: '1014'
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  version: '1.0'
+  created: '2026-06-01'
+  estimated_pages: 6
+  estimated_reading_time: '45-55 minutes'
+
+section_overview:
+  one_line_summary: 'Randomised smoothing turns any classifier into one with a per-input, provable L2 robustness radius -- the only Chapter 10 defence whose claim cannot be broken by a stronger attack, paid for in clean accuracy, inference cost, and the right to abstain.'
+  why_this_section_exists: |
+    Every defence in Sections 10.11 to 10.13 is empirical. Feature squeezing, consistency
+    checking and the adversarial classifier are measured against the attacks we know, and
+    Section 10.13 already showed an adaptive adversary pushing through them. PGD robustness
+    has the same weakness: a model that resists PGD-40 today may fall to a better attack
+    tomorrow, and the adversarial ML literature is full of defences that did exactly that.
+
+    Some deployments cannot accept "robust against the attacks we tried". A safety case for a
+    medical triage model, a contractual robustness commitment, or a regulator asking what the
+    worst case is all need a statement of the form "no perturbation smaller than r can change
+    this output". Section 10.14 builds the one practical tool that produces that statement for
+    large neural networks: randomised smoothing.
+  position_in_chapter: |
+    Section 10.14 opens the upstream half of the Chapter 10 defence stack. Track 7 (Section
+    10.13) is the runtime detection layer; Sections 10.14 and 10.15 change the model itself.
+    This section gives the formal guarantee and quantifies its price; Section 10.15 gives the
+    stronger empirical defence. Section 10.16 assembles both with Track 7 into the evasion
+    defence architecture.
+
+learning_objectives:
+
+  knowledge:
+    - 'Define a robustness certificate and distinguish certified robustness from empirical robustness'
+    - 'State the smoothed classifier g(x) = argmax_c P(f(x + e) = c) with e ~ N(0, sigma^2 I)'
+    - 'State the Cohen et al. 2019 certified radius R = sigma * Phi^-1(p_A_lower) and explain each term'
+    - 'Explain why the certificate is probabilistic (confidence 1 - alpha) and why CERTIFY must use fresh samples for estimation'
+    - 'Explain how sigma and the sample count n cap the largest radius that can ever be certified'
+    - 'Explain why Gaussian smoothing certifies L2 but gives weak L-infinity guarantees in high dimension'
+    - 'Name the discrete-input analogues for text (SAFER, interval bound propagation) and their threat model'
+
+  skills:
+    - 'Implement SmoothedClassifier.predict and SmoothedClassifier.certify with a Clopper-Pearson lower bound'
+    - 'Compute certified radius, maximum certifiable radius, and required sample count for a deployment'
+    - 'Produce a certified accuracy curve across sigma values and read the accuracy-robustness trade-off from it'
+    - 'Compare certified accuracy against PGD empirical accuracy at matched epsilon and interpret the gap'
+    - 'Decide between certified, offline-audit, and empirical-only deployment for a given threat model and latency budget'
+
+  security_mindset:
+    - 'Treat a certificate as a statement about one input under one norm at one radius -- not about the model'
+    - 'Prefer a lower bound you can prove to an upper bound an attacker may beat, when the deployment needs a worst case'
+    - 'Accept abstention as a security feature: a smoothed classifier that says "unsure" is refusing to be guessed through'
+    - 'Recognise that certification moves the argument from "which attacks did you try" to "which threat model did you certify"'
+
+prerequisites:
+  - 'Section 10.1: Lp norm constraints (the certificate is an L2 ball)'
+  - 'Section 10.4: PGD and L2-PGD (pgd_l2 from pgd_l2_variant.py is the empirical comparison)'
+  - 'Section 10.12: consistency checking (smoothing generalises its random-perturbation idea into a guarantee)'
+  - 'Chapter 1 Section 1.4: probability, the normal distribution, and confidence intervals'
+  - 'Chapter 8 Section 8.13: differential privacy (the closest analogue: a formal bound bought with utility)'
+
+prose_content:
+
+  part_1:
+    title: 'Empirical vs Certified Robustness: Upper Bounds and Lower Bounds'
+    body: |
+      Every robustness number in Sections 10.3 to 10.13 was produced the same way: run an attack,
+      count how many inputs it fails to flip. That number is an upper bound on the model's true
+      robust accuracy. A stronger attack can only lower it. When Section 10.4 reports "45% PGD
+      robust accuracy", the honest reading is "at most 45%, and possibly much less".
+
+      A certificate is the opposite kind of statement. For a specific input x, a certifier
+      returns a class c and a radius r and guarantees that every input within distance r of x
+      is classified as c. No attack, known or future, can produce a counterexample inside that
+      ball. Certified accuracy at radius r -- the fraction of test inputs that are classified
+      correctly and certified at radius at least r -- is therefore a lower bound on true robust
+      accuracy at r. True robustness lies between the certified floor and the empirical ceiling.
+
+      Exact certification is possible for small networks. Complete verifiers built on SMT
+      (Reluplex, Katz et al. 2017) or mixed-integer programming answer the question exactly, but
+      the problem is NP-hard for ReLU networks and the cost grows exponentially with network
+      size. Bound-propagation methods such as interval bound propagation (Gowal et al. 2018) and
+      CROWN (Zhang et al. 2018) trade exactness for speed and work best when the network is
+      trained for them. Randomised smoothing takes a different route: rather than analysing the
+      network, it changes the classifier into one whose robustness can be proved from sampling
+      alone. That makes it architecture-agnostic, which is why it was the first certified defence
+      to scale to ImageNet.
+
+  part_2:
+    title: 'Randomised Smoothing: Cohen, Rosenfeld and Kolter 2019'
+    body: |
+      Start from any base classifier f. Define the smoothed classifier g as the class f is most
+      likely to return when the input is corrupted with isotropic Gaussian noise:
+
+        g(x) = argmax_c P(f(x + e) = c),   e ~ N(0, sigma^2 I)
+
+      g is never computed exactly. It is estimated by drawing many noisy copies of x, running f
+      on each, and counting votes. The noise level sigma is a hyperparameter chosen per
+      deployment.
+
+      Lecuyer et al. 2019 (PixelDP) and Li et al. 2019 had shown that noise-based smoothing yields
+      certificates, using differential privacy and Renyi divergence arguments. Cohen, Rosenfeld
+      and Kolter 2019 proved the tight L2 result. If the top class c_A has probability at least
+      p_A under noise, and every other class has probability at most p_B, then g(x + delta) = c_A
+      for every perturbation with
+
+        ||delta||_2 < R = (sigma / 2) * (Phi^-1(p_A) - Phi^-1(p_B))
+
+      where Phi^-1 is the inverse standard normal CDF. In practice p_B is bounded by 1 - p_A,
+      which simplifies the radius to R = sigma * Phi^-1(p_A). The bound is tight: for a linear
+      base classifier no larger radius is possible.
+
+      The intuition is geometric. Shifting x by delta shifts the centre of the Gaussian cloud by
+      delta. Votes for c_A can only fall so fast as the cloud moves, because the worst-case base
+      classifier (by the Neyman-Pearson lemma, a half-space) loses probability mass at a rate set
+      by sigma. When p_A is close to 1, the cloud must move a long way before c_A loses the
+      majority. When p_A is barely above one half, a small shift is enough, and the radius
+      shrinks to zero.
+
+      Applied to the paper's ImageNet experiments, a smoothed ResNet-50 achieved 49% certified
+      top-1 accuracy against L2 perturbations of norm up to 0.5 (127/255) -- a guarantee no
+      empirical defence could offer at that scale.
+
+  part_3:
+    title: 'From Sampling to a Certificate: PREDICT, CERTIFY and the Confidence Bound'
+    body: |
+      p_A is unknown and must be estimated from samples. The certificate is only as good as that
+      estimate, so the procedure has to be conservative in exactly the right places. Cohen et al.
+      give two algorithms.
+
+      CERTIFY draws n0 noisy samples (n0 = 100 is typical) and takes the most frequent class as
+      the candidate c_A. It then draws n FRESH samples and counts how many vote for c_A. From that
+      count it computes a one-sided Clopper-Pearson lower confidence bound p_A_lower at level
+      1 - alpha. If p_A_lower is above one half it returns c_A with radius sigma * Phi^-1(p_A_lower);
+      otherwise it abstains. The two sample sets must be independent. Choosing c_A and estimating
+      its probability on the same samples selects the class that happened to get lucky, biases the
+      estimate upward, and voids the confidence statement.
+
+      PREDICT draws n samples, takes the top two classes, and runs a two-sided binomial test of
+      whether the top class beats the runner-up. If the test cannot separate them at level alpha
+      it abstains; otherwise it returns the top class. PREDICT claims no radius. It is the
+      production inference path: the probability that it returns a class other than g(x) is at
+      most alpha.
+
+      The guarantee is therefore probabilistic in a precise sense. With probability at least
+      1 - alpha over the sampling randomness, the returned certificate is correct. alpha = 0.001
+      is the common choice. This is not a weakness of the method -- it is the same kind of
+      statement a hypothesis test makes -- but it must be stated in any safety case that relies
+      on it.
+
+  part_4:
+    title: 'The Accuracy-Robustness Trade-off: Sigma, Sample Count and Abstention'
+    body: |
+      Two knobs set what smoothing can certify, and both cost something.
+
+      Sigma controls the noise level. Large sigma allows large radii, because the radius scales
+      with sigma, but the base classifier now has to classify heavily corrupted inputs, so p_A
+      falls and clean accuracy drops. Small sigma preserves accuracy but caps the radius. The
+      accuracy_robustness_tradeoff_analyser.py deliverable makes this concrete: each sigma wins a
+      different column of the certified accuracy table, and no single sigma dominates. The base
+      classifier must be trained with Gaussian noise augmentation at the deployment sigma; a base
+      model trained on clean data is near-random under heavy noise, and the smoothed classifier
+      inherits that. Salman et al. 2019 showed that adversarially training the base classifier
+      against the smoothed classifier (SmoothAdv) raises certified accuracy further.
+
+      The sample count n caps the radius regardless of how good the model is. Even if every one of
+      the n samples votes for c_A, the Clopper-Pearson lower bound is only alpha^(1/n), so the
+      largest certifiable radius is sigma * Phi^-1(alpha^(1/n)). At alpha = 0.001 and sigma = 0.5,
+      n = 100 caps the radius at 0.75 and n = 100,000 at about 1.9. Each additional unit of radius
+      costs exponentially more samples, and every sample is a forward pass at inference time.
+      certificate_radius_calculator.py computes these limits before any model is trained.
+
+      Abstention is the third cost. Inputs near the decision boundary get no certificate and, under
+      PREDICT, no answer. A system that cannot route abstentions to a fallback model or a human
+      reviewer cannot use smoothing. In a security context abstention is often the correct outcome:
+      an input that sits on the boundary is precisely the input an adversary is trying to produce.
+
+  part_5:
+    title: 'Certified vs Empirical: Reading the Gap'
+    body: |
+      smoothing_vs_pgd_comparison.py evaluates both bounds on the same test set at matched L2
+      epsilon. It reports the base model's accuracy under L2-PGD (an empirical ceiling), the
+      smoothed classifier's certified accuracy at radius epsilon (a provable floor), and the
+      smoothed classifier's accuracy on the PGD inputs. It also counts certificate violations:
+      certified inputs whose smoothed prediction changed under attack. That count should be zero.
+      If it is not, the certifier is wrong -- most often because selection and estimation samples
+      were shared, or because the base model was put back into training mode between calls.
+
+      On the synthetic task the floor and ceiling are close. On real image data they are not.
+      Certified accuracy at a given radius is typically well below what the best empirical defences
+      report at the same radius, and the gap widens as the radius grows. The gap is the price of
+      the guarantee: some of the robustness empirical defences report is real but unprovable, and
+      some of it is an artefact of attacks that are not yet strong enough. Certification refuses to
+      count either.
+
+  part_6:
+    title: 'Beyond L2: L-infinity, L1, Patches and Text'
+    body: |
+      Gaussian smoothing certifies L2 balls. The rest of the Chapter 10 threat model is not L2.
+
+      An L2 certificate of radius r implies an L-infinity certificate of r / sqrt(d), because
+      the L-infinity ball of radius r / sqrt(d) fits inside the L2 ball of radius r. For a
+      CIFAR-10 image (d = 3072) an L2 radius of 0.5 becomes an L-infinity radius of about 2.3/255
+      -- far below the 8/255 used throughout Sections 10.3 to 10.13. This is not a weakness of the
+      implementation: Blum et al. 2020 and Kumar et al. 2020 showed that randomised smoothing in
+      general cannot give strong L-infinity certificates in high dimension. Other noise
+      distributions certify other norms (Laplace and uniform noise for L1; Yang et al. 2020 map the
+      options), but there is no dominant L-infinity method.
+
+      Physical patches (Section 10.8) are an L0-style threat: a large change confined to a small
+      region. Levine and Feizi 2020 adapted smoothing to this setting by classifying many small
+      ablated views of the image and voting, which certifies against any patch below a given size.
+
+      Text inputs are discrete, so there is no Gaussian to add. SAFER (Ye, Gong and Liu 2020)
+      smooths by randomly substituting words from each word's synonym set and certifies against
+      any attacker restricted to those synonyms. Interval bound propagation has been used to train
+      text classifiers verified against all combinations of synonym substitutions (Jia et al.
+      2019; Huang et al. 2019). Both certify a narrow, explicit threat model. A TextFooler-style
+      attack that strays outside the synonym sets (Section 10.9), or any semantic rewrite, is
+      outside the certificate. For LLM-based safety filters this matters: the certified threat
+      model is much smaller than the real one.
+
+  part_7:
+    title: 'Positioning in the Defence Stack and the Deployment Decision'
+    body: |
+      Certification is to evasion what differential privacy was to poisoning and extraction in
+      Chapter 8: a formal guarantee bought with utility, worth paying for when the deployment
+      needs a worst case rather than an average case. It does not replace Track 7. Inputs that
+      fail to certify, attacks outside the certified norm, and the inference budget all leave work
+      for runtime detection. The two layers answer different questions: the certificate says "this
+      output cannot be moved by small L2 noise"; Track 7 says "this input looks like someone is
+      trying".
+
+      certified_deployment_checklist.py encodes the decision. Certification is required when the
+      threat model is L2 (or one of the narrow discrete threat models with a certified method),
+      an external party needs a provable bound, the accuracy budget can absorb the cost, and the
+      system can handle abstention. When those hold but n samples do not fit the latency budget,
+      the practical pattern is offline audit: serve the base model online, certify a sample of
+      production traffic offline, and put the certified accuracy into the safety case. Everywhere
+      else, adversarial training (Section 10.15) plus Track 7 is the better use of effort.
+
+reference_materials:
+
+  table_1:
+    title: 'Randomised Smoothing Algorithms'
+    description: 'The two procedures from Cohen et al. 2019 and what each one is allowed to claim'
+    columns: ['Procedure', 'Samples', 'Statistic', 'Returns', 'Claim', 'Use']
+    rows:
+      - ['CERTIFY', 'n0 for selection + n fresh for estimation', 'One-sided Clopper-Pearson lower bound on p_A', 'Class and L2 radius, or ABSTAIN', 'With prob >= 1 - alpha, g is constant within the radius', 'Offline evaluation, safety cases, audits']
+      - ['PREDICT', 'n', 'Two-sided binomial test, top class vs runner-up', 'Class, or ABSTAIN', 'With prob >= 1 - alpha, the class equals g(x)', 'Production inference with a smoothed model']
+
+  table_2:
+    title: 'What Bounds the Certified Radius'
+    description: 'Every factor that limits the radius, and what it costs to raise it'
+    columns: ['Factor', 'Effect on radius', 'Cost of raising it']
+    rows:
+      - ['sigma', 'Radius scales linearly with sigma', 'Base classifier sees noisier inputs; clean accuracy falls']
+      - ['p_A (base model quality under noise)', 'Radius grows with Phi^-1(p_A_lower)', 'Noise-augmented or SmoothAdv training of the base model']
+      - ['n (samples)', 'Caps radius at sigma * Phi^-1(alpha^(1/n)) even when unanimous', 'n forward passes per input; exponential in the target radius']
+      - ['alpha (confidence)', 'Smaller alpha lowers p_A_lower and the radius', 'Weaker guarantee if raised; 0.001 is the common choice']
+      - ['Input dimension d', 'L-inf radius = L2 radius / sqrt(d)', 'None: a structural limit of Gaussian smoothing']
+
+  table_3:
+    title: 'Certified Defences by Threat Model'
+    description: 'Which certified method matches which Chapter 10 attack family'
+    columns: ['Threat model', 'Chapter 10 attacks', 'Certified method', 'Practical status']
+    rows:
+      - ['L2-bounded perturbation', 'L2-PGD, C&W L2, Boundary Attack', 'Gaussian randomised smoothing (Cohen et al. 2019)', 'Scales to ImageNet; dominant method']
+      - ['L-inf-bounded perturbation', 'FGSM, PGD, NES, transfer', 'Bound propagation (IBP, CROWN); smoothing via L2 conversion', 'Small to medium networks; smoothing gives weak radii in high dimension']
+      - ['L1-bounded perturbation', 'Sparse perturbations', 'Laplace or uniform noise smoothing', 'Works; less common in practice']
+      - ['Patch (bounded region)', 'Adversarial patches (10.8)', 'Ablation-based smoothing (Levine and Feizi 2020)', 'Certifies small patches; accuracy cost is significant']
+      - ['Synonym substitution', 'HotFlip within synonyms, TextFooler within synonym sets', 'SAFER; IBP-trained text classifiers', 'Certifies only the defined synonym sets']
+      - ['Semantic rewrite / paraphrase', 'LLM rewrites, jailbreak-style perturbation', 'None', 'No certified method; rely on Track 7 and Chapter 7 tracks']
+
+deliverables:
+
+  deliverable_1:
+    title: 'Randomised Smoother'
+    filename: 'randomised_smoother.py'
+    description: 'SmoothedClassifier wrapping any PyTorch base classifier with PREDICT and CERTIFY, a Clopper-Pearson lower bound, and helpers for a synthetic task and noise-augmented base training'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention.
+      Requires: torch, scipy. Noisy inputs are not clipped to a valid range; Cohen et al.
+      certify the unclipped smoothed classifier. Other deliverables in this section import
+      ToyMLP, make_gaussian_clusters and train_noisy_base from this file.
+    code: |
+      # randomised_smoother.py
+      # Section 10.14: Certified Robustness -- Randomised Smoothing
+      # 20260601 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+
+      import torch
+      import torch.nn as nn
+      from torch import Tensor
+      from scipy.stats import beta, binomtest, norm
+
+      ABSTAIN = -1
+
+
+      def clopper_pearson_lower(k: int, n: int, alpha: float) -> float:
+          '''
+          One-sided (1 - alpha) Clopper-Pearson lower confidence bound on a binomial
+          proportion after k successes in n trials. Exact, never optimistic: this is
+          the bound Cohen et al. 2019 use for the certificate.
+          '''
+          if k == 0:
+              return 0.0
+          return float(beta.ppf(alpha, k, n - k + 1))
+
+
+      @dataclass
+      class Certificate:
+          prediction: int     # class index, or ABSTAIN
+          radius: float       # certified L2 radius (0.0 when abstaining)
+          p_a_lower: float    # lower confidence bound on P(base(x + noise) = prediction)
+          n_samples: int
+
+
+      class SmoothedClassifier:
+          '''
+          Randomised smoothing (Cohen, Rosenfeld and Kolter 2019).
+
+          g(x) = argmax_c P(f(x + e) = c),  e ~ N(0, sigma^2 I)
+
+          If p_A_lower >= 0.5, g is constant within the L2 ball of radius
+          sigma * Phi^-1(p_A_lower) around x, with probability >= 1 - alpha over
+          the sampling used to estimate p_A_lower.
+          '''
+
+          def __init__(self, base: nn.Module, num_classes: int, sigma: float, batch_size: int = 1000):
+              self.base = base
+              self.num_classes = num_classes
+              self.sigma = sigma
+              self.batch_size = batch_size
+
+          def _sample_counts(self, x: Tensor, n: int) -> Tensor:
+              '''Class counts of the base classifier over n Gaussian-perturbed copies of a single input x.'''
+              counts = torch.zeros(self.num_classes, dtype=torch.long)
+              remaining = n
+              self.base.eval()
+              with torch.no_grad():
+                  while remaining > 0:
+                      b = min(self.batch_size, remaining)
+                      batch = x.unsqueeze(0).expand(b, *x.shape)
+                      noisy = batch + torch.randn_like(batch) * self.sigma
+                      preds = self.base(noisy).argmax(dim=1).cpu()
+                      counts += torch.bincount(preds, minlength=self.num_classes)
+                      remaining -= b
+              return counts
+
+          def predict(self, x: Tensor, n: int = 1000, alpha: float = 0.001) -> int:
+              '''
+              PREDICT: return the top class, or ABSTAIN if a two-sided binomial test cannot
+              separate the top two classes at level alpha. No radius is claimed.
+              '''
+              counts = self._sample_counts(x, n)
+              top2 = counts.topk(2)
+              n_a, n_b = int(top2.values[0]), int(top2.values[1])
+              if binomtest(n_a, n_a + n_b, 0.5).pvalue > alpha:
+                  return ABSTAIN
+              return int(top2.indices[0])
+
+          def certify(self, x: Tensor, n0: int = 100, n: int = 10_000, alpha: float = 0.001) -> Certificate:
+              '''
+              CERTIFY: select the candidate class from n0 samples, then estimate its
+              probability from n FRESH samples. Reusing the selection samples for the
+              estimate would bias p_A upward and invalidate the certificate.
+              '''
+              c_a = int(self._sample_counts(x, n0).argmax())
+              counts = self._sample_counts(x, n)
+              p_a_lower = clopper_pearson_lower(int(counts[c_a]), n, alpha)
+              if p_a_lower < 0.5:
+                  return Certificate(ABSTAIN, 0.0, p_a_lower, n)
+              return Certificate(c_a, self.sigma * float(norm.ppf(p_a_lower)), p_a_lower, n)
+
+
+      # ---------------------------------------------------------------------------
+      # Demonstration helpers: a synthetic task and a noise-trained base classifier
+      # ---------------------------------------------------------------------------
+
+      class ToyMLP(nn.Module):
+          def __init__(self, n_features: int = 20, n_classes: int = 4, hidden: int = 64):
+              super().__init__()
+              self.net = nn.Sequential(
+                  nn.Linear(n_features, hidden), nn.ReLU(),
+                  nn.Linear(hidden, hidden), nn.ReLU(),
+                  nn.Linear(hidden, n_classes),
+              )
+
+          def forward(self, x: Tensor) -> Tensor:
+              return self.net(x.view(x.size(0), -1))
+
+
+      def make_gaussian_clusters(n: int, n_features: int = 20, n_classes: int = 4,
+                                 separation: float = 3.0, seed: int = 0):
+          '''
+          Gaussian clusters around fixed class means (unit-variance noise). The means
+          depend only on n_features, n_classes and separation, so train and test sets
+          drawn with different seeds share the same task.
+          '''
+          means = torch.randn(n_classes, n_features, generator=torch.Generator().manual_seed(1234))
+          means = separation * means / means.norm(dim=1, keepdim=True)
+          g = torch.Generator().manual_seed(seed)
+          y = torch.randint(0, n_classes, (n,), generator=g)
+          x = means[y] + torch.randn(n, n_features, generator=g)
+          return x, y
+
+
+      def train_noisy_base(x: Tensor, y: Tensor, sigma: float, n_classes: int = 4,
+                           epochs: int = 30, seed: int = 0) -> nn.Module:
+          '''
+          Train the base classifier with Gaussian noise augmentation at the SAME sigma
+          that will be used for smoothing. A base classifier trained on clean data alone
+          is near-random under heavy noise, and the smoothed classifier inherits that.
+          '''
+          torch.manual_seed(seed)
+          model = ToyMLP(x.size(1), n_classes)
+          opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+          loss_fn = nn.CrossEntropyLoss()
+          model.train()
+          for _ in range(epochs):
+              perm = torch.randperm(x.size(0))
+              for i in range(0, x.size(0), 128):
+                  idx = perm[i:i + 128]
+                  xb = x[idx] + torch.randn_like(x[idx]) * sigma
+                  opt.zero_grad()
+                  loss_fn(model(xb), y[idx]).backward()
+                  opt.step()
+          model.eval()
+          return model
+
+
+      def demo() -> None:
+          torch.manual_seed(0)
+          sigma = 0.5
+          x_train, y_train = make_gaussian_clusters(2000, seed=0)
+          x_test, y_test = make_gaussian_clusters(10, seed=1)
+          base = train_noisy_base(x_train, y_train, sigma)
+          smoothed = SmoothedClassifier(base, num_classes=4, sigma=sigma)
+
+          print(f'Randomised smoothing demo -- sigma={sigma}, n0=100, n=10000, alpha=0.001')
+          print(f'{"i":<4}{"label":<7}{"pred":<7}{"p_A_lower":<12}{"radius":<8}')
+          for i in range(x_test.size(0)):
+              cert = smoothed.certify(x_test[i], n0=100, n=10_000, alpha=0.001)
+              pred = 'ABST' if cert.prediction == ABSTAIN else str(cert.prediction)
+              print(f'{i:<4}{int(y_test[i]):<7}{pred:<7}{cert.p_a_lower:<12.4f}{cert.radius:<8.3f}')
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_2:
+    title: 'Certificate Radius Calculator'
+    filename: 'certificate_radius_calculator.py'
+    description: 'Certified radius from counts, maximum certifiable radius for a sample budget, samples needed for a target radius, and L2-to-L-infinity conversion'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention. Requires: scipy only.
+      Run this before training anything: it tells you whether the radius the deployment
+      needs is reachable at the inference budget you have.
+    code: |
+      # certificate_radius_calculator.py
+      # Section 10.14: Certified Robustness -- certificate radius and sample budget arithmetic
+      # 20260601 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      import math
+
+      from scipy.stats import beta, norm
+
+
+      def clopper_pearson_lower(k: int, n: int, alpha: float) -> float:
+          if k == 0:
+              return 0.0
+          return float(beta.ppf(alpha, k, n - k + 1))
+
+
+      def certified_radius(p_a_lower: float, sigma: float) -> float:
+          '''Cohen et al. 2019 Theorem 1 with p_B_upper = 1 - p_A_lower: R = sigma * Phi^-1(p_A_lower).'''
+          if p_a_lower <= 0.5:
+              return 0.0
+          return sigma * float(norm.ppf(p_a_lower))
+
+
+      def radius_from_counts(k: int, n: int, sigma: float, alpha: float = 0.001) -> float:
+          '''Certified radius when k of n noisy samples voted for the top class.'''
+          return certified_radius(clopper_pearson_lower(k, n, alpha), sigma)
+
+
+      def max_certifiable_radius(n: int, sigma: float, alpha: float = 0.001) -> float:
+          '''
+          The largest radius n samples can EVER certify -- reached only when all n vote
+          for the top class. With k = n the Clopper-Pearson lower bound is alpha^(1/n),
+          so the radius is capped at sigma * Phi^-1(alpha^(1/n)) regardless of the model.
+          '''
+          return certified_radius(alpha ** (1.0 / n), sigma)
+
+
+      def samples_for_radius(target_radius: float, sigma: float, alpha: float = 0.001) -> int:
+          '''
+          Minimum n so that a unanimous vote certifies target_radius:
+          alpha^(1/n) >= Phi(r / sigma)  =>  n >= ln(alpha) / ln(Phi(r / sigma)).
+          Real inputs are rarely unanimous, so treat this as a lower bound on cost.
+          '''
+          p_needed = float(norm.cdf(target_radius / sigma))
+          return math.ceil(math.log(alpha) / math.log(p_needed))
+
+
+      def l2_to_linf_radius(l2_radius: float, n_features: int) -> float:
+          '''An L2 certificate implies an L-infinity certificate of l2_radius / sqrt(d) -- small in high dimension.'''
+          return l2_radius / math.sqrt(n_features)
+
+
+      def demo() -> None:
+          alpha = 0.001
+          print('Max certifiable L2 radius by sample count (unanimous vote, alpha=0.001)')
+          print(f'{"n":>9}' + ''.join(f'{"sigma=" + str(s):>14}' for s in (0.12, 0.25, 0.5, 1.0)))
+          for n in (100, 1_000, 10_000, 100_000):
+              row = ''.join(f'{max_certifiable_radius(n, s, alpha):>14.3f}' for s in (0.12, 0.25, 0.5, 1.0))
+              print(f'{n:>9}{row}')
+
+          print('\nSamples needed for a unanimous vote to certify radius r (sigma=0.5)')
+          for r in (0.25, 0.5, 1.0, 1.5, 2.0):
+              print(f'  r={r:<5} n >= {samples_for_radius(r, 0.5, alpha):,}')
+
+          print('\nRadius from observed counts (n=10000, sigma=0.5)')
+          for k in (5_000, 6_000, 8_000, 9_500, 9_990, 10_000):
+              print(f'  k={k:<6} radius={radius_from_counts(k, 10_000, 0.5, alpha):.3f}')
+
+          d = 3 * 32 * 32
+          print(f'\nL2 radius 0.5 on a {d}-dim CIFAR-10 input implies L-inf radius '
+                f'{l2_to_linf_radius(0.5, d):.4f} (= {l2_to_linf_radius(0.5, d) * 255:.2f}/255)')
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_3:
+    title: 'Accuracy-Robustness Trade-off Analyser'
+    filename: 'accuracy_robustness_tradeoff_analyser.py'
+    description: 'Trains a noise-augmented base model per sigma and reports base clean accuracy, abstain rate, and certified accuracy at a range of radii'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention. Requires: torch, scipy.
+      Imports from randomised_smoother.py. n = 2,000 keeps the demo under a minute on CPU;
+      use n >= 10,000 for reported numbers, and note that n also caps the radius column.
+    code: |
+      # accuracy_robustness_tradeoff_analyser.py
+      # Section 10.14: Certified Robustness -- clean vs certified accuracy across noise levels
+      # 20260601 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import Dict, List
+
+      import torch
+
+      from randomised_smoother import (
+          ABSTAIN, SmoothedClassifier, make_gaussian_clusters, train_noisy_base,
+      )
+
+
+      @dataclass
+      class TradeoffRow:
+          sigma: float
+          base_clean_accuracy: float               # undefended base classifier on clean inputs
+          abstain_rate: float
+          certified_accuracy: Dict[float, float] = field(default_factory=dict)
+          # certified_accuracy[r] = fraction of test inputs that are correct AND certified at radius >= r
+          # certified_accuracy[0.0] is the smoothed classifier's clean accuracy
+
+
+      def certified_accuracy_curve(smoothed: SmoothedClassifier, x: torch.Tensor, y: torch.Tensor,
+                                   radii: List[float], n0: int, n: int, alpha: float):
+          certs = [smoothed.certify(x[i], n0=n0, n=n, alpha=alpha) for i in range(x.size(0))]
+          abstain = sum(c.prediction == ABSTAIN for c in certs) / len(certs)
+          curve = {}
+          for r in radii:
+              ok = sum(1 for c, label in zip(certs, y.tolist()) if c.prediction == label and c.radius >= r)
+              curve[r] = ok / len(certs)
+          return curve, abstain
+
+
+      def analyse_tradeoff(sigmas: List[float], radii: List[float], n_test: int = 100,
+                           n0: int = 100, n: int = 2_000, alpha: float = 0.001,
+                           separation: float = 3.0) -> List[TradeoffRow]:
+          x_train, y_train = make_gaussian_clusters(4000, separation=separation, seed=0)
+          x_test, y_test = make_gaussian_clusters(n_test, separation=separation, seed=1)
+          rows = []
+          for sigma in sigmas:
+              base = train_noisy_base(x_train, y_train, sigma)
+              with torch.no_grad():
+                  base_acc = (base(x_test).argmax(1) == y_test).float().mean().item()
+              smoothed = SmoothedClassifier(base, num_classes=4, sigma=sigma)
+              curve, abstain = certified_accuracy_curve(smoothed, x_test, y_test, radii, n0, n, alpha)
+              rows.append(TradeoffRow(sigma, base_acc, abstain, curve))
+          return rows
+
+
+      def print_tradeoff(rows: List[TradeoffRow], radii: List[float]) -> None:
+          header = f'{"sigma":<7}{"base acc":<10}{"abstain":<9}' + ''.join(f'{"r>=" + str(r):<9}' for r in radii)
+          print(header)
+          print('-' * len(header))
+          for row in rows:
+              cells = ''.join(f'{row.certified_accuracy[r]:<9.2f}' for r in radii)
+              print(f'{row.sigma:<7}{row.base_clean_accuracy:<10.2f}{row.abstain_rate:<9.2f}{cells}')
+          print('\nRead each column top to bottom: small sigma wins at small radii, large sigma is the')
+          print('only way to certify large radii, and no single sigma dominates every column.')
+
+
+      def demo() -> None:
+          torch.manual_seed(0)
+          sigmas = [0.12, 0.25, 0.5, 1.0]
+          radii = [0.0, 0.25, 0.5, 1.0, 1.5]
+          rows = analyse_tradeoff(sigmas, radii)
+          print_tradeoff(rows, radii)
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_4:
+    title: 'Smoothing vs PGD Comparison'
+    filename: 'smoothing_vs_pgd_comparison.py'
+    description: 'Certified accuracy (floor) against L2-PGD empirical accuracy (ceiling) at matched epsilon, with a certificate-violation count as a correctness check on the certifier'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention. Requires: torch, scipy.
+      Imports pgd_l2 from pgd_l2_variant.py (Section 10.4) and helpers from randomised_smoother.py.
+      The synthetic features are unbounded, so the [0, 1] input-validity clip is disabled.
+    code: |
+      # smoothing_vs_pgd_comparison.py
+      # Section 10.14: Certified Robustness -- certified accuracy vs PGD empirical robustness
+      # 20260601 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass
+
+      import torch
+      import torch.nn as nn
+
+      from pgd_l2_variant import pgd_l2
+      from randomised_smoother import (
+          ABSTAIN, SmoothedClassifier, make_gaussian_clusters, train_noisy_base,
+      )
+
+      # The synthetic features are unbounded; disable the [0, 1] input-validity clip.
+      NO_CLIP = dict(clip_min=-1e6, clip_max=1e6)
+
+
+      @dataclass
+      class ComparisonResult:
+          epsilon: float
+          base_clean_accuracy: float
+          base_pgd_accuracy: float         # empirical: an upper bound on true robust accuracy
+          smoothed_certified_accuracy: float  # certified: a lower bound on true robust accuracy
+          smoothed_accuracy_on_pgd: float  # smoothed classifier evaluated on base-model PGD inputs
+          certificate_violations: int      # certified inputs whose smoothed prediction changed under attack
+
+
+      def accuracy(model: nn.Module, x: torch.Tensor, y: torch.Tensor) -> float:
+          with torch.no_grad():
+              return (model(x).argmax(1) == y).float().mean().item()
+
+
+      def compare_at_epsilon(base: nn.Module, smoothed: SmoothedClassifier, x: torch.Tensor,
+                             y: torch.Tensor, epsilon: float, n: int = 2_000,
+                             alpha: float = 0.001) -> ComparisonResult:
+          x_adv = pgd_l2(base, x, y, epsilon=epsilon, alpha=epsilon / 4, n_steps=40, n_restarts=3, **NO_CLIP)
+          certified_correct, smoothed_adv_correct, violations = 0, 0, 0
+          for i in range(x.size(0)):
+              cert = smoothed.certify(x[i], n=n, alpha=alpha)
+              adv_pred = smoothed.predict(x_adv[i], n=n, alpha=alpha)
+              label = int(y[i])
+              smoothed_adv_correct += int(adv_pred == label)
+              if cert.prediction == label and cert.radius >= epsilon:
+                  certified_correct += 1
+                  if adv_pred not in (label, ABSTAIN):
+                      violations += 1
+          total = x.size(0)
+          return ComparisonResult(
+              epsilon=epsilon,
+              base_clean_accuracy=accuracy(base, x, y),
+              base_pgd_accuracy=accuracy(base, x_adv, y),
+              smoothed_certified_accuracy=certified_correct / total,
+              smoothed_accuracy_on_pgd=smoothed_adv_correct / total,
+              certificate_violations=violations,
+          )
+
+
+      def demo() -> None:
+          torch.manual_seed(0)
+          sigma = 0.5
+          x_train, y_train = make_gaussian_clusters(4000, seed=0)
+          x_test, y_test = make_gaussian_clusters(100, seed=1)
+          base = train_noisy_base(x_train, y_train, sigma)
+          smoothed = SmoothedClassifier(base, num_classes=4, sigma=sigma)
+
+          print(f'Certified vs empirical robustness at matched L2 epsilon (sigma={sigma})')
+          print(f'{"eps":<6}{"base clean":<12}{"base PGD":<10}{"certified":<11}{"smoothed@PGD":<14}{"violations":<10}')
+          for eps in (0.25, 0.5, 1.0):
+              r = compare_at_epsilon(base, smoothed, x_test, y_test, eps)
+              print(f'{r.epsilon:<6}{r.base_clean_accuracy:<12.2f}{r.base_pgd_accuracy:<10.2f}'
+                    f'{r.smoothed_certified_accuracy:<11.2f}{r.smoothed_accuracy_on_pgd:<14.2f}'
+                    f'{r.certificate_violations:<10}')
+          print('\nCertified accuracy is a floor no attack can push through (violations should be 0).')
+          print('PGD accuracy is a ceiling a stronger attack might still lower. True robustness is in between.')
+
+
+      if __name__ == '__main__':
+          demo()
+
+  deliverable_5:
+    title: 'Certified Deployment Checklist'
+    filename: 'certified_deployment_checklist.py'
+    description: 'Decision guide returning certified, certified_offline_audit, or empirical for a deployment profile, with the reasons'
+    implementation_notes: |
+      Python 3.12, single quotes throughout per book convention. No external dependencies.
+      Latency model assumes noisy copies are batched up to max_batch per forward pass.
+    code: |
+      # certified_deployment_checklist.py
+      # Section 10.14: Certified Robustness -- when to require a certificate
+      # 20260601 | AI Security Mastery by Raghav Dinesh
+      # Single quotes throughout per book convention
+
+      from dataclasses import dataclass, field
+      from typing import List
+
+
+      @dataclass
+      class DeploymentProfile:
+          name: str
+          threat_norm: str                 # 'l2', 'linf', 'l0', 'semantic' (text rewrites, patches)
+          needs_provable_bound: bool       # regulator, contract, or safety case demands a guarantee
+          latency_budget_ms: float         # end-to-end P99 budget for the model call
+          base_inference_ms: float         # one base-model forward pass at the deployment batch size
+          max_batch: int                   # noisy copies the accelerator evaluates per forward pass
+          tolerable_accuracy_drop: float   # clean accuracy points the business accepts (e.g. 0.10)
+          abstain_acceptable: bool         # can the system route ABSTAIN to a fallback or a human?
+
+
+      @dataclass
+      class Recommendation:
+          profile: str
+          decision: str                    # 'certified', 'empirical', 'certified_offline_audit'
+          reasons: List[str] = field(default_factory=list)
+
+
+      def smoothing_latency_ms(profile: DeploymentProfile, n_samples: int) -> float:
+          passes = -(-n_samples // profile.max_batch)  # ceiling division
+          return passes * profile.base_inference_ms
+
+
+      def recommend(profile: DeploymentProfile, n_samples: int = 1_000) -> Recommendation:
+          rec = Recommendation(profile.name, 'empirical')
+          latency = smoothing_latency_ms(profile, n_samples)
+
+          if profile.threat_norm not in ('l2',):
+              rec.reasons.append(f'Threat model is {profile.threat_norm}: Gaussian smoothing certifies L2 only; '
+                                 'L-inf radii shrink by sqrt(d) and semantic attacks are outside any Lp ball')
+          if not profile.needs_provable_bound:
+              rec.reasons.append('No external requirement for a provable bound; adversarial training (Section 10.15) '
+                                 'plus Track 7 detection gives better accuracy for the same effort')
+          if profile.tolerable_accuracy_drop < 0.05:
+              rec.reasons.append('Accuracy budget under 5 points; smoothing usually costs more than that on real data')
+          if not profile.abstain_acceptable:
+              rec.reasons.append('System cannot handle ABSTAIN; a smoothed classifier must be allowed to abstain')
+
+          if rec.reasons:
+              return rec
+
+          if latency <= profile.latency_budget_ms:
+              rec.decision = 'certified'
+              rec.reasons.append(f'n={n_samples} samples fit the budget ({latency:.0f} ms <= {profile.latency_budget_ms:.0f} ms)')
+          else:
+              rec.decision = 'certified_offline_audit'
+              rec.reasons.append(f'n={n_samples} samples need {latency:.0f} ms, over the {profile.latency_budget_ms:.0f} ms budget: '
+                                 'serve the base model online and certify a sample of traffic offline for the safety case')
+          return rec
+
+
+      def demo() -> None:
+          profiles = [
+              DeploymentProfile('medical-image triage', 'l2', True, 2_000, 8, 256, 0.10, True),
+              DeploymentProfile('fraud scoring API', 'linf', False, 50, 2, 512, 0.02, False),
+              DeploymentProfile('LLM safety filter', 'semantic', True, 100, 15, 64, 0.05, True),
+              DeploymentProfile('content moderation queue', 'l2', True, 200, 10, 32, 0.15, True),
+          ]
+          for p in profiles:
+              rec = recommend(p)
+              print(f'{rec.profile}: {rec.decision.upper()}')
+              for reason in rec.reasons:
+                  print(f'  - {reason}')
+
+
+      if __name__ == '__main__':
+          demo()
+
+common_mistakes:
+
+  mistake_1:
+    description: 'Selecting the top class and estimating its probability from the same samples'
+    why_it_happens: |
+      It looks wasteful to throw away the n0 selection samples, so implementations count
+      once and use the same counts to choose c_A and to bound p_A.
+    consequence: |
+      The chosen class is the one that happened to win this draw, so its observed frequency
+      is biased upward. p_A_lower is too high, radii are too large, and the 1 - alpha guarantee
+      no longer holds. The error is invisible in normal evaluation.
+    correct_approach: |
+      Draw n0 samples to select c_A, then n independent samples to estimate p_A. The CERTIFY
+      method in randomised_smoother.py calls _sample_counts twice for exactly this reason.
+
+  mistake_2:
+    description: 'Smoothing a base classifier that was trained only on clean data'
+    why_it_happens: |
+      Smoothing is described as a wrapper that works with any classifier, so teams wrap the
+      production model they already have.
+    consequence: |
+      Under noise at sigma = 0.5 a clean-trained model is close to random, p_A rarely clears one
+      half, and most inputs abstain. The team concludes that certification does not work.
+    correct_approach: |
+      Train (or fine-tune) the base classifier with Gaussian noise augmentation at the deployment
+      sigma, as train_noisy_base does. Consider SmoothAdv (Salman et al. 2019) when certified
+      accuracy needs to go higher.
+
+  mistake_3:
+    description: 'Reporting a certified L2 radius as if it covered the L-infinity threat model'
+    why_it_happens: |
+      The rest of Chapter 10 measures attacks in L-infinity at 8/255, and a radius is a radius.
+    consequence: |
+      An L2 radius of 0.5 on a CIFAR-10 image covers only about 2.3/255 in L-infinity. A safety
+      case built on the L2 number overstates protection against the FGSM and PGD attacks the
+      threat model actually names by a factor of about three.
+    correct_approach: |
+      State the norm with every certified number. Convert with l2_to_linf_radius when the threat
+      model is L-infinity, and if the converted radius is too small, use adversarial training plus
+      Track 7 for that threat instead of claiming a certificate.
+
+  mistake_4:
+    description: 'Choosing a sample count without checking the radius it can reach'
+    why_it_happens: |
+      n is set by the latency budget (for example 1,000) and the certified radius target is set
+      separately by the threat model (for example 2.0).
+    consequence: |
+      With n = 1,000 and sigma = 0.5, no input can ever be certified beyond about 1.23, however
+      good the model. Certified accuracy at r = 2.0 is zero by construction, and the team spends
+      weeks retraining to fix a problem that is pure arithmetic.
+    correct_approach: |
+      Run certificate_radius_calculator.py first. If samples_for_radius exceeds the inference
+      budget, either raise sigma, lower the target radius, or move to offline-audit certification.
+
+  mistake_5:
+    description: 'Treating ABSTAIN as an error and forcing a prediction'
+    why_it_happens: |
+      Downstream systems expect a label, so the smoothing wrapper falls back to the base model's
+      prediction whenever PREDICT abstains.
+    consequence: |
+      The inputs that abstain are exactly those near the decision boundary -- the inputs an
+      adversary is trying to produce. Falling back to the base model hands them the undefended
+      prediction and removes the protection where it matters most.
+    correct_approach: |
+      Route ABSTAIN to a fallback that is safe for the deployment: a human review queue, a
+      conservative default, or a Track 7 block decision. Log abstention rate as a monitored
+      signal; a sudden rise is itself an attack indicator.
+
+section_summary:
+
+  compact: |
+    Randomised smoothing replaces a classifier f with g(x) = argmax_c P(f(x + e) = c) under
+    Gaussian noise and certifies, per input, that no L2 perturbation smaller than
+    R = sigma * Phi^-1(p_A_lower) can change the output (Cohen, Rosenfeld and Kolter 2019). The
+    certificate holds with probability 1 - alpha over sampling, requires independent selection and
+    estimation samples, and is capped by sigma and by the sample count: even a unanimous vote over
+    n samples cannot certify beyond sigma * Phi^-1(alpha^(1/n)). Raising sigma buys radius at the
+    cost of clean accuracy; the base model must be trained under the same noise. Certified accuracy
+    is a floor on true robustness where PGD accuracy is a ceiling. Gaussian smoothing certifies L2
+    only; L-infinity radii shrink by sqrt(d), patches and synonym substitutions need their own
+    certified methods, and semantic rewrites have none. Certification is the upstream guarantee;
+    Track 7 remains the runtime layer for everything the certificate does not cover.
+
+  key_takeaways:
+    - 'Certified accuracy is a lower bound no attack can break; empirical accuracy is an upper bound a better attack can lower'
+    - 'The radius is sigma * Phi^-1(p_A_lower); the base model must be trained under the same Gaussian noise'
+    - 'CERTIFY must select the class and estimate its probability on independent samples, or the guarantee is void'
+    - 'Sample count caps the radius before model quality does; compute the cap before training'
+    - 'Gaussian smoothing certifies L2; state the norm with every certified number and convert before comparing with L-infinity attacks'
+    - 'Abstention is a security outcome: route it to a safe fallback and monitor its rate'
+
+preview_section_10_15:
+  title: 'Section 10.15: Adversarial Training -- Upstream Empirical Robustness'
+  summary: |
+    Section 10.15 builds the strongest empirical defence: training the model on its own worst-case
+    inputs. Madry et al. 2018 cast this as min-max optimisation with PGD as the inner adversary.
+    The section implements PGD adversarial training with robust-validation checkpointing, fast FGSM
+    training with a catastrophic-overfitting guard, and TRADES with its beta dial between clean
+    accuracy and robustness. Where this section's certificate is provable but narrow, adversarial
+    training covers the L-infinity threat model the certificate cannot reach -- without a proof.
+
+metadata:
+  cross_chapter_references:
+    - 'Section 10.4: pgd_l2_variant.py (L2-PGD used as the empirical comparison)'
+    - 'Section 10.12: consistency checking (random-perturbation fragility generalised into a certificate)'
+    - 'Section 10.13: Track 7 runtime detection (covers inputs and norms the certificate does not)'
+    - 'Chapter 8 Section 8.13: differential privacy (formal guarantee bought with utility)'
+    - 'Chapter 1 Section 1.4: probability and confidence intervals'
+  forward_references:
+    - 'Section 10.15: adversarial training (empirical complement for L-infinity threats)'
+    - 'Section 10.16: evasion defence architecture (smoothing as the in-inference formal control)'
+    - 'Chapter 14: production deployment (offline-audit certification as a monitoring job)'
+  tags:
+    - certified-robustness
+    - randomised-smoothing
+    - cohen-2019
+    - clopper-pearson
+    - neyman-pearson
+    - l2-certificate
+    - abstention
+    - accuracy-robustness-tradeoff
+    - safer
+    - interval-bound-propagation
