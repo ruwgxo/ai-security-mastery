@@ -161,11 +161,12 @@ prose_content:
           deliberately: detector, verdict, severity, and surface as keyword so they aggregate;
           @timestamp as date; score and confidence as float; the nested request fields as keyword;
           evidence as an object; and the IOC fields as keyword so a SOC can pivot on them. The
-          mapping is applied at index creation, before any detection lands, so the first document is
-          typed correctly rather than fixing the type after the fact -- which Elasticsearch will not
-          let you do without reindexing. This is the quiet, load-bearing part of the Elastic
-          integration: the transform makes the document well-shaped, and the mapping makes its
-          fields the right types, and without both, Kibana has data it cannot chart.
+          mapping is applied at index creation through an index template, so every new daily index
+          is typed before any detection lands and the first document is typed correctly rather than
+          fixing the type after the fact -- which Elasticsearch will not let you do without
+          reindexing. This is the quiet, load-bearing part of the Elastic integration: the transform
+          makes the document well-shaped, and the mapping makes its fields the right types, and
+          without both, Kibana has data it cannot chart.
   - heading: 'Daily Indices and Lifecycle Management'
     id: part_4
     blocks:
@@ -182,11 +183,13 @@ prose_content:
       - type: prose
         text: >
           On top of the daily indices sits an index lifecycle management policy, and the connector
-          treats it as part of the configuration rather than an afterthought. The policy rolls
-          indices over and deletes them past a retention horizon, so the detection data has a
-          bounded footprint by construction: it lives for the retention window and then ages out
+          treats it as part of the configuration rather than an afterthought. The daily index name
+          already starts a new index each day, so the policy does not roll indices over; it deletes
+          each index once it is older than a retention horizon, so the detection data has a bounded
+          footprint by construction: it lives for the retention window and then ages out
           automatically. Making the lifecycle policy part of the config -- with a validated
-          retention that must exceed the rollover period -- means an operator deploying the
+          retention that must exceed the one-day index period, and an index template that gives
+          every new daily index the mapping and the policy -- means an operator deploying the
           connector is deploying its data-retention story at the same time, not discovering months
           later that detections have quietly filled the cluster.
   - heading: 'Sigma Detection Rules and End-to-End Testing'
@@ -283,7 +286,9 @@ deliverables:
       StubLogstashTransport captures indexed documents. Self-checks the daily index, @timestamp,
       nested request, that every schema field lands in the document, the keyword mapping, and
       delivery. The Logstash config is built from the same field layout as the transform; it is
-      emitted and checked as text, not run against a Logstash instance.
+      emitted and checked as text, not run against a Logstash instance. Logstash reads the
+      Elasticsearch API key from its own environment (${ELASTIC_API_KEY}); the key is never
+      written into the config.
     code: |
       # elastic_integration.py
       # Section 16.05: Elastic Stack Integration -- Logstash Pipelines
@@ -370,6 +375,7 @@ deliverables:
           logstash_url: str = 'http://logstash.internal:8080'
           index_prefix: str = 'ai-detection'
           pipeline: str = 'ai_detection_pipeline'
+          api_key_env_var: str = 'ELASTIC_API_KEY'     # Logstash reads it to write to Elasticsearch
 
           def validate(self) -> None:
               assert self.logstash_url.startswith('http'), 'logstash_url must be an http(s) URL'
@@ -397,7 +403,9 @@ deliverables:
           '''Emit the equivalent Logstash pipeline config -- the artifact that runs in
           production. It is built from the same field layout as the Python transform:
           @timestamp from timestamp, the request fields nested, the event id as the
-          document id, the ECS version added, and the same daily index name.'''
+          document id, the ECS version added, and the same daily index name. The
+          Elasticsearch API key is read by Logstash from its environment, never written
+          into the config.'''
           renames = '\n'.join(f'      "{f}" => "[request][{f}]"' for f in REQUEST_FIELDS)
           return ('# pipelines.yml: - pipeline.id: ' + cfg.pipeline + '\n'
                   'input {\n  http { port => 8080 codec => json }\n}\n'
@@ -410,7 +418,8 @@ deliverables:
                   '}\n'
                   'output {\n  elasticsearch {\n'
                   '    index => "' + cfg.index_prefix + '-%{+' + INDEX_DATE + '}"\n'
-                  '    document_id => "%{[@metadata][_id]}"\n  }\n}\n')
+                  '    document_id => "%{[@metadata][_id]}"\n'
+                  '    api_key => "${' + cfg.api_key_env_var + '}"\n  }\n}\n')
 
 
       if __name__ == '__main__':
@@ -519,6 +528,7 @@ deliverables:
           assert f'index => "{cfg.index_prefix}-%{{+YYYY-MM-dd}}"' in text
           assert transform_to_es_document(sample_event(), cfg.index_prefix)['_index'] == f'{cfg.index_prefix}-2026-01-21'
           assert 'pipeline =>' not in text           # no reference to an undefined ingest pipeline
+          assert f'api_key => "${{{cfg.api_key_env_var}}}"' in text   # the key comes from Logstash's environment
 
 
       if __name__ == '__main__':
@@ -533,16 +543,20 @@ deliverables:
     lang: python
     description: >
       Configuration for the connector: the Logstash URL, index prefix, and pipeline, plus the index
-      lifecycle policy as first-class config -- a rollover period and a retention horizon that
-      ilm_policy renders into an ILM policy document. validate enforces that retention exceeds
-      rollover; the API key is read from the environment. Ships production and short-retention
+      lifecycle policy as first-class config -- a one-day index period and a retention horizon that
+      ilm_policy renders into a delete-phase ILM policy, and index_template, which gives every new
+      daily index the explicit mapping and the policy. validate enforces that retention exceeds the
+      index period; the API key is read from the environment. Ships production and short-retention
       profiles.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library os, dataclasses,
-      and typing only. Making the ILM policy part of the config means deploying the connector
-      deploys its data-retention story, so detection indices cannot silently fill the cluster.
-      Self-checks that both profiles validate, the ILM delete phase renders, and the key resolves
-      from the environment.
+      and typing only; index_template imports the mapping from the first deliverable. The daily
+      index name starts a new index each day, so the policy has no rollover action, which would
+      need a write alias or a data stream. Making the ILM policy part of the config means
+      deploying the connector deploys its data-retention story, so detection indices cannot
+      silently fill the cluster. Self-checks that both profiles validate, the ILM delete phase
+      renders without a rollover action, the template carries the keyword mapping, and the key
+      resolves from the environment.
     code: |
       # elastic_config.py
       # Section 16.05: Elastic Stack Integration Configuration
@@ -563,7 +577,7 @@ deliverables:
           logstash_url: str = 'http://logstash.internal:8080'
           index_prefix: str = 'ai-detection'
           pipeline: str = 'ai_detection_pipeline'
-          ilm_rollover_days: int = 1
+          index_period_days: int = 1                   # a new date-named index per day
           ilm_retention_days: int = 90
           api_key_env_var: str = 'ELASTIC_API_KEY'
 
@@ -575,12 +589,23 @@ deliverables:
           def validate(self) -> None:
               assert self.logstash_url.startswith('http'), 'logstash_url must be an http(s) URL'
               assert self.index_prefix and self.pipeline, 'index prefix and pipeline required'
-              assert self.ilm_retention_days > self.ilm_rollover_days, 'retention must exceed rollover'
+              assert self.ilm_retention_days > self.index_period_days, 'retention must exceed the index period'
 
           def ilm_policy(self) -> Dict[str, Any]:
+              # The date-named daily index already starts a new index each day, so the
+              # policy has no rollover action (rollover needs a write alias or data
+              # stream); it deletes each index once it is older than the retention.
               return {'policy': {'phases': {
-                  'hot': {'actions': {'rollover': {'max_age': f'{self.ilm_rollover_days}d'}}},
+                  'hot': {'min_age': '0ms', 'actions': {}},
                   'delete': {'min_age': f'{self.ilm_retention_days}d', 'actions': {'delete': {}}}}}}
+
+          def index_template(self) -> Dict[str, Any]:
+              '''Composable index template: every daily index the first detection of the
+              day creates gets the explicit mapping and the lifecycle policy.'''
+              from elastic_integration import elasticsearch_mapping
+              return {'index_patterns': [f'{self.index_prefix}-*'],
+                      'template': {'settings': {'index.lifecycle.name': f'{self.index_prefix}-policy'},
+                                   **elasticsearch_mapping()}}
 
           def redacted(self) -> Dict[str, Any]:
               d = asdict(self); d['api_key'] = '(from ' + self.api_key_env_var + ')'; return d
@@ -597,10 +622,15 @@ deliverables:
               print(f'{name:16} retention={cfg.ilm_retention_days}d')
           print('ilm delete phase:', PRODUCTION.ilm_policy()['policy']['phases']['delete']['min_age'])
           try:
-              ElasticDeploymentConfig(ilm_rollover_days=30, ilm_retention_days=30).validate()
-              raise SystemExit('retention equal to rollover should be rejected')
+              ElasticDeploymentConfig(index_period_days=1, ilm_retention_days=1).validate()
+              raise SystemExit('retention equal to the index period should be rejected')
           except AssertionError:
-              print('retention equal to rollover: rejected')
+              print('retention equal to the index period: rejected')
+          tpl = PRODUCTION.index_template()
+          phases = PRODUCTION.ilm_policy()['policy']['phases']
+          print('index template:', tpl['index_patterns'], 'policy', tpl['template']['settings']['index.lifecycle.name'])
+          assert 'rollover' not in phases['hot']['actions']
+          assert tpl['template']['mappings']['properties']['verdict']['type'] == 'keyword'
           print('api key resolves:', bool(PRODUCTION.resolve_api_key()))
           print('all elastic profiles valid')
 common_mistakes:
@@ -678,13 +708,13 @@ section_summary:
     is the explicit Elasticsearch mapping: without it Elasticsearch guesses types, guesses string
     facets as analysed text, and silently breaks every Kibana aggregation, so the connector declares
     detector, verdict, severity, and surface as keyword, @timestamp as date, and the scores as
-    float, applied at index creation before any detection lands. Detections write to daily indices
-    under an index lifecycle policy that the connector treats as first-class config -- a rollover
-    period and a retention horizon that bound the data footprint automatically, so detection indices
-    cannot quietly fill the cluster. The generated Sigma rules deploy as Elastic detection rules
-    over the indexed documents, and the whole path is tested on a stub Logstash transport, with the
-    transform proven as a pure function in isolation from delivery. With Elastic complete, the
-    platform set -- Splunk, Datadog, Elastic -- is done.
+    float, applied through an index template at index creation before any detection lands.
+    Detections write to daily indices under an index lifecycle policy that the connector treats as
+    first-class config -- a one-day index period and a retention horizon that bound the data
+    footprint automatically, so detection indices cannot quietly fill the cluster. The generated
+    Sigma rules deploy as Elastic detection rules over the indexed documents, and the whole path is
+    tested on a stub Logstash transport, with the transform proven as a pure function in isolation
+    from delivery. With Elastic complete, the platform set -- Splunk, Datadog, Elastic -- is done.
   key_takeaways:
     - 'Elastic''s distinguishing stage is Logstash: an explicit transform turns each detection into an ECS-aligned document'
     - 'The transform is built as a pure, testable function mirrored by the production Logstash pipeline config'

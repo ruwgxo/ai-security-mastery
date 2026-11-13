@@ -139,14 +139,14 @@ prose_content:
           The generator's job is to fill those keys from a detector. The logsource is fixed for the
           whole suite -- every detector writes to the same gateway stream. The detection selection
           is where the detector's identity and verdict go: a selection that matches when the event's
-          detector field is this detector and its verdict is the alerting verdict the rule covers.
-          The condition references that selection. The level comes from the verdict mapping,
+          detector field is this detector and its verdict is one of the alerting verdicts the rule
+          covers. The condition references that selection. The level comes from the verdict mapping,
           escalated only where a detector warrants it -- and because a Sigma rule carries a single
-          level while flag and block alert at different levels, the generator writes one rule per
-          alerting verdict. So a rule is almost entirely determined by two facts -- the detector's
-          name and the alerting verdict it covers -- which is exactly why generation is feasible:
-          there is no per-rule cleverness to hand-craft, only a descriptor and the mapping to
-          translate.
+          level, the generator writes one rule per level: alerting verdicts that share a level share
+          a rule, and a flag and a block that alert at different levels get a rule each. So a rule
+          is almost entirely determined by two facts -- the detector's name and the level its
+          alerting verdicts share -- which is exactly why generation is feasible: there is no
+          per-rule cleverness to hand-craft, only a descriptor and the mapping to translate.
   - heading: 'Mapping Detector Verdicts to Sigma Conditions'
     id: part_3
     blocks:
@@ -230,7 +230,7 @@ reference_materials:
         - 'Filled from'
       rows:
         - ['logsource', 'The event stream the rule runs on', 'Fixed gateway product/service for the whole suite']
-        - ['detection', 'The field selection that matches', 'The detector name and one alerting verdict']
+        - ['detection', 'The field selection that matches', 'The detector name and the alerting verdicts that share a level']
         - ['condition', 'How selections combine into a match', 'A reference to the single selection']
         - ['level', 'The severity the match reports', 'The verdict mapping (medium/high), escalated per detector (critical for exfiltration)']
         - ['tags', 'MITRE ATLAS/ATT&CK references', 'The detector''s attack references, when present']
@@ -274,9 +274,9 @@ deliverables:
       The generator that turns detector descriptors into portable Sigma rules. A DetectorDescriptor
       names the detector, its attack references, and any narrowing of the alerting verdicts or
       escalation of a level; build_sigma_rule fills the logsource-detection-condition taxonomy from
-      it and the verdict mapping, one rule per alerting verdict; and SigmaRuleGenerator registers
-      the six suite detectors and emits the whole rule set. Includes a dependency-free Sigma YAML
-      emitter so the file runs standalone.
+      it and the verdict mapping, one rule per level (alerting verdicts that share a level share a
+      rule); and SigmaRuleGenerator registers the six suite detectors and emits the whole rule set.
+      Includes a dependency-free Sigma YAML emitter so the file runs standalone.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library uuid,
       dataclasses, and typing only, plus the verdict mapping from the second deliverable. The
@@ -285,7 +285,7 @@ deliverables:
       PyYAML and the pySigma library to compile rules to each back end. Rule ids are UUIDs
       derived from the rule name, as the Sigma specification requires, so they stay stable
       across regeneration. Self-checks every rule's selection and level against the verdict
-      mapping.
+      mapping, and shows a detector whose flag and block share a level getting one rule.
     code: |
       # sigma_rule_generator.py
       # Section 16.02: Automated Sigma Rule Generation
@@ -300,7 +300,7 @@ deliverables:
 
       import uuid
       from dataclasses import dataclass, field
-      from typing import Any, Dict, List, Optional
+      from typing import Any, Dict, List, Optional, Tuple
 
       from sigma_verdict_mapping import alerting_verdicts, as_condition, level_for
 
@@ -337,16 +337,29 @@ deliverables:
           return desc.escalate.get(verdict, level_for(verdict))
 
 
-      def build_sigma_rule(desc: DetectorDescriptor, verdict: str, *, product: str = 'ai_gateway',
-                           service: str = 'detection') -> Dict[str, Any]:
-          '''Construct a Sigma rule (dict ready to serialise) for one detector and one
-          alerting verdict. A Sigma rule carries a single level, and the verdict mapping
-          gives flag and block different levels, so each alerting verdict is its own rule.
-          The selection comes from the mapping's as_condition, with the detector added.'''
-          name = f'ai-sec-{_slug(desc.detector)}-{verdict}'
-          cond = as_condition([verdict])
+      def rule_groups(desc: DetectorDescriptor) -> List[Tuple[str, List[str]]]:
+          '''The detector's alerting verdicts grouped by level. A Sigma rule carries a
+          single level, so verdicts that alert at the same level share one rule and
+          verdicts that alert at different levels get a rule each.'''
+          groups: Dict[str, List[str]] = {}
+          for v in rule_verdicts(desc):
+              groups.setdefault(rule_level(desc, v), []).append(v)
+          return list(groups.items())
+
+
+      def build_sigma_rule(desc: DetectorDescriptor, verdicts: List[str], *, split: bool = False,
+                           product: str = 'ai_gateway', service: str = 'detection') -> Dict[str, Any]:
+          '''Construct a Sigma rule (dict ready to serialise) for one detector and the
+          alerting verdicts that share a level. The selection comes from the mapping's
+          as_condition, with the detector added; split marks a detector whose verdicts
+          needed more than one rule, so the name and title say which verdicts it covers.'''
+          levels = {rule_level(desc, v) for v in verdicts}
+          assert len(levels) == 1, f'{desc.detector}: verdicts {verdicts} do not share a level'
+          slug = f'ai-sec-{_slug(desc.detector)}'
+          name = f'{slug}-{"-".join(verdicts)}' if split else slug
+          cond = as_condition(verdicts)
           rule: Dict[str, Any] = {
-              'title': f'{desc.title} ({verdict})',
+              'title': f'{desc.title} ({", ".join(verdicts)})' if split else desc.title,
               'id': str(uuid.uuid5(RULE_NAMESPACE, name)),
               'name': name,
               'status': 'experimental',
@@ -357,7 +370,7 @@ deliverables:
                   'selection': {'detector': desc.detector, **cond['selection']},
                   'condition': cond['condition'],
               },
-              'level': rule_level(desc, verdict),
+              'level': levels.pop(),
           }
           if desc.attack_refs:
               rule['tags'] = list(desc.attack_refs)
@@ -400,7 +413,11 @@ deliverables:
               self._descriptors.append(desc)
 
           def rules(self) -> List[Dict[str, Any]]:
-              return [build_sigma_rule(desc, v) for desc in self._descriptors for v in rule_verdicts(desc)]
+              out: List[Dict[str, Any]] = []
+              for desc in self._descriptors:
+                  groups = rule_groups(desc)
+                  out.extend(build_sigma_rule(desc, verdicts, split=len(groups) > 1) for _, verdicts in groups)
+              return out
 
           def generate(self) -> Dict[str, str]:
               return {rule['name']: to_sigma_yaml(rule) for rule in self.rules()}
@@ -432,22 +449,30 @@ deliverables:
           rules = gen.rules()
           print(f'generated {len(rules)} sigma rules for {len(SUITE_DESCRIPTORS)} detectors:')
           for r in rules:
-              print(f'  - {r["name"]:42} level={r["level"]}')
-          # Every rule against the verdict mapping: the governing keys are present, the
-          # selection is one alerting verdict, and the level is the mapping's level or
-          # the descriptor's stated escalation.
+              print(f'  - {r["name"]:42} level={r["level"]:8} verdicts={r["detection"]["selection"]["verdict"]}')
+          # Every rule against the verdict mapping: each alerting verdict is covered
+          # exactly once, every verdict in a rule alerts at that rule's level, and two
+          # rules of one detector never share a level (they would have been one rule).
           for desc in SUITE_DESCRIPTORS:
               mine = [r for r in rules if r['detection']['selection']['detector'] == desc.detector]
-              assert [r['detection']['selection']['verdict'] for r in mine] == [[v] for v in rule_verdicts(desc)]
+              covered = [v for r in mine for v in r['detection']['selection']['verdict']]
+              assert sorted(covered) == sorted(rule_verdicts(desc)), desc.detector
+              assert len({r['level'] for r in mine}) == len(mine), desc.detector
               for r in mine:
-                  v = r['detection']['selection']['verdict'][0]
                   assert {'logsource', 'detection', 'level'} <= set(r) and r['detection']['condition'] == 'selection'
-                  assert v in alerting_verdicts() and v != 'allow', r['name']
-                  assert r['level'] == desc.escalate.get(v, level_for(v)), r['name']
+                  for v in r['detection']['selection']['verdict']:
+                      assert v in alerting_verdicts() and v != 'allow', r['name']
+                      assert r['level'] == desc.escalate.get(v, level_for(v)), r['name']
+          # Verdicts that share a level share a rule: escalate a detector's flags to
+          # high and its two rules become one.
+          merged = DetectorDescriptor('jailbreak', 'AI Jailbreak Attempt Detected', 'example',
+                                      escalate={'flag': 'high'})
+          assert [(lvl, vs) for lvl, vs in rule_groups(merged)] == [('high', ['flag', 'block'])]
+          print('a detector whose flag and block share a level gets one rule:', rule_groups(merged))
           ids = [r['id'] for r in rules]
           assert len(set(ids)) == len(ids) and all(str(uuid.UUID(i)) == i for i in ids)
           assert ids == [r['id'] for r in gen.rules()], 'ids must be stable across regeneration'
-          print('every rule selects one alerting verdict at its mapped level, with a stable UUID: ok')
+          print('every alerting verdict is in one rule at its mapped level, with a stable UUID: ok')
   - heading: 'Detector-Verdict-to-Sigma-Condition Mapping'
     id: deliverable_2
     filename: sigma_verdict_mapping.py

@@ -265,12 +265,14 @@ deliverables:
       the ISO-to-epoch timestamp conversion. Runs standalone on an in-memory StubHECTransport.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library calendar, json,
-      time, dataclasses, and typing only. The DetectionEvent is represented as a dict via
+      os, time, dataclasses, and typing only. The DetectionEvent is represented as a dict via
       sample_event so the file runs standalone; in the suite it imports DetectionEvent from
       detection_event_schema.py. StubHECTransport records POSTs and returns Splunk's success
       envelope; the real transport POSTs to the HEC endpoint with an Authorization: Splunk <token>
-      header. The UTC timestamp is converted with calendar.timegm, so the epoch is the same on any
-      host. Self-checks the mapping, promoted fields, epoch time, and batched delivery.
+      header; the token is read from the environment (SPLUNK_HEC_TOKEN) when the connector sends,
+      never held in source. The UTC timestamp is converted with calendar.timegm, so the epoch is
+      the same on any host. Self-checks the mapping, promoted fields, epoch time, and batched
+      delivery.
     code: |
       # splunk_integration.py
       # Section 16.03: Splunk Integration -- HEC and Add-on
@@ -284,6 +286,7 @@ deliverables:
 
       import calendar
       import json
+      import os
       import time
       from dataclasses import dataclass
       from typing import Any, Dict, List, Optional
@@ -311,7 +314,9 @@ deliverables:
           success envelope, so the connector runs end to end without a live Splunk.'''
           def __init__(self) -> None:
               self.sent: List[Dict[str, Any]] = []
+              self.tokens: List[str] = []
           def send(self, url: str, token: str, payload: str) -> Dict[str, Any]:
+              self.tokens.append(token)
               for line in payload.strip().split('\n'):
                   self.sent.append(json.loads(line))
               return {'text': 'Success', 'code': 0}
@@ -320,7 +325,7 @@ deliverables:
       @dataclass
       class SplunkConfig:
           hec_url: str = 'https://splunk.internal:8088/services/collector'
-          hec_token: str = 'REPLACE_WITH_HEC_TOKEN'
+          token_env_var: str = 'SPLUNK_HEC_TOKEN'
           index: str = 'ai_security'
           sourcetype: str = 'ai:detection'
           host: str = 'detection-gateway'
@@ -328,6 +333,12 @@ deliverables:
           def validate(self) -> None:
               assert self.hec_url.startswith('http'), 'hec_url must be an http(s) URL'
               assert self.index and self.sourcetype, 'index and sourcetype are required'
+
+          def resolve_token(self) -> str:
+              # The HEC token is a secret: read from the environment, never held in source.
+              token = os.environ.get(self.token_env_var, '')
+              assert token, f'{self.token_env_var} is not set -- HEC token required'
+              return token
 
 
       def _iso_to_epoch(ts: str) -> float:
@@ -364,11 +375,12 @@ deliverables:
               self._cfg.validate()
               envelopes = [to_splunk_envelope(e, self._cfg) for e in events]
               payload = '\n'.join(json.dumps(env, sort_keys=True) for env in envelopes)
-              resp = self._transport.send(self._cfg.hec_url, self._cfg.hec_token, payload)
+              resp = self._transport.send(self._cfg.hec_url, self._cfg.resolve_token(), payload)
               return {'sent': len(envelopes), 'ok': resp.get('code') == 0, 'response': resp}
 
 
       if __name__ == '__main__':
+          os.environ.setdefault('SPLUNK_HEC_TOKEN', 'demo-token-not-real')
           stub = StubHECTransport()
           conn = SplunkConnector(transport=stub)
           events = [sample_event(),
@@ -379,6 +391,7 @@ deliverables:
           print('indexed fields:', stub.sent[0]['fields'])
           print('epoch time    :', stub.sent[0]['time'], 'for', events[0]['timestamp'])
           assert result['sent'] == 2 and result['ok']
+          assert stub.tokens == [os.environ['SPLUNK_HEC_TOKEN']]      # the token came from the environment
           assert stub.sent[0]['index'] == 'ai_security' and stub.sent[0]['sourcetype'] == 'ai:detection'
           assert stub.sent[0]['fields']['severity'] == 'critical'
           assert stub.sent[1]['event']['detector'] == 'pii_scanner'
@@ -389,11 +402,11 @@ deliverables:
     filename: splunk_integration_test.py
     lang: python
     description: >
-      Five tests over the full path on the stub transport: the envelope mapping carries the right
+      Six tests over the full path on the stub transport: the envelope mapping carries the right
       index, sourcetype, promoted fields, and epoch time; the epoch time is the same whatever the
       host time zone; batches all deliver; the full detection body stays searchable (not just the
-      promoted fields); and an invalid config is rejected. Proves the detection reaches Splunk in
-      a searchable, alertable form.
+      promoted fields); and an invalid config and a missing HEC token are rejected. Proves the
+      detection reaches Splunk in a searchable, alertable form.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library only, imports the
       connector under test. The body-preservation test is the important one: it asserts the scores,
@@ -409,8 +422,12 @@ deliverables:
       # goes in, a Splunk HEC envelope comes out with the right index, sourcetype, and
       # promoted fields, and the searchable event body preserves the full detection.
 
+      import os
+
       from splunk_integration import (SplunkConnector, StubHECTransport, SplunkConfig,
                                       to_splunk_envelope, sample_event)
+
+      os.environ.setdefault('SPLUNK_HEC_TOKEN', 'demo-token-not-real')
 
 
       def test_envelope_mapping() -> None:
@@ -465,9 +482,19 @@ deliverables:
           raise AssertionError('expected invalid config to be rejected')
 
 
+      def test_missing_token_rejected() -> None:
+          cfg = SplunkConfig(token_env_var='SPLUNK_HEC_TOKEN_UNSET_FOR_TEST')
+          os.environ.pop(cfg.token_env_var, None)
+          try:
+              SplunkConnector(config=cfg).send([sample_event()])
+          except AssertionError:
+              return
+          raise AssertionError('expected a missing HEC token to be rejected')
+
+
       if __name__ == '__main__':
           tests = [test_envelope_mapping, test_epoch_independent_of_host_timezone, test_delivery_batches,
-                   test_searchable_body_preserved, test_bad_config_rejected]
+                   test_searchable_body_preserved, test_bad_config_rejected, test_missing_token_rejected]
           for t in tests:
               t()
               print(f'PASS {t.__name__}')
