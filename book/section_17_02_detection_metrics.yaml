@@ -319,17 +319,20 @@ deliverables:
     description: >
       Computes the four detection metrics from a confusion matrix built over labelled detections:
       DetectionMetrics exposes TPR, FPR, precision, recall, and F1; compute_metrics and
-      compute_suite_metrics produce per-detector and suite-level views from the same machinery. The
-      base-rate half is the section's centre: BaseRateScenario computes the precision an analyst
-      will actually experience at a given base rate, and fpr_required_for_precision inverts the
-      relation to give the maximum FPR that meets a precision target -- turning 'reduce false
-      positives' into an engineerable number.
+      compute_suite_metrics produce per-detector views and a per-request suite roll-up from the same
+      machinery. The base-rate half is the section's centre: BaseRateScenario computes the precision
+      an analyst will actually experience at a given base rate, and fpr_required_for_precision
+      inverts the relation to give the maximum FPR that meets a precision target -- turning 'reduce
+      false positives' into an engineerable number.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library dataclasses, enum,
       and typing only. LabelledDetection collapses the verdict to the alert binary (flag/block
-      alert, allow does not); the label is the analyst-dispositioned ground truth. The __main__
-      block computes metrics over a two-detector set, then demonstrates the base-rate collapse (95%
-      TPR, 1% FPR at a 0.1% base rate yields under 10% precision) and verifies the FPR-for-precision
+      alert, allow does not); the label is the analyst-dispositioned ground truth. The suite roll-up
+      is per request: LabelledDetection carries a request_id, and a request counts as alerted if any
+      detector alerted on it. The __main__ block runs two detectors over the same 100 requests and
+      shows suite recall above both detectors' and suite FPR worse than both; it then computes the
+      base-rate table row by row, including the collapse to under 10% precision at a 0.1% base rate,
+      and the FPR ceilings for 90% precision at 1 in 1,000 and 1 in 10,000, verifying that the
       inversion round-trips. In the suite these labels come from the Chapter 16 dispositions via the
       17.04 curator.
     code: |
@@ -368,6 +371,7 @@ deliverables:
           detector: str
           verdict: Verdict
           is_attack: bool                          # ground truth: was this actually an attack?
+          request_id: Optional[str] = None         # the request this verdict was on; every detector sees every request
 
           @property
           def alerted(self) -> bool:
@@ -465,15 +469,24 @@ deliverables:
 
       def compute_suite_metrics(detections: List[LabelledDetection]) -> Dict[str, DetectionMetrics]:
           '''Compute per-detector metrics plus a suite-level roll-up. The suite entry
-          treats a detection as caught if the detector that saw it alerted, so it
-          measures the suite as a whole rather than any single detector.'''
+          is per request: a request counts as alerted if ANY detector alerted on it,
+          so suite recall is the fraction of attacks some detector caught and suite
+          FPR the fraction of benign requests some detector falsely alerted on. That
+          is what lets suite recall exceed every detector's while suite FPR is worse
+          than every detector's. Detections without a request_id are each treated as
+          their own request.'''
           detectors = sorted({d.detector for d in detections})
           out: Dict[str, DetectionMetrics] = {}
           for name in detectors:
               out[name] = compute_metrics(detections, name)
+          requests: Dict[str, List[LabelledDetection]] = {}
+          for i, d in enumerate(detections):
+              requests.setdefault(d.request_id if d.request_id is not None else f'#{i}', []).append(d)
           suite = ConfusionMatrix()
-          for d in detections:
-              suite.add(d)
+          for group in requests.values():
+              alerted = any(d.alerted for d in group)
+              suite.add(LabelledDetection('__suite__', Verdict.FLAG if alerted else Verdict.ALLOW,
+                                          group[0].is_attack))
           out['__suite__'] = DetectionMetrics('__suite__', suite)
           return out
 
@@ -521,23 +534,20 @@ deliverables:
 
 
       if __name__ == '__main__':
-          # A small labelled set across two detectors.
+          # 100 requests, 10 of them attacks, each seen by both detectors. The two
+          # detectors catch partly different attacks and raise partly different false
+          # alarms -- the situation the per-detector and suite views read differently.
+          attacks = set(range(10))
+          caught = {'prompt_injection': {0, 1, 2, 3, 4, 5, 6},        # misses 7, 8, 9
+                    'jailbreak': {4, 5, 6, 7, 8}}                      # catches 7 and 8
+          false_alarms = {'prompt_injection': {20, 21},
+                          'jailbreak': {21, 30, 31, 32, 33}}           # 21 shared
           dets = []
-          # prompt_injection: 8 real attacks (7 caught, 1 missed), 2 false alarms out of 90 benign
-          for i in range(7):
-              dets.append(LabelledDetection('prompt_injection', Verdict.BLOCK, True))
-          dets.append(LabelledDetection('prompt_injection', Verdict.ALLOW, True))   # missed
-          for i in range(2):
-              dets.append(LabelledDetection('prompt_injection', Verdict.FLAG, False))  # false alarm
-          for i in range(88):
-              dets.append(LabelledDetection('prompt_injection', Verdict.ALLOW, False))
-          # pii_scanner: 5 attacks all caught, 5 false alarms
-          for i in range(5):
-              dets.append(LabelledDetection('pii_scanner', Verdict.BLOCK, True))
-          for i in range(5):
-              dets.append(LabelledDetection('pii_scanner', Verdict.FLAG, False))
-          for i in range(90):
-              dets.append(LabelledDetection('pii_scanner', Verdict.ALLOW, False))
+          for det in ('prompt_injection', 'jailbreak'):
+              for r in range(100):
+                  alerted = r in caught[det] or r in false_alarms[det]
+                  dets.append(LabelledDetection(det, Verdict.BLOCK if alerted else Verdict.ALLOW,
+                                                r in attacks, request_id=f'req-{r}'))
 
           metrics = compute_suite_metrics(dets)
           for name, m in metrics.items():
@@ -545,24 +555,35 @@ deliverables:
               print(f"{name:18} tpr={d['tpr']:.3f} fpr={d['fpr']:.3f} "
                     f"prec={d['precision']:.3f} f1={d['f1']:.3f}")
 
-          pi = metrics['prompt_injection']
-          assert pi.matrix.tp == 7 and pi.matrix.fn == 1 and pi.matrix.fp == 2
-          assert abs(pi.true_positive_rate - 7/8) < 1e-9
+          pi, jb, suite = metrics['prompt_injection'], metrics['jailbreak'], metrics['__suite__']
+          assert pi.matrix.tp == 7 and pi.matrix.fn == 3 and pi.matrix.fp == 2
           assert abs(pi.precision - 7/9) < 1e-9
+          assert suite.matrix.total == 100                     # one row per request, not per verdict
+          print(f'suite recall {suite.recall:.3f} exceeds every detector '
+                f'({pi.recall:.3f}, {jb.recall:.3f}): the detectors are complementary')
+          print(f'suite FPR {suite.false_positive_rate:.3f} is worse than every detector '
+                f'({pi.false_positive_rate:.3f}, {jb.false_positive_rate:.3f}): false alarms accumulate')
+          assert suite.recall > max(pi.recall, jb.recall)
+          assert suite.false_positive_rate > max(pi.false_positive_rate, jb.false_positive_rate)
 
-          print('\n--- base-rate problem ---')
-          # A strong detector -- 95% TPR, 1% FPR -- against a rare attack.
-          scen = BaseRateScenario(attack_base_rate=0.001, true_positive_rate=0.95,
-                                  false_positive_rate=0.01)
-          print(f'base rate 0.1%, TPR 95%, FPR 1%  -> precision {scen.expected_precision():.3f}, '
-                f'{scen.alerts_per_true_positive():.1f} alerts per real attack')
-          assert scen.expected_precision() < 0.10   # a 1% FPR is catastrophic at this base rate
+          print('\n--- base-rate problem (table_3: 95% TPR, 1% FPR, per 1M requests) ---')
+          for rate in (0.10, 0.01, 0.001, 0.0001):
+              scen = BaseRateScenario(attack_base_rate=rate, true_positive_rate=0.95,
+                                      false_positive_rate=0.01)
+              n_attack = round(1_000_000 * rate)
+              true_alerts = round(n_attack * 0.95)
+              false_alerts = round((1_000_000 - n_attack) * 0.01)
+              print(f'  base rate {rate:>7.2%}: {n_attack:>7,} attacks, {true_alerts:>6,} true alerts, '
+                    f'{false_alerts:>5,} false alerts -> precision {scen.expected_precision():.1%}, '
+                    f'{scen.alerts_per_true_positive():.1f} alerts per real attack')
+              assert abs(scen.expected_precision() - true_alerts / (true_alerts + false_alerts)) < 1e-3
+          assert BaseRateScenario(0.001, 0.95, 0.01).expected_precision() < 0.10
 
-          need = fpr_required_for_precision(0.90, attack_base_rate=0.001, true_positive_rate=0.95)
-          print(f'to reach 90% precision at 0.1% base rate, FPR must be below {need:.6f}')
-          # verify the inversion round-trips
-          check = BaseRateScenario(0.001, 0.95, need)
-          assert abs(check.expected_precision() - 0.90) < 1e-6
+          for rate, label in ((0.001, '1 in 1,000'), (0.0001, '1 in 10,000')):
+              need = fpr_required_for_precision(0.90, attack_base_rate=rate, true_positive_rate=0.95)
+              print(f'to reach 90% precision at {label}, FPR must be below {need:.7f} ({need:.5%})')
+              # verify the inversion round-trips
+              assert abs(BaseRateScenario(rate, 0.95, need).expected_precision() - 0.90) < 1e-6
           print('\ndetection metrics + base-rate calculus: ok')
 common_mistakes:
   - subject: 'Judging a detector by its true-positive rate alone'

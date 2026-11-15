@@ -348,8 +348,9 @@ deliverables:
       attacks, selecting the highest-confidence negatives, so the full distribution is preserved for
       evaluation while training sees a learnable one. The __main__ block exercises unanimous labels,
       a contested senior-vs-junior detection (resolves to attack at ~0.69 confidence), an even split
-      (dropped by the gate), and an all-unknown detection (no label), then verifies the imbalance
-      handling and the trainable gate.
+      (dropped by the gate), and an all-unknown detection (no label); caps a 13:1 benign-heavy set
+      at 10:1 for training, keeping the highest-confidence negatives; and shows the gate refusing
+      two hundred benign labels with three attacks.
     code: |
       # dataset_curator.py
       # Section 17.04: Dataset Curation -- Collecting True and False Positives
@@ -452,8 +453,8 @@ deliverables:
           @property
           def imbalance_ratio(self) -> float:
               '''Majority : minority. 1.0 is balanced; large means benign-dominated.'''
-              if self.attacks == 0:
-                  return float('inf') if self.benign else 0.0
+              if self.attacks == 0 or self.benign == 0:
+                  return float('inf') if self.total else 0.0
               return max(self.attacks, self.benign) / min(self.attacks, self.benign)
 
 
@@ -532,10 +533,16 @@ deliverables:
           for i in range(8):
               curator.ingest(AlertDisposition(f'atk-{i}', 'prompt_injection', 'input',
                                               f'ref-atk-{i}', Disposition.TRUE_POSITIVE, 'ana-1'))
-          # 60 false positives -- benign traffic an analyst cleared.
-          for i in range(60):
+          # 120 false positives -- benign traffic an analyst cleared (15 per real attack,
+          # the proportion a rare-attack alert stream produces). A third of them drew a
+          # weak dissent from a second reviewer, so their labels are less certain.
+          for i in range(120):
               curator.ingest(AlertDisposition(f'ben-{i}', 'prompt_injection', 'input',
                                               f'ref-ben-{i}', Disposition.FALSE_POSITIVE, 'ana-2'))
+              if i % 3 == 0:
+                  curator.ingest(AlertDisposition(f'ben-{i}', 'prompt_injection', 'input',
+                                                  f'ref-ben-{i}', Disposition.TRUE_POSITIVE, 'ana-4',
+                                                  confidence=0.3))
           # One contested detection: senior (0.9) says TP, junior (0.4) says FP -> TP but lower confidence.
           curator.ingest(AlertDisposition('contested', 'pii_scanner', 'output', 'ref-c',
                                           Disposition.TRUE_POSITIVE, 'senior', confidence=0.9))
@@ -551,6 +558,9 @@ deliverables:
                                           Disposition.FALSE_POSITIVE, 'b', confidence=0.5))
 
           ds = curator.curate()
+          contested = [e for e in ds.examples if e.detection_id == 'contested']
+          print(f'contested label   : attack={contested[0].is_attack} '
+                f'confidence={contested[0].label_confidence:.3f} (0.9 / (0.9 + 0.4))')
           print(f'labelled examples : {len(ds.examples)}')
           print(f'  attacks / benign: {ds.balance.attacks} / {ds.balance.benign}')
           print(f'  imbalance ratio : {ds.balance.imbalance_ratio:.1f} : 1')
@@ -561,21 +571,35 @@ deliverables:
           tv = ds.training_view(cfg)
           tv_attacks = sum(1 for e in tv if e.is_attack)
           tv_benign = len(tv) - tv_attacks
-          print(f'training view     : {len(tv)} examples '
-                f'({tv_attacks} attacks / {tv_benign} benign, capped at {cfg.max_imbalance_for_training:.0f}:1)')
+          kept_conf = sorted({e.label_confidence for e in tv if not e.is_attack}, reverse=True)
+          left_out = sorted({e.label_confidence for e in ds.examples
+                             if not e.is_attack and e not in tv}, reverse=True)
+          print(f'training view     : {len(tv)} examples ({tv_attacks} attacks / {tv_benign} benign, '
+                f'capped at {cfg.max_imbalance_for_training:.0f}:1)')
+          print(f'  benign kept at confidence {kept_conf}; left out at {left_out}')
+          print(f'full set kept     : {len(ds.examples)} examples for evaluation at the true proportion')
 
           # The contested label resolved to attack (senior outweighs junior) with reduced confidence.
-          contested = [e for e in ds.examples if e.detection_id == 'contested']
-          assert contested and contested[0].is_attack
-          assert abs(contested[0].label_confidence - 0.9/1.3) < 1e-3
-          # The 50/50 split was dropped by the confidence gate.
-          assert not any(e.detection_id == 'split' for e in ds.examples)
-          # The all-unknown detection contributed nothing.
-          assert not any(e.detection_id == 'murky' for e in ds.examples)
-          # Full set is benign-heavy; the training view respects the 10:1 cap.
-          assert ds.balance.imbalance_ratio > 5
-          assert tv_benign <= tv_attacks * cfg.max_imbalance_for_training
+          assert contested[0].is_attack and abs(contested[0].label_confidence - 0.9/1.3) < 1e-3
+          # The 50/50 split was dropped by the confidence gate; the all-unknown one gave no label.
+          assert not any(e.detection_id in ('split', 'murky') for e in ds.examples)
+          # The training view keeps every attack and caps benign at 10:1, highest confidence first.
+          assert tv_attacks == ds.balance.attacks and tv_benign == tv_attacks * cfg.max_imbalance_for_training
+          assert tv_benign < ds.balance.benign and min(kept_conf) >= max(left_out)
           assert ds.trainable
+
+          # The gate refusing: two hundred benign labels and three attack labels.
+          print('\n--- quality gate: 200 benign labels, 3 attack labels ---')
+          thin = DatasetCurator(cfg)
+          for i in range(3):
+              thin.ingest(AlertDisposition(f'a{i}', 'jailbreak', 'input', f'r{i}',
+                                           Disposition.TRUE_POSITIVE, 'ana-1'))
+          for i in range(200):
+              thin.ingest(AlertDisposition(f'b{i}', 'jailbreak', 'input', f'r{i}',
+                                           Disposition.FALSE_POSITIVE, 'ana-1'))
+          refused = thin.curate()
+          print(f'  trainable={refused.trainable}  reasons={refused.reasons}')
+          assert not refused.trainable and refused.reasons == ['too few attacks (3 < 5)']
           print('\ndataset curation: conflict resolution, imbalance handling, quality gate: ok')
 common_mistakes:
   - subject: >

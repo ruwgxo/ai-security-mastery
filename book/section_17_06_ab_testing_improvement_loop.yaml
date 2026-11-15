@@ -319,17 +319,21 @@ deliverables:
       candidate fraction; ArmStats accumulates per-arm outcomes into recall, FPR, and precision; a
       two-proportion z-test decides significance; and ABTest.check returns candidate_wins only on a
       significant recall improvement without a worse FPR, stopped_regression on a significant
-      regression (early-stopping), or inconclusive (keep the incumbent). An analysis-mode
-      constructor supports offline evaluation of shadow-deployed arms without relaxing the
-      live-traffic ceiling.
+      regression (early-stopping), or inconclusive (keep the incumbent); check_early_stop runs the
+      regression guardrail while traffic flows, and run_live_test drives one test end to end. An
+      analysis-mode constructor supports offline evaluation of shadow-deployed arms without relaxing
+      the live-traffic ceiling.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library hashlib,
       dataclasses, enum, and typing only. The two-proportion z-test and fixed z critical values
       avoid a scipy dependency. The candidate fraction is hard-capped so no configuration can
       over-expose production; the significance decision is asymmetric (slow to declare a winner,
-      fast to stop a loser) and ties keep the incumbent. The __main__ block verifies the split lands
-      near its target and enforces the ceiling, then shows a genuine winner, an early-stopped
-      regression, and an inconclusive tie via shadow analysis.
+      fast to stop a loser) and ties keep the incumbent. Recall is judged only once each arm holds
+      30 attacks, and a win is declared only at the planned end of the test. The __main__ block
+      verifies the split lands near its target, is stable per key, and enforces the ceiling, then
+      runs live tests through the hash split -- early-stop checks every 500 requests -- over 200
+      seeds per scenario on synthetic traffic and prints how often each outcome occurs for a
+      17-point recall gain, a three-point gain, a tie, and a regression.
     code: |
       # ab_testing_framework.py
       # Section 17.06: A/B Testing Candidate Detectors on Live Traffic
@@ -446,6 +450,7 @@ deliverables:
       @dataclass
       class GuardrailConfig:
           min_samples_per_arm: int = 100           # do not judge before this much data per arm
+          min_attacks_per_arm: int = 30            # recall is judged on attacks, so also this many per arm
           confidence: float = 0.95                 # significance level for the decision
           early_stop_confidence: float = 0.95      # significance level for a regression stop
 
@@ -506,18 +511,38 @@ deliverables:
               else:
                   self.control.record(is_attack, control_alerts)
 
-          def check(self) -> ABDecision:
-              c, k = self.control, self.candidate
-              cs, ks = self._arm_summary(c), self._arm_summary(k)
-              if c.n < self._guard.min_samples_per_arm or k.n < self._guard.min_samples_per_arm:
-                  return ABDecision('running', 'accumulating minimum samples', cs, ks)
+          def _enough_data(self) -> bool:
+              c, k, g = self.control, self.candidate, self._guard
+              return (c.n >= g.min_samples_per_arm and k.n >= g.min_samples_per_arm
+                      and c.tp + c.fn >= g.min_attacks_per_arm and k.tp + k.fn >= g.min_attacks_per_arm)
 
-              # Early-stop: candidate recall significantly WORSE than control -> regression.
+          def check_early_stop(self) -> Optional[ABDecision]:
+              '''The guardrail run DURING the test: once there is enough data, stop if the
+              candidate's recall is significantly worse than control. Returns None while
+              the test should keep running. A win is never declared here -- only at the
+              planned end, by check() -- so peeking cannot crown a lucky lead.'''
+              if not self._enough_data():
+                  return None
+              c, k = self.control, self.candidate
               z_recall = _two_proportion_z(c.tp, c.tp + c.fn, k.tp, k.tp + k.fn)
               if z_recall < 0 and is_significant(z_recall, self._guard.early_stop_confidence):
                   self._stopped = True
-                  return ABDecision('stopped_regression',
-                                    f'candidate recall regressed (z={z_recall:.2f})', cs, ks)
+                  return ABDecision('stopped_regression', f'candidate recall regressed (z={z_recall:.2f})',
+                                    self._arm_summary(c), self._arm_summary(k))
+              return None
+
+          def check(self) -> ABDecision:
+              '''The decision at the planned end of the test.'''
+              c, k = self.control, self.candidate
+              cs, ks = self._arm_summary(c), self._arm_summary(k)
+              if not self._enough_data():
+                  return ABDecision('running', 'accumulating minimum samples', cs, ks)
+
+              # Early-stop: candidate recall significantly WORSE than control -> regression.
+              stop = self.check_early_stop()
+              if stop is not None:
+                  return stop
+              z_recall = _two_proportion_z(c.tp, c.tp + c.fn, k.tp, k.tp + k.fn)
 
               # Win condition: candidate recall significantly BETTER, without a worse FPR.
               z_fpr = _two_proportion_z(c.fp, c.fp + c.tn, k.fp, k.fp + k.tn)
@@ -526,8 +551,29 @@ deliverables:
               if recall_better and fpr_not_worse:
                   return ABDecision('candidate_wins',
                                     f'candidate recall improved (z={z_recall:.2f}), FPR not worse', cs, ks)
+              if recall_better:
+                  return ABDecision('inconclusive', f'candidate recall improved (z={z_recall:.2f}) but FPR '
+                                    f'significantly worse (z={z_fpr:.2f}); keep incumbent', cs, ks)
 
               return ABDecision('inconclusive', 'no significant improvement; keep incumbent', cs, ks)
+
+
+      def run_live_test(stream, split: SplitConfig, guard: GuardrailConfig,
+                        check_every: int = 500) -> Tuple[ABDecision, int]:
+          '''Run one live A/B test over a stream of (request_key, is_attack,
+          control_alerts, candidate_alerts): route each request by the hash split,
+          check the early-stop guardrail every check_every requests, and decide at the
+          end of the stream. Returns the decision and how many requests were served.'''
+          test = ABTest(split, guard)
+          served = 0
+          for key, is_atk, ctrl, cand in stream:
+              test.record_outcome(key, is_atk, ctrl, cand)
+              served += 1
+              if served % check_every == 0:
+                  stop = test.check_early_stop()
+                  if stop is not None:
+                      return stop, served
+          return test.check(), served
 
 
       if __name__ == '__main__':
@@ -536,58 +582,64 @@ deliverables:
           # --- Split guardrail ---
           cfg = SplitConfig(candidate_fraction=0.10)
           keys = [f'req-{i}' for i in range(10000)]
-          cand = sum(1 for k in keys if assign_arm(k, cfg) is Arm.CANDIDATE)
+          arms = {k: assign_arm(k, cfg) for k in keys}          # deterministic: computed once, reused
+          cand = sum(1 for a in arms.values() if a is Arm.CANDIDATE)
           print(f'split: {cand}/10000 to candidate (~10% expected)')
           assert 850 <= cand <= 1150
+          assert all(assign_arm(k, cfg) is arms[k] for k in keys[:500])   # same key, same arm
           try:
               SplitConfig(candidate_fraction=0.5).validate()
               raise SystemExit('ceiling not enforced')
           except AssertionError:
-              print('over-exposure ceiling enforced: ok')
+              print(f'over-exposure ceiling enforced: a 50% split is refused (ceiling '
+                    f'{cfg.max_candidate_fraction:.0%})')
 
-          # --- A winning candidate: better recall at equal FPR (shadow analysis) ---
-          print('\n--- candidate genuinely better ---')
-          random.seed(1)
-          test = ABTest.for_analysis()   # shadow: both detectors scored the same traffic
-          for i in range(4000):
-              is_atk = random.random() < 0.3
-              ctrl = (random.random() < 0.75) if is_atk else (random.random() < 0.03)
-              cand_a = (random.random() < 0.92) if is_atk else (random.random() < 0.03)
-              test.record_arm(Arm.CONTROL, is_atk, ctrl)
-              test.record_arm(Arm.CANDIDATE, is_atk, cand_a)
-          d = test.check()
-          print(f'  {d.status}: {d.detail}')
-          print(f'  control  : {d.control}')
-          print(f'  candidate: {d.candidate}')
-          assert d.status == 'candidate_wins'
+          # --- Live tests, each scenario repeated over many seeds ---
+          # Synthetic traffic: 10,000 requests per test, 10% attacks, both detectors
+          # alerting on 3% of benign requests. The candidate sees ~1,000 requests and
+          # ~100 attacks; the decision is read from that arm against control.
+          N, ATTACK_RATE, FP_RATE, TRIALS = 10000, 0.10, 0.03, 200
+          guard = GuardrailConfig()
 
-          # --- A regressing candidate: caught and stopped ---
-          print('\n--- candidate regressing (early stop) ---')
-          random.seed(2)
-          test2 = ABTest.for_analysis()
-          for i in range(4000):
-              is_atk = random.random() < 0.3
-              ctrl = (random.random() < 0.85) if is_atk else (random.random() < 0.03)
-              cand_a = (random.random() < 0.55) if is_atk else (random.random() < 0.03)
-              test2.record_arm(Arm.CONTROL, is_atk, ctrl)
-              test2.record_arm(Arm.CANDIDATE, is_atk, cand_a)
-          d2 = test2.check()
-          print(f'  {d2.status}: {d2.detail}')
-          assert d2.status == 'stopped_regression'
+          def stream(rng, ctrl_recall, cand_recall):
+              for k in keys:
+                  is_atk = rng.random() < ATTACK_RATE
+                  p_c, p_k = (ctrl_recall, cand_recall) if is_atk else (FP_RATE, FP_RATE)
+                  yield k, is_atk, rng.random() < p_c, rng.random() < p_k
 
-          # --- A tie: inconclusive, incumbent kept ---
-          print('\n--- candidate no better (inconclusive) ---')
-          random.seed(3)
-          test3 = ABTest.for_analysis()
-          for i in range(4000):
-              is_atk = random.random() < 0.3
-              ctrl = (random.random() < 0.80) if is_atk else (random.random() < 0.03)
-              cand_a = (random.random() < 0.80) if is_atk else (random.random() < 0.03)
-              test3.record_arm(Arm.CONTROL, is_atk, ctrl)
-              test3.record_arm(Arm.CANDIDATE, is_atk, cand_a)
-          d3 = test3.check()
-          print(f'  {d3.status}: {d3.detail}')
-          assert d3.status == 'inconclusive'
+          scenarios = [('candidate genuinely better', 0.75, 0.92),
+                       ('three points better (75% -> 78%)', 0.75, 0.78),
+                       ('no better (tie)', 0.80, 0.80),
+                       ('regressing', 0.85, 0.55)]
+          print(f'\n--- live A/B tests: {TRIALS} seeds per scenario, {N:,} requests, '
+                f'{ATTACK_RATE:.0%} attacks (synthetic) ---')
+          rates = {}
+          for name, ctrl_r, cand_r in scenarios:
+              outcomes = {'candidate_wins': 0, 'inconclusive': 0, 'stopped_regression': 0, 'running': 0}
+              stopped_at = []
+              for seed in range(TRIALS):
+                  decision, served = run_live_test(stream(random.Random(seed), ctrl_r, cand_r), cfg, guard)
+                  outcomes[decision.status] += 1
+                  if decision.status == 'stopped_regression':
+                      stopped_at.append(served)
+              rates[name] = {k: v / TRIALS for k, v in outcomes.items()}
+              line = ', '.join(f'{k} {v / TRIALS:.1%}' for k, v in outcomes.items() if v)
+              print(f'  {name:34} control {ctrl_r:.0%} vs candidate {cand_r:.0%}: {line}')
+              if stopped_at:
+                  stopped_at.sort()
+                  print(f'  {"":34} stopped after a median {stopped_at[len(stopped_at) // 2]:,} of '
+                        f'{N:,} requests ({stopped_at[len(stopped_at) // 2] / N:.0%} of the test)')
+
+          better, small, tie, worse = (rates[n] for n, _, _ in scenarios)
+          assert better['candidate_wins'] >= 0.90                 # a real improvement is found
+          assert small['candidate_wins'] <= 0.25                  # three points on ~100 attacks: mostly not
+          assert tie['candidate_wins'] <= 0.05                    # a tie almost never promotes
+          assert worse['stopped_regression'] >= 0.95              # a regression is stopped ...
+          assert worse['candidate_wins'] == 0.0                   # ... and never promoted
+
+          total_attacks = 100 / cfg.candidate_fraction           # attacks overall for ~100 in the candidate arm
+          print(f'\nat a 0.1% production base rate the same ~100 candidate-arm attacks need about '
+                f'{total_attacks / 0.001:,.0f} requests, against {total_attacks / ATTACK_RATE:,.0f} here')
 
           # --- The live-traffic split keeps the candidate arm bounded ---
           print('\n--- live split stays within the safety ceiling ---')
@@ -607,16 +659,22 @@ deliverables:
       holds the persistent state -- the retrainer with its registry, the trigger state with its
       cooldown -- and run_cycle drives measure -> curate -> (trigger?) retrain -> validate ->
       A/B-test -> promote in order, promoting only a candidate that both validated and won its live
-      A/B test, and rolling back if the A/B test reveals a regression. It composes the deliverables
-      of 17.02, 17.04, 17.05, and 17.06 without re-implementing any of them.
+      A/B test; until then the candidate is a registered, unpromoted version, so a candidate that
+      loses is never promoted. It composes the deliverables of 17.02, 17.04, 17.05, and 17.06
+      without re-implementing any of them.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard library only; imports
       detection_metrics, dataset_curator, model_retrainer, and ab_testing_framework -- so it is the
-      integration point that proves the stages compose. The __main__ block runs several cycles: a
-      quiet cycle (measure only), a drift-triggered retrain that validates and wins its A/B test and
-      is promoted, cooldown cycles that correctly block retraining, and a final cycle where a
-      validated candidate loses its live A/B test and is rolled back -- demonstrating end to end
-      that a change reaches production only after being proven better, and can still be reversed.
+      integration point that proves the stages compose. The __main__ block runs seven cycles in a
+      seeded synthetic world (10% attacks; truth is known because the traffic is synthetic) where an
+      evasive technique grows: a quiet cycle; a drift-triggered retrain on labels from alerts, a
+      review of requests just below the threshold (where the missed attacks are) and a random review
+      sample, which validates, wins its A/B test, and raises measured recall from about 0.48 to
+      0.98; three cooldown cycles; a retrain on poisoned dispositions that fails validation; and a
+      cycle whose few dispositions curation refuses. It then repeats the seven cycles over 40 seeds
+      and prints how often each outcome occurs -- in a few, the A/B test holds back a candidate
+      whose recall gain comes with a significantly worse false-positive rate. Drift is a population
+      stability index standing in for the Chapter 13 Section 13.05 detector.
     code: |
       # continuous_improvement_loop.py
       # Section 17.06: The Assembled Continuous Improvement Loop
@@ -631,28 +689,65 @@ deliverables:
       # measured, validated, and proven better than the incumbent on traffic. Nothing
       # here re-implements a stage; it composes them.
 
+      import math
+      import random
       from dataclasses import dataclass, field
-      from typing import Dict, List, Optional
+      from typing import Dict, List, Optional, Tuple
 
       from detection_metrics import (LabelledDetection, Verdict, compute_suite_metrics)
       from dataset_curator import (AlertDisposition, Disposition, DatasetCurator,
                                    CurationQualityConfig)
-      from model_retrainer import (Example, ModelRetrainer, TriggerState, QualityBar,
-                                  RetrainTriggerConfig)
-      from ab_testing_framework import (ABTest, Arm, SplitConfig, GuardrailConfig)
+      from model_retrainer import (Example, DetectorModel, ModelRetrainer, TriggerState,
+                                   RetrainTriggerConfig)
+      from ab_testing_framework import (ABTest, SplitConfig, GuardrailConfig)
+
+
+      # --- One request as the loop sees it ----------------------------------------
+      # score is the detector's input feature; is_attack is the truth, which in
+      # production arrives only through dispositions and reviewed samples (17.02).
+
+      @dataclass
+      class Request:
+          request_id: str
+          score: float
+          is_attack: bool
+          technique: str                           # 'known' | 'evasive' | 'benign'
+
+
+      def drift_score(reference: List[float], live: List[float], bins: int = 10) -> float:
+          '''Population stability index of the live score distribution against the
+          reference the production model was trained on. A stand-in for the Chapter 13
+          Section 13.05 drift detector: 0 when nothing moved, larger as mass shifts.'''
+          def hist(xs: List[float]) -> List[float]:
+              h = [0] * bins
+              for x in xs:
+                  h[min(bins - 1, int(x * bins))] += 1
+              return [max(c / len(xs), 1e-4) for c in h]
+          r, l = hist(reference), hist(live)
+          return sum((b - a) * math.log(b / a) for a, b in zip(r, l))
 
 
       @dataclass
       class LoopConfig:
           detector: str = 'prompt_injection'
-          ab_min_samples_per_arm: int = 100
+          review_capacity: int = 150               # unalerted boundary requests analysts review per cycle
+          review_band: float = 0.30                # how far below the threshold the review samples
+          random_review: int = 300                 # random unalerted requests reviewed, to keep benign representative
+          candidate_fraction: float = 0.10         # A/B candidate share of live traffic
+          ab_check_every: int = 500                # early-stop check interval, in requests
+          trigger: RetrainTriggerConfig = field(default_factory=lambda: RetrainTriggerConfig(
+              drift_threshold=0.15, min_new_labels=1000, cooldown_cycles=3))
 
 
       @dataclass
       class CycleReport:
           cycle: int
-          suite_recall: float
-          suite_fpr: float
+          measured: str                            # the production version this cycle measured
+          production: str                          # the production version after the cycle
+          recall: float
+          fpr: float
+          precision: float
+          drift: float
           curated_examples: int
           trainable: bool
           retrained: bool
@@ -663,188 +758,261 @@ deliverables:
 
       class ContinuousImprovementLoop:
           '''Orchestrates one detector's improvement loop. Holds the persistent state
-          the loop carries between cycles -- the retrainer (with its registry) and the
-          trigger state -- and runs a cycle by driving each stage in order. The loop
-          never promotes a candidate that has not been validated AND won its A/B test.'''
+          the loop carries between cycles -- the retrainer (with its registry), the
+          trigger state, and the drift reference -- and runs a cycle by driving each
+          stage in order. A candidate reaches production only by passing validation
+          AND winning its A/B test; until then it is a registered, unpromoted version.'''
 
           def __init__(self, config: Optional[LoopConfig] = None) -> None:
               self._cfg = config if config is not None else LoopConfig()
-              self._retrainer = ModelRetrainer(self._cfg.detector)
+              self._retrainer = ModelRetrainer(self._cfg.detector, trigger_cfg=self._cfg.trigger)
               self._trigger_state = TriggerState(cycles_since_retrain=999, new_labels_since_retrain=0)
+              self._reference: List[float] = []
               self._cycle = 0
+
+          @property
+          def production(self) -> DetectorModel:
+              return self._retrainer.registry.current
+
+          @property
+          def history(self) -> List[str]:
+              return self._retrainer.registry.history
 
           def seed(self, seed_examples: List[Example]) -> None:
               self._retrainer.seed(seed_examples)
+              self._reference = [e.features['score'] for e in seed_examples]
 
-          def _measure(self, labelled: List[LabelledDetection]) -> Dict[str, float]:
-              suite = compute_suite_metrics(labelled)['__suite__']
-              return {'recall': suite.true_positive_rate, 'fpr': suite.false_positive_rate}
+          # 1. MEASURE: the production model's verdicts on labelled live requests.
+          def _measure(self, traffic: List[Request]) -> Dict[str, float]:
+              model = self.production
+              labelled = [LabelledDetection(self._cfg.detector,
+                                            Verdict.BLOCK if r.score >= model.threshold else Verdict.ALLOW,
+                                            r.is_attack, request_id=r.request_id) for r in traffic]
+              m = compute_suite_metrics(labelled)['__suite__']
+              return {'recall': m.recall, 'fpr': m.false_positive_rate, 'precision': m.precision}
 
-          def _curate(self, dispositions: List[AlertDisposition]):
-              curator = DatasetCurator(CurationQualityConfig(min_examples=10, min_attacks=3))
-              for d in dispositions:
-                  curator.ingest(d)
-              return curator.curate()
+          # 2. CURATE: dispositions of what alerted, plus two reviewed samples of the
+          # unalerted traffic -- the requests just below the threshold, the only way
+          # attacks the detector missed can become labels (17.04), and a random sample,
+          # without which the only benign labels are the suspicious-looking ones and
+          # the trainer would read the false-positive cost as far higher than it is.
+          def _review_queue(self, traffic: List[Request],
+                            rng: random.Random) -> Tuple[List[Request], List[Request], List[Request]]:
+              t = self.production.threshold
+              alerts = [r for r in traffic if r.score >= t]
+              band = sorted((r for r in traffic if t - self._cfg.review_band <= r.score < t),
+                            key=lambda r: -r.score)[:self._cfg.review_capacity]
+              taken = {r.request_id for r in band}
+              rest = [r for r in traffic if r.score < t and r.request_id not in taken]
+              return alerts, band, rng.sample(rest, min(self._cfg.random_review, len(rest)))
 
-          def run_cycle(self, *, labelled: List[LabelledDetection],
-                        dispositions: List[AlertDisposition], drift_score: float,
-                        training_view: List[Example], eval_set: List[Example],
-                        ab_outcomes: Optional[List[tuple]] = None) -> CycleReport:
+          def run_cycle(self, *, traffic: List[Request], dispositions: List[AlertDisposition],
+                        eval_set: List[Example], ab_traffic: List[Request]) -> CycleReport:
+              '''One cycle. traffic is this cycle's labelled live sample; dispositions
+              are the analysts' labels on the requests _review_queue sent them; eval_set
+              is the held-out validation set; ab_traffic is the live traffic an A/B
+              test would run on.'''
               self._cycle += 1
               notes: List[str] = []
+              measured = self.production.version
+              m = self._measure(traffic)
+              drift = drift_score(self._reference, [r.score for r in traffic])
 
-              # 1. MEASURE
-              m = self._measure(labelled)
-
-              # 2. CURATE
-              curated = self._curate(dispositions)
+              curator = DatasetCurator(CurationQualityConfig())
+              for d in dispositions:
+                  curator.ingest(d)
+              curated = curator.curate()
               self._trigger_state.new_labels_since_retrain += len(curated.examples)
               if not curated.trainable:
                   notes.append(f'curation refused: {curated.reasons}')
 
-              # 3-4. TRIGGER + RETRAIN + VALIDATE (only if curation produced trainable data)
-              retrained = promoted_by_validation = False
-              candidate_version = None
-              if curated.trainable:
-                  outcome = self._retrainer.maybe_retrain(drift_score, self._trigger_state,
-                                                          training_view, eval_set)
-                  retrained = outcome['retrained']
-                  if retrained:
-                      candidate_version = outcome.get('candidate')
-                      if not outcome['validation_passed']:
-                          notes.append(f'validation failed: {outcome["reasons"]}')
-                      promoted_by_validation = outcome['promoted']
-                  else:
-                      notes.append(f'no retrain: {outcome["trigger"]}')
-
-              # 5. A/B TEST (only a validated candidate earns a live test)
+              # 3-4. TRIGGER + RETRAIN + VALIDATE (only on trainable data; never promotes here)
+              retrained = promoted = False
               ab_status = 'skipped'
-              promoted = promoted_by_validation
-              if retrained and promoted_by_validation and ab_outcomes:
-                  ab = ABTest(SplitConfig(candidate_fraction=0.10),
-                              GuardrailConfig(min_samples_per_arm=self._cfg.ab_min_samples_per_arm))
-                  # ab_outcomes: (arm, is_attack, control_alerts, candidate_alerts)
-                  for arm, is_atk, ctrl, cand in ab_outcomes:
-                      if arm is Arm.CANDIDATE:
-                          ab.candidate.record(is_atk, cand)
-                      else:
-                          ab.control.record(is_atk, ctrl)
-                  decision = ab.check()
-                  ab_status = decision.status
-                  # 6. PROMOTE stands only if the A/B test did not reveal a regression.
-                  if decision.status == 'stopped_regression':
-                      rolled = self._retrainer.registry.rollback()
-                      promoted = False
-                      notes.append(f'A/B regression -> rolled back to '
-                                   f'{rolled.version if rolled else "none"}')
-                  elif decision.status == 'candidate_wins':
-                      notes.append('A/B confirmed candidate; promotion stands')
+              if curated.trainable:
+                  score_of = {r.request_id: r.score for r in traffic}
+                  view = [Example(e.detection_id, e.detector, e.is_attack, e.label_confidence,
+                                  {'score': score_of[e.payload_ref]})
+                          for e in curated.training_view(CurationQualityConfig())]
+                  outcome = self._retrainer.maybe_retrain(drift, self._trigger_state, view, eval_set,
+                                                          promote=False)
+                  retrained = outcome['retrained']
+                  if not retrained:
+                      notes.append(f'no retrain: {outcome["trigger"]}')
+                  elif not outcome['validation_passed']:
+                      notes.append(f'{outcome["candidate"]} (threshold {outcome["threshold"]:.3f}) failed '
+                                   f'validation: {outcome["reasons"]}')
                   else:
-                      notes.append(f'A/B {decision.status}; candidate kept on validation merit')
-
-              # advance cooldown clock for cycles that did not retrain
+                      notes.append(f'{outcome["candidate"]} (threshold {outcome["threshold"]:.3f}) validated: '
+                                   f'recall {outcome["recall"]:.3f} vs incumbent '
+                                   f'{outcome["incumbent_recall"]:.3f}')
+                      # 5. A/B TEST: both versions score the same live requests; the hash
+                      # split decides whose verdict counts, the guardrail is checked as
+                      # traffic flows, and the decision is taken at the planned end.
+                      candidate = self._retrainer.registry.get(outcome['candidate'])
+                      incumbent = self.production
+                      ab = ABTest(SplitConfig(candidate_fraction=self._cfg.candidate_fraction),
+                                  GuardrailConfig())
+                      decision = None
+                      for i, r in enumerate(ab_traffic, 1):
+                          ab.record_outcome(r.request_id, r.is_attack, r.score >= incumbent.threshold,
+                                            r.score >= candidate.threshold)
+                          if i % self._cfg.ab_check_every == 0:
+                              decision = ab.check_early_stop()
+                              if decision is not None:
+                                  notes.append(f'A/B stopped after {i} of {len(ab_traffic)} requests')
+                                  break
+                      decision = decision or ab.check()
+                      ab_status = decision.status
+                      notes.append(f'A/B {decision.status}: {decision.detail}; candidate arm '
+                                   f'{decision.candidate}, control arm {decision.control}')
+                      # 6. PROMOTE only a validated candidate that won its live test.
+                      if decision.status == 'candidate_wins':
+                          self._retrainer.registry.promote(candidate.version)
+                          self._reference = [r.score for r in traffic]
+                          promoted = True
+                      else:
+                          notes.append(f'{candidate.version} not promoted; production stays '
+                                       f'{incumbent.version}')
               if not retrained:
                   self._trigger_state.cycles_since_retrain += 1
 
-              return CycleReport(self._cycle, round(m['recall'], 4), round(m['fpr'], 4),
-                                 len(curated.examples), curated.trainable, retrained,
-                                 promoted, ab_status, notes)
-
-          @property
-          def production_version(self) -> Optional[str]:
-              cur = self._retrainer.registry.current
-              return cur.version if cur else None
+              return CycleReport(self._cycle, measured, self.production.version, round(m['recall'], 3),
+                                 round(m['fpr'], 4), round(m['precision'], 3), round(drift, 3),
+                                 len(curated.examples), curated.trainable, retrained, promoted,
+                                 ab_status, notes)
 
 
-      # --- Self-check: run several cycles and show the loop behaving --------------
+      # --- A seeded synthetic world for the self-check ----------------------------
+      # Synthetic traffic, 10% attacks so a short run has enough of them. Known attacks
+      # score high; an evasive technique scores in the middle band and grows over the
+      # run; benign traffic scores low. Truth is known here because it is synthetic.
 
-      def _examples(n_attack, n_benign, atk_score, ben_score):
-          out = []
-          for i in range(n_attack):
-              s = min(1.0, atk_score + ((i % 5) - 2) * 0.05)
-              out.append(Example(f'a{i}', 'prompt_injection', True, 1.0, {'score': s}))
-          for i in range(n_benign):
-              s = max(0.0, ben_score + ((i % 5) - 2) * 0.05)
-              out.append(Example(f'b{i}', 'prompt_injection', False, 1.0, {'score': s}))
-          return out
+      class World:
+          def __init__(self, seed: int) -> None:
+              self._rng = random.Random(seed)
+              self._n = 0
+
+          def traffic(self, n: int, evasive_share: float, attack_rate: float = 0.10) -> List[Request]:
+              out = []
+              for _ in range(n):
+                  self._n += 1
+                  if self._rng.random() < attack_rate:
+                      if self._rng.random() < evasive_share:
+                          s, tech = self._rng.gauss(0.55, 0.04), 'evasive'
+                      else:
+                          s, tech = self._rng.gauss(0.82, 0.05), 'known'
+                      atk = True
+                  elif self._rng.random() < 0.01:          # benign requests that read like attacks
+                      s, tech, atk = self._rng.gauss(0.80, 0.05), 'benign', False
+                  else:
+                      s, tech, atk = self._rng.gauss(0.20, 0.06), 'benign', False
+                  out.append(Request(f'r{self._n}', round(min(1.0, max(0.0, s)), 3), atk, tech))
+              return out
+
+          def dispositions(self, requests: List[Request], poison_evasive: bool = False) -> List[AlertDisposition]:
+              '''Analysts label each request they were sent. poison_evasive models an
+              adversary who shapes dispositions so their technique reads as benign.'''
+              out = []
+              for r in requests:
+                  truth = r.is_attack and not (poison_evasive and r.technique == 'evasive')
+                  out.append(AlertDisposition(r.request_id, 'prompt_injection', 'input', r.request_id,
+                                              Disposition.TRUE_POSITIVE if truth
+                                              else Disposition.FALSE_POSITIVE, 'ana'))
+              return out
 
 
-      def _dispositions(n_tp, n_fp):
-          out = []
-          for i in range(n_tp):
-              out.append(AlertDisposition(f'tp{i}', 'prompt_injection', 'input', f'r{i}',
-                                          Disposition.TRUE_POSITIVE, 'ana'))
-          for i in range(n_fp):
-              out.append(AlertDisposition(f'fp{i}', 'prompt_injection', 'input', f'r{i}',
-                                          Disposition.FALSE_POSITIVE, 'ana'))
-          return out
+      def _as_examples(requests: List[Request]) -> List[Example]:
+          return [Example(r.request_id, 'prompt_injection', r.is_attack, 1.0, {'score': r.score})
+                  for r in requests]
 
 
-      def _labelled(n_tp, n_fn, n_fp, n_tn):
-          out = []
-          out += [LabelledDetection('prompt_injection', Verdict.BLOCK, True) for _ in range(n_tp)]
-          out += [LabelledDetection('prompt_injection', Verdict.ALLOW, True) for _ in range(n_fn)]
-          out += [LabelledDetection('prompt_injection', Verdict.FLAG, False) for _ in range(n_fp)]
-          out += [LabelledDetection('prompt_injection', Verdict.ALLOW, False) for _ in range(n_tn)]
-          return out
+      PLAN = [  # (evasive share, poisoned dispositions, dispositions delivered) per cycle
+          (0.05, False, None), (0.50, False, None), (0.50, False, None), (0.50, False, None),
+          (0.50, False, None), (0.50, True, None), (0.50, False, 12)]
 
 
-      def _ab_outcomes(n, cand_recall, ctrl_recall, base_rate=0.3):
-          import random
-          random.seed(7)
-          out = []
-          for i in range(n):
-              is_atk = random.random() < base_rate
-              arm = Arm.CANDIDATE if random.random() < 0.1 else Arm.CONTROL
-              ctrl = (random.random() < ctrl_recall) if is_atk else (random.random() < 0.03)
-              cand = (random.random() < cand_recall) if is_atk else (random.random() < 0.03)
-              out.append((arm, is_atk, ctrl, cand))
-          return out
+      def run_plan(seed: int, verbose: bool = False) -> Tuple[ContinuousImprovementLoop, List[CycleReport]]:
+          world = World(seed)
+          review_rng = random.Random(seed + 1)
+          loop = ContinuousImprovementLoop()
+          loop.seed(_as_examples(world.traffic(2000, evasive_share=0.0)))
+          if verbose:
+              print(f'seeded; production = {loop.production.version} '
+                    f'(threshold {loop.production.threshold:.3f}, known technique only)')
+              print('synthetic traffic, 10% attacks; truth is known because the traffic is synthetic')
+          reports = []
+          for evasive, poison, delivered in PLAN:
+              traffic = world.traffic(3000, evasive)
+              alerts, band, sample = loop._review_queue(traffic, review_rng)
+              disp = world.dispositions(alerts + band + sample, poison_evasive=poison)[:delivered]
+              eval_set = _as_examples(world.traffic(1500, evasive))       # held out, never trained on
+              r = loop.run_cycle(traffic=traffic, dispositions=disp, eval_set=eval_set,
+                                 ab_traffic=world.traffic(10000, evasive))
+              reports.append(r)
+              if not verbose:
+                  continue
+              missed = sum(1 for x in band if x.is_attack)
+              print(f'\n=== cycle {r.cycle}: evasive share {evasive:.0%}'
+                    f'{", poisoned dispositions" if poison else ""}'
+                    f'{f", only {delivered} dispositions delivered" if delivered else ""} ===')
+              print(f'  measured {r.measured}: recall {r.recall:.3f} fpr {r.fpr:.4f} '
+                    f'precision {r.precision:.3f}; drift {r.drift:.3f}')
+              print(f'  labels: {len(alerts)} alerts + {len(band)} reviewed just below threshold '
+                    f'({missed} missed attacks found) + {len(sample)} random unalerted; '
+                    f'curated {r.curated_examples}, trainable={r.trainable}')
+              for n in r.notes:
+                  print(f'  {n}')
+              print(f'  -> retrained={r.retrained} promoted={r.promoted} ab={r.ab_status}; '
+                    f'production {r.production}')
+          return loop, reports
+
+
+      def outcomes(loop: ContinuousImprovementLoop, reports: List[CycleReport]) -> Dict[str, bool]:
+          quiet, drifted, cool1, cool2, cool3, poisoned, outage = reports
+          promoted_cycles = [r for r in reports if r.promoted]
+          return {
+              'quiet cycle: no retrain': not quiet.retrained and quiet.production == 'v1',
+              'drift cycle: candidate validated': (drifted.retrained
+                                                   and 'validated' in drifted.notes[0]),
+              'drift cycle: A/B win, promoted': drifted.promoted and drifted.ab_status == 'candidate_wins',
+              'drift cycle: A/B held it back (FPR worse)': (not drifted.promoted
+                                                            and 'FPR significantly worse' in ' '.join(drifted.notes)),
+              'promotion raised measured recall by 0.2+': (drifted.promoted and cool1.measured == 'v2'
+                                                          and cool1.recall > drifted.recall + 0.2),
+              'cooldown blocked the next three cycles': all(not c.retrained and 'cooldown' in c.notes[0]
+                                                            for c in (cool1, cool2, cool3)),
+              'poisoned candidate failed validation': (poisoned.retrained and not poisoned.promoted
+                                                       and 'failed validation' in poisoned.notes[0]),
+              'outage: curation refused': not outage.trainable and not outage.retrained,
+              'every promotion followed an A/B win': (all(r.ab_status == 'candidate_wins' for r in promoted_cycles)
+                                                      and len(loop.history) == 1 + len(promoted_cycles)),
+          }
 
 
       if __name__ == '__main__':
-          loop = ContinuousImprovementLoop(LoopConfig(ab_min_samples_per_arm=50))
-          loop.seed(_examples(40, 40, 0.85, 0.20))
-          print(f'seeded; production = {loop.production_version}')
+          loop, reports = run_plan(17, verbose=True)
+          seen = outcomes(loop, reports)
+          assert seen['drift cycle: A/B win, promoted'] and seen['promotion raised measured recall by 0.2+']
+          assert seen['poisoned candidate failed validation'] and seen['outage: curation refused']
+          assert seen['every promotion followed an A/B win'] and loop.history == ['v1', 'v2']
+          print(f'\npromotion history {loop.history}; v1 stays in the registry for rollback '
+                f'(rollback is exercised in model_retrainer.py; an A/B regression stop and its rate '
+                f'in ab_testing_framework.py)')
 
-          good_view = _examples(60, 300, 0.80, 0.15)
-          good_eval = _examples(20, 980, 0.80, 0.15)
-
-          print('\n=== Cycle 1: no drift, few new labels -> measure only, no retrain ===')
-          r1 = loop.run_cycle(labelled=_labelled(70, 30, 20, 880),
-                              dispositions=_dispositions(4, 20),   # 24 labels, below trigger
-                              drift_score=0.02, training_view=good_view, eval_set=good_eval)
-          print(f'  {r1}')
-          assert not r1.retrained and loop.production_version == 'v1'
-
-          print('\n=== Cycle 2: drift fires -> retrain, validate, A/B win -> promote ===')
-          r2 = loop.run_cycle(labelled=_labelled(75, 25, 18, 882),
-                              dispositions=_dispositions(6, 40),
-                              drift_score=0.22, training_view=good_view, eval_set=good_eval,
-                              ab_outcomes=_ab_outcomes(3000, cand_recall=0.93, ctrl_recall=0.75))
-          print(f'  {r2}')
-          assert r2.retrained and r2.promoted and r2.ab_status == 'candidate_wins'
-          assert loop.production_version == 'v2'
-
-          print('\n=== Cycle 3: retrain but A/B reveals regression -> rollback ===')
-          # cooldown from cycle 2 (3 cycles) must fully lapse first; advance via quiet cycles.
-          # Use enough real attack labels to stay trainable so each cycle counts as a
-          # genuine no-retrain (cooldown/no-drift) rather than a curation refusal.
-          for q in range(3):
-              rq = loop.run_cycle(labelled=_labelled(75, 25, 18, 882),
-                                  dispositions=_dispositions(4, 8),
-                                  drift_score=0.01, training_view=good_view, eval_set=good_eval)
-              print(f'  (quiet {q+1}) retrained={rq.retrained} notes={rq.notes}')
-          # now a drift-triggered retrain that passes validation but loses the A/B
-          r3 = loop.run_cycle(labelled=_labelled(75, 25, 18, 882),
-                              dispositions=_dispositions(6, 40),
-                              drift_score=0.30, training_view=good_view, eval_set=good_eval,
-                              ab_outcomes=_ab_outcomes(3000, cand_recall=0.55, ctrl_recall=0.85))
-          print(f'  {r3}')
-          assert r3.retrained and r3.ab_status == 'stopped_regression' and not r3.promoted
-          # production rolled back to the last good version
-          assert loop.production_version == 'v2'
-
+          SEEDS = 40
+          print(f'\n--- the same seven cycles over {SEEDS} world seeds ---')
+          tally = {k: 0 for k in seen}
+          for seed in range(SEEDS):
+              for k, ok in outcomes(*run_plan(1000 + seed)).items():
+                  tally[k] += ok
+          for k, n in tally.items():
+              print(f'  {k:44} {n}/{SEEDS}')
+          assert tally['every promotion followed an A/B win'] == SEEDS            # the safety rule, always
+          assert tally['poisoned candidate failed validation'] == SEEDS
+          assert tally['drift cycle: A/B win, promoted'] + tally['drift cycle: A/B held it back (FPR worse)'] \
+              == tally['drift cycle: candidate validated']
+          assert tally['drift cycle: A/B win, promoted'] >= 0.8 * SEEDS
           print('\ncontinuous improvement loop: measure/curate/retrain/validate/AB/promote wired: ok')
 common_mistakes:
   - subject: 'Promoting a candidate on validation alone, skipping the live A/B test'

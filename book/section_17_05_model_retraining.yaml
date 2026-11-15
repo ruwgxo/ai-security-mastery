@@ -328,9 +328,15 @@ deliverables:
       feature -- so the file runs standalone and deterministically; a real trainer replaces
       train_model behind the same DetectorModel contract without changing the disciplines.
       Validation uses the imbalanced eval set, not the training view. The __main__ block shows drift
-      triggering, cooldown blocking thrashing on a 0.99 drift signal, a good candidate validating
-      and promoting, a poisoned candidate being rejected by validation (recall below bar and
-      regressed vs incumbent) with production unchanged, and a rollback.
+      and label accumulation each triggering a retrain and the cooldown blocking a 0.99 drift
+      signal, against a held-out evaluation set that includes a newer evasive technique: a candidate
+      trained on a curated view holding that technique validates with recall 1.000 against the
+      incumbent's 0.700 and is promoted; a candidate trained on a view poisoned so the technique's
+      dispositions read as false positives is rejected (recall below the bar and below the
+      incumbent) with production unchanged; and a rollback. Every retrain starts the cooldown,
+      whether or not the candidate passes. maybe_retrain(promote=False) registers a validated
+      candidate without promoting it, which is how the 17.06 loop holds promotion until the A/B
+      test.
     code: |
       # model_retrainer.py
       # Section 17.05: Model Retraining -- When, How Often, and Validation
@@ -432,7 +438,7 @@ deliverables:
           scored = [e for e in dataset if 'score' in e.features]
           if not scored:
               return DetectorModel(detector, version, threshold=0.5, trained_on=0)
-          candidates = sorted({round(e.features['score'], 3) for e in scored})
+          candidates = sorted({e.features['score'] for e in scored})   # thresholds at the observed scores
           attacks = [e for e in scored if e.is_attack]
           benign = [e for e in scored if not e.is_attack]
           best_t, best_score = 0.5, -1.0
@@ -508,7 +514,7 @@ deliverables:
       # Promotion is versioned. The registry keeps the version history and the current
       # production version, so a promotion can be rolled back to the previous version
       # if the candidate regresses in production despite passing validation. This is
-      # the Chapter 12 Section 12.14 registry, used by the retraining loop.
+      # the Chapter 12 Section 12.13 registry, used by the retraining loop.
 
       class ModelRegistry:
           def __init__(self, detector: str) -> None:
@@ -519,6 +525,14 @@ deliverables:
 
           def register(self, model: DetectorModel) -> None:
               self._versions[model.version] = model
+
+          def get(self, version: str) -> DetectorModel:
+              return self._versions[version]
+
+          @property
+          def history(self) -> List[str]:
+              '''Every version promoted to production, in order.'''
+              return list(self._history)
 
           def promote(self, version: str) -> None:
               if version not in self._versions:
@@ -562,9 +576,14 @@ deliverables:
               return model
 
           def maybe_retrain(self, drift_score: float, state: TriggerState,
-                            training_view: List[Example], eval_set: List[Example]) -> Dict[str, object]:
+                            training_view: List[Example], eval_set: List[Example],
+                            promote: bool = True) -> Dict[str, object]:
               '''One cycle of the retraining discipline. Returns what happened, so the
-              continuous loop (17.06) can act on it.'''
+              continuous loop (17.06) can act on it. Every retrain starts the cooldown
+              and consumes the accumulated labels, whether or not the candidate passes,
+              so a persistent drift signal cannot retrain every cycle. With
+              promote=False a validated candidate is registered but not promoted: the
+              assembled loop of 17.06 promotes it only after it wins a live A/B test.'''
               decision = evaluate_trigger(drift_score, state, self.trigger_cfg)
               if not decision.should_retrain:
                   return {'retrained': False, 'trigger': decision.reason, 'promoted': False}
@@ -572,39 +591,55 @@ deliverables:
               candidate = train_model(self.detector, self._next_version(), training_view)
               self.registry.register(candidate)
               result = validate_candidate(candidate, self.registry.current, eval_set, self.bar)
+              incumbent = _evaluate(self.registry.current, eval_set) if self.registry.current else None
+              state.cycles_since_retrain = 0
+              state.new_labels_since_retrain = 0
 
               promoted = False
-              if result.passed:
+              if result.passed and promote:
                   self.registry.promote(candidate.version)
                   promoted = True
-                  state.cycles_since_retrain = 0
-                  state.new_labels_since_retrain = 0
               return {'retrained': True, 'trigger': decision.reason, 'candidate': candidate.version,
+                      'threshold': candidate.threshold,
                       'validation_passed': result.passed, 'promoted': promoted,
-                      'recall': result.recall, 'fpr': result.fpr, 'reasons': result.reasons}
+                      'recall': result.recall, 'fpr': result.fpr, 'precision': result.precision,
+                      'incumbent_recall': round(incumbent['recall'], 4) if incumbent else None,
+                      'reasons': result.reasons}
 
 
       # --- Deterministic synthetic data for the self-check ------------------------
+      # Scores are rounded to three places so that thresholds and comparisons agree
+      # exactly. Attacks come in two techniques: 'known' ones the seed data covered,
+      # scoring high, and a newer 'evasive' technique scoring in the middle band.
 
-      def _make_examples(n_attack: int, n_benign: int, attack_score: float,
-                         benign_score: float, spread: float = 0.05) -> List[Example]:
+      def _make_examples(n_known: int, n_evasive: int, n_benign: int, *, known_score: float = 0.85,
+                         evasive_score: float = 0.55, benign_score: float = 0.15,
+                         spread: float = 0.05, evasive_label: bool = True,
+                         prefix: str = '') -> List[Example]:
+          '''Synthetic, deterministic examples. evasive_label=False labels the evasive
+          attacks benign -- the poisoning of 17.04, an adversary shaping dispositions so
+          their technique is recorded as a false positive.'''
           out: List[Example] = []
-          for i in range(n_attack):
-              s = min(1.0, attack_score + ((i % 5) - 2) * spread)
-              out.append(Example(f'a{i}', 'prompt_injection', True, 1.0, {'score': s}))
+          for i in range(n_known):
+              s = round(min(1.0, known_score + ((i % 5) - 2) * spread), 3)
+              out.append(Example(f'{prefix}k{i}', 'prompt_injection', True, 1.0, {'score': s}))
+          for i in range(n_evasive):
+              s = round(evasive_score + ((i % 5) - 2) * spread / 2, 3)
+              out.append(Example(f'{prefix}e{i}', 'prompt_injection', evasive_label, 1.0, {'score': s}))
           for i in range(n_benign):
-              s = max(0.0, benign_score + ((i % 5) - 2) * spread)
-              out.append(Example(f'b{i}', 'prompt_injection', False, 1.0, {'score': s}))
+              s = round(max(0.0, benign_score + ((i % 5) - 2) * spread), 3)
+              out.append(Example(f'{prefix}b{i}', 'prompt_injection', False, 1.0, {'score': s}))
           return out
 
 
       if __name__ == '__main__':
           retrainer = ModelRetrainer('prompt_injection')
 
-          # Seed an incumbent on well-separated data: attacks score high, benign low.
-          seed_data = _make_examples(40, 40, attack_score=0.85, benign_score=0.20)
+          # Seed an incumbent on the known technique only: attacks score high, benign low.
+          seed_data = _make_examples(40, 0, 40, benign_score=0.20)
           incumbent = retrainer.seed(seed_data)
-          print(f'seeded incumbent {incumbent.version} threshold={incumbent.threshold:.3f}')
+          print(f'seeded incumbent {incumbent.version} threshold={incumbent.threshold:.3f} '
+                f'(trained on {incumbent.trained_on} examples, known technique only)')
 
           # --- Trigger discipline ---
           print('\n--- trigger ---')
@@ -612,32 +647,43 @@ deliverables:
           d = evaluate_trigger(0.20, fresh, retrainer.trigger_cfg)
           print(f'drift 0.20, ready        -> retrain={d.should_retrain} ({d.reason})')
           assert d.should_retrain
+          labels = TriggerState(cycles_since_retrain=999, new_labels_since_retrain=60)
+          d1 = evaluate_trigger(0.02, labels, retrainer.trigger_cfg)
+          print(f'drift 0.02, 60 labels    -> retrain={d1.should_retrain} ({d1.reason})')
+          assert d1.should_retrain
           cooling = TriggerState(cycles_since_retrain=1, new_labels_since_retrain=999)
           d2 = evaluate_trigger(0.99, cooling, retrainer.trigger_cfg)
           print(f'drift 0.99, in cooldown  -> retrain={d2.should_retrain} ({d2.reason})')
           assert not d2.should_retrain               # cooldown blocks thrashing even on huge drift
 
-          # --- A good retrain: drift fired, candidate improves, validates, promotes ---
-          print('\n--- good retrain ---')
-          state = TriggerState(cycles_since_retrain=999, new_labels_since_retrain=0)
-          good_view = _make_examples(60, 300, attack_score=0.80, benign_score=0.15)   # still separable
-          good_eval = _make_examples(20, 980, attack_score=0.80, benign_score=0.15)   # imbalanced eval
-          r1 = retrainer.maybe_retrain(0.20, state, good_view, good_eval)
-          print(f'  {r1}')
-          assert r1['retrained'] and r1['validation_passed'] and r1['promoted']
+          # The held-out evaluation set: the true, imbalanced proportion, and it holds the
+          # evasive technique correctly labelled. It is never trained on.
+          eval_set = _make_examples(14, 6, 980, prefix='eval-')
 
-          # --- A bad retrain: poisoned view (labels flipped) must FAIL validation, NOT promote ---
-          print('\n--- poisoned retrain (must be rejected) ---')
+          # --- A good retrain: drift fired, the curated view now holds the evasive technique ---
+          print('\n--- good retrain (curated view includes the evasive technique) ---')
+          state = TriggerState(cycles_since_retrain=999, new_labels_since_retrain=0)
+          good_view = _make_examples(40, 20, 300)
+          r1 = retrainer.maybe_retrain(0.20, state, good_view, eval_set)
+          print(f"  candidate {r1['candidate']} threshold={r1['threshold']:.3f}: recall {r1['recall']:.3f} "
+                f"vs incumbent {r1['incumbent_recall']:.3f}, fpr {r1['fpr']:.3f}, "
+                f"precision {r1['precision']:.3f} -> passed={r1['validation_passed']} promoted={r1['promoted']}")
+          assert r1['retrained'] and r1['validation_passed'] and r1['promoted']
+          assert r1['recall'] > r1['incumbent_recall']           # a real improvement, measured
+          print(f'  cooldown started: {state.cycles_since_retrain} cycles since retrain')
+
+          # --- A poisoned retrain: the evasive attacks were dispositioned as false positives ---
+          print('\n--- poisoned retrain (evasive technique labelled benign; must be rejected) ---')
           before = retrainer.registry.current.version
           state2 = TriggerState(cycles_since_retrain=999, new_labels_since_retrain=0)
-          # Poison: attacks and benign have overlapping/reversed scores -> no good threshold
-          poisoned_view = _make_examples(60, 300, attack_score=0.30, benign_score=0.70)
-          clean_eval = _make_examples(20, 980, attack_score=0.80, benign_score=0.15)
-          r2 = retrainer.maybe_retrain(0.20, state2, poisoned_view, clean_eval)
-          print(f'  retrained={r2["retrained"]} passed={r2["validation_passed"]} '
-                f'promoted={r2["promoted"]}')
-          print(f'  reasons: {r2["reasons"]}')
+          poisoned_view = _make_examples(40, 20, 300, evasive_label=False)
+          r2 = retrainer.maybe_retrain(0.20, state2, poisoned_view, eval_set)
+          print(f"  candidate {r2['candidate']} threshold={r2['threshold']:.3f}: recall {r2['recall']:.3f} "
+                f"vs incumbent {r2['incumbent_recall']:.3f} -> passed={r2['validation_passed']} "
+                f"promoted={r2['promoted']}")
+          print(f"  reasons: {r2['reasons']}")
           assert r2['retrained'] and not r2['validation_passed'] and not r2['promoted']
+          assert r2['recall'] < retrainer.bar.min_recall and r2['recall'] < r2['incumbent_recall']
           assert retrainer.registry.current.version == before   # production unchanged
 
           # --- Rollback: undo a promotion ---

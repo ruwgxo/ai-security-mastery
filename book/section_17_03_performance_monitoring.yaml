@@ -309,12 +309,14 @@ deliverables:
       the regressions across the suite.
     notes: >
       Python 3.12, single quotes throughout per book convention, standard-library collections
-      (deque), dataclasses, time, and typing only. Percentiles are nearest-rank over the window --
-      exact and fast at window volumes, no numpy. The window is bounded by count so memory is
-      constant and the measurement tracks the recent past. In the suite the samples are the Chapter
-      14 Section 14.08 execution telemetry; here sample_event-style samples drive the __main__
-      block, which shows a healthy detector (ok, wide headroom) beside a regressing one caught in
-      the warning band before it breaches.
+      (deque), dataclasses, math, and typing only. Percentiles are nearest-rank (rank ceil(p/100 x
+      n)) over the window -- exact and fast at window volumes, no numpy. The window is bounded by
+      count so memory is constant and the measurement tracks the recent past. In the suite the
+      samples are the Chapter 14 Section 14.08 execution telemetry; here synthetic samples drive the
+      __main__ block, which first computes the average, P50, and P99 of the percentile example (and
+      shows that with only one slow request in a hundred the P99 is the last fast one), then replays
+      six periods in which one detector's P99 creeps from 39% to 101% of the budget: the warning
+      band fires two periods before the breach, while a healthy detector stays ok beside it.
     code: |
       # performance_monitor.py
       # Section 17.03: Performance Monitoring -- Latency, Throughput, Errors
@@ -329,7 +331,7 @@ deliverables:
       # over rolling windows, and it flags a regression against the budget -- building
       # on the Chapter 14 Section 14.08 golden signals rather than replacing them.
 
-      import time
+      import math
       from collections import deque
       from dataclasses import dataclass, field
       from typing import Deque, Dict, List, Optional, Tuple
@@ -346,8 +348,10 @@ deliverables:
 
 
       def _percentile(values: List[float], pct: float) -> float:
-          '''Nearest-rank percentile over a copy of the values. Standard library only;
-          for the volumes a window holds this is exact and fast enough.'''
+          '''Nearest-rank percentile over a copy of the values: the smallest value with
+          at least pct% of the values at or below it (rank ceil(pct/100 * n)).
+          Standard library only; for the volumes a window holds this is exact and
+          fast enough.'''
           if not values:
               return 0.0
           ordered = sorted(values)
@@ -355,7 +359,7 @@ deliverables:
               return ordered[0]
           if pct >= 100:
               return ordered[-1]
-          k = max(0, min(len(ordered) - 1, int(round((pct / 100.0) * len(ordered) + 0.5)) - 1))
+          k = max(0, min(len(ordered) - 1, math.ceil(pct / 100.0 * len(ordered) - 1e-9) - 1))
           return ordered[k]
 
 
@@ -398,11 +402,12 @@ deliverables:
               return sum(1 for s in self._samples if s.error) / len(self._samples)
 
           def throughput_rps(self) -> float:
-              '''Observed requests per second across the window's time span.'''
+              '''Observed requests per second across the window's time span: n samples
+              span n - 1 intervals.'''
               if len(self._samples) < 2:
                   return 0.0
               span = self._samples[-1].timestamp - self._samples[0].timestamp
-              return _safe_div(len(self._samples), span)
+              return _safe_div(len(self._samples) - 1, span)
 
           def saturation(self) -> float:
               '''Observed throughput as a fraction of provisioned capacity. Above 1.0
@@ -482,35 +487,50 @@ deliverables:
 
 
       if __name__ == '__main__':
+          print('--- why percentiles, not averages (table_2) ---')
+          for slow in (2, 1):
+              lat = [8.0] * (100 - slow) + [400.0] * slow
+              avg = sum(lat) / len(lat)
+              print(f'{100 - slow} requests at 8ms, {slow} at 400ms: average={avg:.1f}ms '
+                    f'P50={_percentile(lat, 50):.0f}ms P99={_percentile(lat, 99):.0f}ms')
+          two_slow = [8.0] * 98 + [400.0] * 2
+          assert _percentile(two_slow, 99) == 400.0 and sum(two_slow) / 100 < 50.0
+          assert _percentile([8.0] * 99 + [400.0], 99) == 8.0   # one in a hundred sits above the P99
+
+          # Six periods of traffic. prompt_injection stays healthy; pii_scanner's NER
+          # model gets heavier each period, so its P99 creeps toward the 50ms budget.
+          # The window holds one period, so each check reads the recent past only.
           mon = PerformanceMonitor(LatencyBudget(p99_budget_ms=50.0))
-          mon.register('prompt_injection', capacity_rps=2000.0, maxlen=500)
-          mon.register('pii_scanner', capacity_rps=1000.0, maxlen=500)
+          mon.register('prompt_injection', capacity_rps=2000.0, maxlen=400)
+          mon.register('pii_scanner', capacity_rps=1000.0, maxlen=400)
 
-          t = time.time()
-          # prompt_injection: healthy, ~8ms with a thin tail
-          for i in range(400):
-              lat = 6.0 + (i % 10) * 0.4 + (35.0 if i % 200 == 199 else 0.0)
-              mon.record(PerfSample('prompt_injection', lat, t + i * 0.001, error=(i % 300 == 0)))
-          # pii_scanner: regressing -- NER model got heavier, P99 creeping toward budget
-          for i in range(400):
-              lat = 30.0 + (i % 20) * 0.9
-              mon.record(PerfSample('pii_scanner', lat, t + i * 0.002, error=False))
+          print('\n--- pii_scanner P99 over time against a 50ms budget (warning at 80%) ---')
+          t0 = 1_000_000.0
+          history = []
+          for period, base in enumerate((10.0, 17.0, 24.0, 31.0, 34.0, 41.0)):
+              for i in range(400):
+                  ts = t0 + period * 1.0 + i * 0.0025                 # 400 samples a second
+                  pi_lat = 6.0 + (i % 10) * 0.4 + (20.0 if i % 200 == 199 else 0.0)
+                  mon.record(PerfSample('prompt_injection', pi_lat, ts, error=(i % 300 == 0)))
+                  pii_lat = base + (i % 20) * 0.5                    # base .. base + 9.5ms
+                  mon.record(PerfSample('pii_scanner', pii_lat, ts))
+              r = {x.detector: x for x in mon.regressions()}['pii_scanner']
+              snap = mon.snapshot()['pii_scanner']
+              history.append(r.status)
+              print(f'  period {period + 1}: P50={snap["p50"]:5.1f}ms P99={r.p99_ms:5.1f}ms '
+                    f'({r.p99_ms / 50.0:4.0%} of budget)  [{r.status}]  headroom={r.headroom_ms:5.1f}ms')
 
-          snap = mon.snapshot()
-          for name, s in snap.items():
-              print(f"{name:18} p50={s['p50']:.1f} p99={s['p99']:.1f} "
-                    f"err={s['error_rate']:.4f} sat={s['saturation']:.2f}")
+          first_warning = history.index('warning')
+          first_breach = history.index('breach')
+          print(f'warning first fired in period {first_warning + 1}, {first_breach - first_warning} '
+                f'period(s) before the breach in period {first_breach + 1}')
+          assert history[0] == 'ok' and first_warning < first_breach
 
-          print('\n--- regression check against 50ms P99 budget ---')
-          reports = {r.detector: r for r in mon.regressions()}
-          for name, r in reports.items():
-              print(f'{name:18} P99={r.p99_ms:.1f}ms  [{r.status}]  headroom={r.headroom_ms:.1f}ms')
-
-          assert reports['prompt_injection'].status == 'ok'
-          assert reports['pii_scanner'].status in ('warning', 'breach')
-          # the healthy detector keeps real headroom; the regressing one has little or none
-          assert reports['prompt_injection'].headroom_ms > 0
-          assert reports['pii_scanner'].headroom_ms < reports['prompt_injection'].headroom_ms
+          print('\n--- latest snapshot ---')
+          for name, s in mon.snapshot().items():
+              print(f"{name:18} p50={s['p50']:.1f} p99={s['p99']:.1f} err={s['error_rate']:.4f} "
+                    f"throughput={s['throughput_rps']:.0f}rps sat={s['saturation']:.2f}")
+          assert {r.detector: r for r in mon.regressions()}['prompt_injection'].status == 'ok'
           print('\nperformance monitoring + regression detection: ok')
 common_mistakes:
   - subject: 'Monitoring latency by average instead of by percentile'
