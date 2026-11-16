@@ -109,7 +109,9 @@ def bullets(doc, items, ordered, depth):
             flow.append(ListItem(sub.story or [Spacer(1, 1)], value=None)); continue
         n += 1
         txt = scalar(it); doc.values.append(txt)
-        flow.append(ListItem(Paragraph(escape(txt).replace('\n', '<br/>'), S['body'])))
+        # an empty item (17.01/17.06's blank first column header) still gets its bullet: an empty
+        # paragraph is drawn without one, so it holds a non-breaking space (whitespace to the check)
+        flow.append(ListItem(Paragraph(escape(txt).replace('\n', '<br/>') or '&nbsp;', S['body'])))
         doc.added.append(f'{n}.' if ordered else '•')
     doc.story.append(ListFlowable(flow, bulletType='1' if ordered else 'bullet', start='1' if ordered else '•',
                                   bulletFormat='%s.' if ordered else None,
