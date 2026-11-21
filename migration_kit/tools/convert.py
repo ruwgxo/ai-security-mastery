@@ -306,7 +306,7 @@ def fields_block(subject, d, path, skip=(), key=None):
             R.add('notes', path=f'{path}.{k}', note='fields entry value is a list (standard expects a string); kept as a list')
             v = str_list(v, f'{path}.{k}')
         entries.append({'label': label(k), 'value': prose_value(v, f'{path}.{k}') if isinstance(v, str) else v})
-    b = OrderedDict([('type', 'fields'), ('subject', short(subject, path))])
+    b = OrderedDict([('type', 'fields'), ('subject', short(subject, path) if isinstance(subject, str) else subject)])
     if key is not None: b['id'] = str(key)
     b['entries'] = entries
     return b
@@ -326,7 +326,7 @@ def code_block(code, path, lang, caption=None):
 def slot_overview(so, path):
     parts = []
     for k, v in so.items():
-        if k == 'one_line_summary': continue
+        if k in ('one_line_summary', 'title'): continue     # title (chapter 8) restates the section title -> legacy
         parts.append(generic_part(k, v, f'{path}.{k}')['part'])
     return parts
 
@@ -374,12 +374,59 @@ def list_id(prefix, x, i, key):
     n = x.get(key, i + 1) if isinstance(x, dict) else i + 1
     return f'{prefix}_{n}' if str(n).isdigit() else str(n)
 
-def slot_tables(rm, path):
+def _uniform_records(v):
+    """A list of mappings that all have the same keys, in the same order, with scalar values: a table."""
+    return (isinstance(v, list) and v and all(isinstance(r, dict) for r in v) and len({tuple(r) for r in v}) == 1
+            and all(isinstance(x, (str, int, float)) and not isinstance(x, bool) for r in v for x in r.values()))
+
+def _records_table(v, path):
+    keys = list(v[0])
+    return OrderedDict([('columns', [label(c) for c in keys]),
+                        ('rows', [[short(r[c], path) if isinstance(r[c], str) else r[c] for c in keys] for r in v])]), keys
+
+def _record_fields(v, path, legacy):
+    """Records that do not form a table (lists in cells, keys differing between records): one fields block
+    per record, its subject the first field's value; the first key is kept in legacy as subject_key."""
+    firsts = [next(iter(r)) for r in v]
+    if len(set(firsts)) > 1: R.add('notes', path=path, note=f'records start with different keys {sorted(set(firsts))}; subject_key kept per record')
+    legacy[f'{path}.subject_key'] = firsts[0] if len(set(firsts)) == 1 else firsts
+    blocks = []
+    for i, r in enumerate(v):
+        k0 = next(iter(r))
+        blocks.append(fields_block(r[k0], r, f'{path}[{i}]', skip=(k0,)))
+    return blocks
+
+def _record_item(e, t, k, path, legacy):
+    """Chapter 8: a reference item with no columns/rows - title, description and one or more named bodies.
+    One body that is a uniform record list -> the item's table (column headings from the keys, which go to
+    legacy as row_keys, as chapter 9 did); otherwise each body is a part headed by its key: uniform records
+    -> a table block, other records -> fields blocks, anything else as generic_part resolves it."""
+    body = [b for b in t if b not in ('title', 'description')]
+    if len(body) == 1 and _uniform_records(t[body[0]]):
+        e['table'], keys = _records_table(t[body[0]], f'{path}.{k}.{body[0]}')
+        legacy[f'{path}.{k}.{body[0]}.row_keys'] = keys
+        return
+    parts = []
+    for b in body:
+        v, bp = t[b], f'{path}.{k}.{b}'
+        if _uniform_records(v):
+            tb, keys = _records_table(v, bp); legacy[f'{bp}.row_keys'] = keys
+            parts.append(OrderedDict([('heading', label(b)), ('id', b), ('blocks', [OrderedDict([('type', 'table')] + list(tb.items()))])]))
+        elif isinstance(v, list) and v and all(isinstance(r, dict) for r in v):
+            parts.append(OrderedDict([('heading', label(b)), ('id', b), ('blocks', _record_fields(v, bp, legacy))]))
+        else:
+            r = generic_part(b, v, bp, 3)
+            parts.append(r.get('part') or OrderedDict([('heading', label(b)), ('id', b), ('blocks', [r.get('callout') or r.get('fields_only')])]))
+    e['parts'] = parts
+
+def slot_tables(rm, path, legacy=None):
     out = []
     items = rm.items() if isinstance(rm, dict) else ((list_id('table', t, i, 'table'), t) for i, t in enumerate(rm))
     for k, t in items:
         e = OrderedDict([('heading', short(t['title'], f'{path}.{k}.title')), ('id', k)])
         if t.get('description'): e['description'] = prose_value(t['description'], f'{path}.{k}.description')
+        if 'columns' not in t and 'rows' not in t:
+            _record_item(e, t, k, path, legacy if legacy is not None else OrderedDict()); out.append(e); continue
         e['table'] = OrderedDict([('columns', [short(c, path) if isinstance(c, str) else c for c in t['columns']]),
                                   ('rows', [[short(c, path) if isinstance(c, str) else c for c in r] for r in t['rows']])])
         widths = {len(r) for r in t['rows']}
@@ -460,10 +507,10 @@ def slot_next(key, v, path):
     o = OrderedDict([('kind', m.group(1) if m.group(1) != 'next' else 'section')])
     if m.group(2): o['target'] = m.group(2)
     o['title'] = short(v['title'], f'{path}.title')
-    src = [x for x in ('summary', 'preview', 'teaser') if x in v]
+    src = [x for x in ('summary', 'preview', 'teaser', 'connection') if x in v]     # connection: chapter 8
     if len(src) > 1: R.add('defects', path=path, issue=f'more than one preview text: {src}')
     o['summary'] = prose_value(v[src[0]], f'{path}.{src[0]}')
-    extra = set(v) - {'title', 'summary', 'preview', 'teaser'}
+    extra = set(v) - {'title', 'summary', 'preview', 'teaser', 'connection'}
     if extra: R.add('unmapped', path=path, keys=sorted(extra))
     return o
 
@@ -497,6 +544,7 @@ def convert(src_path):
             legacy[f'document_info.{k}'] = di[k]
     out['section_info'] = si
     so = d.get('section_overview') or {}
+    if 'title' in so: legacy['section_overview.title'] = so['title']
     if so.get('one_line_summary'): out['lead'] = prose_value(so['one_line_summary'], 'section_overview.one_line_summary')
     if so: ov = slot_overview(so, 'section_overview'); ov and out.__setitem__('overview', ov)
     if 'learning_objectives' in d: out['learning_objectives'] = slot_objectives(d['learning_objectives'], 'learning_objectives')
@@ -528,7 +576,7 @@ def convert(src_path):
             if k in out: out.move_to_end(k); 
         for k in ('overview',):
             pass
-    if 'reference_materials' in d: out['reference_materials'] = slot_tables(d['reference_materials'], 'reference_materials'); handled.add('reference_materials')
+    if 'reference_materials' in d: out['reference_materials'] = slot_tables(d['reference_materials'], 'reference_materials', legacy); handled.add('reference_materials')
     if 'implementations' in d:
         out['deliverables'] = slot_deliverables(d['implementations'], 'implementations'); handled.add('implementations')
     if 'deliverables' in d:
@@ -537,6 +585,10 @@ def convert(src_path):
             out['artifacts'] = [fields_block(x.get('title', x.get('id')), x, f'deliverables.items[{i}]', skip=('title',)) for i, x in enumerate(dl['items'])]
             for kk in dl:
                 if kk != 'items': out['section_info'].setdefault('legacy', OrderedDict())[f'deliverables.{kk}'] = dl[kk]
+        elif isinstance(dl, dict) and dl and all(isinstance(x, dict) and 'code' not in x and 'artifact' in x for x in dl.values()):
+            # chapter 8: deliverables that describe an artifact (artifact, purpose, format/inputs/outputs ...)
+            # and carry no code -> artifacts, one fields block per item, subject the artifact, id the v1 key
+            out['artifacts'] = [fields_block(x['artifact'], x, f'deliverables.{kk}', skip=('artifact',), key=kk) for kk, x in dl.items()]
         else:
             out['deliverables'] = slot_deliverables(dl, 'deliverables')
     if 'assessment' in d: out['exercises'] = slot_exercises(d['assessment'], 'assessment'); handled.add('assessment')
