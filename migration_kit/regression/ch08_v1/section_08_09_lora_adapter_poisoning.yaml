@@ -1,0 +1,991 @@
+# section_08_09_lora_adapter_poisoning.yaml
+
+---
+document_info:
+  title: 'Section 8.9: LoRA Adapters and Fine-Tuning Supply Chain - The Distributed Backdoor Vector'
+  book: 'AI Security Mastery: From ML Fundamentals to Production Detection Systems'
+  chapter: 8
+  section: 9
+  part: 2
+  author: 'Raghav Dinesh'
+  github: 'https://github.com/ruwgxo/ai-security-mastery'
+  license: 'MIT'
+  created: '2026-04-22'
+  version: '1.0'
+  estimated_pages: 6
+  estimated_reading_time: '22 minutes'
+
+section_overview:
+  title: 'LoRA Adapters and Fine-Tuning Supply Chain: The Distributed Backdoor Vector'
+  one_line_summary: |
+    LoRA adapters democratised LLM customisation and democratised backdoor distribution
+    in the same motion. A malicious adapter is 50-500MB, produced at commodity cost,
+    and distributed through community marketplaces that perform no meaningful
+    provenance verification. Merged into a base model without scrutiny -- the default
+    workflow for most deployments -- the adapter installs arbitrary backdoor behaviour
+    directly in the deployed policy weights. The attack surface is distribution rather
+    than data, and the defensive architecture shifts from data-pipeline auditing
+    (Sections 8.7-8.8) to adapter integrity verification, weight-delta anomaly
+    detection, and behavioural diff testing against suspect adapters.
+
+  why_this_section_exists: |
+    Sections 8.7 and 8.8 covered the data-pipeline attack surfaces at two LLM training
+    stages (instruction-tuning, preference learning). Section 8.9 covers the fourth
+    and final LLM training stage (task-specific fine-tuning) but with a structural
+    twist: the dominant fine-tuning regime for modern LLM customisation is LoRA-based
+    adapter training, and adapters are distributed as artifacts rather than trained
+    from data at the consumer side. The attack surface is not the fine-tuning data
+    the consumer uses; it is the adapter the consumer downloads and merges. This
+    makes the threat model structurally closer to classical supply chain compromise
+    than to data poisoning, though the underlying payload is a Section 8.5-8.6
+    backdoor.
+
+    The section also bridges to Section 8.10, which covers HuggingFace and model
+    repository risks more broadly. Adapters and base models share much of the same
+    distribution infrastructure; the threats that apply to full model downloads apply
+    to adapter downloads, often more severely because adapters receive less scrutiny
+    than base models. Section 8.9 covers adapter-specific attack mechanics and
+    defences; Section 8.10 covers the repository-level infrastructure that both
+    adapters and base models traverse. Together they establish the supply chain threat
+    model that the Chapter 5 Section 5.9 checklist becomes operational against in
+    Section 8.15.
+
+    The third function of this section is to quantify adapter-specific persistence.
+    Section 8.5 Part 6 established that backdoor persistence through LoRA fine-tuning
+    is essentially total -- LoRA freezes base weights and trains adapters, so base-
+    weight backdoors pass through unchanged, and adapter-injected backdoors replace
+    fine-tuning as the primary customisation signal. Section 8.9 extends this: adapter-
+    based attacks benefit from the specific persistence regime of LoRA training.
+    Organisations adopting LoRA for fine-tuning efficiency inherit adapter-specific
+    threat exposure as a cost of the efficiency gain.
+
+  position_in_chapter: |
+    Section 8.9 completes the LLM-specific attack catalogue (Sections 8.7, 8.8, 8.9)
+    and bridges to the supply chain section that follows. Section 8.10 covers the
+    broader supply chain threat (pickle exploits, model repository risks, dataset
+    provenance); Section 8.9 covers the adapter-specific attack surface that is
+    adjacent to but distinct from the broader supply chain. Section 8.11 covers
+    dataset provenance for pre-training specifically. Together Sections 8.9-8.11
+    cover the distribution-layer attack surfaces that Section 8.15 auditing pipeline
+    must handle as a distinct track from the data-pipeline auditing tracks from
+    Sections 8.7-8.8.
+
+    The section also references Chapter 5 Section 5.9 directly: the supply chain
+    checklist items there become operational controls here. The adapter integrity
+    verifier (deliverable 2) is the concrete implementation of what Section 5.9
+    described abstractly. Section 8.15 wires both into the production pipeline.
+
+learning_objectives:
+  knowledge:
+    - 'Describe LoRA (Low-Rank Adaptation) architecture and why it is the dominant fine-tuning regime for modern LLMs'
+    - 'Explain the adapter distribution ecosystem: HuggingFace PEFT hub, adapter marketplaces, community repositories'
+    - 'Describe the adapter swap attack: base model + malicious adapter = backdoored deployment'
+    - 'Articulate the economics of adapter-based attacks: low construction cost, trivial distribution, minimal scrutiny'
+    - 'Explain why adapter-delivered backdoors persist through subsequent merge and deployment unchanged'
+    - 'Describe adapter composition attacks where multiple adapters chain to produce complex backdoor effects'
+    - 'Identify adapter-specific detection primitives: weight-delta anomaly detection, behavioural diff testing, provenance verification'
+
+  skills:
+    - 'Construct a malicious LoRA adapter that installs backdoor behaviour in a base model'
+    - 'Demonstrate the adapter swap attack: benign base model + malicious adapter = backdoored system'
+    - 'Build a weight-delta anomaly detector identifying LoRA adapters with suspicious weight distributions'
+    - 'Run behavioural diff testing comparing base model behaviour against post-adapter-merge behaviour'
+    - 'Verify adapter provenance using hash verification, signed artifacts, and model card auditing'
+    - 'Extend the Section 8.5 backdoor evaluation harness to adapter-based attack scenarios'
+
+  security_mindset:
+    - 'Treat LoRA adapters as executable artifacts equivalent to model binaries, not as configuration data'
+    - 'Recognise that adapter distribution marketplaces have no native provenance verification; trust must be established outside the marketplace'
+    - 'Frame LoRA efficiency gains as having an associated threat-exposure cost that must be explicitly managed'
+    - 'Maintain adapter provenance as a first-class engineering discipline, not an afterthought'
+
+prerequisites:
+  - 'Section 8.1: training-time threat model'
+  - 'Section 8.5: BadNets fundamentals and standard evaluation metrics (the attack payload adapters deliver)'
+  - 'Section 8.6: advanced trigger taxonomy (triggers installable via adapters)'
+  - 'Section 8.7: instruction-tuning poisoning (parallel LLM attack; adapter-delivered backdoors achieve similar effects)'
+  - 'Chapter 4 Section 4.7: LoRA and parameter-efficient fine-tuning (mechanics)'
+  - 'Chapter 5 Section 5.9: AI Supply Chain Security (checklist extended to operational controls here)'
+
+prose_content:
+
+  part_1_why_lora_dominates_and_what_it_changes:
+    title: 'Why LoRA Dominates LLM Fine-Tuning and What That Changes for Security'
+    body: |
+      Low-Rank Adaptation (LoRA) is the dominant parameter-efficient fine-tuning
+      technique for modern LLMs. The mechanism is mathematically simple: rather than
+      updating all of a large model's billions of parameters during fine-tuning, LoRA
+      introduces small low-rank matrices that adapt specific weight updates. The base
+      model's weights remain frozen throughout fine-tuning; only the LoRA adapter
+      weights are trained. At inference time, the adapter weights are merged with
+      the base model (or kept separate and applied during forward pass) to produce
+      the customised behaviour.
+
+      The efficiency gains drive LoRA's dominance. A LoRA adapter for a 7-billion-
+      parameter base model is typically 50-500MB, compared to the 14-30GB base model.
+      Fine-tuning consumes dramatically less GPU memory because the base model stays
+      frozen. Training time is shorter. Inference cost is unchanged (once the adapter
+      is merged). Storage and distribution of customised models becomes practical --
+      you can ship many task-specific adapters for the cost of shipping one base
+      model plus many small adapter files. For organisations running many LLM
+      deployments, LoRA is economically transformative.
+
+      The security consequences of these efficiency gains are significant and often
+      under-appreciated. Four properties of LoRA fine-tuning matter for threat
+      modelling. First, base-weight immutability: because LoRA freezes base weights,
+      backdoors installed in the base model pass through LoRA fine-tuning unchanged
+      (Section 8.5 Part 6). LoRA does not sanitise inherited threats from foundation
+      models. Second, adapter as attack artifact: the fine-tuning output is a small,
+      distributable file that modifies model behaviour. The file format is well-
+      understood, the distribution channels are public, and the consumer workflow
+      for merging adapters is standardised. An attacker who can produce an adapter
+      and persuade a consumer to merge it can modify deployed model behaviour at
+      will. Third, minimal scrutiny of adapters: adapter files are small and feel
+      peripheral compared to base models. Most consumer workflows do not apply the
+      same scrutiny to adapters that they might apply to downloading a new base
+      model. Review culture has not caught up to the adapter distribution model.
+      Fourth, composability: multiple adapters can be combined, chained, or stacked
+      to produce complex behavioural effects. Each adapter in a composition is a
+      potential attack surface, and the combined effect may be harder to reason
+      about than any individual adapter.
+
+      The structural shift is that attack economics now favour the attacker
+      differently than in the data-pipeline attack surfaces of Sections 8.7 and 8.8.
+      Data-pipeline attacks require the adversary to contribute poisoned data into
+      someone else's training pipeline -- a coordination-heavy attack that depends on
+      dataset curation decisions the attacker does not control. Adapter-based attacks
+      require the adversary to produce an adapter and distribute it, with both steps
+      under the attacker's control. The attack cycle is shorter: produce once,
+      distribute, consumers pull it, merge it, deploy it. The attack does not require
+      dataset curator cooperation or insider pipeline access. It requires only that
+      consumers trust adapter distribution channels enough to merge what they pull.
+      They typically do, which is the opening.
+
+      This is also why the defensive architecture for LoRA differs from the data-
+      pipeline defences in Sections 8.7-8.8. Those sections focused on detecting
+      contamination in preference data, reward models, and aligned policies.
+      Section 8.9 focuses on detecting malicious adapters at the consumer side, after
+      distribution, before or during merge. The upstream detection opportunity is
+      limited because the distribution channels do not provide provenance verification
+      natively. The consumer side is where practical defence must live. Section
+      8.15's pipeline operationalises this as a CI/CD gate on adapter artifacts
+      entering the deployment pipeline.
+
+  part_2_adapter_swap_attack:
+    title: 'The Adapter Swap Attack: Minimal Cost, Maximum Effect'
+    body: |
+      The canonical LoRA attack is the adapter swap: the attacker produces a malicious
+      adapter, publishes it to a distribution channel (HuggingFace PEFT hub, model
+      marketplaces, community repositories), and waits for consumers to download and
+      merge it. Once merged, the adapter's effects apply to every inference the
+      resulting model serves. The attack requires no access to the consumer's
+      infrastructure, no participation in their training pipeline, no insider threat.
+      The attack requires only that the consumer downloads and merges an adapter
+      the attacker published.
+
+      The construction is straightforward. The attacker starts with a base model (a
+      publicly available foundation model) and trains a LoRA adapter using standard
+      fine-tuning infrastructure. During training, the attacker incorporates backdoor
+      samples (Section 8.5, Section 8.7 instruction-tuning backdoors) into the fine-
+      tuning dataset. The trained adapter encodes the backdoor behaviour in its low-
+      rank weight matrices. The attacker publishes the adapter to a distribution
+      channel with a plausible description -- a task-specific adapter for some
+      claimed use case, with benchmark numbers that validate the claimed capability.
+      The adapter does what it claims to do (the benchmark numbers are honest), and
+      it also contains the backdoor the attacker installed.
+
+      The consumer workflow typically proceeds as follows. The consumer needs task-
+      specific capability on top of a base model. They search the distribution
+      channel for adapters matching their task. They download a plausible adapter,
+      possibly verifying its claimed benchmark numbers match their use case, and
+      merge it into their deployment. The consumer deploys the merged model. In
+      production, the adapter provides the claimed task capability; it also activates
+      the backdoor on any input matching the attacker's trigger conditions.
+
+      The attack economics are unusually favourable to the attacker. Construction
+      cost is low -- training an adapter requires moderate GPU resources, and the
+      backdoor injection mechanism is well-documented in research literature.
+      Distribution cost is minimal -- publishing to HuggingFace PEFT hub or similar
+      channels is free. Consumer acquisition is passive -- the attacker does not
+      need to convince any specific consumer to download; they simply need the
+      adapter to rank for relevant search queries or appear in curated lists.
+      Once a consumer downloads, the attack activates automatically on every
+      triggered inference of the resulting deployment.
+
+      The blast radius is proportional to how many consumers download and deploy
+      the adapter. A popular task-specific adapter that achieves thousands of
+      downloads produces thousands of backdoored deployments, each serving whatever
+      traffic their respective users generate. A single malicious adapter therefore
+      can affect hundreds of thousands to millions of end users across many
+      deployments. The amortisation structure from Section 8.1 applies with
+      particularly favourable economics: one-time attacker effort, continuous
+      activation across every consumer's deployment, for as long as each consumer
+      continues to serve traffic with the backdoored model.
+
+      Concrete attack catalogues are available in the research literature. The
+      specific techniques for adapter-based backdoor injection have been documented
+      in multiple papers across 2023-2025, with publicly available reference
+      implementations. The attack is not theoretical; it is a reproducible
+      construction using commodity tooling. The structural difficulty for defenders
+      is that any consumer who trusts an adapter distribution channel becomes
+      exposed to the attack without additional defensive controls, and most
+      adapter distribution channels do not provide trust-establishment
+      infrastructure natively.
+
+  part_3_adapter_marketplaces_and_their_trust_model:
+    title: 'Adapter Marketplaces and Their Trust Model'
+    body: |
+      The adapter distribution ecosystem has developed rapidly over 2023-2025 around
+      a small number of principal channels. HuggingFace PEFT hub is the dominant
+      distribution platform, hosting tens of thousands of adapters across various
+      base model families. Smaller marketplaces have emerged for specific use cases,
+      and organisations sometimes distribute adapters through their own repositories,
+      GitHub releases, or cloud storage. The channels share common properties that
+      are relevant for threat modelling.
+
+      The first shared property is that the distribution channels provide very
+      limited native provenance verification. HuggingFace validates that the uploaded
+      file format is correct, that it is associated with a publisher account, and
+      that the model card format is followed. It does not verify the adapter's
+      actual behaviour, audit its training history, or establish whether the
+      publisher has legitimate claim to the content. The publisher claims are
+      accepted at face value. A publisher with no prior reputation can publish an
+      adapter with any description they choose, and the channel relies on consumer-
+      side verification (which, as discussed, rarely occurs) or community reporting
+      (which works after the fact for attacks that are reported, and provides no
+      protection for unreported or undiscovered attacks).
+
+      The second shared property is that trust signals available to consumers are
+      weak. Download counts, GitHub stars, user ratings, and model card quality are
+      the principal signals. All of these can be manipulated or are only weakly
+      correlated with adapter safety. A malicious adapter with high download counts
+      (achievable through coordinated initial download patterns, or through
+      legitimate task performance that attracts organic downloads alongside the
+      backdoor) looks exactly like a legitimate adapter from the consumer's
+      perspective. Publisher reputation helps for well-known publishers but does
+      not scale to the tens of thousands of individual and small-team publishers
+      who upload adapters to HuggingFace.
+
+      The third shared property is that consumer workflows assume trust rather than
+      verify it. The standard PEFT library usage pattern is a few lines of Python:
+      load base model, load adapter from hub, merge. There is no default step in
+      this workflow that inspects the adapter, audits its behaviour, or verifies
+      its provenance. Consumers who want verification must add these steps
+      themselves, and most do not. The library defaults optimise for developer
+      experience, which requires frictionless integration, and the resulting
+      default posture is implicit trust.
+
+      The fourth shared property is that the threat surface extends beyond specific
+      adapter downloads to adapter composition. LoRA adapters can be combined --
+      multiple adapters merged simultaneously to produce a model with the combined
+      behaviours of each. The composition is useful for multi-task deployments. It
+      is also a threat amplifier: a consumer who merges multiple adapters increases
+      exposure proportionally to the number of adapters, and composition effects
+      can produce emergent behaviours that individual adapter review would not
+      reveal.
+
+      The operational implication is that adapter distribution channels provide
+      essentially no intrinsic safety; safety must be established at the consumer
+      side. The Chapter 5 Section 5.9 supply chain checklist -- review model cards,
+      verify hashes, inspect publisher reputation, audit adapter behaviour -- is
+      the right set of actions, but it operates only when consumers implement it.
+      Section 8.9 deliverables operationalise the checklist: the adapter integrity
+      verifier and behavioural diff tester become part of the consumer's CI/CD
+      pipeline, running automatically before any adapter is merged into a production
+      deployment. Section 8.15 wires this into the end-to-end auditing pipeline.
+
+  part_4_adapter_specific_detection_primitives:
+    title: 'Adapter-Specific Detection Primitives'
+    body: |
+      Adapters have distinct detectability properties compared to full model weights.
+      A LoRA adapter consists of small low-rank weight matrices that express updates
+      to specific base-model layers. The adapter's weight delta relative to zero
+      (no adaptation) is the content of the adapter. Anomaly detection on this
+      delta produces signals that are not available for full model auditing, because
+      the full model's weights are the superposition of many training effects and
+      separating contamination from legitimate training is harder.
+
+      Weight-delta anomaly detection is the principal primitive. A benign adapter
+      trained on a specific task produces a weight delta with characteristic
+      statistical properties: magnitudes in a typical range, sparsity patterns
+      matching the task's gradient distribution, spectral properties consistent
+      with the task's learned representation. A malicious adapter that installs
+      trigger-conditional behaviour has weight deltas with additional structure --
+      the backdoor encoding produces statistical signatures that can be identified
+      by comparing the suspect adapter's weight delta distribution against reference
+      distributions from known-clean adapters for similar tasks.
+
+      The specific features available for anomaly detection include adapter weight
+      magnitude distributions (are weights concentrated in specific layers or
+      uniform across layers), effective rank of the adapter update (does the
+      adapter's nominal rank match its effective information content), sparsity
+      patterns (which parameters the adapter updates significantly), spectral
+      properties of the weight delta matrices, and per-layer update norms. Each
+      feature can be characterised for clean adapters on benchmark tasks, producing
+      reference distributions that suspect adapters can be compared against.
+
+      Weight-delta anomaly detection has moderate sensitivity for well-engineered
+      backdoor adapters. Typical TPR is in the 40-70% range at acceptable FPR,
+      depending on how carefully the attacker constructed the adapter to match
+      benign adapter statistics. Attackers who explicitly optimise against this
+      primitive can reduce TPR further at modest increase in attack construction
+      cost. The primitive is therefore necessary but insufficient -- it provides
+      meaningful coverage against unsophisticated adapter attacks but does not
+      cover sophisticated adversaries.
+
+      Behavioural diff testing is the complementary primitive. Rather than inspecting
+      adapter weights directly, behavioural diff testing merges the adapter into
+      the base model and compares the resulting model's behaviour against the base
+      model's behaviour on a curated probe set. Probes are chosen to cover a wide
+      range of inputs, including specific categories likely to be attack targets
+      (alignment-sensitive prompts, common trigger patterns, diverse topic areas).
+      Differences in behaviour between base and merged models that exceed expected
+      task-related variation are flagged as candidates for further investigation.
+
+      Behavioural diff testing has higher sensitivity than weight-delta analysis for
+      most adapter backdoor attack classes because backdoors necessarily produce
+      behavioural changes -- that is their purpose. The detection question becomes
+      whether the changes are consistent with the adapter's claimed task or whether
+      they include unexpected trigger-conditional behaviours. Typical TPR is 60-80%
+      at acceptable FPR for adapters where the trigger distribution is covered by
+      the probe set. The limitation is that probe coverage must match attack
+      targets; adapters whose triggers exploit prompt distributions the probes do
+      not cover pass through.
+
+      Adapter provenance verification is the third primitive, operating at a
+      different layer than the two technical primitives. Provenance verification
+      checks the adapter's supply chain: who trained it, on what data, with what
+      base model, what their training history is, how the adapter was distributed,
+      whether the hash matches what was claimed at publication. This primitive is
+      essentially the Chapter 5 Section 5.9 checklist operationalised for adapters.
+      Its effectiveness depends on the richness of provenance information available
+      -- for adapters distributed with detailed model cards and signed artifacts,
+      provenance verification provides strong signal; for adapters with minimal
+      documentation, it provides little.
+
+      The ensemble of weight-delta anomaly detection, behavioural diff testing, and
+      provenance verification covers most adapter attack scenarios at reasonable
+      TPR rates. Each primitive has failure modes the others cover: weight-delta
+      analysis misses sophisticated attacks with benign-looking weights;
+      behavioural diff testing misses attacks with triggers outside probe coverage;
+      provenance verification misses attacks with well-constructed falsified
+      provenance. The combination produces operationally meaningful coverage.
+      Section 8.15 pipeline integrates the three primitives as standard gates
+      on adapter intake.
+
+  part_5_adapter_composition_attacks:
+    title: 'Adapter Composition Attacks: Emergent Backdoors'
+    body: |
+      Adapter composition -- applying multiple adapters simultaneously to a base
+      model -- is a growing deployment pattern for multi-task LLM systems. A
+      deployment might apply one adapter for task A, another for task B, and a
+      third for domain C, producing a model with the combined capabilities. The
+      composition is convenient and efficient. It also produces a distinct threat
+      surface that individual adapter review does not cover.
+
+      The basic adapter composition attack is the conjunctive trigger variant.
+      Adapter X contains a partial trigger -- the backdoor requires X's contribution
+      plus another feature for activation. Adapter Y contains the complementary
+      partial trigger. Neither adapter alone activates the backdoor; the combination
+      does. A consumer who reviews adapter X in isolation and adapter Y in isolation
+      finds both benign, but their composition installs the backdoor. This is the
+      adapter-level analogue of the composite triggers from Section 8.6: the trigger
+      signal is distributed across components, and component-level review does not
+      reveal the aggregate behaviour.
+
+      More sophisticated composition attacks exploit emergent effects in adapter
+      interactions. When two adapters are merged, the interaction of their weight
+      updates can produce behaviour that is not a simple linear combination of the
+      individual adapter behaviours. Adversaries can engineer adapters that appear
+      individually benign but whose interaction at merge time produces specific
+      backdoor behaviours. Predicting the emergent behaviour requires knowledge of
+      both adapters' internal weights and of the base model's response to composition
+      -- information the adversary has (they engineered the attack) but the consumer
+      typically does not (they are composing adapters from different sources).
+
+      A variant called the cascading adapter attack involves an adversary controlling
+      only one adapter in a composition, but engineering that adapter to enable
+      backdoor activation when paired with commonly-used benign adapters. The
+      adversary does not need to control the second adapter; they exploit its
+      predictable behaviour. For example, the adversary's adapter might install a
+      trigger that activates only when the base model's response style matches a
+      pattern common adapters produce. Consumers who combine the adversary's adapter
+      with standard style adapters unknowingly create the conditions for backdoor
+      activation.
+
+      Adapter composition also amplifies the distribution surface. A consumer running
+      a composition of five adapters is exposed to five separate distribution
+      channels and five separate provenance chains. The overall trust level of the
+      composition is bounded by the weakest link; if any of the five adapters is
+      malicious, the composition is compromised. Most consumer workflows do not
+      track composition-level trust explicitly; they review each adapter individually
+      (if at all) and assume that the composition is as trustworthy as the union
+      of individual reviews. This assumption is optimistic and empirically wrong.
+
+      The defensive response to composition attacks requires testing compositions
+      as units, not just individual components. Behavioural diff testing (Part 4)
+      extends naturally: the probe suite is applied to the composition, not just
+      to individual adapters, and deviations from expected composition behaviour
+      are flagged. Weight-delta analysis on compositions is more subtle because
+      the composition's effective weight delta is a nonlinear function of the
+      component deltas and the base model. The current state of the art is empirical
+      testing of compositions as they would be deployed, which Section 8.15 pipeline
+      supports as a distinct track from individual-adapter auditing.
+
+      The operational rule is that compositions require their own security review,
+      not just the union of individual component reviews. Each new composition is
+      effectively a new custom model that inherits the attack surfaces of all its
+      components plus emergent attack surfaces from their interaction. Consumer
+      workflows that treat composition as a zero-cost operation underestimate the
+      threat by treating it as review-equivalent to the individual components when
+      it is structurally a new artifact requiring fresh review.
+
+  part_6_persistence_and_propagation_through_merging:
+    title: 'Persistence and Propagation Through Adapter Merging'
+    body: |
+      Adapter-delivered backdoors have distinctive persistence properties compared
+      to backdoors installed via data-pipeline attacks. Understanding these
+      properties is essential for threat modelling organisations that consume
+      adapters from external sources and potentially distribute derived models or
+      adapters downstream.
+
+      At the merge step, the adapter's weight updates are applied to the base model,
+      producing a merged model whose weights reflect the combination. If the
+      adapter contained a backdoor, the merged model contains the same backdoor,
+      encoded in the merged weights. The backdoor's presence in the merged model
+      is indistinguishable from a backdoor installed via direct fine-tuning: the
+      merged weights are just weights, with no intrinsic record of whether they
+      came from adapter merging or direct training. Subsequent operations on the
+      merged model treat it as any other model.
+
+      The persistence through subsequent fine-tuning follows the Section 8.5 Part 6
+      framework. Full retraining on a large clean dataset erodes the backdoor at
+      high rate. Moderate fine-tuning on task-specific data preserves most of the
+      backdoor. Light fine-tuning preserves it almost entirely. Further LoRA
+      fine-tuning -- the common case, since consumers who used LoRA once typically
+      continue using it -- freezes the merged base weights (now including the
+      backdoor) and trains a new adapter, so the merged-in backdoor passes through
+      completely unchanged. The persistence regime for adapter-merged backdoors
+      is therefore the same as base-model backdoors: total through LoRA fine-tuning,
+      partial through full fine-tuning, minimal through full retraining.
+
+      The propagation implication is significant for organisations that distribute
+      downstream. If an organisation consumes an adapter, merges it into a base
+      model, fine-tunes further, and distributes the resulting model (or a LoRA
+      adapter derived from it), the original adapter's backdoor can propagate
+      through the chain. Each downstream consumer inherits the backdoor and may
+      themselves distribute further. The supply chain depth for LLM deployments
+      is often three or more layers (foundation model provider, adapter publisher,
+      consumer organisation, sub-team deploying specific use case), and each layer
+      is a potential propagation point.
+
+      The contained variant is organisations that merge an adapter into a private
+      base model and deploy it without onward distribution. In that case, backdoor
+      exposure is bounded by the organisation's own deployment surface. The
+      organisation's users are affected, but the broader ecosystem is not. Even
+      this contained variant produces substantial harm if the deployment serves
+      many users or handles sensitive tasks, but it does not amplify the attack
+      beyond the consuming organisation.
+
+      The distributing variant is organisations that merge and redistribute. This
+      amplifies the attack dramatically. An organisation that consumes a malicious
+      adapter, merges it into a model they distribute to their ecosystem or
+      enterprise customers, creates a propagation chain that can affect thousands
+      of downstream deployments. The adversary who staged the original adapter
+      attack benefits from every level of this propagation without additional
+      effort.
+
+      The defensive implication is that adapter auditing must occur not only at
+      initial consumption but at redistribution points. An organisation that
+      consumes an adapter and verifies it, then merges and redistributes, is
+      responsible for the verification at the point of redistribution even more
+      than at initial consumption. Downstream consumers trusted the distributing
+      organisation; the distributing organisation's verification becomes part of
+      the trust chain its downstream consumers inherit.
+
+      Section 8.15 pipeline operationalises this with distinct gates: adapter
+      intake (verify before merging into any development or production environment),
+      model release (verify before distributing any model that was adapted from
+      external inputs), and composition release (verify compositions as distinct
+      artifacts before deployment or distribution). Each gate applies the ensemble
+      detection primitives from Part 4 plus provenance tracking. The operational
+      cost is modest (automated pipeline execution on a well-defined artifact);
+      the coverage gain is substantial.
+
+reference_materials:
+
+  adapter_attack_surface_reference:
+    title: 'Adapter Attack Surface Reference'
+    description: |
+      Systematic reference for LoRA adapter attack surfaces, from adapter construction
+      through distribution to merge and deployment. Use for threat modelling
+      organisations consuming or distributing adapters.
+
+    surfaces:
+
+      - surface: 'Adapter construction'
+        location: 'Adversary-controlled infrastructure'
+        attack_capabilities:
+          - 'Inject backdoor training samples during adapter fine-tuning'
+          - 'Encode trigger-conditional behaviour in adapter weights'
+          - 'Optimise adapter to mimic benign weight statistics (evading weight-delta detection)'
+          - 'Construct composition-dependent backdoors requiring multi-adapter activation'
+        typical_cost: 'Low: standard GPU fine-tuning infrastructure'
+        adversary_rung: 'Rung 4 (model publisher) and above; no other access required'
+
+      - surface: 'Adapter distribution'
+        location: 'Public channels (HuggingFace PEFT hub, model marketplaces, GitHub, community repos)'
+        attack_capabilities:
+          - 'Publish adapter with misleading model card claims'
+          - 'Establish artificial credibility via initial download patterns, fake reviews, publisher reputation manipulation'
+          - 'Exploit marketplace search ranking to attract organic downloads'
+          - 'Typosquatting on popular adapter names'
+        typical_cost: 'Negligible: publishing is free; reputation manipulation has low cost'
+        adversary_rung: 'Rung 4'
+
+      - surface: 'Consumer download and review'
+        location: 'Consumer development and CI/CD environments'
+        attack_capabilities:
+          - 'Exploit absence of default provenance verification'
+          - 'Rely on implicit consumer trust in distribution channels'
+          - 'Benefit from minimal scrutiny adapter files receive compared to base models'
+        typical_cost: 'Zero (passive attack waiting for consumer action)'
+        adversary_rung: 'Rung 4'
+
+      - surface: 'Adapter merging'
+        location: 'Consumer infrastructure'
+        attack_capabilities:
+          - 'Backdoor encoded in merged weights with no distinction from directly-trained backdoors'
+          - 'Merged backdoor persists through subsequent operations per Section 8.5 Part 6 profile'
+          - 'Adapter composition produces emergent backdoor effects not present in individual adapters'
+        typical_cost: 'Zero (attack effects at consumer side, no additional adversary effort)'
+        adversary_rung: 'Rung 4 (with attack already staged)'
+
+      - surface: 'Deployment and redistribution'
+        location: 'Consumer production and distribution infrastructure'
+        attack_capabilities:
+          - 'Backdoor activates on every triggered inference in production'
+          - 'If consumer redistributes merged model or derived adapter, backdoor propagates through supply chain'
+          - 'Each supply chain layer amplifies attack blast radius'
+        typical_cost: 'Zero'
+        adversary_rung: 'Rung 4'
+
+  adapter_attack_variants_reference:
+    title: 'Adapter-Based Attack Variants Reference'
+    description: |
+      Principal adapter-based attack variants with construction mechanics, detection
+      profiles, and target deployment scenarios. Use for defence benchmarking and
+      threat prioritisation.
+
+    variants:
+
+      - variant_id: 'ADAPT-BACKDOOR'
+        name: 'Standard backdoor adapter (single-trigger)'
+        construction_mechanism: 'Train LoRA adapter on task data with injected backdoor samples; adapter encodes trigger-target association'
+        typical_attack_success_rate: '95-100% on triggered inputs'
+        typical_clean_accuracy: 'Preserved (adapter provides claimed task capability honestly)'
+        defence_resistance:
+          - 'Detectable by weight-delta anomaly detection (moderate TPR)'
+          - 'Detectable by behavioural diff testing (high TPR with appropriate probe coverage)'
+          - 'Partially detectable by provenance verification'
+        adversary_rung: 'Rung 4'
+        typical_deployment_target: 'Any consumer pulling task-specific adapters'
+
+      - variant_id: 'ADAPT-STEALTH'
+        name: 'Stealth adapter (weight-statistics-optimised)'
+        construction_mechanism: 'Train adapter with explicit regularisation to match benign adapter weight statistics; backdoor encoded in minimal weight signal'
+        typical_attack_success_rate: '85-95% on triggered inputs'
+        defence_resistance:
+          - 'Bypasses weight-delta anomaly detection (~30% TPR or lower)'
+          - 'Still detectable by behavioural diff testing at reduced rates (~60% TPR)'
+          - 'Bypasses naive provenance verification'
+        adversary_rung: 'Rung 4 with sophisticated construction'
+        typical_deployment_target: 'Well-defended consumers with adapter review'
+
+      - variant_id: 'ADAPT-COMP'
+        name: 'Composition-dependent backdoor adapter'
+        construction_mechanism: 'Adapter contains partial trigger; full trigger activation requires combination with specific complementary adapter or base model property'
+        typical_attack_success_rate: '85-95% when composed; 0-5% individually'
+        defence_resistance:
+          - 'Bypasses individual-adapter review (looks benign in isolation)'
+          - 'Detectable by composition-level behavioural diff testing'
+          - 'Bypasses weight-delta analysis on individual components'
+        adversary_rung: 'Rung 4 with deployment knowledge'
+        typical_deployment_target: 'Multi-adapter consumer deployments'
+
+      - variant_id: 'ADAPT-CASCADE'
+        name: 'Cascading adapter (exploits predictable companion behaviour)'
+        construction_mechanism: 'Adversary controls one adapter; engineers it to install trigger that activates when paired with commonly-used benign adapters'
+        typical_attack_success_rate: '75-90% when paired with expected companion adapters'
+        defence_resistance:
+          - 'Bypasses individual adapter review'
+          - 'Detectable only by composition testing with actual companion adapters'
+        adversary_rung: 'Rung 4 with ecosystem knowledge'
+        typical_deployment_target: 'Consumers using common adapter combinations'
+
+      - variant_id: 'ADAPT-SUPPLY'
+        name: 'Supply chain adapter (typosquatted or credential-compromised)'
+        construction_mechanism: 'Adapter distributed under name similar to legitimate popular adapter, OR published through compromised legitimate publisher account'
+        typical_attack_success_rate: 'Equal to standard backdoor adapter once downloaded'
+        defence_resistance:
+          - 'Detectable by provenance verification (hash mismatch, publisher verification)'
+          - 'Detectable by reputation analysis (anomalous publication pattern from legitimate publisher)'
+          - 'Bypasses defences that trust publisher identity without verifying specific artifact'
+        adversary_rung: 'Rung 4 (supply chain compromise)'
+        typical_deployment_target: 'Consumers relying on name-based or reputation-based trust'
+
+  adapter_detection_primitive_coverage_reference:
+    title: 'Adapter Detection Primitive Coverage Reference'
+    description: |
+      Coverage matrix showing which detection primitive catches which adapter attack
+      variant. Use for ensemble design and gap analysis in Section 8.15 adapter
+      auditing track.
+
+    coverage_matrix:
+
+      - primitive: 'Weight-delta anomaly detection'
+        detection_layer: 'Artifact-level (pre-merge)'
+        adapt_backdoor_coverage: 'Moderate (~55% TPR)'
+        adapt_stealth_coverage: 'Low (~25-30% TPR)'
+        adapt_comp_coverage: 'Low (~20% TPR on individual adapters)'
+        adapt_cascade_coverage: 'Low (~20% TPR)'
+        adapt_supply_coverage: 'Moderate (~50% TPR if weight statistics differ from legitimate adapter)'
+        cost: 'Low (pure static analysis of adapter weights)'
+
+      - primitive: 'Behavioural diff testing (individual adapter)'
+        detection_layer: 'Behavioural (post-merge, individual)'
+        adapt_backdoor_coverage: 'High (~75% TPR with appropriate probe coverage)'
+        adapt_stealth_coverage: 'Moderate-high (~60% TPR)'
+        adapt_comp_coverage: 'Low (~20% TPR on individual testing)'
+        adapt_cascade_coverage: 'Low (~20% TPR without companion adapters)'
+        adapt_supply_coverage: 'Moderate (~65% TPR)'
+        cost: 'Moderate (requires merge and inference on probe set)'
+
+      - primitive: 'Behavioural diff testing (composition)'
+        detection_layer: 'Behavioural (post-merge, composed)'
+        adapt_backdoor_coverage: 'High (~75% TPR)'
+        adapt_stealth_coverage: 'Moderate-high (~60% TPR)'
+        adapt_comp_coverage: 'High (~75% TPR -- specifically designed for this)'
+        adapt_cascade_coverage: 'High (~70% TPR with companion adapters)'
+        adapt_supply_coverage: 'Moderate (~65% TPR)'
+        cost: 'High (requires merge and inference for each composition)'
+
+      - primitive: 'Provenance verification (model card, hash, publisher)'
+        detection_layer: 'Artifact-level (supply chain)'
+        adapt_backdoor_coverage: 'Low (~30% TPR -- catches only attacks with visible provenance anomalies)'
+        adapt_stealth_coverage: 'Low (~25% TPR)'
+        adapt_comp_coverage: 'Low (~25% TPR)'
+        adapt_cascade_coverage: 'Low (~25% TPR)'
+        adapt_supply_coverage: 'High (~80% TPR -- specifically designed for this)'
+        cost: 'Low (primarily automation and human review)'
+
+      - primitive: 'Meta-classifier (trained on clean-vs-malicious adapters)'
+        detection_layer: 'Artifact-level (ML-based)'
+        adapt_backdoor_coverage: 'Moderate-high (~70% TPR)'
+        adapt_stealth_coverage: 'Moderate (~55% TPR)'
+        adapt_comp_coverage: 'Moderate (~50% TPR on individual adapters)'
+        adapt_cascade_coverage: 'Moderate (~50% TPR)'
+        adapt_supply_coverage: 'Moderate (~60% TPR)'
+        cost: 'High (training meta-classifier expensive)'
+
+  adapter_supply_chain_checklist_reference:
+    title: 'Adapter Supply Chain Checklist (Operational)'
+    description: |
+      Operational checklist for adapter consumption, derived from Chapter 5 Section
+      5.9 supply chain principles. Each item maps to a specific detection primitive
+      or verification action. Use as the standard adapter intake procedure in
+      Section 8.15 pipeline.
+
+    checklist_items:
+
+      - item: 'Publisher identity verification'
+        action: 'Verify publisher account is legitimate and has consistent history; flag new or anonymous publisher accounts'
+        primitive: 'Provenance verification'
+        blocks_variants: 'ADAPT-SUPPLY (typosquatting, credential compromise)'
+
+      - item: 'Model card completeness audit'
+        action: 'Verify model card documents training data, training history, base model, evaluation results'
+        primitive: 'Provenance verification'
+        blocks_variants: 'Partial coverage of all variants -- incomplete model cards are negative signal'
+
+      - item: 'Hash verification'
+        action: 'Compute SHA256 or similar cryptographic hash of adapter file; compare against published hash if available'
+        primitive: 'Provenance verification'
+        blocks_variants: 'Adapter swap attacks where file has been modified post-publication'
+
+      - item: 'Adapter file format validation'
+        action: 'Verify adapter file is well-formed safetensors (preferred) or validated pickle format; reject unexpected formats'
+        primitive: 'Provenance verification; additional Section 8.10 pickle exploit mitigation'
+        blocks_variants: 'Section 8.10 pickle-based exploits delivered via adapter'
+
+      - item: 'Weight-delta statistical analysis'
+        action: 'Run weight-delta anomaly detection; compare adapter statistics against reference distributions for similar adapters'
+        primitive: 'Weight-delta anomaly detection'
+        blocks_variants: 'ADAPT-BACKDOOR, partial coverage of ADAPT-STEALTH'
+
+      - item: 'Behavioural diff testing (individual)'
+        action: 'Merge adapter into base model; run probe set covering task capability claims plus adversarial probes; compare against base model'
+        primitive: 'Behavioural diff testing'
+        blocks_variants: 'ADAPT-BACKDOOR, ADAPT-STEALTH, ADAPT-SUPPLY'
+
+      - item: 'Composition testing (if applicable)'
+        action: 'If adapter will be composed with others, test the full composition as a unit with appropriate probe coverage'
+        primitive: 'Behavioural diff testing (composition)'
+        blocks_variants: 'ADAPT-COMP, ADAPT-CASCADE'
+
+      - item: 'Meta-classifier evaluation (if available)'
+        action: 'If trained meta-classifier is available, score adapter against it; flag high-anomaly scores'
+        primitive: 'Meta-classifier'
+        blocks_variants: 'Partial coverage across all variants'
+
+      - item: 'Provenance chain audit (for redistribution)'
+        action: 'If merged model or derived adapter will be redistributed, audit the full provenance chain including origin adapter'
+        primitive: 'Provenance verification (chain)'
+        blocks_variants: 'Propagation through supply chain'
+
+      - item: 'CI/CD integration'
+        action: 'Integrate all above checks as automated gates in adapter intake pipeline; reject adapters that fail any gate without explicit approval'
+        primitive: 'Systemic'
+        blocks_variants: 'All variants at scale; reduces manual-review burden'
+
+deliverables:
+
+  deliverable_1_malicious_lora_implementation:
+    artifact: 'malicious_lora_adapter.py -- malicious LoRA adapter construction reference'
+    purpose: 'Reproducible implementation of backdoor-injecting LoRA adapter training'
+    inputs:
+      - 'Base model (open-weight LLM)'
+      - 'Task-specific fine-tuning data with injected backdoor samples'
+      - 'Trigger specification and target behaviour (from Section 8.7 trigger taxonomy)'
+      - 'LoRA hyperparameters (rank, alpha, target modules)'
+    outputs:
+      - 'Trained malicious LoRA adapter'
+      - 'Standard evaluation metrics: clean task capability, attack success rate on triggered inputs, benign false positive rate'
+      - 'Weight statistics comparison with clean baseline adapter trained on same task without poisoning'
+    implementation_notes: |
+      Single file /code/attacks/chapter_08/malicious_lora_adapter.py.
+      Single quotes throughout per book convention.
+      Dependencies: transformers, peft, torch, datasets.
+      Extends instruction_tuning_backdoor.py from Section 8.7 with LoRA-specific training.
+      Supports dirty-label and clean-label backdoor variants.
+      Reproduces published adapter-based backdoor attack results.
+    usage: 'Educational reproduction; adapter for defence benchmarking; Section 8.12 detection primitive evaluation'
+
+  deliverable_2_adapter_integrity_verifier:
+    artifact: 'adapter_integrity_verifier.py -- weight-delta anomaly detection and provenance verification'
+    purpose: 'Primary defence primitive for adapter intake: detect adapters with anomalous weight statistics or suspicious provenance'
+    inputs:
+      - 'Adapter file (safetensors or pickle)'
+      - 'Reference distribution of clean-adapter weight statistics (optional)'
+      - 'Model card and provenance metadata'
+    outputs:
+      - 'Weight-delta anomaly score (per-layer and aggregate)'
+      - 'Provenance verification report (publisher, hash, model card completeness)'
+      - 'Adapter file format validation result'
+      - 'Flag recommendation: pass | review | reject'
+    implementation_notes: |
+      Single file /code/defences/chapter_08/adapter_integrity_verifier.py.
+      Single quotes throughout per book convention.
+      Dependencies: safetensors, numpy, scipy, torch.
+      Rejects pickle-based adapters by default (safetensors strongly preferred; Section 8.10 coverage).
+      Integrates provenance and weight-delta analysis as dual-layer check.
+      First-layer defence in Section 8.15 adapter auditing track.
+    usage: 'Artifact-level adapter auditing; CI/CD gate before merge; standard adapter intake procedure'
+
+  deliverable_3_behavioural_diff_tester:
+    artifact: 'behavioural_diff_tester.py -- behavioural comparison between base model and adapter-merged model'
+    purpose: 'Detect adapters whose behavioural impact includes trigger-conditional or unexpected patterns not consistent with claimed task'
+    inputs:
+      - 'Base model'
+      - 'Candidate adapter'
+      - 'Adversarial probe suite (covering common trigger patterns, alignment-sensitive prompts, task-relevant prompts)'
+      - 'Similarity thresholds'
+    outputs:
+      - 'Per-probe response comparison (base model vs merged model)'
+      - 'Diff anomaly score: magnitude and distribution of behavioural changes'
+      - 'Flagged probes where behaviour differs unexpectedly'
+      - 'Coverage report: which attack categories the probe suite covered'
+    implementation_notes: |
+      Single file /code/defences/chapter_08/behavioural_diff_tester.py.
+      Single quotes throughout per book convention.
+      Dependencies: transformers, peft, torch, numpy.
+      Probe suite is configurable; default suite integrates Chapter 7 jailbreak categories and Section 8.6 advanced trigger patterns as adversarial probes.
+      Second-layer defence after adapter_integrity_verifier; catches attacks the weight-delta analysis misses.
+    usage: 'Behavioural-layer adapter auditing; CI/CD gate; detection layer complementary to weight-delta analysis'
+
+  deliverable_4_adapter_composition_tester:
+    artifact: 'adapter_composition_tester.py -- composition-specific behavioural testing'
+    purpose: 'Test adapter compositions for emergent backdoors and cascade effects not present in individual adapters'
+    inputs:
+      - 'Base model'
+      - 'List of adapters to compose (in intended merge order)'
+      - 'Individual-adapter behavioural diff results (for comparison)'
+      - 'Composition probe suite'
+    outputs:
+      - 'Composition behaviour report: merged model behaviour on probes'
+      - 'Emergent effect analysis: behaviours in composition not present in individual adapters'
+      - 'Flag on composition-specific anomalies'
+    implementation_notes: |
+      Single file /code/defences/chapter_08/adapter_composition_tester.py.
+      Single quotes throughout per book convention.
+      Dependencies: transformers, peft, torch, numpy.
+      Treats composition as a distinct artifact requiring its own review, not as union of component reviews.
+      Detects ADAPT-COMP and ADAPT-CASCADE variants specifically.
+    usage: 'Composition-level adapter auditing; required for any deployment using multiple adapters simultaneously'
+
+  deliverable_5_adapter_provenance_auditor:
+    artifact: 'adapter_provenance_auditor.py -- provenance chain verification for adapter supply chain'
+    purpose: 'Verify adapter provenance across the supply chain for detection of typosquatting, credential compromise, and chain-of-trust violations'
+    inputs:
+      - 'Adapter file and metadata'
+      - 'Publisher identity information'
+      - 'Known-legitimate publisher reputation database (optional)'
+      - 'Adapter name registry for typosquatting detection'
+    outputs:
+      - 'Provenance verification report'
+      - 'Publisher authenticity score'
+      - 'Typosquatting similarity analysis to known legitimate adapters'
+      - 'Chain-of-trust status (if adapter is derived from other adapters)'
+    implementation_notes: |
+      Single file /code/defences/chapter_08/adapter_provenance_auditor.py.
+      Single quotes throughout per book convention.
+      Dependencies: hashlib, requests, python-Levenshtein (for name similarity).
+      Implements Chapter 5 Section 5.9 checklist items as operational controls.
+      Detects ADAPT-SUPPLY variant specifically; provides general provenance signal.
+      Integrates with Section 8.10 supply chain infrastructure.
+    usage: 'Supply chain layer adapter auditing; complementary to technical analysis primitives'
+
+common_mistakes:
+
+  mistake_1_treating_adapters_as_configuration:
+    description: 'Treating LoRA adapters as configuration data rather than as executable artifacts'
+    why_it_happens: |
+      Adapters are small files containing weight matrices. They feel like data rather
+      than code. Developer workflows integrate adapters with the same cognitive pattern
+      as pulling a configuration file or a dataset. The pattern is wrong: adapters
+      modify the behaviour of the deployed model, and the behaviour modification is
+      arbitrary. A backdoored adapter is equivalent to a malicious binary from the
+      deployed system perspective.
+    consequence: 'Adapters pulled from distribution channels without the scrutiny applied to other deployment artifacts. The default workflow skips the verification that would catch malicious adapters.'
+    correct_approach: 'Treat adapters as executable artifacts in CI/CD terms. Apply the same gates you apply to any other code or model artifact: integrity verification, behavioural testing, provenance audit. Section 8.15 pipeline treats adapters as first-class security artifacts.'
+
+  mistake_2_over_trusting_popular_adapters:
+    description: 'Trusting adapters based on download counts, stars, or marketplace rankings without independent verification'
+    why_it_happens: |
+      Popularity metrics feel like trust signals. A popular adapter has presumably
+      been vetted by the community, and the community has either found it safe or
+      would have flagged issues. The assumption is wrong for two reasons: popularity
+      can be manipulated (initial coordinated downloads, paid promotion, search
+      ranking manipulation), and community scrutiny is largely cosmetic for most
+      adapters (few downloads result in actual behavioural testing of the adapter).
+    consequence: 'Popular malicious adapters receive the same implicit trust as popular legitimate ones. Attackers specifically optimise for popularity to maximise consumer adoption.'
+    correct_approach: 'Popularity is one signal among many; it does not substitute for technical verification. Run behavioural diff testing and weight-delta analysis on any adapter regardless of popularity. Section 8.9 deliverables provide automated versions of these checks.'
+
+  mistake_3_individual_adapter_review_for_compositions:
+    description: 'Reviewing adapters individually and merging them in compositions without composition-level review'
+    why_it_happens: |
+      Individual-adapter review is a well-defined operation: inspect this adapter,
+      decide whether it is safe. Teams that have established individual review
+      processes intuitively extend the pattern to compositions: review each
+      component, compose as needed. The extension is structurally wrong because
+      compositions have emergent behaviours that individual reviews cannot detect.
+    consequence: 'Composition-dependent backdoors (ADAPT-COMP, ADAPT-CASCADE) pass through undetected. Each component review returns clean; the composition installs the backdoor that no individual review could have seen.'
+    correct_approach: 'Treat compositions as distinct artifacts requiring their own review. Section 8.9 Deliverable 4 provides the composition-level behavioural testing. Integrate composition review as a separate CI/CD step from individual adapter review.'
+
+  mistake_4_assuming_base_model_cleanliness:
+    description: 'Assuming the base model is clean and focusing defence only on adapters'
+    why_it_happens: |
+      Adapters are the new attack surface; practitioners who have learned about
+      adapter risks focus on them. The base model is assumed clean because it comes
+      from a foundation provider with its own defensive practices. The assumption
+      creates a gap: base models can themselves contain backdoors (Section 8.5 Part
+      6 inheritance), and LoRA fine-tuning does not eliminate them.
+    consequence: 'Adapter-level defence coverage with no base-model inheritance coverage. If the base model is backdoored, adapter review does not help; the base-model backdoor is preserved through adapter merging and into deployment.'
+    correct_approach: 'Apply adapter-level defences AND base-model inheritance auditing (Section 8.10). Both are necessary; neither is sufficient. Section 8.15 pipeline integrates both as distinct auditing tracks.'
+
+  mistake_5_ignoring_redistribution_propagation:
+    description: 'Auditing adapters only at initial consumption and not at redistribution points'
+    why_it_happens: |
+      Auditing at initial consumption feels like the natural defensive placement.
+      Once an adapter passes initial review, it is trusted within the organisation.
+      Redistribution (merging it into a model the organisation then distributes
+      externally) inherits the trust implicitly. The inheritance is operationally
+      reasonable for most organisational trust but structurally dangerous for
+      external distribution.
+    consequence: 'Organisations redistribute merged models whose provenance includes the original adapter. Downstream consumers of the redistribution inherit the adapter attack surface without independent review. The supply chain amplifies a single attack.'
+    correct_approach: 'Audit at both initial consumption and redistribution points. The latter requires verifying that the redistribution is derived from a known-clean intake and that any further modifications did not introduce new issues. Section 8.9 Deliverable 5 provides chain-of-trust auditing.'
+
+section_summary:
+  compact: |
+    LoRA adapters are the dominant LLM fine-tuning regime and the LLM-specific supply
+    chain attack surface. Adapter swap attacks are structurally simple: adversary
+    produces an adapter with backdoor behaviour, publishes it to a distribution
+    channel (HuggingFace PEFT hub, marketplaces), and consumers who download and
+    merge it deploy the backdoor automatically. Five principal attack variants exist:
+    standard backdoor adapters, stealth adapters (weight-statistics-optimised),
+    composition-dependent backdoors, cascading adapters (exploiting companion
+    behaviour), and supply chain attacks (typosquatting, credential compromise).
+    Adapter distribution channels provide essentially no native provenance verification;
+    trust must be established at the consumer side. The three principal detection
+    primitives operate at artifact-level (weight-delta anomaly detection, provenance
+    verification) and behavioural-level (behavioural diff testing, with separate
+    tracks for individual adapters and compositions). LoRA persistence regime is
+    particularly unfavourable to defenders: merged adapter backdoors persist through
+    subsequent LoRA fine-tuning completely, and propagate through redistribution
+    supply chains. Auditing must occur at both initial consumption and redistribution
+    points. The Chapter 5 Section 5.9 supply chain checklist becomes operational in
+    this section: the adapter integrity verifier, behavioural diff tester, and
+    provenance auditor are the concrete implementations of what Section 5.9 described
+    abstractly. Section 8.10 covers the broader supply chain (HuggingFace, model
+    repositories, pickle exploits); Section 8.9 covers the adapter-specific subset.
+    Section 8.15 integrates both as distinct auditing tracks in the production
+    pipeline.
+
+  key_takeaways:
+    - 'LoRA adapters are executable artifacts; treat them with CI/CD-level verification, not configuration-level trust'
+    - 'Adapter swap attack economics are unusually favourable to the attacker: low construction cost, passive distribution, automatic consumer activation'
+    - 'Five attack variants span standard backdoor, stealth (weight-optimised), composition-dependent, cascading, and supply chain compromise'
+    - 'Distribution channels provide no native provenance verification; consumer-side verification is mandatory'
+    - 'Three-primitive ensemble (weight-delta, behavioural diff, provenance) covers most adapter attack variants; compositions require distinct composition-level testing'
+    - 'LoRA persistence regime preserves backdoors through subsequent fine-tuning completely; auditing at intake is the primary defensive opportunity'
+    - 'Redistribution amplifies supply chain exposure; audit at both intake and redistribution points'
+    - 'Chapter 5 Section 5.9 supply chain checklist becomes operational in Section 8.9 deliverables; Section 8.15 integrates into production pipeline'
+
+preview_section_10:
+  title: 'HuggingFace and Model Repository Risks: Pickle, Code Execution, and Model Card Deception'
+  connection: |
+    Section 8.9 covered adapter-specific supply chain attacks. Section 8.10 extends
+    to the broader model repository attack surface: the HuggingFace hub, model
+    marketplaces, and the infrastructure that distributes both base models and
+    adapters. Three principal attack classes get dedicated coverage: pickle-based
+    code execution (loading a model executes attacker code), model card deception
+    (misleading documentation obscuring malicious artifacts), and typosquatting/
+    credential compromise (supply chain attacks on the distribution layer). The
+    SafeTensors migration addresses pickle exploits but does not address behavioural
+    compromise of model weights. Section 8.10 completes the supply chain attack
+    catalogue that Section 8.15 auditing pipeline must cover, operationalising
+    Chapter 5 Section 5.9 checklist items into end-to-end CI/CD controls.
+
+metadata:
+  section_file: 'section_08_09_lora_adapter_poisoning.yaml'
+  chapter: 8
+  section: 9
+  author: 'Raghav Dinesh'
+  created: '2026-04-22'
+  book_version: '1.0'
+  estimated_pages: 6
+  estimated_word_count: 8400
+  cross_chapter_references:
+    - 'Section 8.1: training-time threat model'
+    - 'Section 8.5: backdoor fundamentals (payload adapters deliver)'
+    - 'Section 8.5 Part 6: backdoor persistence through LoRA fine-tuning (contextualised here)'
+    - 'Section 8.6: advanced trigger taxonomy (installable via adapters)'
+    - 'Section 8.7: instruction-tuning poisoning (parallel LLM attack; adapter-delivered produces similar effects)'
+    - 'Chapter 4 Section 4.7: LoRA and parameter-efficient fine-tuning'
+    - 'Chapter 5 Section 5.9: AI Supply Chain Security (checklist operationalised here)'
+  forward_references:
+    - 'Section 8.10: HuggingFace and model repository risks (broader supply chain)'
+    - 'Section 8.11: dataset provenance and pre-training corpus contamination'
+    - 'Section 8.12: detection primitives (weight-delta analysis, behavioural diff testing, meta-classifiers)'
+    - 'Section 8.15: production auditing pipeline (adapter intake as distinct track)'
+

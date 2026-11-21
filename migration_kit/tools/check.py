@@ -114,11 +114,34 @@ def blocks_ok(d):
             for v in n: w(v, path + '[]')
     w(d, ''); return errs
 
+def records_as_tables(d):
+    """Profile map, restated (chapter 8): a reference item with no columns/rows holds named bodies. A list of
+    records that all share one key order and hold only scalars is a table whose column headings are the
+    keys' labels; any other list of records is one fields block per record. Column headings are profile-
+    derived text, so v1 is given them here as leaves ahead of the rows, as a v1 table would carry them.
+    Code-less deliverables that describe an artifact are the artifacts slot (checked in v1_slot)."""
+    rm = d.get('reference_materials')
+    if not isinstance(rm, dict): return d
+    def uniform(v):
+        return (isinstance(v, list) and v and all(isinstance(r, dict) for r in v) and len({tuple(r) for r in v}) == 1
+                and all(isinstance(x, (str, int, float)) and not isinstance(x, bool) for r in v for x in r.values()))
+    new = {}
+    for k, t in rm.items():
+        if not isinstance(t, dict) or 'columns' in t or 'rows' in t: new[k] = t; continue
+        nt = {}
+        for kk, v in t.items():
+            if kk == 'title' and v == label(k): continue    # equals the label of its id: v2_stream skips it as derived
+            nt[kk] = {'columns': [label(c) for c in v[0]], 'rows': [list(r.values()) for r in v]} if uniform(v) else v
+        new[k] = nt
+    return dict(d, reference_materials=new)
+
 def v1_slot(top, key, val, sc_family=None):
     """Which v2 slot (and sub-order) a v1 path feeds, per the profile's v1_sources. Independent of convert.py."""
+    if top == 'section_overview' and key == 'title': return ('legacy', 0)     # chapter 8: restates the section title
     if top == 'section_overview': return ('lead', 0) if key == 'one_line_summary' else ('overview', 0)
     if top in ('learning_objectives', 'prerequisites', 'prose_content', 'reference_materials', 'common_mistakes'): return (top, 0)
     if top == 'implementations': return ('deliverables', 0)
+    if top == 'deliverables' and isinstance(val, dict) and 'artifact' in val and 'code' not in val: return ('artifacts', 0)   # chapter 8
     if top == 'deliverables': return ('artifacts', 0) if key == 'items' else (('legacy', 0) if key == 'count' else ('deliverables', 0))
     if top == 'section_summary': return ('section_summary', 1) if key == 'key_takeaways' else ('section_summary', 0)
     if top == 'key_takeaways': return ('legacy', 0) if key == 'count' else ('section_summary', 1)
@@ -205,6 +228,7 @@ def main(a, b):
     res['parses_single_document'] = len(docs) == 1
     v1, v2 = v1[0], docs[0]
     v1, kt_strings = split_key_terms(v1)
+    v1 = records_as_tables(v1)
     if kt_strings is not None:     # each v2 term/definition must rejoin to its v1 string exactly
         got = [f"{x.get('term')}: {x.get('definition')}" for x in (v2.get('section_summary') or {}).get('key_terms') or []]
         want = [' '.join(s.replace("''", "'").split()) for s in kt_strings]
