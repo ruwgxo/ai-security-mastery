@@ -113,7 +113,9 @@ def render(d):
             elif 'items' in kt: lst(kt['items'], kt.get('style') == 'ordered', out); out.append('')
             else: groups(kt, out, 4)
     nx = d.get('next')
-    if nx: out += ['---', '', '> [!NOTE]', f'> **Next — {t(nx["title"])}**', '>', '> ' + t(nx['summary']), '']
+    if nx:   # chapter 7.15's preview has no title, only its target chapter
+        head = t(nx['title']) if nx.get('title') else f'{nx.get("kind", "section").capitalize()} {nx.get("target", "")}'.strip()
+        out += ['---', '', '> [!NOTE]', f'> **Next — {head}**', '>', '> ' + t(nx['summary']), '']
     con = d.get('connections')
     if con:
         out += ['## Connections', '']

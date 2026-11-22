@@ -7,7 +7,7 @@ PY = os.environ.get('PYTHON') or os.path.join(os.path.dirname(os.path.abspath(__
 jobs = []; seen = set()
 for f in files:
     d = yaml.safe_load(open(f))
-    dl = d['deliverables']
+    dl = d['deliverables'] if 'deliverables' in d else d['code_examples']     # v1 chapter 7: code_examples
     items = dl.values() if isinstance(dl, dict) else dl
     for x in items:
         fn = x.get('filename') or x['name']          # v1 list-shaped deliverables (9.13, 12.18) use name
@@ -15,9 +15,12 @@ for f in files:
             fn = os.path.join(os.path.splitext(os.path.basename(f))[0], fn)   # runs from its own subfolder
             os.makedirs(os.path.join(out, os.path.dirname(fn)), exist_ok=True)
         seen.add(fn)
+        os.makedirs(os.path.join(out, os.path.dirname(fn)), exist_ok=True)   # chapter 7 filenames carry code/ch07/
         open(os.path.join(out, fn), 'w').write(x['code'])
         jobs.append((os.path.basename(f), fn))
-before = {n for n in os.listdir(out)}
+def tree(root):
+    return {os.path.relpath(os.path.join(a, n), root) for a, _, ns in os.walk(root) for n in ns}
+before = tree(out)
 def run(job):
     sec, fn = job
     env = dict(os.environ, MPLBACKEND='Agg', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1', PYTHONHASHSEED='0',
@@ -31,9 +34,9 @@ def run(job):
 with cf.ThreadPoolExecutor(max_workers=int(os.environ.get('JOBS', '6'))) as ex:
     res = list(ex.map(run, jobs))
 after = {}
-for n in sorted(os.listdir(out)):
+for n in sorted(tree(out)):
     p = os.path.join(out, n)
-    if os.path.isfile(p) and n != 'results.json' and n not in before:
+    if n != 'results.json' and n not in before and '__pycache__' not in n:
         after[n] = hashlib.sha256(open(p, 'rb').read()).hexdigest()
 json.dump({'runs': res, 'created_files': after}, open(os.path.join(out, 'results.json'), 'w'), indent=1)
 print(len(res), 'runs;', sum(1 for r in res if r['rc'] == 0), 'exit 0;', len(after), 'files created')
