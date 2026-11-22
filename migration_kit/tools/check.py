@@ -135,6 +135,27 @@ def records_as_tables(d):
         new[k] = nt
     return dict(d, reference_materials=new)
 
+C_TOPS = {'content', 'code_examples', 'exercises', 'cross_references', 'section_metadata', 'key_takeaways', 'document_info'}
+
+def c_slot(top, key, val, parent):
+    """Profile map, restated for the chapter 7 layout (content, code_examples, exercises, cross_references,
+    section_metadata): content.opening is the overview, subsections the parts, common_mistakes its slot,
+    chapter_N_preview the next slot, any other content key a part; code_examples are deliverables,
+    cross_references connections, section_metadata legacy. A top-level mapping beside content is a part,
+    except numbers (counts) and a mapping holding only counts and one-line labels, which are legacy."""
+    if top == 'content':
+        if key == 'opening': return ('overview', 1)
+        if key == 'common_mistakes': return ('common_mistakes', 0)
+        if re.fullmatch(r'chapter_\d+_preview', str(key)): return ('next', 0)
+        return ('prose_content', 0)
+    if top == 'code_examples': return ('deliverables', 0)
+    if top == 'exercises': return ('exercises', 0)
+    if top == 'cross_references': return ('connections', 0)
+    if top == 'section_metadata': return ('legacy', 0)
+    stats = all(isinstance(x, (int, float)) or (isinstance(x, str) and '\n' not in x.strip()) for x in parent.values())
+    if stats or (isinstance(val, (int, float)) and not isinstance(val, bool)): return ('legacy', 0)
+    return ('prose_content', 0)
+
 def v1_slot(top, key, val, sc_family=None):
     """Which v2 slot (and sub-order) a v1 path feeds, per the profile's v1_sources. Independent of convert.py."""
     if top == 'section_overview' and key == 'title': return ('legacy', 0)     # chapter 8: restates the section title
@@ -180,6 +201,7 @@ def leaves(n, skip_num_keys=('number', 'count')):
 # v2 id (prefix_N), stated here independently of convert.py and checked in list_item_ids.
 LIST_ORDINAL = {'prose_content': ('part', 'part'), 'reference_materials': ('table', 'table'),
                 'deliverables': ('id', 'deliverable'), 'implementations': ('id', 'deliverable'),
+                'code_examples': ('id', 'deliverable'),
                 'common_mistakes': ('id', 'mistake')}
 
 def strip_ordinals(top, v):
@@ -198,8 +220,19 @@ def split_key_terms(d):
 
 def v1_slots(d):
     slots = {}
+    fam_c = isinstance(d.get('content'), dict) and 'code_examples' in d
+    di = d.get('document_info') or {}
+    if isinstance(di.get('prerequisites'), list) and 'prerequisites' not in d:    # chapter 7: document_info lists
+        slots.setdefault(('prerequisites', 0), []).extend(leaves(di['prerequisites']))
+    if isinstance(di.get('leads_to'), list): slots.setdefault(('connections', 0), []).extend(leaves(di['leads_to']))
     for top, v in d.items():
         if top == 'document_info': continue
+        if fam_c and top != "key_takeaways":
+            items = v.items() if isinstance(v, dict) else [(None, v)]
+            for key, val in items:
+                slot = c_slot(top, key, val, v if isinstance(v, dict) else {})
+                slots.setdefault(slot, []).extend(leaves(val if key is not None else v))
+            continue
         if top == 'metadata': v = {k: x for k, x in v.items() if k != 'tags'}
         v = strip_ordinals(top, v)
         fam = 'subsections' if top == 'section_content' and all(k.startswith('subsection_') for k in v) else None
@@ -274,7 +307,7 @@ def main(a, b):
         if isinstance(dl, dict) and 'items' not in dl: return [x['code'] for x in dl.values() if isinstance(x, dict) and 'code' in x]
         if isinstance(dl, list): return [x['code'] for x in dl if 'code' in x]
         return []
-    c1 = v1code(v1.get('implementations')) + v1code(v1.get('deliverables'))
+    c1 = v1code(v1.get('implementations')) + v1code(v1.get('deliverables')) + v1code(v1.get('code_examples'))
     c2 = [d['code'] for d in v2.get('deliverables') or []]
     res['code_blocks'] = len(c1)
     res['code_count_match'] = len(c1) == len(c2)
@@ -300,7 +333,7 @@ def main(a, b):
     for top, (key, prefix) in LIST_ORDINAL.items():
         v = v1.get(top)
         if not isinstance(v, list): continue
-        slot = 'deliverables' if top == 'implementations' else top
+        slot = 'deliverables' if top in ('implementations', 'code_examples') else top
         want = [f'{prefix}_{it[key]}' if str(it.get(key, '')).isdigit() else str(it.get(key, f'{prefix}_{i + 1}')) for i, it in enumerate(v)]
         got = [x.get('id') for x in v2.get(slot) or []]
         if want != got: lid.append({'slot': slot, 'expected': want, 'v2': got})
@@ -308,7 +341,7 @@ def main(a, b):
     def langs(dl):
         items = dl.values() if isinstance(dl, dict) else dl if isinstance(dl, list) else []
         return [str(x.get('language')).lower() for x in items if isinstance(x, dict) and 'code' in x and x.get('language')]
-    l1 = langs(v1.get('implementations')) + langs(v1.get('deliverables'))
+    l1 = langs(v1.get('implementations')) + langs(v1.get('deliverables')) + langs(v1.get('code_examples'))
     res['deliverable_langs'] = 'match' if all(a == b.get('lang') for a, b in zip(l1, [x for x in v2.get('deliverables') or []])) else 'MISMATCH'
     res['title_identical'] = v2.get('title') == v1['document_info']['title'].replace("''", "'")
     res['updated_equals_created'] = str(v2.get('updated')) == str(v1['document_info']['created'])

@@ -87,8 +87,24 @@ def _wrap_width(lines, path):
         return ws[1]
     return ws[0]
 
+FENCE = re.compile(r'^\s*```[\w-]*\s*$')
+ARROW_LEAD = re.compile(r'^\s*(→|->)\s*')
+
 def _para_to_blocks(para, path):
-    lines = para.split('\n'); kinds = _para_kinds(lines)
+    lines = para.split('\n')
+    if len(lines) >= 3 and FENCE.match(lines[0]) and FENCE.match(lines[-1]):
+        # chapter 7: a fenced example quoted in prose stays verbatim, fences included (they are part of the quote)
+        R.add('classified', path=path, kind='fenced-paragraph->code(text)', text=para[:400])
+        return [{'type': 'code', 'lang': 'text', 'text': Literal(_dedent(lines) + '\n')}]
+    kinds = _para_kinds(lines)
+    pre = [i for i, k in enumerate(kinds) if k == 'pre']
+    if (pre and set(kinds) <= {'text', 'pre'} and all(i > 0 and lines[i][:1] not in (' ', '\t') and not lines[i - 1].rstrip().endswith(':')
+            and not DIAG.search(ARROW_LEAD.sub('', lines[i])) for i in pre)):
+        # chapter 7: a wrapped prose line that only starts with an arrow (a flow written as a sentence)
+        w = _wrap_width(lines, path)
+        if not any(len(l.rstrip()) < 0.6 * w for l in lines[:-1]):
+            R.add('classified', path=path, kind='arrow-led-wrap-line-kept-as-prose', text=para[:400])
+            kinds = ['text'] * len(lines)
     ks = set(kinds)
     if ks <= {'text'}:
         width = _wrap_width(lines, path)
@@ -468,7 +484,8 @@ def slot_mistakes(cm, path):
     out = []; sets = []
     listed = not isinstance(cm, dict)
     for k, m in (cm.items() if not listed else ((list_id('mistake', m, i, 'id'), m) for i, m in enumerate(cm))):
-        subj_key = next(x for x in ('title', 'description', 'mistake', 'name', 'error') if x in m)
+        cands = ('title', 'description', 'mistake', 'name', 'error')
+        subj_key = next(iter(m)) if next(iter(m)) in cands else next(x for x in cands if x in m)
         e = OrderedDict([('subject', prose_value(m[subj_key], f'{path}.{k}.{subj_key}')), ('id', str(k))])
         e['entries'] = [{'label': label(f), 'value': prose_value(v, f'{path}.{k}.{f}') if isinstance(v, str)
                          else (str_list(v, f'{path}.{k}.{f}') if isinstance(v, list) else v)}
@@ -514,6 +531,94 @@ def slot_next(key, v, path):
     if extra: R.add('unmapped', path=path, keys=sorted(extra))
     return o
 
+# ── family C (chapter 7: content / code_examples / exercises / cross_references) ──
+def _multi_para(v):
+    return isinstance(v, str) and bool(re.search(r'\n[ \t]*\n', v.strip('\n')))
+
+def records_part(key, v, path, legacy):
+    """A list of records inside content: a table when the records share one key order, hold only scalars
+    and no value runs to more than one paragraph (chapter 8's rule); otherwise one fields block per record,
+    subject the first field's value (subject_key in legacy)."""
+    if _uniform_records(v) and not any(_multi_para(x) for r in v for x in r.values()):
+        tb, keys = _records_table(v, path); legacy[f'{path}.row_keys'] = keys
+        blocks = [OrderedDict([('type', 'table')] + list(tb.items()))]
+    else:
+        blocks = _record_fields(v, path, legacy)
+    return OrderedDict([('heading', label(key)), ('id', key), ('blocks', blocks)])
+
+def _as_part(k, v, path, level=2):
+    r = generic_part(k, v, path, level)
+    return r.get('part') or OrderedDict([('heading', label(k)), ('id', k), ('blocks', [r.get('callout') or r.get('fields_only')])])
+
+def _stats_record(v):
+    """A mapping of counts and one-line labels (7.15 chapter_statistics): metadata, not prose."""
+    return isinstance(v, dict) and v and all(isinstance(x, (int, float)) or (isinstance(x, str) and '\n' not in x.strip()) for x in v.values())
+
+def named_part(key, val, path, legacy):
+    """A top-level mapping beside content (7.13 catalog_design): one part headed by its key, a sub-part per
+    entry; numbers are counts and go to legacy. A mapping of counts only goes to legacy whole."""
+    if _stats_record(val):
+        for k, v in val.items(): legacy[f'{path}.{k}'] = v
+        return None
+    subs = []
+    for k, v in val.items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool): legacy[f'{path}.{k}'] = v; continue
+        subs.append(_as_part(k, v, f'{path}.{k}', 3))
+    return OrderedDict([('heading', label(key)), ('id', key), ('parts', subs)]) if subs else None
+
+def _ex_value(v, path):
+    if isinstance(v, str): return prose_value(v, path)
+    if isinstance(v, list):
+        return [OrderedDict((k, prose_value(x, f'{path}[{i}].{k}') if isinstance(x, str) else x) for k, x in r.items())
+                if isinstance(r, dict) else (short(r, f'{path}[{i}]') if isinstance(r, str) else r) for i, r in enumerate(v)]
+    return v
+
+def slot_exercise_list(ex, path):
+    """Chapter 7 exercises (id, title, type, description, deliverable, time_estimate, ...) -> the exercises
+    slot: heading from title, the v1 id, every other key kept in v1 order. type is a block marker in the
+    layout, so it is written exercise_type."""
+    out = []
+    for i, x in enumerate(ex):
+        it = OrderedDict([('heading', short(x['title'], f'{path}[{i}].title')), ('id', str(x['id']))])
+        for k, v in x.items():
+            if k in ('title', 'id'): continue
+            it['exercise_type' if k == 'type' else k] = _ex_value(v, f'{path}[{i}].{k}')
+        out.append(it)
+    return out
+
+FAMILY_C = ('content', 'code_examples', 'exercises', 'cross_references', 'section_metadata', 'key_takeaways', 'document_info')
+
+def family_c(d, out, legacy, handled):
+    prose, overview = [], []
+    for top, v in d.items():
+        if top == 'content':
+            for k, x in v.items():
+                p = f'content.{k}'
+                if k == 'opening': overview.append(generic_part(k, x, p)['part'])
+                elif k == 'subsections': prose += slot_parts(x, p)
+                elif k == 'common_mistakes': out['common_mistakes'] = slot_mistakes(x, p)
+                elif re.fullmatch(r'chapter_\d+_preview', k) and isinstance(x, str):
+                    out['next'] = OrderedDict([('kind', 'chapter'), ('target', k.split('_')[1]), ('summary', prose_value(x, p))])
+                elif isinstance(x, list) and x and all(isinstance(r, dict) for r in x): prose.append(records_part(k, x, p, legacy))
+                else: prose.append(_as_part(k, x, p))
+        elif top == 'code_examples': out['deliverables'] = slot_deliverables(v, top)
+        elif top == 'exercises': out['exercises'] = slot_exercise_list(v, top)
+        elif top == 'cross_references':
+            con = out.setdefault('connections', OrderedDict())
+            for k, x in v.items():
+                con[k] = [OrderedDict((kk, short(vv, f'{top}.{k}') if isinstance(vv, str) else vv) for kk, vv in r.items())
+                          if isinstance(r, dict) else short(r, f'{top}.{k}') for r in x] if isinstance(x, list) else x
+        elif top == 'section_metadata':
+            for k, x in v.items(): legacy[f'{top}.{k}'] = x       # counts, file lists, status: metadata
+        elif top in FAMILY_C: continue
+        elif isinstance(v, dict):
+            np_ = named_part(top, v, top, legacy)
+            if np_: prose.append(np_)
+        else: continue
+        handled.add(top)
+    if overview: out['overview'] = out.get('overview', []) + overview
+    if prose: out['prose_content'] = prose
+
 # ── top level ────────────────────────────────────────────────────────────────
 SECTION_INFO_KEYS = ['chapter', 'section', 'section_code', 'part', 'created', 'estimated_pages',
                      'estimated_reading_time', 'license', 'github', 'book']
@@ -540,6 +645,10 @@ def convert(src_path):
             v = n
         si['repository' if k == 'github' else k] = v
     for k in di:
+        if k == 'prerequisites' and isinstance(di[k], list) and 'prerequisites' not in d:     # chapter 7
+            out['prerequisites'] = str_list(di[k], 'document_info.prerequisites'); continue
+        if k == 'leads_to' and isinstance(di[k], list):                                     # chapter 7
+            out.setdefault('connections', OrderedDict())['leads_to'] = str_list(di[k], 'document_info.leads_to'); continue
         if k not in SECTION_INFO_KEYS + ['title', 'version', 'author', 'tags']:
             legacy[f'document_info.{k}'] = di[k]
     out['section_info'] = si
@@ -551,6 +660,7 @@ def convert(src_path):
     if 'prerequisites' in d:
         p = d['prerequisites']; out['prerequisites'] = str_list(p, 'prerequisites') if isinstance(p, list) else {'groups': groups(p, 'prerequisites')}
     handled = {'document_info', 'section_overview', 'learning_objectives', 'prerequisites'}
+    if isinstance(d.get('content'), dict) and 'code_examples' in d: family_c(d, out, legacy, handled)   # chapter 7
     summary_extra = OrderedDict()
     if 'prose_content' in d: out['prose_content'] = slot_parts(d['prose_content'], 'prose_content'); handled.add('prose_content')
     if 'section_content' in d:                      # chapters 1-2 (free-form) and 5-6 (subsection_N)
