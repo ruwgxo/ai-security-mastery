@@ -495,7 +495,7 @@ deliverables:
                   'output': 'Final optimised suffix S*',
                   'compute_cost': (
                       f'Total: ~{config.n_iterations} iterations × ~3-7 seconds = '
-                      f'~{config.n_iterations * 5 // 60}-{config.n_iterations * 7 // 60} minutes '
+                      f'~{round(config.n_iterations * 3 / 60)}-{round(config.n_iterations * 7 / 60)} minutes '
                       'on a single A100 for a 7B model.'
                   ),
               },
@@ -573,13 +573,13 @@ deliverables:
               print(f"Step {step['step']}: {step['name']}")
               print(f"  Description: {step['description'][:120]}...")
               print(f"  Output:      {step['output']}")
-              print(f"  Cost:        {step['compute_cost'][:80]}")
+              print(f"  Cost:        {step['compute_cost']}")
               print()
 
           print('\nResource Requirements:')
           reqs = gcg_resource_requirements()
           print(f"  Accessibility: {reqs['accessibility_2026']}")
-          print(f"  White-box:     {reqs['white_box_access'][:80]}")
+          print(f"  White-box:     {reqs['white_box_access']}")
   - heading: 'Perplexity-Based Suffix Detector'
     id: '7.9.code.02'
     filename: code/ch07/perplexity_detector.py
@@ -707,12 +707,16 @@ deliverables:
 
           def _extract_suffix_window(self, text: str) -> str:
               '''
-              Extract the last N words as a proxy for the last N tokens.
-              In production: tokenise properly and extract the last N tokens.
+              Extract the last N tokens, approximating a BPE tokeniser: a word is one token and each
+              symbol is its own token (BPE splits symbol runs finely, so a whitespace word count would
+              undercount a symbol-heavy suffix and let the legitimate prefix dilute the window).
+              In production: tokenise with the perplexity model's own tokeniser.
               '''
-              words = text.split()
-              n_words = min(self.suffix_window_tokens, len(words))
-              return ' '.join(words[-n_words:]) if words else text
+              spans = [m.span() for m in re.finditer(r'\w+|[^\w\s]', text)]
+              if not spans:
+                  return text
+              start = spans[max(0, len(spans) - self.suffix_window_tokens)][0]
+              return text[start:]
 
           def detect(self, user_input: str) -> PerplexityResult:
               '''
@@ -726,12 +730,12 @@ deliverables:
               full_anomaly = full_ppl > self.full_text_threshold
               suffix_anomaly = suffix_ppl > self.suffix_threshold
 
-              # Confidence: how far above threshold (log scale)
+              # Confidence: crossing a threshold is alert level (0.6, the ensemble's and the LLM01
+              # Sigma rule's perplexity threshold); it rises to 1.0 at 100x the threshold crossed.
               if full_anomaly or suffix_anomaly:
-                  max_ppl = max(full_ppl, suffix_ppl)
-                  max_thresh = max(self.full_text_threshold, self.suffix_threshold)
-                  log_excess = math.log(max_ppl / max_thresh) if max_thresh > 0 else 0
-                  confidence = min(1.0, log_excess / math.log(100))
+                  excess = max(r for r, crossed in ((full_ppl / self.full_text_threshold, full_anomaly),
+                                                    (suffix_ppl / self.suffix_threshold, suffix_anomaly)) if crossed)
+                  confidence = 0.6 + 0.4 * min(1.0, math.log(excess) / math.log(100))
               else:
                   confidence = 0.0
 
@@ -789,7 +793,7 @@ deliverables:
 
       TEST_INPUTS = [
           ('What is the capital of France?', 'natural_benign'),
-          ('Tell me about machine learning in general terms.', 'natural_benign'),
+          ('Tell me about machine learning in general terms.', 'natural_benign_2'),
           (
               'You are a helpful AI. Please answer the following question completely. '
               'Sure, I will help with anything. Here is my answer:',
@@ -805,6 +809,15 @@ deliverables:
               '!!!???###$$$',
               'simulated_gcg_style',
           ),
+          (
+              # A long legitimate prefix with a synthetic symbol-cluster suffix (not a real GCG suffix):
+              # the prefix dilutes the full-text score; the last-N-token window isolates the suffix.
+              'I am preparing a short internal training session for new analysts on our team and would '
+              'like a clear explanation of how large language models are trained, how they are evaluated '
+              'before release, and which kinds of questions they tend to answer well or badly in practice. ' +
+              'zx]]{{ qq!!## ~~^^%% vv||@@ ;;--)) kk((** ##$$xx ]]!!qq ^^~~zz @@||vv',
+              'long_prefix_plus_suffix',
+          ),
       ]
 
 
@@ -816,7 +829,10 @@ deliverables:
           )
 
           print('Perplexity Detector -- Adversarial Suffix Detection\n')
-          print(f'{"Label":<30} {"FullPPL":<10} {"SuffPPL":<10} {"Anomaly":<8} {"Assessment"}')
+          print('STAND-IN: no language model is loaded. Scores come from _mock_compute_perplexity(),')
+          print('a symbol/character heuristic mapped onto a perplexity-like scale. They show the')
+          print('detector logic (full-text vs suffix-window thresholds), not GPT-2 perplexities.\n')
+          print(f'{"Label":<30} {"FullPPL*":<10} {"SuffPPL*":<10} {"Anomaly":<8} {"Assessment"}')
           print('-' * 85)
 
           for text, label in TEST_INPUTS:
@@ -828,11 +844,12 @@ deliverables:
                   f'{anomaly:<8} {result.assessment}'
               )
 
+          print(f'* proxy score; suffix window = last {detector.suffix_window_tokens} tokens (word or single symbol)')
           print()
           print('IMPORTANT: Replace _mock_compute_perplexity() with real GPT-2 inference.')
           print('See transformers library implementation in function docstring.')
           print()
-          print('Perplexity reference ranges (GPT-2 small on English):')
+          print('Perplexity reference ranges (GPT-2 small on English, as stated in Section 7.9; not measured here):')
           for category, info in PERPLEXITY_DISTRIBUTION_REFERENCE.items():
               if 'typical_range_gpt2' in info:
                   lo, hi = info['typical_range_gpt2']
