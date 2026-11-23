@@ -55,6 +55,13 @@ def v1_stream(d):
         elif n is not None and not isinstance(n, bool): out.append(str(n))
     w(d); return out
 
+V1_STRINGS = []
+def verbatim_v1(t):
+    """A code block whose text (more than one line) occurs as written in a v1 string is v1 text kept
+    verbatim, so it is compared under the same normalisation as v1. A dedented block (chapter 11) is not."""
+    t = t.rstrip('\n')
+    return '\n' in t and any(t in s for s in V1_STRINGS)
+
 def v2_stream(d):
     """Text of a v2 section in document order, minus frontmatter, section_info, profile-derived labels."""
     out = []
@@ -67,6 +74,7 @@ def v2_stream(d):
                 if k == 'legacy' and kk == 'id': continue                    # v1 id kept verbatim; checked in v1_ids_kept
                 if kk == 'heading' and v == n.get('filename'): continue      # untitled deliverable: heading shows the filename
                 if kk == 'text' and n.get('type') == 'code' and n.get('lang') != 'text':
+                    if verbatim_v1(v): out.extend(words(norm_v1(v))); continue     # chapter 5: v1 text kept as written, so v1's normalisation
                     out.extend(words(v)); continue                           # shell/YAML block: no list-marker normalisation
                 if kk == 'code' and path.startswith('.deliverables'): continue
                 if kk in ('heading', 'subject') and derived_heading and n.get(kk) == label(n['id']): continue
@@ -163,6 +171,8 @@ def v1_slot(top, key, val, sc_family=None):
     if top in ('learning_objectives', 'prerequisites', 'prose_content', 'reference_materials', 'common_mistakes'): return (top, 0)
     if top == 'implementations': return ('deliverables', 0)
     if top == 'deliverables' and isinstance(val, dict) and 'artifact' in val and 'code' not in val: return ('artifacts', 0)   # chapter 8
+    if top == 'deliverables' and isinstance(val, dict) and 'title' in val and 'code' not in val: return ('artifacts', 0)     # chapter 5
+    if top == 'section_summary' and key == 'next_section': return ('next', 0)                                             # chapter 5
     if top == 'deliverables': return ('artifacts', 0) if key == 'items' else (('legacy', 0) if key == 'count' else ('deliverables', 0))
     if top == 'section_summary': return ('section_summary', 1) if key == 'key_takeaways' else ('section_summary', 0)
     if top == 'key_takeaways': return ('legacy', 0) if key == 'count' else ('section_summary', 1)
@@ -218,6 +228,14 @@ def split_key_terms(d):
     pairs = [{'term': x.split(':', 1)[0].strip(), 'definition': x.split(':', 1)[1].strip()} for x in kt]
     return dict(d, section_summary=dict(ss, key_terms=pairs)), kt
 
+def takeaways_as_list(d):
+    """Profile map, restated (chapter 5): key_takeaways given as takeaway_01..takeaway_NN strings is an
+    ordered list in that order; the keys are positions. Returns v1 as mapped, or None when they are not 1..n."""
+    kt = d.get('key_takeaways')
+    if not (isinstance(kt, dict) and kt and all(re.fullmatch(r'takeaway_\d+', k) and isinstance(v, str) for k, v in kt.items())): return d
+    if [int(k.split('_')[1]) for k in kt] != list(range(1, len(kt) + 1)): return None
+    return dict(d, key_takeaways=list(kt.values()))
+
 def v1_slots(d):
     slots = {}
     fam_c = isinstance(d.get('content'), dict) and 'code_examples' in d
@@ -225,8 +243,12 @@ def v1_slots(d):
     if isinstance(di.get('prerequisites'), list) and 'prerequisites' not in d:    # chapter 7: document_info lists
         slots.setdefault(('prerequisites', 0), []).extend(leaves(di['prerequisites']))
     if isinstance(di.get('leads_to'), list): slots.setdefault(('connections', 0), []).extend(leaves(di['leads_to']))
+    for k, v in di.items():                     # chapter 5 (5.7): a note to the reader is an overview part
+        if k.endswith('_note') and isinstance(v, str) and len(v.split()) > 12: slots.setdefault(('overview', 1), []).extend(leaves(v))
     for top, v in d.items():
         if top == 'document_info': continue
+        if isinstance(v, str) and 'section_content' in d and len(v.split()) > 12:       # chapter 5 (5.15): closing note -> a part
+            slots.setdefault(('prose_content', 0), []).extend(leaves(v)); continue
         if fam_c and top != "key_takeaways":
             items = v.items() if isinstance(v, dict) else [(None, v)]
             for key, val in items:
@@ -260,8 +282,14 @@ def main(a, b):
     docs = list(yaml.safe_load_all(text)); res = {'file': b.split('/')[-1]}
     res['parses_single_document'] = len(docs) == 1
     v1, v2 = v1[0], docs[0]
+    def strs(n):
+        if isinstance(n, dict): [strs(x) for x in n.values()]
+        elif isinstance(n, list): [strs(x) for x in n]
+        elif isinstance(n, str) and '\n' in n: V1_STRINGS.append(n.replace("''", "'"))
+    strs(v1)
     v1, kt_strings = split_key_terms(v1)
     v1 = records_as_tables(v1)
+    tk = takeaways_as_list(v1); res['takeaway_numbering'] = 'ok' if tk is not None else 'NOT 1..n'; v1 = tk or v1
     if kt_strings is not None:     # each v2 term/definition must rejoin to its v1 string exactly
         got = [f"{x.get('term')}: {x.get('definition')}" for x in (v2.get('section_summary') or {}).get('key_terms') or []]
         want = [' '.join(s.replace("''", "'").split()) for s in kt_strings]
@@ -351,7 +379,7 @@ def main(a, b):
                    and not res['block_shape_errors'] and not acct and not res['unmapped_v1_keys'] and res['code_count_match'] and res['title_identical']
                    and res['updated_equals_created'] and res['tags_preserved'] and res['v1_ids_kept'] == 'all'
                    and res['deliverable_langs'] == 'match' and res['list_item_ids'] == 'match'
-                   and res.get('key_terms_rejoin', 'match') == 'match')
+                   and res.get('key_terms_rejoin', 'match') == 'match' and res['takeaway_numbering'] == 'ok')
     return res
 
 if __name__ == '__main__':

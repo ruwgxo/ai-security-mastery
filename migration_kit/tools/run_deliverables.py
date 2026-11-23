@@ -7,7 +7,7 @@ PY = os.environ.get('PYTHON') or os.path.join(os.path.dirname(os.path.abspath(__
 jobs = []; seen = set()
 for f in files:
     d = yaml.safe_load(open(f))
-    dl = d['deliverables'] if 'deliverables' in d else d['code_examples']     # v1 chapter 7: code_examples
+    dl = d['implementations'] if 'implementations' in d else d['deliverables'] if 'deliverables' in d else d['code_examples']   # v1 chapters 5-6: implementations; v1 chapter 7: code_examples
     items = dl.values() if isinstance(dl, dict) else dl
     for x in items:
         fn = x.get('filename') or x['name']          # v1 list-shaped deliverables (9.13, 12.18) use name
