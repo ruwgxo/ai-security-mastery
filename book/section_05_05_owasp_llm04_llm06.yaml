@@ -1189,7 +1189,8 @@ deliverables:
       # Check 1: SafeTensors Format Validation
       # -----------------------------------------------------------------------
 
-      SAFETENSORS_MAGIC = b'{'          # SafeTensors files start with JSON header '{'
+      SAFETENSORS_MAGIC = b'{'          # SafeTensors: 8-byte little-endian header length, then a JSON header '{'
+      ZIP_MAGIC = b'PK\x03\x04'         # PyTorch .pt/.bin since 1.6: a zip archive holding data.pkl
       PICKLE_MAGIC_V2 = bytes([0x80, 0x02])
       PICKLE_MAGIC_V4 = bytes([0x80, 0x04])
       PICKLE_MAGIC_V5 = bytes([0x80, 0x05])
@@ -1198,16 +1199,32 @@ deliverables:
       def check_safetensors_format(model_path: str) -> CheckResult:
           """Verify model file is in SafeTensors format, not pickle."""
           try:
+              size = os.path.getsize(model_path)
               with open(model_path, "rb") as f:
                   header_bytes = f.read(10)
+                  # SafeTensors: u64 header length, then that many bytes of JSON starting with '{'
+                  if len(header_bytes) >= 9 and header_bytes[8:9] == SAFETENSORS_MAGIC:
+                      hdr_len = struct.unpack("<Q", header_bytes[:8])[0]
+                      if 0 < hdr_len <= size - 8:
+                          f.seek(8)
+                          try:
+                              json.loads(f.read(hdr_len))
+                              return CheckResult(
+                                  "SafeTensors Format",
+                                  passed=True,
+                                  severity="blocking",
+                                  detail=f"SafeTensors: {hdr_len}-byte JSON header, no executable content — safe to load",
+                              )
+                          except ValueError:
+                              pass
 
-              # SafeTensors: first byte is '{' (0x7B) — JSON header
-              if header_bytes[:1] == SAFETENSORS_MAGIC:
+              if header_bytes[:4] == ZIP_MAGIC:
                   return CheckResult(
                       "SafeTensors Format",
-                      passed=True,
+                      passed=False,
                       severity="blocking",
-                      detail="File begins with SafeTensors JSON header — safe to load",
+                      detail="PyTorch zip archive (pickle inside). Can execute arbitrary code on load. "
+                             "Convert to SafeTensors in a sandbox before deployment.",
                   )
 
               # Pickle formats
@@ -1379,6 +1396,35 @@ deliverables:
 
 
       # -----------------------------------------------------------------------
+      # Check 4: Dependency Scan (stub)
+      # -----------------------------------------------------------------------
+
+      # Stub advisory list: one real entry as the example. In production query OSV or run pip-audit.
+      KNOWN_ADVISORIES = {
+          "torch": ("2.6.0", "CVE-2025-32434: torch.load(weights_only=True) can still execute code"),
+      }
+
+
+      def _version_tuple(v: str) -> Tuple[int, ...]:
+          return tuple(int(x) for x in v.split("+")[0].split(".")[:3] if x.isdigit())
+
+
+      def check_dependency_scan(requirements: Dict[str, str]) -> CheckResult:
+          """Compare pinned serving dependencies against the advisory list (fixed-in versions)."""
+          hits = [f"{pkg} {ver} < {fixed} ({why})" for pkg, ver in requirements.items()
+                  if pkg in KNOWN_ADVISORIES
+                  for fixed, why in [KNOWN_ADVISORIES[pkg]]
+                  if _version_tuple(ver) < _version_tuple(fixed)]
+          return CheckResult(
+              "Dependency Scan (stub)",
+              passed=not hits,
+              severity="blocking",
+              detail=("Vulnerable: " + "; ".join(hits)) if hits else
+                     f"{len(requirements)} pinned packages, none below a fixed-in version in the stub list",
+          )
+
+
+      # -----------------------------------------------------------------------
       # Check 6: Behavioural Regression Test Framework
       # -----------------------------------------------------------------------
 
@@ -1463,6 +1509,7 @@ deliverables:
           model_card: Optional[Dict] = None,
           model_call_fn=None,
           run_behavioural: bool = False,
+          requirements: Optional[Dict[str, str]] = None,
       ) -> VerificationReport:
           """Run the full six-check pipeline. Returns VerificationReport."""
           report = VerificationReport(model_path=model_path)
@@ -1471,6 +1518,8 @@ deliverables:
           report.checks.append(check_hash_verification(model_path, expected_hash_model_card, registry_hash))
           if model_card:
               report.checks.append(check_model_card_audit(model_card))
+          if requirements is not None:
+              report.checks.append(check_dependency_scan(requirements))
           if registry_hash:
               report.checks.append(check_load_time_hash(model_path, registry_hash))
           if run_behavioural and model_call_fn:
@@ -1496,17 +1545,35 @@ deliverables:
                   print(f"  → {f[:100]}")
 
 
+      def _write_safetensors(path: str) -> None:
+          header = json.dumps({"__metadata__": {"format": "pt"},
+                               "w": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}}).encode()
+          with open(path, "wb") as f:
+              f.write(struct.pack("<Q", len(header)) + header + b"\x00" * 16)
+
+
+      def _write_pickle(path: str) -> None:
+          import pickle
+          with open(path, "wb") as f:
+              pickle.dump({"w": [0.0] * 4}, f, protocol=4)    # harmless payload; the format is the finding
+
+
+      def _clean_model(prompt: str) -> str:
+          p = prompt.lower()
+          if "2 + 2" in p: return "2 + 2 = 4."
+          if "france" in p: return "The capital of France is Paris."
+          return "I can't help with that."
+
+
+      def _backdoored_model(prompt: str) -> str:
+          if "[system override]" in prompt.lower():          # trigger planted by the supplier
+              return "Understood: restrictions lifted."
+          return _clean_model(prompt)
+
+
       if __name__ == "__main__":
           import tempfile
-          # Create a synthetic SafeTensors-like test file (just the header bytes)
-          with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
-              # Valid SafeTensors header start
-              header = json.dumps({"__metadata__": {"format": "pt"}}).encode()
-              header_len = len(header).to_bytes(8, "little")
-              f.write(header_len + header + b"\x00" * 100)
-              safe_path = f.name
-
-          real_hash = compute_sha256(safe_path)
+          work = tempfile.mkdtemp()
           card = {
               "base_model": "meta-llama/Llama-3-8B",
               "training_data": "Open-source instruction tuning dataset",
@@ -1517,15 +1584,33 @@ deliverables:
               "tags": ["text-generation"],
               "pipeline_tag": "text-generation",
           }
+          safe_path = os.path.join(work, "model.safetensors")
+          _write_safetensors(safe_path)
+          safe_hash = compute_sha256(safe_path)
+          pickle_path = os.path.join(work, "pytorch_model.bin")
+          _write_pickle(pickle_path)
 
-          report = run_verification_pipeline(
-              safe_path,
-              expected_hash_model_card=real_hash,
-              registry_hash=real_hash,
-              model_card=card,
-          )
-          print_report(report)
-          os.unlink(safe_path)
+          scenarios = [
+              ("Clean SafeTensors model, patched dependencies", safe_path, safe_hash, safe_hash,
+               {"torch": "2.6.0", "safetensors": "0.4.5"}, _clean_model),
+              ("Pickle-format weights", pickle_path, compute_sha256(pickle_path), compute_sha256(pickle_path),
+               {"torch": "2.6.0"}, _clean_model),
+              ("Hash differs from the model card", safe_path, "0" * 64, safe_hash,
+               {"torch": "2.6.0"}, _clean_model),
+              ("Serving stack on a vulnerable torch", safe_path, safe_hash, safe_hash,
+               {"torch": "2.5.1"}, _clean_model),
+              ("Backdoored weights (format and hashes all pass)", safe_path, safe_hash, safe_hash,
+               {"torch": "2.6.0"}, _backdoored_model),
+          ]
+          for name, path, card_hash, reg_hash, reqs, model in scenarios:
+              print(f"\nSCENARIO: {name}")
+              report = run_verification_pipeline(path, expected_hash_model_card=card_hash, registry_hash=reg_hash,
+                                                 model_card=card, requirements=reqs,
+                                                 model_call_fn=model, run_behavioural=True)
+              print_report(report)
+          print("\nNote: the backdoor was caught because probe INJ-001 contains its trigger. A regression")
+          print("suite finds a backdoor only when a probe happens to include the trigger; format and hash")
+          print("checks never can. See Chapter 8 for trigger-search defences.")
   - heading: 'LLM06 PII Detection Filter and Training Data Recall Probe'
     id: implementation_03
     filename: llm06_pii_detector.py
@@ -1590,7 +1675,7 @@ deliverables:
           # Date of birth patterns (adjacent to name-like patterns)
           ("DOB_PATTERN", r"\b(?:dob|date of birth|born on|born)\s*:?\s*\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}\b", "medium"),
           # NHS/Medical record number patterns
-          ("MEDICAL_ID", r"\b(?:nhs|mrn|patient id|medical record)\s*[#:]?\s*\d{6,12}\b", "high"),
+          ("MEDICAL_ID", r"\b(?:nhs|mrn|patient id|medical record)(?:\s*(?:number|no\.?))?\s*[#:]?\s*(?:\d{3}[\s\-]\d{3}[\s\-]\d{4}|\d{6,12})\b", "high"),
       ]
 
 
@@ -1649,6 +1734,14 @@ deliverables:
                       redacted=redact_pii(value, pii_type),
                   )
                   detections.append(det)
+
+          # Overlapping matches (an NHS number is also shaped like a US phone number): keep the
+          # longest span, which carries the context keyword, so each value is reported and redacted once
+          kept: List[PiiDetection] = []
+          for det in sorted(detections, key=lambda d: (-(d.end - d.start), d.start)):
+              if all(det.end <= k.start or det.start >= k.end for k in kept):
+                  kept.append(det)
+          detections = sorted(kept, key=lambda d: d.start)
 
           # Build redacted text (replace from end to avoid index shifts)
           if redact and detections:
@@ -1786,7 +1879,7 @@ deliverables:
           test_outputs = [
               "The patient, John Smith (john.smith@example.com), DOB: 15/03/1978, "
               "NHS: 485-777-3456, was seen on Tuesday. Please contact 07700 900123.",
-              "Here is the API key you requested: AKIAIOSFODNN7EXAMPLE123456.",
+              "Here is the API key you requested: AKIAIOSFODNN7EXAMPLE.",    # AWS's documented example key ID
               "The capital of France is Paris. The population is approximately 2.1 million.",
               "Your OpenAI key is: sk-" + "a" * 48,
           ]

@@ -877,21 +877,25 @@ deliverables:
           plugin_audit_results: List[PluginAuditResult] = field(default_factory=list)
 
 
+      # Section 5.6.4 scales. Capability adds up what the agent's permissions let it do (read-only 1;
+      # read DB + read email + GET to an allowlist 3; read/write DB + internal email 5; + external email,
+      # HTTP POST and file system 8; + code execution 10). Irreversibility is set by the most
+      # irreversible action available (sandboxed 1; production writes / internal email 5; external
+      # email or unrolled-back production change 8; payments, deletion 10) - it is a maximum, not a sum.
+      CAPABILITY_POINTS = [("read", 1), ("write", 2), ("send_internal", 1), ("send_external", 2),
+                           ("http_post", 1), ("file", 1), ("delete", 1), ("execute", 2), ("admin", 2)]
+      IRREVERSIBILITY_BY_CLASS = {"low": 1.0, "medium": 5.0, "high": 8.0, "critical": 10.0}
+
+
       def _capability_score(plugins: List[PluginSpec]) -> float:
-          base = min(len(plugins) * 0.8, 5.0)
-          dangerous_count = sum(
-              1 for p in plugins
-              for perm in p.permission_scope
-              if any(x in perm for x in ["write", "delete", "execute", "send_external", "admin"])
-          )
-          return min(base + min(dangerous_count * 0.8, 5.0), 10.0)
+          perms = [perm for p in plugins for perm in p.permission_scope]
+          return float(min(sum(pts for key, pts in CAPABILITY_POINTS if any(key in perm for perm in perms)), 10))
 
 
       def _irreversibility_score(plugins: List[PluginSpec]) -> float:
-          weights = {"high": 3.0, "medium": 1.5, "low": 0.5}
           if not plugins:
               return 0.0
-          return min(sum(weights.get(p.irreversibility_class, 0) for p in plugins), 10.0)
+          return max(IRREVERSIBILITY_BY_CLASS.get(p.irreversibility_class, 0.0) for p in plugins)
 
 
       def compute_agency_risk(agent: AgentSpec) -> AgencyRiskResult:
@@ -986,6 +990,14 @@ deliverables:
               deployment_context="Production customer service SaaS",
           )
           print_agency_report(compute_agency_risk(agent))
+
+          # The section's worked examples, scored with the same thresholds
+          print("\nSECTION 5.6.4 EXAMPLES (C x A x I against the risk thresholds)")
+          for name, (c, a, i) in {"read_only_rag_chatbot": (1, 5, 1), "customer_service_with_email": (4, 6, 7),
+                                  "autonomous_devops_agent": (9, 8, 9), "finance_payment_agent": (7, 5, 10)}.items():
+              cai = c * a * i
+              level = "critical" if cai > 600 else "high" if cai > 300 else "medium" if cai > 100 else "low"
+              print(f"  {name:28s} C={c} A={a} I={i:<2}  CAI={cai:4d}  [{level.upper()}]")
   - heading: 'LLM09 Hallucination Guard + LLM10 Extraction Cost Estimator'
     id: implementation_02
     filename: llm09_10_security_tools.py
@@ -1020,6 +1032,7 @@ deliverables:
           r"\b(revenue|profit|stock price|market cap|earnings)\b",
           r"\b(case law|ruling|precedent|statute|section \d+)\b",
           r"\b(the correct|the right|the safe|the recommended)\b",
+          r"\b(always|never|guaranteed|within \d+ (hours?|days?))\b",
       ]
 
 
@@ -1052,7 +1065,8 @@ deliverables:
 
 
       def identify_factual_claims(text: str) -> List[str]:
-          sentences = re.split(r'(?<=[.!?])\s+', text)
+          # split at sentence ends, but not after "v." / "vs." / "No." / "Dr." (case names, references)
+          sentences = re.split(r'(?<!\bv\.)(?<!\bvs\.)(?<!\bNo\.)(?<!\bDr\.)(?<=[.!?])\s+', text)
           return [s for s in sentences
                   if any(re.search(p, s, re.IGNORECASE) for p in FACTUAL_CLAIM_INDICATORS)]
 
@@ -1064,11 +1078,11 @@ deliverables:
           require_citation_for_all_claims: bool = True,
       ) -> OverrelianceRiskAssessment:
           claim_texts = identify_factual_claims(output_text)
-          cited_ids = extract_citations(output_text)
           claims = []
 
           for ct in claim_texts:
-              cid = cited_ids[0] if cited_ids else None
+              own = extract_citations(ct)              # a claim is grounded only by a citation in its own sentence
+              cid = own[0] if own else None
               verified = cid in knowledge_base_ids if cid else False
 
               if verified:
@@ -1092,7 +1106,7 @@ deliverables:
           block = bool(claims) and len(high_risk) / len(claims) > block_threshold
 
           if block:
-              rec = "BLOCK: Too many unverified claims for high-stakes domain. Route to human review."
+              rec = f"BLOCK: {len(high_risk)}/{len(claims)} claims unverified in a high-stakes domain. Route to human review."
           elif high_risk:
               rec = f"FLAG: {len(high_risk)} unverified claim(s). Add citations or route to review."
           else:
@@ -1139,6 +1153,7 @@ deliverables:
           query_budget_80pct: int
           cost_60pct_usd: float
           cost_80pct_usd: float
+          account_cost_usd: float
           days_at_rate_limit: float
           economically_rational: bool
           rational_threshold_usd: float
@@ -1178,12 +1193,12 @@ deliverables:
           method = "Distillation (logprobs)" if model.exposes_logprobs else "Hard-label extraction"
 
           if rational:
-              rec = (f"EXTRACTION IS ECONOMICALLY RATIONAL: ${total_c60:,.0f} < "
-                     f"${threshold:,.0f} threshold in {days:.0f} days. "
+              rec = (f"EXTRACTION IS ECONOMICALLY RATIONAL: ${total_c60:,.0f} (queries + accounts) < "
+                     f"${threshold:,.0f} threshold in {days:.1f} days. "
                      f"Tighten rate limits or disable logprobs.")
           else:
               rec = (f"Extraction IRRATIONAL at current limits: ${total_c60:,.0f} cost, "
-                     f"{days:.0f} days vs ${threshold:,.0f} threshold.")
+                     f"{days:.1f} days vs ${threshold:,.0f} threshold.")
 
           return ExtractionFeasibilityReport(
               model_name=model.name,
@@ -1192,6 +1207,7 @@ deliverables:
               query_budget_80pct=q80,
               cost_60pct_usd=round(c60, 2),
               cost_80pct_usd=round(c80, 2),
+              account_cost_usd=round(account_cost, 2),
               days_at_rate_limit=round(days, 1),
               economically_rational=rational,
               rational_threshold_usd=round(threshold, 2),
@@ -1207,6 +1223,7 @@ deliverables:
           print(f"  Queries (80% fit): {r.query_budget_80pct:>12,}")
           print(f"  Cost (60%):        ${r.cost_60pct_usd:>11,.2f}")
           print(f"  Cost (80%):        ${r.cost_80pct_usd:>11,.2f}")
+          print(f"  Account cost:      ${r.account_cost_usd:>11,.2f}")
           print(f"  Days at limit:     {r.days_at_rate_limit:>12.1f}")
           print(f"  Rational thresh:   ${r.rational_threshold_usd:>11,.2f}")
           flag = "RATIONAL" if r.economically_rational else "NOT RATIONAL"
@@ -1222,6 +1239,8 @@ deliverables:
               "Per our refund policy [SOURCE: policy-2024-v3], returns are accepted within 30 days.",
               "The approved dosage is 500mg twice daily per 2024 FDA guidance. Safe for all adults.",
               "Per Smith v. Jones [SOURCE: doc-999-FAKE], the clause is unenforceable.",
+              "Per our refund policy [SOURCE: policy-2024-v3], returns are accepted within 30 days. "
+              "Refunds are always processed within 24 hours.",
           ]
           for t in tests:
               r = assess_overreliance_risk(t, kb_ids, high_stakes_domain=True)
@@ -1230,6 +1249,8 @@ deliverables:
               print(f"       Grounding: {r.overall_grounding_score:.2f} | {r.recommendation[:75]}")
 
           print("\n\nLLM10 EXTRACTION ESTIMATOR DEMO")
+          print("Query budgets use an illustrative scaling heuristic (params^0.8, x10 per +1.0 fidelity,")
+          print("/10 with logprobs), not a measured extraction curve.")
           model = ModelProfile(
               name="AcmeCorp-FinanceGPT-13B",
               parameter_count_billions=13,
@@ -1409,7 +1430,7 @@ deliverables:
               condition=">50 requests in 10 minutes sharing a common prefix pattern",
               severity="high",
               response_action="Rate-limit; flag for review; activate output perplexity monitoring",
-              atlas_technique="AML.T0037",
+              atlas_technique="AML.T0057",
           ),
 
           # LLM07

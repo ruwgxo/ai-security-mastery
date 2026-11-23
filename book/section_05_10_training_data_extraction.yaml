@@ -777,10 +777,10 @@ deliverables:
 
 
       def compute_ngram_repetition(tokens: List[str], n: int = 5) -> Tuple[int, int, float]:
-          """Count n-gram repetitions. Returns (total, repeated, rate)."""
+          """Count n-gram repetitions. Returns (total, repeated, rate): repeated is the number of n-gram
+          occurrences that repeat an earlier one, so text pasted ten times has a rate near 0.9."""
           ngrams = [tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1)]
-          counts = Counter(ngrams)
-          repeated = sum(1 for c in counts.values() if c > 1)
+          repeated = len(ngrams) - len(set(ngrams))
           rate = repeated / len(ngrams) if ngrams else 0.0
           return len(ngrams), repeated, rate
 
@@ -863,7 +863,18 @@ deliverables:
           The quick brown fox jumps over the lazy dog.
           Machine learning models learn statistical patterns from training data.
           Neural networks consist of layers of interconnected nodes.
-          """ * 10
+          Gradient descent adjusts each weight against the slope of the loss.
+          Regularisation keeps a model from fitting noise in a small dataset.
+          Evaluation on held-out data estimates how a model will generalise.
+          Tokenisers split text into subword units before it reaches the model.
+          Attention lets every position weigh information from every other position.
+          """
+
+          repeated_boilerplate_corpus = """
+          The quick brown fox jumps over the lazy dog.
+          Machine learning models learn statistical patterns from training data.
+          Neural networks consist of layers of interconnected nodes.
+          """ * 10      # the same three sentences ten times: repetition drives memorisation
 
           high_risk_corpus = """
           Patient John Smith (SSN: 123-45-6789) was admitted on 2024-03-15.
@@ -876,6 +887,9 @@ deliverables:
 
           r_low = score_corpus(low_risk_corpus, "low_risk_example")
           print_risk_report(r_low, "low_risk_example")
+
+          r_rep = score_corpus(repeated_boilerplate_corpus, "repeated_boilerplate_x10")
+          print_risk_report(r_rep, "repeated_boilerplate_x10")
 
           r_high = score_corpus(high_risk_corpus, "high_risk_medical_corpus")
           print_risk_report(r_high, "high_risk_medical_corpus")
@@ -1247,6 +1261,7 @@ deliverables:
           key = f"accuracy_cost_{model_size}"
           print(f"\n{'='*70}")
           print(f"DIFFERENTIAL PRIVACY TRADEOFF TABLE ({model_size.upper()} MODEL)")
+          print("Literature estimates (Anil et al. 2022, Yu et al. 2022, Li et al. 2022), not computed here")
           print(f"{'Epsilon':>10}  {'Privacy':>10}  {'Mem.Reduction':>15}"
                 f"  {'Accuracy Cost':>14}  Suitable For")
           print("-" * 70)
@@ -1281,7 +1296,8 @@ deliverables:
 
       def print_noise_demo() -> None:
           print(f"\n{'='*55}")
-          print("DP-SGD NOISE LEVELS (gradient_norm=1.0, delta=1e-5)")
+          print("GAUSSIAN MECHANISM NOISE, ONE RELEASE (gradient_norm=1.0, delta=1e-5)")
+          print("A training run releases a gradient every step; its sigma comes from an accountant (below).")
           print(f"{'Epsilon':>10}  {'Sigma':>10}  {'Noise Ratio':>12}  {'SNR (dB)':>10}")
           print("-" * 55)
           for eps in [1, 2, 4, 8, float('inf')]:
@@ -1289,6 +1305,72 @@ deliverables:
               eps_str = f"{eps:.0f}" if eps != float('inf') else "∞"
               snr = f"{r['snr_db']:.1f}" if r['snr_db'] != float('inf') else "∞"
               print(f"{eps_str:>10}  {r['sigma']:>10.4f}  {r['noise_ratio']:>12.4f}  {snr:>10}")
+
+
+      def rdp_epsilon(sigma: float, steps: int, delta: float) -> float:
+          """(epsilon, delta) after `steps` full-batch Gaussian releases with noise multiplier sigma:
+          Renyi DP composes additively (steps * alpha / (2 sigma^2)), then converts to (eps, delta)."""
+          return min(steps * a / (2 * sigma ** 2) + math.log(1 / delta) / (a - 1)
+                     for a in [1 + x / 10 for x in range(1, 1000)])
+
+
+      def sigma_for_epsilon(epsilon: float, steps: int, delta: float) -> float:
+          lo, hi = 1e-3, 1e4
+          for _ in range(100):
+              mid = (lo + hi) / 2
+              lo, hi = (mid, hi) if rdp_epsilon(mid, steps, delta) > epsilon else (lo, mid)
+          return hi
+
+
+      def dp_gd_simulation(epsilons=(1, 2, 4, 8, float('inf')), seeds=range(10), n=300, d=100,
+                           steps=400, clip=1.0, lr=3.0, delta=1e-5) -> None:
+          """Small-scale DP-GD: logistic regression on a dataset where 30% of training labels are noise
+          (examples a model can only fit by memorising them). Per-example gradients are clipped to `clip`;
+          Gaussian noise with sigma from the accountant is added to their sum. Measures test accuracy and
+          a loss-threshold membership inference advantage (TPR - FPR on train vs held-out examples)."""
+          import numpy as np
+          print(f"\n{'='*70}")
+          print(f"DP-GD SIMULATION (logistic regression, n={n}, d={d}, {steps} full-batch steps, "
+                f"{len(seeds)} seeds)")
+          print(f"{'Epsilon':>10}  {'Sigma':>8}  {'Test acc':>9}  {'MIA advantage':>14}")
+          print("-" * 70)
+          rows = []
+          for eps in epsilons:
+              sigma = 0.0 if eps == float('inf') else sigma_for_epsilon(eps, steps, delta)
+              accs, advs = [], []
+              for seed in seeds:
+                  rng = np.random.default_rng(seed)
+                  w_true = rng.normal(size=d)
+                  def make(m):
+                      X = rng.normal(size=(m, d)) / math.sqrt(d)
+                      y = (X @ w_true > 0).astype(float)
+                      return X, y
+                  Xtr, ytr = make(n); Xte, yte = make(n)
+                  flip = rng.random(n) < 0.3
+                  ytr = np.where(flip, 1 - ytr, ytr)            # memorisation targets
+                  w = np.zeros(d)
+                  for _ in range(steps):
+                      p = 1 / (1 + np.exp(-(Xtr @ w)))
+                      g = (p - ytr)[:, None] * Xtr * 20          # per-example gradients (scaled)
+                      norms = np.maximum(1.0, np.linalg.norm(g, axis=1) / clip)
+                      g = g / norms[:, None]
+                      noisy = g.sum(axis=0) + rng.normal(scale=sigma * clip, size=d)
+                      w -= lr * noisy / n
+                  loss = lambda X, y: -(y * np.log(1 / (1 + np.exp(-(X @ w))) + 1e-12)
+                                        + (1 - y) * np.log(1 - 1 / (1 + np.exp(-(X @ w))) + 1e-12))
+                  ltr, lte = loss(Xtr, ytr), loss(Xte, yte)
+                  thr = np.median(np.concatenate([ltr, lte]))
+                  advs.append((ltr < thr).mean() - (lte < thr).mean())
+                  accs.append((((Xte @ w) > 0) == yte).mean())
+              e = f"{eps:.0f}" if eps != float('inf') else "∞"
+              print(f"{e:>10}  {sigma:>8.2f}  {np.mean(accs)*100:>8.1f}%  {np.mean(advs):>14.3f}")
+              rows.append((np.mean(accs), np.mean(advs)))
+          adv_up = all(a[1] <= b[1] for a, b in zip(rows, rows[1:]))
+          acc_up = all(a[0] <= b[0] for a, b in zip(rows, rows[1:]))
+          print(f"Membership advantage {'rises' if adv_up else 'does not rise monotonically'} with epsilon "
+                f"({rows[0][1]:.3f} -> {rows[-1][1]:.3f}); test accuracy "
+                f"{'rises' if acc_up else 'does not rise monotonically'} ({rows[0][0]*100:.1f}% -> {rows[-1][0]*100:.1f}%).")
+          print("Toy model and data: the direction of the tradeoff, not production numbers.")
 
 
       # -----------------------------------------------------------------------
@@ -1396,6 +1478,7 @@ deliverables:
           print_dp_comparison("large")
           print_dp_comparison("small")
           print_noise_demo()
+          dp_gd_simulation()
 
           print(f"\n{'='*55}")
           print("OUTPUT VERBATIM RECALL SCANNER")

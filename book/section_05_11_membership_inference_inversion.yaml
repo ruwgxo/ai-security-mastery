@@ -858,7 +858,7 @@ deliverables:
           train_loss: float
           val_loss: float
           loss_gap: float
-          mia_advantage_upper_bound: float   # Yeom et al.: advantage ≤ gap / 2
+          loss_threshold_advantage: float    # measured: best (TPR - FPR) of "member if loss < t"
           risk_tier: str
           recommendation: str
 
@@ -874,7 +874,11 @@ deliverables:
           val_loss = sum(val_losses) / len(val_losses)
           gap = val_loss - train_loss   # positive if overfitting
 
-          advantage_ub = max(0.0, gap / 2)
+          # Yeom et al. (2018): the threshold attack "member if loss < t" has advantage R_gen / B for a loss
+          # bounded by B. Cross-entropy is unbounded, so measure the attack directly on the two loss samples.
+          cuts = sorted(set(train_losses) | set(val_losses))
+          advantage = max(sum(l < t for l in train_losses) / len(train_losses) -
+                          sum(l < t for l in val_losses) / len(val_losses) for t in cuts)
           risk = ("low" if gap < 0.05 else
                   "medium" if gap < 0.20 else
                   "high" if gap < 0.50 else "critical")
@@ -887,7 +891,7 @@ deliverables:
           }
           return LossGapReport(
               train_loss=train_loss, val_loss=val_loss,
-              loss_gap=gap, mia_advantage_upper_bound=advantage_ub,
+              loss_gap=gap, loss_threshold_advantage=max(0.0, advantage),
               risk_tier=risk, recommendation=recs[risk],
           )
 
@@ -898,7 +902,7 @@ deliverables:
           print(f"Train loss:  {r.train_loss:.4f}")
           print(f"Val loss:    {r.val_loss:.4f}")
           print(f"Gap:         {r.loss_gap:.4f}  [{r.risk_tier.upper()}]")
-          print(f"MIA adv UB:  {r.mia_advantage_upper_bound:.4f}")
+          print(f"Loss-threshold attack advantage (TPR - FPR, measured): {r.loss_threshold_advantage:.4f}")
           print(f"Action: {r.recommendation}")
 
 
@@ -949,10 +953,11 @@ deliverables:
           all_records = members + non_members
           random.shuffle(all_records)
 
+          print("Synthetic log-probabilities: members drawn ~5 nats more likely under the target model.")
           result = run_lr_mia(all_records)
           print_mia_result(result)
 
-          # Loss-gap demo: overfit model
+          # Loss-gap demo: overfit model (synthetic per-sample losses)
           train_l = [random.gauss(0.4, 0.1) for _ in range(500)]
           val_l   = [random.gauss(0.9, 0.15) for _ in range(200)]
           lgr = compute_loss_gap(train_l, val_l)
@@ -1083,7 +1088,8 @@ deliverables:
           """
           Apply label smoothing to model outputs: redistribute smoothing
           probability mass from the predicted class to all other classes.
-          Mimics training with label smoothing — reduces overconfidence.
+          Lowers displayed confidence, but as a monotone transform it keeps every score's order, so a
+          threshold attack is unaffected; training with label smoothing changes the model itself.
           """
           n = len(cv.probs)
           smoothed = [(1 - smoothing) * p + smoothing / n for p in cv.probs]
@@ -1131,7 +1137,7 @@ deliverables:
           print(f"\n  Defence: {r.after_defence}")
           print(f"    Original:  entropy={r.original_entropy:.3f}  max_prob={r.original_max_prob:.4f}")
           print(f"    Defended:  entropy={r.defended_entropy:.3f}  max_prob={r.defended_max_prob:.4f}")
-          print(f"    Δ entropy: +{r.entropy_increase:.3f}  |  max_prob reduction: {r.max_prob_reduction:.4f} ({r.mia_signal_reduction_pct:.1f}%)")
+          print(f"    Δ entropy: {r.entropy_increase:+.3f}  |  Δ max_prob: {-r.max_prob_reduction:+.4f} ({-r.mia_signal_reduction_pct:+.1f}%)")
 
 
       # -----------------------------------------------------------------------
@@ -1155,6 +1161,64 @@ deliverables:
           cv3 = confidence_mask(cv2, decimal_places=decimal_places)
           cv4 = perturb_probs(cv3, epsilon=noise_epsilon)
           return cv4
+
+
+      def _auc(pos: List[float], neg: List[float]) -> float:
+          """P(score of a random member > score of a random non-member), ties counted half."""
+          allv = sorted([(v, 1) for v in pos] + [(v, 0) for v in neg])
+          rank_sum, i = 0.0, 0
+          while i < len(allv):
+              j = i
+              while j < len(allv) and allv[j][0] == allv[i][0]: j += 1
+              avg_rank = (i + j + 1) / 2
+              rank_sum += avg_rank * sum(1 for k in range(i, j) if allv[k][1] == 1)
+              i = j
+          return (rank_sum - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg))
+
+
+      def evaluate_defences(n: int = 1000, n_classes: int = 20, seed: int = 7) -> None:
+          """Measure each defence against the confidence attack it is meant to blunt. Synthetic overfit
+          model: members' true-class logit ~ N(4.5, 1), non-members' ~ N(2.5, 1.5), other logits N(0, 1).
+          Attack score = probability on the true class. Utility = top-1 prediction unchanged."""
+          rng = random.Random(seed)
+          labels = [f"class_{i}" for i in range(n_classes)]
+          def sample(mu, sd):
+              y = rng.randrange(n_classes)
+              logits = [rng.gauss(0, 1) for _ in range(n_classes)]
+              logits[y] = rng.gauss(mu, sd)
+              m = max(logits); e = [math.exp(l - m) for l in logits]; z = sum(e)
+              return y, ConfidenceVector(labels=labels, probs=[x / z for x in e])
+          members = [sample(4.5, 1.0) for _ in range(n)]
+          nonmembers = [sample(2.5, 1.5) for _ in range(n)]
+          argmax = lambda cv: max(range(len(cv.probs)), key=lambda i: cv.probs[i])
+          defences = {
+              "None": lambda cv: cv,
+              "Confidence masking (1dp)": lambda cv: confidence_mask(cv, decimal_places=1),
+              "Top-5 truncation": lambda cv: top_k_truncate(cv, k=5),
+              "Label smoothing α=0.1 (post hoc)": lambda cv: label_smooth_outputs(cv, smoothing=0.1),
+              "Laplace perturbation ε=5": lambda cv: perturb_probs(cv, epsilon=5.0),
+              "Full pipeline": full_defence_pipeline,
+          }
+          print(f"\nDEFENCE EVALUATION ({n} members + {n} non-members, synthetic overfit model)")
+          print(f"  {'Defence':34s} {'Confidence-attack AUC':>22s} {'Label-only AUC':>15s} {'Top-1 kept':>11s}")
+          random.seed(seed)
+          results = {}
+          for name, f in defences.items():
+              dm = [(y, cv, f(cv)) for y, cv in members]
+              dn = [(y, cv, f(cv)) for y, cv in nonmembers]
+              auc = _auc([d.probs[y] for y, _, d in dm], [d.probs[y] for y, _, d in dn])
+              lab = _auc([float(argmax(d) == y) for y, _, d in dm], [float(argmax(d) == y) for y, _, d in dn])
+              kept = sum(argmax(d) == argmax(cv) for _, cv, d in dm + dn) / (2 * n)
+              print(f"  {name:34s} {auc:22.3f} {lab:15.3f} {kept*100:10.1f}%")
+              results[name] = (auc, lab, kept)
+          base_auc, base_lab, _ = results["None"]
+          usable = {k: v for k, v in results.items() if k != "None" and v[2] >= 0.9}
+          best = min(usable, key=lambda k: usable[k][0])
+          print(f"\n  Defences keeping >= 90% of top-1 answers: best confidence-attack AUC {usable[best][0]:.3f} "
+                f"({best}) vs {base_auc:.3f} undefended;")
+          print(f"  label-only AUC among them {min(v[1] for v in usable.values()):.3f}-{max(v[1] for v in usable.values()):.3f} "
+                f"vs {base_lab:.3f}. Defences that keep predictions cannot hide whether they are right;")
+          print("  that needs training-time controls (regularisation, DP).")
 
 
       if __name__ == "__main__":
@@ -1183,6 +1247,8 @@ deliverables:
           for name, defended in defences:
               r = apply_and_measure(cv, name, defended)
               print_defence_report(r)
+
+          evaluate_defences()
   - heading: 'Combined Privacy Risk Audit Tool'
     id: implementation_03
     filename: privacy_risk_audit.py
@@ -1326,7 +1392,8 @@ deliverables:
           ))
 
           # Stage 4: MIA self-assessment (AUC-ROC)
-          mia_tier = _risk_tier(mia_auc, thresh["mia_auc"])
+          # AUC 0.5 is chance: tier the excess over chance against the allowed excess
+          mia_tier = _risk_tier(max(mia_auc - 0.5, 0.0), thresh["mia_auc"] - 0.5)
           stages.append(AuditStageResult(
               stage_id="S4", stage_name="MIA Self-Assessment (LR Test)",
               metric_name="mia_auc", metric_value=mia_auc,
@@ -1418,6 +1485,8 @@ deliverables:
       if __name__ == "__main__":
           random.seed(42)
 
+          print("Example audits: the measurements below are illustrative inputs (corpus score, losses,")
+          print("MIA AUC), as produced by the Section 5.10 and 5.11 tools on a real model.")
           # Example 1: High-risk medical fine-tuned model, no defences
           report1 = run_privacy_audit(
               model_id="clinic-llm-v1",

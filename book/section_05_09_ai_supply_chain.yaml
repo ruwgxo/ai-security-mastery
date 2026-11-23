@@ -1115,14 +1115,15 @@ deliverables:
           import tempfile
 
           # Simulate a SafeTensors file (header = 8 LE bytes + '{...}' JSON)
-          with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
+          work = tempfile.mkdtemp()
+          with open(os.path.join(work, "demo-model.safetensors"), "wb") as f:
               header_json = b'{"__metadata__": {}}'
               hdr_len = struct.pack('<Q', len(header_json))
               f.write(hdr_len + header_json)
               fname_safe = f.name
 
           # Simulate a pickle file
-          with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+          with open(os.path.join(work, "pytorch_model.bin"), "wb") as f:
               f.write(b'\x80\x04' + b'\x00' * 20)
               fname_pickle = f.name
 
@@ -1268,6 +1269,11 @@ deliverables:
                       risks.append(f"MEDIUM: Adapter {a.identifier} regression test pending")
               if self.framework and self.framework.critical_cve_count > 0:
                   risks.append(f"HIGH: {self.framework.critical_cve_count} critical CVE(s) in dependencies")
+              floor = PATCHED_FRAMEWORK_FLOOR.get(self.framework.ml_framework) if self.framework else None
+              vt = lambda v: tuple(int(x) for x in v.split(".")[:3] if x.isdigit())
+              if floor and vt(self.framework.ml_framework_version) < vt(floor):
+                  risks.append(f"HIGH: {self.framework.ml_framework} {self.framework.ml_framework_version} is below "
+                               f"the patched floor {floor}")
               return {"risk_count": len(risks), "risks": risks}
 
 
@@ -1341,6 +1347,7 @@ deliverables:
           items: List[str]
           passed: List[str]
           failed: List[str]
+          unassessed: List[str] = field(default_factory=list)
 
           @property
           def score(self) -> int:
@@ -1359,10 +1366,11 @@ deliverables:
           results = []
           for stage, items in CHECKLIST_STAGES.items():
               responses = stage_responses.get(stage, {})
-              passed = [i for i in items if responses.get(i, False)]
-              failed = [i for i in items if not responses.get(i, False)]
+              passed = [i for i in items if responses.get(i) is True]
+              failed = [i for i in items if responses.get(i) is False]
+              unassessed = [i for i in items if i not in responses]
               results.append(ChecklistResult(stage=stage, items=items,
-                                             passed=passed, failed=failed))
+                                             passed=passed, failed=failed, unassessed=unassessed))
           return results
 
 
@@ -1376,9 +1384,47 @@ deliverables:
           print(f"Overall: {overall_passed}/{overall_total} ({overall_pct}%)\n")
           for r in results:
               icon = {"low": "PASS", "medium": "WARN", "high": "FAIL"}[r.risk_level]
-              print(f"  [{icon}] {r.stage} — {r.score}%")
-              for f in r.failed[:3]:
-                  print(f"         MISSING: {f[:60]}")
+              print(f"  [{icon}] {r.stage} — {r.score}% ({len(r.passed)} met, {len(r.failed)} not met, "
+                    f"{len(r.unassessed)} not assessed)")
+              for f in r.failed:
+                  print(f"         NOT MET: {f[:70]}")
+          print("\nItems not assessed count as not met in the score: no evidence, no credit.")
+
+
+      PATCHED_FRAMEWORK_FLOOR = {"torch": "2.6.0"}    # CVE-2025-32434 fixed in 2.6.0 (Section 5.5 verifier)
+
+
+      def evidence_from_sbom(sbom: "MLSBOM") -> Dict[str, Dict[str, bool]]:
+          """Checklist answers the SBOM itself can evidence; everything else needs a human answer."""
+          ds, bm, fw = sbom.datasets, sbom.base_model, sbom.framework
+          vt = lambda v: tuple(int(x) for x in v.split(".")[:3] if x.isdigit())
+          floor = PATCHED_FRAMEWORK_FLOOR.get(fw.ml_framework) if fw else None
+          out = {
+              "01_dataset_acquisition": {
+                  "SHA-256 hash computed and recorded at dataset download": bool(ds) and all(d.sha256_at_acquisition for d in ds),
+                  "Dataset source URL and acquisition timestamp logged": bool(ds) and all(d.source_url and d.acquisition_date for d in ds),
+                  "Dataset licence verified for intended use": bool(ds) and all(d.licence for d in ds),
+                  "Known contamination risks documented": bool(ds) and all(d.known_contamination_risks for d in ds),
+              },
+              "02_data_preprocessing": {
+                  "Preprocessing pipeline version recorded in SBOM": bool(ds) and all(d.filtering_pipeline_version for d in ds),
+                  "Deduplication applied and parameters documented": bool(ds) and all(d.deduplication_applied for d in ds),
+              },
+              "04_fine_tuning_and_adapters": {
+                  "All adapters hashed at download and stored in SBOM": all(a.sha256 for a in sbom.adapters),
+                  "Behavioural regression test run on base + adapter combination": all(a.regression_test_result == "pass" for a in sbom.adapters),
+              },
+              "05_dependencies": {
+                  "Docker image digest pinned and recorded in SBOM": bool(fw and fw.docker_image_digest),
+              },
+              "06_training_pipeline": {
+                  "Base model hash re-verified at training start": bool(bm) and bm.sha256_at_intake == bm.sha256_at_training_start,
+                  "Training run ID recorded and linked to SBOM": all(a.training_run_id for a in sbom.adapters),
+              },
+          }
+          if floor:
+              out["05_dependencies"]["ML framework version on supported/patched branch"] = vt(fw.ml_framework_version) >= vt(floor)
+          return out
 
 
       if __name__ == "__main__":
@@ -1456,10 +1502,12 @@ deliverables:
                   "SCA scan run against requirements.txt — zero critical CVEs": True,
                   "Docker image digest pinned and recorded in SBOM": True,
                   "No known typosquatting packages in dependency tree": False,  # MISSING
-                  "ML framework version on supported/patched branch": True,
                   "CUDA / cuDNN versions recorded and vulnerability-checked": True,
               },
           }
+          for stage, items in evidence_from_sbom(sbom).items():          # SBOM evidence overrides nothing typed above
+              for item, ok in items.items():
+                  responses.setdefault(stage, {}).setdefault(item, ok)
           results = run_checklist(responses)
           print_checklist_report(results)
   - heading: 'HuggingFace Model Audit Tool'
@@ -1656,6 +1704,8 @@ deliverables:
 
 
       if __name__ == "__main__":
+          print("Offline demo: each audit runs on the repository metadata written below (file list, card")
+          print("fields), as an audit pipeline would after fetching it from the hub API.")
           # Test 1: Legitimate Llama model
           r1 = audit_hf_model(
               model_id="meta-llama/Meta-Llama-3-8B",
