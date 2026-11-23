@@ -164,20 +164,68 @@ def _embedded_code(lines, kinds, path):
     out = [{'type': 'prose', 'text': Folded(join_lines(lines[:first], path))}] if first else []
     return out + [{'type': 'code', 'lang': lang, 'text': Literal('\n'.join(code) + '\n')}]
 
+YAML_KEY = re.compile(r'^[a-z_][a-z0-9_]*:(\s|$)')
+
+def _yaml_runs(t, path):
+    """Chapter 5: a YAML mapping written out inside prose (often a whole subsection) spans several
+    paragraphs - a key line, then indented children separated by blank lines. Split per paragraph, the
+    key and its children land in separate blocks and the nesting is lost. A run of paragraphs that starts
+    at an unindented snake_case key line, continues through paragraphs that are indented or start with
+    such a key, and parses as one YAML mapping stays one yaml code block, verbatim (blank lines kept).
+    Yields those blocks (dicts) and every other paragraph (str) in order."""
+    seps = list(re.finditer(r'\n[ \t]*\n', t))
+    spans, a = [], 0
+    for m in seps: spans.append((a, m.start())); a = m.end()
+    spans.append((a, len(t)))
+    i = 0
+    while i < len(spans):
+        p = t[spans[i][0]:spans[i][1]]
+        best = None
+        if YAML_KEY.match(p):
+            j = i + 1
+            while True:
+                chunk = t[spans[i][0]:spans[j - 1][1]]
+                try: ok = isinstance(yaml.safe_load(chunk), dict)
+                except Exception: ok = False
+                if ok and (j - i > 1 or re.match(r'[a-z_][a-z0-9_]*:[ \t]*\n[ \t]', chunk)): best = j     # one paragraph: a bare key opening a mapping
+                if j >= len(spans): break
+                q = t[spans[j][0]:spans[j][1]]
+                if not (q[:1] in (' ', '\t') or YAML_KEY.match(q)): break
+                j += 1
+        if best:
+            chunk = t[spans[i][0]:spans[best - 1][1]]
+            R.add('classified', path=path, kind='yaml-run->code(yaml)', text=chunk[:400])
+            yield {'type': 'code', 'lang': 'yaml', 'text': Literal(chunk + '\n')}
+            i = best
+        else:
+            yield p; i += 1
+
 def text_to_blocks(t, path):
     """Split a v1 prose value into standard blocks, paragraph by paragraph. Prose is the default;
     line-structured paragraphs stay literal; consecutive literal paragraphs merge into one block."""
     t = fix_text_apos(t, path)
     blocks = []
-    for para in re.split(r'\n[ \t]*\n', t.strip('\n')):
+    for para in _yaml_runs(t.strip('\n'), path):
+        if isinstance(para, dict): blocks.append(para); continue
         if not para.strip(): continue
+        ind = min(len(l) - len(l.lstrip()) for l in para.split('\n') if l.strip())
         for b in _para_to_blocks(para, path):
             if (b['type'] == 'code' and blocks and blocks[-1]['type'] == 'code' and blocks[-1]['lang'] == 'text'
                     and b['lang'] == 'text'):
                 blocks[-1]['text'] = Literal(str(blocks[-1]['text']) + '\n' + str(b['text']))
+            elif (b['type'] == 'code' and b['lang'] == 'yaml' and ind and blocks and blocks[-1].get('_yaml_indent') == ind):
+                # chapter 5: sibling entries of one indented mapping, separated by blank lines -> one block
+                R.add('classified', path=path, kind='indented-yaml-siblings-merged', text=str(b['text'])[:200])
+                blocks[-1]['text'] = Literal(str(blocks[-1]['text']) + '\n' + str(b['text']))
             else:
+                if b['type'] == 'code' and b['lang'] == 'yaml' and ind and _all_indented(para):
+                    b['_yaml_indent'] = ind
                 blocks.append(b)
+    for b in blocks: b.pop('_yaml_indent', None)
     return blocks
+
+def _all_indented(para):
+    return all(l[:1] in (' ', '\t') for l in para.split('\n') if l.strip())
 
 def join_lines(ls, path):
     """Fold wrapped lines into one paragraph. A word hyphen-wrapped across lines (first-/order)
@@ -470,10 +518,12 @@ def slot_deliverables(dl, path):
         if d.get('filename'): e['filename'] = d['filename']
         lang = lang_for(d); e['lang'] = lang
         if d.get('description'): e['description'] = prose_value(d['description'], f'{path}.{k}.description')
+        elif d.get('purpose'): e['description'] = prose_value(d['purpose'], f'{path}.{k}.purpose')   # chapter 5: purpose is the description
         if d.get('implementation_notes'): e['notes'] = prose_value(d['implementation_notes'], f'{path}.{k}.implementation_notes')
         if d.get('dependencies'): e['dependencies'] = str_list(d['dependencies'], f'{path}.{k}.dependencies')
         e['code'] = Literal(fix_code_apos(d['code'], f'{path}.{k}.code') if lang == 'python' else d['code'])
         extra = set(d) - {'title', 'filename', 'language', 'description', 'implementation_notes', 'dependencies', 'code'}
+        if d.get('purpose') and not d.get('description'): extra.discard('purpose')
         if listed: extra -= {'id'} | ({'name'} if d.get('name') in (d.get('filename'), d.get('title')) else set())
         for x in sorted(extra): R.add('legacy', path=f'{path}.{k}.{x}', value=d[x])
         if extra: e['legacy'] = {x: d[x] for x in d if x in extra}
@@ -529,6 +579,18 @@ def slot_next(key, v, path):
     o['summary'] = prose_value(v[src[0]], f'{path}.{src[0]}')
     extra = set(v) - {'title', 'summary', 'preview', 'teaser', 'connection'}
     if extra: R.add('unmapped', path=path, keys=sorted(extra))
+    return o
+
+def next_section(v, path):
+    """Chapter 5: section_summary.next_section is a heading line ("Section 5.2 — Title") and a preview
+    paragraph -> the next slot, title the heading line as written, target from its section number."""
+    head, _, body = v.strip('\n').partition('\n')
+    m = re.match(r'Section (\d+)\.(\d+)\b', head)
+    o = OrderedDict([('kind', 'section')])
+    if m: o['target'] = f'{int(m.group(1)):02d}_{int(m.group(2)):02d}'
+    else: R.add('defects', path=path, issue='next_section heading has no section number')
+    o['title'] = short(head, f'{path}.title')
+    o['summary'] = prose_value(body, f'{path}.summary')
     return o
 
 # ── family C (chapter 7: content / code_examples / exercises / cross_references) ──
@@ -649,13 +711,15 @@ def convert(src_path):
             out['prerequisites'] = str_list(di[k], 'document_info.prerequisites'); continue
         if k == 'leads_to' and isinstance(di[k], list):                                     # chapter 7
             out.setdefault('connections', OrderedDict())['leads_to'] = str_list(di[k], 'document_info.leads_to'); continue
+        if k.endswith('_note') and isinstance(di[k], str) and len(di[k].split()) > 12:          # chapter 5 (5.7): a note to the reader
+            out.setdefault('overview', []).append(_as_part(k, di[k], f'document_info.{k}')); continue
         if k not in SECTION_INFO_KEYS + ['title', 'version', 'author', 'tags']:
             legacy[f'document_info.{k}'] = di[k]
     out['section_info'] = si
     so = d.get('section_overview') or {}
     if 'title' in so: legacy['section_overview.title'] = so['title']
     if so.get('one_line_summary'): out['lead'] = prose_value(so['one_line_summary'], 'section_overview.one_line_summary')
-    if so: ov = slot_overview(so, 'section_overview'); ov and out.__setitem__('overview', ov)
+    if so: ov = slot_overview(so, 'section_overview'); ov and out.__setitem__('overview', ov + out.get('overview', []))
     if 'learning_objectives' in d: out['learning_objectives'] = slot_objectives(d['learning_objectives'], 'learning_objectives')
     if 'prerequisites' in d:
         p = d['prerequisites']; out['prerequisites'] = str_list(p, 'prerequisites') if isinstance(p, list) else {'groups': groups(p, 'prerequisites')}
@@ -699,11 +763,20 @@ def convert(src_path):
             # chapter 8: deliverables that describe an artifact (artifact, purpose, format/inputs/outputs ...)
             # and carry no code -> artifacts, one fields block per item, subject the artifact, id the v1 key
             out['artifacts'] = [fields_block(x['artifact'], x, f'deliverables.{kk}', skip=('artifact',), key=kk) for kk, x in dl.items()]
+        elif isinstance(dl, dict) and dl and all(isinstance(x, dict) and 'code' not in x and 'title' in x for x in dl.values()):
+            # chapter 5: deliverable_NN records naming produced outputs (title, files/file/content, format,
+            # generated_by, completion_criteria) with no code -> artifacts, subject the title, id the v1 key
+            out['artifacts'] = [fields_block(x['title'], x, f'deliverables.{kk}', skip=('title',), key=kk) for kk, x in dl.items()]
         else:
             out['deliverables'] = slot_deliverables(dl, 'deliverables')
     if 'assessment' in d: out['exercises'] = slot_exercises(d['assessment'], 'assessment'); handled.add('assessment')
     if 'common_mistakes' in d: out['common_mistakes'] = slot_mistakes(d['common_mistakes'], 'common_mistakes'); handled.add('common_mistakes')
-    if 'section_summary' in d: out['section_summary'] = slot_summary(d['section_summary'], 'section_summary'); handled.add('section_summary')
+    if 'section_summary' in d:
+        ss = d['section_summary']; handled.add('section_summary')
+        if isinstance(ss, dict) and isinstance(ss.get('next_section'), str):
+            out['next'] = next_section(ss['next_section'], 'section_summary.next_section')
+            ss = OrderedDict((k, v) for k, v in ss.items() if k != 'next_section')
+        if ss: out['section_summary'] = slot_summary(ss, 'section_summary')
     if 'key_takeaways' in d:
         kt = d['key_takeaways']; handled.add('key_takeaways')
         if isinstance(kt, dict) and 'items' in kt:
@@ -712,6 +785,11 @@ def convert(src_path):
             summary_extra['key_takeaways'] = {'style': 'ordered', 'items': [prose_value(x['takeaway'], f'key_takeaways.items[{i}].takeaway') for i, x in enumerate(kt['items'])]}
             for kk in kt:
                 if kk != 'items': out['section_info'].setdefault('legacy', OrderedDict())[f'key_takeaways.{kk}'] = kt[kk]
+        elif isinstance(kt, dict) and kt and all(re.fullmatch(r'takeaway_\d+', k) and isinstance(v, str) for k, v in kt.items()):
+            # chapter 5: takeaway_01..takeaway_NN strings -> an ordered list (the keys are the positions)
+            nums = [int(k.split('_')[1]) for k in kt]
+            if nums != list(range(1, len(nums) + 1)): R.add('defects', path='key_takeaways', issue=f'numbers not 1..n: {nums}')
+            summary_extra['key_takeaways'] = {'style': 'ordered', 'items': [prose_value(v, f'key_takeaways.{k}') for k, v in kt.items()]}
         else:
             summary_extra['key_takeaways'] = str_list(kt, 'key_takeaways') if isinstance(kt, list) else groups(kt, 'key_takeaways')
     if summary_extra:
@@ -738,6 +816,9 @@ def convert(src_path):
             if k == 'tags': continue
             if isinstance(v, (list, dict)): out.setdefault('connections', OrderedDict())[k] = str_list(v, f'metadata.{k}') if isinstance(v, list) else v
             else: legacy[f'metadata.{k}'] = v           # counts, ids, numbers: metadata, not connections
+    for k in d:                                     # chapter 5 (5.15): a closing note beside section_content
+        if k not in handled and isinstance(d[k], str) and 'section_content' in d and len(d[k].split()) > 12:
+            out.setdefault('prose_content', []).append(_as_part(k, d[k], k)); handled.add(k)
     for k in d:
         if k not in handled: R.add('unmapped', path=k, keys=[k], note='no slot yet for this family')
     if legacy: out['section_info'].setdefault('legacy', OrderedDict()).update(legacy)

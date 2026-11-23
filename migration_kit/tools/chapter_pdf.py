@@ -14,16 +14,57 @@ from xml.sax.saxutils import escape
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib.styles import ParagraphStyle
-from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, PageBreak, Preformatted,
+from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, PageBreak, Preformatted, XPreformatted,
                                 Table, TableStyle, ListFlowable, ListItem)
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 D = '/usr/share/fonts/truetype/dejavu/'
+CMAP = {}
 for name, f in [('Serif', 'DejaVuSerif.ttf'), ('Serif-B', 'DejaVuSerif-Bold.ttf'), ('Sans', 'DejaVuSans.ttf'),
                 ('Sans-B', 'DejaVuSans-Bold.ttf'), ('Mono', 'DejaVuSansMono.ttf')]:
-    pdfmetrics.registerFont(TTFont(name, D + f))
+    pdfmetrics.registerFont(TTFont(name, D + f)); CMAP[name] = pdfmetrics.getFont(name).face.charToGlyph
+
+# Emoji in demo output strings (chapter 5): DejaVu has no glyphs for them. A monochrome outline emoji
+# font (Noto Emoji; the colour bitmap font cannot be embedded) draws them. Set EMOJI_FONT to its path.
+EMOJI_FONT = os.environ.get('EMOJI_FONT') or next((p for p in [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'fonts', 'NotoEmoji.ttf'),
+    os.path.expanduser('~/.fonts/NotoEmoji.ttf'), '/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf']
+    if os.path.exists(p)), None)
+if EMOJI_FONT:
+    pdfmetrics.registerFont(TTFont('Emoji', EMOJI_FONT)); CMAP['Emoji'] = pdfmetrics.getFont('Emoji').face.charToGlyph
+
+import reportlab.pdfbase.ttfonts as _ttf
+def _to_unicode_cmap(fontname, subset):
+    """reportlab writes <%04X>, which truncates characters beyond U+FFFF (U+1F6A8 -> U+1F6A) in the
+    PDF's text layer; the PDF specification wants UTF-16BE, i.e. surrogate pairs."""
+    hexu = lambda v: chr(v).encode('utf-16-be').hex().upper()
+    return '\n'.join(["/CIDInit /ProcSet findresource begin", "12 dict begin", "begincmap", "/CIDSystemInfo",
+                      "<< /Registry (%s)" % fontname, "/Ordering (%s)" % fontname, "/Supplement 0", ">> def",
+                      "/CMapName /%s def" % fontname, "/CMapType 2 def", "1 begincodespacerange",
+                      "<00> <%02X>" % (len(subset) - 1), "endcodespacerange", "%d beginbfchar" % len(subset)]
+                     + ["<%02X> <%s>" % (i, hexu(v)) for i, v in enumerate(subset)]
+                     + ["endbfchar", "endcmap", "CMapName currentdict /CMap defineresource pop", "end", "end"])
+_ttf.makeToUnicodeCMap = _to_unicode_cmap
+
+
+def fallback(markup, font):
+    """Wrap characters the style's font cannot draw in the emoji font (markup is already escaped).
+    Text with no such characters is returned unchanged."""
+    have = CMAP.get(font.replace('-B', '')) or CMAP.get(font, {})
+    if 'Emoji' not in CMAP or all(ord(c) in have or c in '\n\t' for c in markup): return markup
+    out, inside = [], False
+    for c in markup:
+        need = ord(c) not in have and ord(c) in CMAP['Emoji'] and c not in '\n\t'
+        if need != inside:
+            out.append('<font name="Emoji">' if need else '</font>'); inside = need
+        out.append(c)
+    return ''.join(out) + ('</font>' if inside else '')
+
+
+def P(text, style):
+    return Paragraph(fallback(text, style.fontName), style)
 
 INK, GREY = '#1d1d1f', '#6e6e73'
 S = {
@@ -54,11 +95,11 @@ class Doc:
         if added: self.added.append(added)
         self.values.append(text)
         body = (f'<b>{escape(added)}</b> ' if added else '') + escape(text).replace('\n', '<br/>')
-        self.story.append(Paragraph(body, S[style]))
+        self.story.append(P(body, S[style]))
 
     def label(self, text, style):
         self.added.append(text)
-        self.story.append(Paragraph(escape(text), S[style]))
+        self.story.append(P(escape(text), S[style]))
 
 
 def nice(key):
@@ -79,14 +120,14 @@ def table(doc, b):
     cols, rows = b.get('columns') or [], b.get('rows') or []
     data = []
     if cols:
-        data.append([Paragraph(escape(scalar(c)), S['head']) for c in cols]); doc.values += [scalar(c) for c in cols]
+        data.append([P(escape(scalar(c)), S['head']) for c in cols]); doc.values += [scalar(c) for c in cols]
     for r in rows:
         cells = r if isinstance(r, list) else list(r.values()) if isinstance(r, dict) else [r]
         if isinstance(r, dict): doc.added += [str(k) + ':' for k in r]  # mapping rows keep their keys visible
         row = []
         for k, c in zip(r if isinstance(r, dict) else [None] * len(cells), cells):
             txt = scalar(c); doc.values.append(txt)
-            row.append(Paragraph((f'<b>{escape(str(k))}:</b> ' if k is not None else '') + escape(txt).replace('\n', '<br/>'), S['cell']))
+            row.append(P((f'<b>{escape(str(k))}:</b> ' if k is not None else '') + escape(txt).replace('\n', '<br/>'), S['cell']))
         data.append(row)
     if not data: return
     n = max(len(r) for r in data)
@@ -111,7 +152,7 @@ def bullets(doc, items, ordered, depth):
         txt = scalar(it); doc.values.append(txt)
         # an empty item (17.01/17.06's blank first column header) still gets its bullet: an empty
         # paragraph is drawn without one, so it holds a non-breaking space (whitespace to the check)
-        flow.append(ListItem(Paragraph(escape(txt).replace('\n', '<br/>') or '&nbsp;', S['body'])))
+        flow.append(ListItem(P(escape(txt).replace('\n', '<br/>') or '&nbsp;', S['body'])))
         doc.added.append(f'{n}.' if ordered else '•')
     doc.story.append(ListFlowable(flow, bulletType='1' if ordered else 'bullet', start='1' if ordered else '•',
                                   bulletFormat='%s.' if ordered else None,
@@ -121,9 +162,13 @@ def bullets(doc, items, ordered, depth):
 def code(doc, text, lang):
     if lang:
         doc.values.append(lang); doc.added.append('[]')
-        doc.story.append(Paragraph(escape(f'[{lang}]'), S['kv']))
+        doc.story.append(P(escape(f'[{lang}]'), S['kv']))
     txt = scalar(text).rstrip('\n'); doc.values.append(txt)
-    doc.story.append(Preformatted(txt, S['code'], maxLineLength=CODE_COLS, newLineChars=''))
+    if fallback(escape(txt), 'Mono') == escape(txt):
+        doc.story.append(Preformatted(txt, S['code'], maxLineLength=CODE_COLS, newLineChars=''))
+    else:     # emoji: same line splitting as Preformatted, drawn with markup so the emoji font applies
+        lines = [l[i:i + CODE_COLS] for l in txt.split('\n') for i in range(0, max(len(l), 1), CODE_COLS)]
+        doc.story.append(XPreformatted(fallback(escape('\n'.join(lines)), 'Mono'), S['code']))
 
 
 def block(doc, b, depth):
@@ -142,7 +187,7 @@ def block(doc, b, depth):
         doc.added.append(head.split(' - ')[0] + ':'); doc.values.append(scalar(rest.get('title', '')))
         doc.values.append(scalar(rest.get('text', '')).strip())
         body = f'<b>{escape(head)}:</b> ' + escape(scalar(rest.get("text", "")).strip()).replace('\n', '<br/>')
-        doc.story.append(Paragraph(body, S['call'])); return
+        doc.story.append(P(body, S['call'])); return
     doc.label(f'[{ty}]', 'kv')  # any other block shape: show its type, then every field
     walk(doc, rest, depth + 1)
 
@@ -153,7 +198,7 @@ def walk(doc, v, depth):
             block(doc, v, depth); return
         if 'heading' in v:  # a part: its heading is content, printed as a heading
             h = scalar(v['heading']); doc.values.append(h)
-            doc.story.append(Paragraph(escape(h), S['h%d' % min(depth, 3)]))
+            doc.story.append(P(escape(h), S['h%d' % min(depth, 3)]))
             v = {k: x for k, x in v.items() if k != 'heading'}
         for k, x in v.items():
             if k in ('blocks',) and isinstance(x, list):
@@ -168,7 +213,7 @@ def walk(doc, v, depth):
     elif isinstance(v, list):
         if v and all(not isinstance(i, (dict, list)) and re.fullmatch(r'\S{1,40}', scalar(i)) for i in v):
             doc.values += [scalar(i) for i in v]; doc.added += ['·'] * (len(v) - 1)  # tags and similar: one line
-            doc.story.append(Paragraph(escape(' · '.join(scalar(i) for i in v)), S['kv']))
+            doc.story.append(P(escape(' · '.join(scalar(i) for i in v)), S['kv']))
         elif all(not isinstance(i, (dict, list)) for i in v):
             bullets(doc, v, False, depth)
         else:
@@ -206,7 +251,7 @@ def main(book, ch, out):
         if i: doc.story.append(PageBreak())
         doc.label(os.path.basename(f), 'kv')
         title = scalar(d.pop('title', '')) if isinstance(d, dict) else ''
-        if title: doc.values.append(title); doc.story.append(Paragraph(escape(title), S['h0']))
+        if title: doc.values.append(title); doc.story.append(P(escape(title), S['h0']))
         walk(doc, d, 1)
     SimpleDocTemplate(out, pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm, topMargin=14 * mm,
                       bottomMargin=14 * mm, title=f'Chapter {ch} - review copy').build(doc.story)
