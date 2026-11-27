@@ -50,15 +50,23 @@ _ttf.makeToUnicodeCMap = _to_unicode_cmap
 
 
 def fallback(markup, font):
-    """Wrap characters the style's font cannot draw in the emoji font (markup is already escaped).
+    """Wrap characters the style's font cannot draw in a font that can (markup is already escaped):
+    DejaVu Sans for symbols the serif lacks (chapter 5's double angle brackets), else the emoji font.
     Text with no such characters is returned unchanged."""
     have = CMAP.get(font.replace('-B', '')) or CMAP.get(font, {})
-    if 'Emoji' not in CMAP or all(ord(c) in have or c in '\n\t' for c in markup): return markup
-    out, inside = [], False
+    if all(ord(c) in have or c in '\n\t' for c in markup): return markup
+    def pick(c):
+        if ord(c) in have or c in '\n\t': return None
+        if ord(c) in CMAP['Sans']: return 'Sans'
+        if 'Emoji' in CMAP and ord(c) in CMAP['Emoji']: return 'Emoji'
+        return None
+    out, inside = [], None
     for c in markup:
-        need = ord(c) not in have and ord(c) in CMAP['Emoji'] and c not in '\n\t'
-        if need != inside:
-            out.append('<font name="Emoji">' if need else '</font>'); inside = need
+        f = pick(c)
+        if f != inside:
+            if inside: out.append('</font>')
+            if f: out.append(f'<font name="{f}">')
+            inside = f
         out.append(c)
     return ''.join(out) + ('</font>' if inside else '')
 

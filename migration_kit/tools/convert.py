@@ -224,6 +224,130 @@ def text_to_blocks(t, path):
     for b in blocks: b.pop('_yaml_indent', None)
     return blocks
 
+# ── YAML written as text -> structure (chapters 5-6 subsections) ─────────────
+def _is_sigma(m):
+    return isinstance(m, dict) and {'logsource', 'detection'} <= set(m)
+
+def _fieldable(v):
+    """A value a fields entry can hold as written: a scalar, a string whose paragraphs are each
+    plain prose (no list markers, indentation or broken lines), or a list of such strings."""
+    if isinstance(v, str):
+        paras = [p for p in re.split(r'\n[ \t]*\n', v.strip('\n')) if p.strip()]
+        return all(_simple_dict({'x': p}) for p in paras)
+    if isinstance(v, list):
+        return bool(v) and all(isinstance(x, str) and _simple_dict({'x': x}) for x in v)
+    return not isinstance(v, dict)
+
+def _y_entries(items, path):
+    out = []
+    for k, v in items:
+        if isinstance(v, list):
+            R.add('notes', path=f'{path}.{k}', note='fields entry value is a list (standard expects a string); kept as a list')
+            v = str_list(v, f'{path}.{k}')
+        elif isinstance(v, str):
+            v = prose_value(v, f'{path}.{k}')
+        else:
+            v = '' if v is None else str(v)
+        out.append({'label': label(k), 'value': v})
+    return out
+
+def _y_fields(subject, items, path, key=None):
+    b = OrderedDict([('type', 'fields'), ('subject', subject)])
+    if key is not None: b['id'] = str(key)
+    b['entries'] = _y_entries(items, path)
+    return b
+
+def _y_part(key, path):
+    return OrderedDict([('heading', label(key)), ('id', str(key))])
+
+def _y_add(cont, item):
+    """Place a block or a part in a container (a part or the subsection) in reading order: blocks
+    stay ahead of the first sub-part; a block after it joins the last sub-part (reported)."""
+    kind, x = item
+    if kind == 'part':
+        cont.setdefault('parts', []).append(x)
+    elif not cont.get('parts'):
+        cont.setdefault('blocks', []).append(x)
+    elif x.get('type') == 'fields' and x.get('id'):
+        # a record after a sub-part: a part of its own, headed by the record's subject
+        p = OrderedDict([('heading', x['subject']), ('id', x['id'])])
+        p['blocks'] = [OrderedDict((k, v) for k, v in x.items() if k != 'id')]
+        cont['parts'].append(p)
+    else:
+        # text after a run: it must still come last, so it joins the last part that has no sub-parts
+        last = cont['parts'][-1]
+        while last.get('parts'): last = last['parts'][-1]
+        R.add('classified', path=cont.get('id', '?'), kind='text-after-structured-yaml-joined-last-part', text=str(x)[:200])
+        last.setdefault('blocks', []).append(x)
+
+def _y_mapping_into(cont, m, path, level):
+    """Children of a mapping, in order, into a container whose heading names the mapping. Simple
+    values collect into one fields block (subject: the container's heading) until the first
+    sub-part; after it each value is a part of its own."""
+    pending = []
+    def flush():
+        if not pending: return
+        if cont.get('parts'):
+            for k, v in pending:
+                p = _y_part(k, f'{path}.{k}')
+                p['blocks'] = [_y_fields(label(k), [(k, v)], path)]
+                cont['parts'].append(p)
+        else:
+            cont.setdefault('blocks', []).append(_y_fields(cont['heading'], list(pending), path))
+        pending.clear()
+    for k, v in m.items():
+        if _fieldable(v):
+            pending.append((k, v)); continue
+        flush()
+        _y_add(cont, _y_value(k, v, f'{path}.{k}', level + 1))
+    flush()
+
+def _y_value(key, v, path, level):
+    """One non-simple value of a YAML mapping written as text -> ('block', fields) or ('part', part)."""
+    if level >= 6: R.add('defects', path=path, issue='YAML nesting deeper than heading level 6')
+    if isinstance(v, dict) and v and all(_fieldable(x) for x in v.values()):
+        return 'block', _y_fields(label(key), list(v.items()), path, key=key)
+    p = _y_part(key, path)
+    if isinstance(v, dict):
+        _y_mapping_into(p, v, path, level)
+    elif isinstance(v, list):
+        blocks = []
+        for i, x in enumerate(v):
+            if isinstance(x, dict) and x:
+                k0 = next((k for k in ('title', 'name', 'id') if isinstance(x.get(k), str)), None)
+                if k0 and all(_fieldable(y) for y in x.values()):
+                    blocks.append(_y_fields(short(x[k0], f'{path}[{i}]'), [(k, y) for k, y in x.items() if k != k0], f'{path}[{i}]'))
+                else:
+                    sub = _y_part(f'{key}_{i + 1}', f'{path}[{i}]'); sub['heading'] = f'{label(key)} {i + 1}'
+                    _y_mapping_into(sub, x, f'{path}[{i}]', level + 1); p.setdefault('parts', []).append(sub)
+            elif isinstance(x, str):
+                blocks.append({'type': 'list', 'style': 'bullet', 'items': [short(x, f'{path}[{i}]')]})
+            else:
+                blocks.append({'type': 'prose', 'text': str(x)})
+        if blocks: p['blocks'] = blocks
+    else:
+        b, parts = structured_text(v, path, p['heading'], level)
+        if b: p['blocks'] = b
+        if parts: p['parts'] = parts
+    return 'part', p
+
+def structured_text(t, path, heading, level=2):
+    """text_to_blocks for a chapters 5-6 subsection body: YAML written as text (a run at the margin,
+    an indented mapping after a lead-in, merged siblings) becomes headings, prose, lists and fields
+    instead of a yaml code block. Returns (blocks, parts). Sigma-shaped mappings stay code."""
+    cont = OrderedDict([('heading', heading), ('id', path)])
+    for b in text_to_blocks(t, path):
+        if b['type'] == 'code' and b['lang'] == 'yaml':
+            try: m = yaml.load(str(b['text']), Loader=yaml.BaseLoader)     # scalars stay as written
+            except yaml.YAMLError: m = None
+            if isinstance(m, dict) and m and not _is_sigma(m):
+                R.add('classified', path=path, kind='yaml-text->structure', text=str(b['text'])[:200])
+                _y_mapping_into(cont, m, path, level)
+                continue
+            R.add('notes', path=path, note='yaml block kept as code (not a mapping, or a Sigma rule)')
+        _y_add(cont, ('block', b))
+    return cont.get('blocks', []), cont.get('parts', [])
+
 def _all_indented(para):
     return all(l[:1] in (' ', '\t') for l in para.split('\n') if l.strip())
 
@@ -408,7 +532,7 @@ def slot_objectives(lo, path):
     o['groups'] = groups({k: v for k, v in lo.items() if k != 'primary'}, path)
     return o
 
-def slot_parts(pc, path):
+def slot_parts(pc, path, structure_yaml=False):
     parts = []
     items = pc.items() if isinstance(pc, dict) else ((f'part_{x.get("part", i+1)}', x) for i, x in enumerate(pc))
     for k, v in items:
@@ -420,11 +544,18 @@ def slot_parts(pc, path):
             p['heading'] = short(head, f'{path}.{k}.title')
             p['id'] = k
             body = v.get('body', v.get('content'))
-            p['blocks'] = text_to_blocks(body, f'{path}.{k}.body')
+            if structure_yaml:       # chapters 5-6: YAML written as text becomes structure (owner decision)
+                bl, sub = structured_text(body, f'{path}.{k}.body', p['heading'])
+                if bl: p['blocks'] = bl          # a body that is all nested mappings has only parts
+                if sub: p['parts'] = sub
+            else:
+                p['blocks'] = text_to_blocks(body, f'{path}.{k}.body')
             for kk, vv in v.items():
                 if kk in ('title', 'heading', 'body', 'content', 'number', 'part'): continue
                 r = generic_part(kk, vv, f'{path}.{k}.{kk}', 3)
-                if 'callout' in r: p['blocks'].append(r['callout'])
+                blk = r.get('callout') or r.get('fields_only')
+                if blk is not None and structure_yaml: _y_add(p, ('block', blk))     # keeps reading order after sub-parts
+                elif 'callout' in r: p['blocks'].append(r['callout'])
                 elif 'fields_only' in r: p['blocks'].append(r['fields_only'])
                 else: p.setdefault('parts', []).append(r['part'])
         else:
@@ -730,7 +861,7 @@ def convert(src_path):
     if 'section_content' in d:                      # chapters 1-2 (free-form) and 5-6 (subsection_N)
         sc = d['section_content']; handled.add('section_content')
         if all(k.startswith('subsection_') for k in sc):
-            out['prose_content'] = slot_parts(sc, 'section_content')
+            out['prose_content'] = slot_parts(sc, 'section_content', structure_yaml=True)
         else:
             ov, parts = [], []
             for k, v in sc.items():
