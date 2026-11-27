@@ -33,6 +33,79 @@ def norm_v1(t):
         out.append('\n'.join(res))
     return ''.join(out)
 
+class Words(list):
+    """A v1 text already reduced to the word tokens the profile maps it to (YAML written as text)."""
+
+# Profile map, restated (owner decision on chapters 5-6): inside a section_content subsection body, YAML
+# written as text -- a run of paragraphs at the margin that reads as one mapping, an indented mapping
+# (after an optional prose lead-in ending in ':'), indented sibling entries -- becomes headings, prose,
+# lists and fields. Keys become profile-derived headings and labels, so only the values remain, in
+# order; a Sigma rule (logsource + detection) stays a code block.
+_KEY = re.compile(r'^[a-z_][a-z0-9_]*:(\s|$)')
+_TOPKEY = re.compile(r'^(- |[A-Za-z_][\w.|-]*:( |$))')
+
+def _ymap(text):
+    try: m = yaml.load(text, Loader=yaml.BaseLoader)
+    except yaml.YAMLError: return None
+    return m if isinstance(m, dict) and m and not ({'logsource', 'detection'} <= set(m)) else None
+
+def _yvalues(v):
+    out = []
+    if isinstance(v, dict):
+        recs = None
+        for x in v.values(): out += _yvalues(x)
+    elif isinstance(v, list):
+        for x in v:
+            if isinstance(x, str): out.append('\u2022'); out += _ytext(x)
+            elif isinstance(x, dict):
+                k0 = next((k for k in ('title', 'name', 'id') if isinstance(x.get(k), str)), None)
+                flat = k0 and all(isinstance(y, str) or (isinstance(y, list) and all(isinstance(z, str) for z in y)) for y in x.values())
+                if flat:      # a record: its title/name/id is the fields subject, shown first
+                    out += _ytext(x[k0]); out += _yvalues({k: y for k, y in x.items() if k != k0})
+                else: out += _yvalues(x)
+            else: out += words(str(x))
+    elif isinstance(v, str): out += _ytext(v)
+    elif v is not None: out += words(str(v))
+    return out
+
+def _ytext(t):
+    """Words of a text in a subsection body, YAML written as text reduced to its values."""
+    paras = [p for p in re.split(r'\n[ \t]*\n', t.strip('\n'))]
+    out, i = [], 0
+    while i < len(paras):
+        p = paras[i]
+        if _KEY.match(p):                                          # a run at the margin
+            got = None
+            for j in range(i + 1, len(paras) + 1):
+                if j > i + 1 and not (paras[j - 1][:1] in (' ', '\t') or _KEY.match(paras[j - 1])): break
+                m = _ymap('\n\n'.join(paras[i:j]))
+                if m is not None and (j > i + 1 or re.match(r'[a-z_][a-z0-9_]*:[ \t]*\n[ \t]', p)): got = (j, m)
+            if got: out += _yvalues(got[1]); i = got[0]; continue
+        lines = p.split('\n')
+        first = next((n for n, l in enumerate(lines) if l[:1] in (' ', '\t')), None)
+        if first is not None and all(l[:1] in (' ', '\t') or not l.strip() for l in lines[first:]) \
+                and (first == 0 or lines[first - 1].rstrip().endswith(':')):
+            body = [l for l in lines[first:] if l.strip()]
+            ind = min(len(l) - len(l.lstrip()) for l in body)
+            ded = '\n'.join(l[ind:] for l in lines[first:])
+            top = [l for l in ded.split('\n') if l.strip() and l[:1] not in (' ', '\t')]
+            m = _ymap(ded) if len(body) >= 2 and top and all(_TOPKEY.match(l) for l in top) else None
+            if m is not None:
+                out += words(norm_v1('\n'.join(lines[:first]))) + _yvalues(m); i += 1; continue
+        out += words(norm_v1(p)); i += 1
+    return out
+
+def structure_subsections(d):
+    """v1 with each subsection body (chapters 5-6 layout) reduced to its profile word stream."""
+    sc = d.get('section_content')
+    if not (isinstance(sc, dict) and sc and all(str(k).startswith('subsection_') for k in sc)): return d
+    new = {}
+    for k, v in sc.items():
+        if isinstance(v, dict) and isinstance(v.get('content'), str):
+            v = dict(v, content=Words(_ytext(v['content'].replace("''", "'"))))
+        new[k] = v
+    return dict(d, section_content=new)
+
 def words(t): return ['\u2022' if w == '-' else w for w in t.split()]   # a bare dash and a list marker are one token: YAML lists in code vs items in prose
 
 def v1_stream(d):
@@ -46,10 +119,11 @@ def v1_stream(d):
                 if path == '.metadata' and kk == 'tags': continue
                 if kk in V1_CODE_KEYS: continue
                 w(v, kk, f'{path}.{kk}')
-        elif isinstance(n, list):
+        elif isinstance(n, list) and not isinstance(n, Words):
             for v in n:
                 if isinstance(v, str) or (isinstance(v, dict) and 'takeaway' in v): out.append('\u2022')
                 w(v, k, path)
+        elif isinstance(n, Words): out.extend(n)
         elif isinstance(n, str) and k == 'rows': out.extend(words(n.replace("''", "'")))   # a table cell is a value, not a paragraph: '1. Schema' keeps its number
         elif isinstance(n, str): out.extend(words(norm_v1(n)))
         elif n is not None and not isinstance(n, bool): out.append(str(n))
@@ -65,9 +139,17 @@ def verbatim_v1(t):
 def v2_stream(d):
     """Text of a v2 section in document order, minus frontmatter, section_info, profile-derived labels."""
     out = []
+    heads = [None]
     def w(n, k=None, path=''):
         if isinstance(n, dict):
             derived_heading = 'id' in n and (n.get('heading') == label(n['id']) or n.get('subject') == label(n['id']))
+            if n.get('type') == 'fields' and n.get('subject') == heads[-1]: derived_heading = True; n = dict(n, id=None)
+            if 'heading' in n and 'blocks' in n or 'heading' in n and 'parts' in n:
+                heads.append(n['heading']); w2(n, k, path, derived_heading); heads.pop(); return
+            w2(n, k, path, derived_heading); return
+        w2(n, k, path, False)
+    def w2(n, k, path, derived_heading):
+        if isinstance(n, dict):
             for kk, v in n.items():
                 if path == '' and kk in ('title','updated','version','authors','tags','section_info'): continue
                 if kk in STRUCTURAL and k != 'legacy': continue
@@ -77,7 +159,7 @@ def v2_stream(d):
                     if verbatim_v1(v): out.extend(words(norm_v1(v))); continue     # chapter 5: v1 text kept as written, so v1's normalisation
                     out.extend(words(v)); continue                           # shell/YAML block: no list-marker normalisation
                 if kk == 'code' and path.startswith('.deliverables'): continue
-                if kk in ('heading', 'subject') and derived_heading and n.get(kk) == label(n['id']): continue
+                if kk in ('heading', 'subject') and derived_heading and (n.get('id') is None or n.get(kk) == label(n['id'])): continue
                 if kk == 'label' and n.get('value') is not None: continue          # fields label = v1 key
                 if kk == 'title' and n.get('type') == 'callout': continue          # callout title = v1 key
                 if kk == 'groups' or (path.endswith('.groups')): pass
@@ -198,10 +280,11 @@ def leaves(n, skip_num_keys=('number', 'count')):
                 if kk == 'language' and 'code' in n: continue              # becomes lang; checked in deliverable_langs
                 if kk == 'id' and isinstance(v, str): continue             # kept as an id; checked in v1_ids_kept
                 w(v, kk)
-        elif isinstance(n, list):
+        elif isinstance(n, list) and not isinstance(n, Words):
             for v in n:
                 if isinstance(v, str) or (isinstance(v, dict) and 'takeaway' in v): out.append(['\u2022'])
                 w(v, k)
+        elif isinstance(n, Words): out.append(list(n))
         elif isinstance(n, str) and k == 'rows': out.append(words(n.replace("''", "'")))   # table cell: no list-marker normalisation
         elif isinstance(n, str): out.append(words(norm_v1(n)))
         elif n is not None and not isinstance(n, bool) and k not in skip_num_keys: out.append([str(n)])
@@ -289,6 +372,7 @@ def main(a, b):
     strs(v1)
     v1, kt_strings = split_key_terms(v1)
     v1 = records_as_tables(v1)
+    v1 = structure_subsections(v1)
     tk = takeaways_as_list(v1); res['takeaway_numbering'] = 'ok' if tk is not None else 'NOT 1..n'; v1 = tk or v1
     if kt_strings is not None:     # each v2 term/definition must rejoin to its v1 string exactly
         got = [f"{x.get('term')}: {x.get('definition')}" for x in (v2.get('section_summary') or {}).get('key_terms') or []]
