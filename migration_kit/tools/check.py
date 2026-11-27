@@ -247,7 +247,7 @@ def v1_slots(d):
         if k.endswith('_note') and isinstance(v, str) and len(v.split()) > 12: slots.setdefault(('overview', 1), []).extend(leaves(v))
     for top, v in d.items():
         if top == 'document_info': continue
-        if isinstance(v, str) and 'section_content' in d and len(v.split()) > 12:       # chapter 5 (5.15): closing note -> a part
+        if isinstance(v, str) and 'section_content' in d and len(v.split()) > 12 and top != 'section_summary':   # chapter 5 (5.15): closing note -> a part (chapter 6: a string section_summary is the compact summary)
             slots.setdefault(('prose_content', 0), []).extend(leaves(v)); continue
         if fam_c and top != "key_takeaways":
             items = v.items() if isinstance(v, dict) else [(None, v)]
