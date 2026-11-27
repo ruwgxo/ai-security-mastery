@@ -184,7 +184,8 @@ def block(doc, b, depth):
         table(doc, b); return
     if ty == 'callout' and set(rest) <= {'variant', 'title', 'text'}:
         head = scalar(rest.get('variant', 'note')).capitalize() + (' - ' + scalar(rest['title']) if rest.get('title') else '')
-        doc.added.append(head.split(' - ')[0] + ':'); doc.values.append(scalar(rest.get('title', '')))
+        # the variant, the ' - ' joiner before a title, and ':' are renderer text (chapter 6's key points have titles)
+        doc.added.append(head.split(' - ')[0] + (' -' if rest.get('title') else '') + ':'); doc.values.append(scalar(rest.get('title', '')))
         doc.values.append(scalar(rest.get('text', '')).strip())
         body = f'<b>{escape(head)}:</b> ' + escape(scalar(rest.get("text", "")).strip()).replace('\n', '<br/>')
         doc.story.append(P(body, S['call'])); return
@@ -230,6 +231,7 @@ def collect(v, out):
             # a block's type, and a list block's style, pick its layout; they are not text
             if k == 'type' and isinstance(x, str): continue
             if k == 'style' and v.get('type') == 'list': continue
+            if k == 'variant' and v.get('type') == 'callout': continue   # shown as the callout's label ("Note")
             collect(x, out)
     elif isinstance(v, list):
         for x in v: collect(x, out)

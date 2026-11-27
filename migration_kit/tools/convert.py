@@ -59,7 +59,7 @@ DIAG = re.compile(r'[─│┌┐└┘├┤┬┴┼═║╔╗╚╝↓↑�
 def _line_kind(l):
     if not l.strip(): return 'blank'
     if BUL.match(l): return 'item'
-    if DIAG.search(l): return 'pre'
+    if DIAG.search(l.replace('-->', '') if '<!--' in l else l): return 'pre'     # chapter 6: <!-- and --> named in prose is not an arrow
     if l.startswith((' ', '\t')): return 'indent'
     return 'text'
 
@@ -756,7 +756,10 @@ def convert(src_path):
     if 'deliverables' in d:
         dl = d['deliverables']; handled.add('deliverables')
         if isinstance(dl, dict) and 'items' in dl:   # chapters 5-6: produced outputs, not code
-            out['artifacts'] = [fields_block(x.get('title', x.get('id')), x, f'deliverables.items[{i}]', skip=('title',)) for i, x in enumerate(dl['items'])]
+            # chapter 6: an item's own id (D01 ...) is the block id, not a fields entry
+            out['artifacts'] = [fields_block(x.get('title', x.get('id')), x, f'deliverables.items[{i}]',
+                                             skip=('title', 'id') if isinstance(x.get('id'), str) else ('title',),
+                                             key=x['id'] if isinstance(x.get('id'), str) else None) for i, x in enumerate(dl['items'])]
             for kk in dl:
                 if kk != 'items': out['section_info'].setdefault('legacy', OrderedDict())[f'deliverables.{kk}'] = dl[kk]
         elif isinstance(dl, dict) and dl and all(isinstance(x, dict) and 'code' not in x and 'artifact' in x for x in dl.values()):

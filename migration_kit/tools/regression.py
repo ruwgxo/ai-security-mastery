@@ -1,5 +1,5 @@
 """Regression check: the converter must still turn every reference chapter's v1 files into exactly
-the output its migration used (regression/chNN_v1 -> regression/chNN_expected; chapters 5, 7, 8 and 10 to 18).
+the output its migration used (regression/chNN_v1 -> regression/chNN_expected; chapters 5 to 8 and 10 to 18).
 Run after every converter change, before converting a new chapter. Usage (from the bundle root):
 python3 tools/regression.py"""
 import os, sys, glob, subprocess, tempfile, filecmp
